@@ -33,7 +33,7 @@ memory-server ping
 
 ## API Reference
 
-The server exposes eight MCP tools:
+The server exposes nine MCP tools:
 
 ### ping
 
@@ -334,6 +334,56 @@ Returns the result from the highest-priority stage that produces meaningful outp
 
 Python 3.12+, MCP SDK, Pydantic, SQLAlchemy, Qdrant, Neo4j, GitPython
 
+## Confidence Lifecycle
+
+Every fact and extracted memory item passes through a confidence lifecycle.
+The lifecycle determines how a fact moves from raw ingestion to trusted knowledge:
+
+### Verification Statuses
+
+| Status       | Description |
+|-------------|-------------|
+| `candidate` | Initial state after ingestion via `remember()` or `learn()`. Low confidence (0.5 default). |
+| `validated` | Confidence >= 0.7 — fact has passed an internal quality check. |
+| `trusted`   | Confidence >= 0.85 AND corroboration >= 2 sources. High-reliability knowledge. |
+| `deprecated`| Marked obsolete due to conflict resolution or evidence change. |
+| `archived`  | Deprecated fact moved to cold storage. |
+
+### Lifecycle Flow
+
+```
+candidate → validated → trusted
+     ↓                        ↓
+deprecated → archived    deprecated → archived
+```
+
+### Confidence Scoring
+
+Confidence scores (0.0–1.0) are computed heuristically from:
+
+- **Source reliability**: `verified` (0.9), `admin` (0.85), `inferred` (0.7),
+  `extracted` (0.6), `unknown` (0.3)
+- **Age decay**: Exponential decay over TTL (default 90 days), minimum 0.3
+- **Corroboration boost**: +0.05 for 2 sources, +0.10 for 3+
+- **Conflict penalty**: -0.10 for 1 conflict, -0.20 for 2+
+
+### Decay Engine
+
+The `DecayEngine` applies time-based decay to all stored facts:
+- TTL-based confidence reduction (default 90 days)
+- Archive threshold: facts below 0.3 confidence are flagged for archiving
+- Runs on-demand at audit time, not as a background process
+
+### Auto-Indexing
+
+When a fact is stored via `remember()` or `learn()`, the server automatically:
+
+1. **Embeds** the fact text using SentenceTransformer (`all-MiniLM-L6-v2`)
+2. **Upserts** the embedding into Qdrant for semantic search
+3. **Syncs** to the knowledge graph (creates entity nodes + relation edges)
+
+This is best-effort — failures during auto-indexing never crash the caller.
+
 ## Roadmap
 
 | Phase | Milestone |
@@ -342,4 +392,4 @@ Python 3.12+, MCP SDK, Pydantic, SQLAlchemy, Qdrant, Neo4j, GitPython
 | v0.2  | Qdrant + embeddings + semantic router |
 | v0.3  | LLM extractors + learn() |
 | v0.4  | Graph DB + entity relations |
-| v0.5+ | Confidence engine + validation + decay + auditor |
+| v0.5  | Confidence engine + validation + decay + auditor + auto-indexing (done) |
