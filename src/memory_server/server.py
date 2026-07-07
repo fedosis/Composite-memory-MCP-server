@@ -1,6 +1,8 @@
 """MCP server entry point with tool registrations."""
 
+import asyncio
 import json
+import logging
 
 from mcp.server.fastmcp import FastMCP
 
@@ -19,6 +21,8 @@ from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.embedding_router import EmbeddingRouter
 from memory_server.router.graph_router import GraphRouter
 from memory_server.router.hybrid_router import HybridRouter
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP("CompositeMemoryServer")
 
@@ -135,10 +139,21 @@ async def remember_tool(
         source=source,
     )
     # Serialize Pydantic models in result
+    fact = result["fact"]
     serialized = {
         "receipt": result["receipt"].model_dump(mode="json"),
-        "fact": result["fact"].model_dump(mode="json"),
+        "fact": fact.model_dump(mode="json"),
     }
+
+    # Auto-index into Qdrant + graph (best-effort, never crashes)
+    await _auto_index_fact(
+        fact_id=fact.id,
+        subject=fact.subject,
+        predicate=fact.predicate,
+        object=fact.object,
+        source=fact.source,
+    )
+
     return json.dumps(serialized)
 
 
@@ -162,6 +177,54 @@ async def learn_tool(
         text=text,
         source=source,
     )
+
+    # Auto-index all extracted items (best-effort, never crashes)
+    try:
+        # Facts -> Qdrant + graph
+        for f in result.get("facts", []):
+            item = f.get("item", {})
+            await _auto_index_fact(
+                fact_id=item.get("id", ""),
+                subject=item.get("subject", ""),
+                predicate=item.get("predicate", ""),
+                object=item.get("object", ""),
+                source=source,
+            )
+
+        # Decisions -> graph
+        graph_router = await _get_graph_router()
+        for d in result.get("decisions", []):
+            item = d.get("item", {})
+            try:
+                graph_router.sync_decision(
+                    choice=item.get("choice", ""),
+                    reason=item.get("reason", ""),
+                    entities=[item.get("context", "")],
+                )
+            except Exception:
+                logger.warning(
+                    "Auto-sync to graph failed for decision %s",
+                    item.get("id", ""),
+                    exc_info=True,
+                )
+
+        # Skills -> graph
+        for s in result.get("skills", []):
+            item = s.get("item", {})
+            try:
+                graph_router.sync_skill(
+                    purpose=item.get("purpose", ""),
+                    steps=item.get("steps", []),
+                )
+            except Exception:
+                logger.warning(
+                    "Auto-sync to graph failed for skill %s",
+                    item.get("id", ""),
+                    exc_info=True,
+                )
+    except Exception:
+        logger.warning("Auto-indexing during learn() failed", exc_info=True)
+
     return json.dumps(result)
 
 
@@ -286,6 +349,71 @@ async def _get_hybrid_router() -> HybridRouter:
             graph=_graph,
         )
     return _hybrid_router
+
+
+async def _get_qdrant_and_embedder() -> tuple[QdrantProvider, SentenceTransformerEmbeddingProvider]:
+    """Get or create the QdrantProvider and Embedder singletons."""
+    global _qdrant, _embedder
+    if _qdrant is None:
+        _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+    if _embedder is None:
+        _embedder = SentenceTransformerEmbeddingProvider()
+    return _qdrant, _embedder
+
+
+async def _auto_index_fact(
+    fact_id: str,
+    subject: str,
+    predicate: str,
+    object: str,
+    source: str,
+) -> None:
+    """Auto-index a stored fact into Qdrant (vector search) and graph.
+
+    Wrapped in try/except -- never crashes the caller if Qdrant/graph
+    is unavailable.
+
+    Args:
+        fact_id: Unique fact ID.
+        subject: Fact subject.
+        predicate: Fact predicate.
+        object: Fact object.
+        source: Fact source.
+    """
+    try:
+        qdrant, embedder = await _get_qdrant_and_embedder()
+        graph_router = await _get_graph_router()
+
+        # Build fact text for embedding
+        fact_text = f"{subject} {predicate} {object}"
+
+        # Embed (sync call, run in thread to avoid blocking)
+        vector = await asyncio.to_thread(embedder.embed, fact_text)
+
+        # Upsert into Qdrant
+        await qdrant.upsert(
+            point_id=fact_id,
+            vector=vector,
+            payload={
+                "subject": subject,
+                "predicate": predicate,
+                "object": object,
+                "source": source,
+                "memory_type": "fact",
+            },
+        )
+
+        # Sync to graph
+        graph_router.sync_fact(subject, predicate, object)
+    except Exception:
+        logger.warning(
+            "Auto-indexing failed for fact %s (%s %s %s)",
+            fact_id,
+            subject,
+            predicate,
+            object,
+            exc_info=True,
+        )
 
 
 @mcp.tool(name="route")
