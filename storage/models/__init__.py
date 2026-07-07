@@ -9,6 +9,7 @@ from storage.models.fact import FactORM  # noqa: F401, E402
 from storage.models.lifecycle import LifecycleEventORM, LifecycleStateORM  # noqa: F401, E402
 from storage.models.receipt import MemoryReceiptORM  # noqa: F401, E402
 from storage.models.skill import SkillORM  # noqa: F401, E402
+from storage.outbox import OutboxEntryORM  # noqa: F401, E402
 
 __all__ = [
     "Base",
@@ -19,4 +20,5 @@ __all__ = [
     "LifecycleStateORM",
     "MemoryReceiptORM",
     "SkillORM",
+    "OutboxEntryORM",
 ]

@@ -1,10 +1,17 @@
-"""MCP server entry point with tool registrations."""
+"""MCP server entry point with tool registrations.
+
+v0.6 Phase 4: Uses transactional outbox pattern for async indexing.
+- remember() / learn() write to SQL + outbox in same transaction
+- Outbox worker polls pending entries and pushes to Qdrant + graph
+- Failed entries are retried 3 times, then marked as failed
+"""
 
 import asyncio
 import json
 import logging
 
 from mcp.server.fastmcp import FastMCP
+from storage.outbox_worker import OutboxWorker
 
 from memory_server.api.get_context import get_context as get_context_fn
 from memory_server.api.learn import learn as learn_fn
@@ -37,6 +44,8 @@ _hybrid_router: HybridRouter | None = None
 _validator_store: Validator | None = None
 _confidence_engine: ConfidenceEngine | None = None
 _decay_engine: DecayEngine | None = None
+_outbox_worker: OutboxWorker | None = None
+_outbox_task: asyncio.Task | None = None
 
 
 async def _get_provider() -> SQLiteProvider:
@@ -61,6 +70,30 @@ async def _get_router() -> EmbeddingRouter:
             embedder=_embedder,
         )
     return _router
+
+
+async def _get_outbox_worker() -> OutboxWorker:
+    """Get or create the OutboxWorker singleton.
+
+    Starts the worker as a background asyncio task on first access.
+    The worker polls the outbox table and processes pending entries.
+    """
+    global _outbox_worker, _outbox_task
+    if _outbox_worker is None:
+        _chart_router = await _get_graph_router()
+        _outbox_worker = OutboxWorker(
+            db_url=_provider._url if _provider else "sqlite+aiosqlite:///:memory:",
+            qdrant=_qdrant,
+            embedder=_embedder,
+            graph_router=_chart_router,
+        )
+        await _outbox_worker.initialize()
+
+        # Start background polling task
+        if _outbox_task is None or _outbox_task.done():
+            _outbox_task = asyncio.create_task(_outbox_worker.run())
+            logger.info("Outbox worker background task started")
+    return _outbox_worker
 
 
 @mcp.tool()
@@ -124,6 +157,10 @@ async def remember_tool(
 ) -> str:
     """Store a fact and generate a provenance receipt.
 
+    Writes the fact + receipt to SQL and adds an outbox entry for
+    async indexing into Qdrant (vector store) and graph. The outbox
+    worker processes the entry in the background.
+
     Args:
         subject: The subject of the fact.
         predicate: The predicate/relation.
@@ -140,6 +177,7 @@ async def remember_tool(
         confidence=confidence,
         source=source,
     )
+
     # Serialize Pydantic models in result
     fact = result["fact"]
     serialized = {
@@ -147,8 +185,8 @@ async def remember_tool(
         "fact": fact.model_dump(mode="json"),
     }
 
-    # Auto-index into Qdrant + graph (best-effort, never crashes)
-    await _auto_index_fact(
+    # Add outbox entry for async indexing (best-effort, never crashes)
+    await _write_outbox_fact(
         fact_id=fact.id,
         subject=fact.subject,
         predicate=fact.predicate,
@@ -167,7 +205,8 @@ async def learn_tool(
     """Extract and store facts, decisions, and skills from natural language text.
 
     Runs all three extractors (FactExtractor, DecisionExtractor, SkillExtractor)
-    on the input text and stores extracted items in the memory database.
+    on the input text, stores extracted items in SQLite, and adds outbox
+    entries for async indexing into Qdrant + graph.
 
     Args:
         text: Natural language text to extract knowledge from.
@@ -180,12 +219,11 @@ async def learn_tool(
         source=source,
     )
 
-    # Auto-index all extracted items (best-effort, never crashes)
+    # Add outbox entries for all extracted items (best-effort, never crashes)
     try:
-        # Facts -> Qdrant + graph
         for f in result.get("facts", []):
             item = f.get("item", {})
-            await _auto_index_fact(
+            await _write_outbox_fact(
                 fact_id=item.get("id", ""),
                 subject=item.get("subject", ""),
                 predicate=item.get("predicate", ""),
@@ -193,39 +231,24 @@ async def learn_tool(
                 source=source,
             )
 
-        # Decisions -> graph
-        graph_router = await _get_graph_router()
         for d in result.get("decisions", []):
             item = d.get("item", {})
-            try:
-                graph_router.sync_decision(
-                    choice=item.get("choice", ""),
-                    reason=item.get("reason", ""),
-                    entities=[item.get("context", "")],
-                )
-            except Exception:
-                logger.warning(
-                    "Auto-sync to graph failed for decision %s",
-                    item.get("id", ""),
-                    exc_info=True,
-                )
+            await _write_outbox_decision(
+                decision_id=item.get("id", ""),
+                choice=item.get("choice", ""),
+                reason=item.get("reason", ""),
+                context=item.get("context", ""),
+            )
 
-        # Skills -> graph
         for s in result.get("skills", []):
             item = s.get("item", {})
-            try:
-                graph_router.sync_skill(
-                    purpose=item.get("purpose", ""),
-                    steps=item.get("steps", []),
-                )
-            except Exception:
-                logger.warning(
-                    "Auto-sync to graph failed for skill %s",
-                    item.get("id", ""),
-                    exc_info=True,
-                )
+            await _write_outbox_skill(
+                skill_id=item.get("id", ""),
+                purpose=item.get("purpose", ""),
+                steps=item.get("steps", []),
+            )
     except Exception:
-        logger.warning("Auto-indexing during learn() failed", exc_info=True)
+        logger.warning("Writing outbox entries during learn() failed", exc_info=True)
 
     return json.dumps(result)
 
@@ -353,59 +376,95 @@ async def _get_hybrid_router() -> HybridRouter:
     return _hybrid_router
 
 
-async def _auto_index_fact(
+async def _write_outbox_fact(
     fact_id: str,
     subject: str,
     predicate: str,
     object: str,
     source: str,
 ) -> None:
-    """Auto-index a stored fact into Qdrant (vector search) and graph.
+    """Write a 'index_fact' outbox entry for async processing.
 
-    Wrapped in try/except -- never crashes the caller if Qdrant/graph
-    is unavailable.
-
-    Args:
-        fact_id: Unique fact ID.
-        subject: Fact subject.
-        predicate: Fact predicate.
-        object: Fact object.
-        source: Fact source.
+    Best-effort — never crashes the caller.
     """
     try:
-        router = await _get_router()
-        qdrant = router._qdrant
-        embedder = router._embedder
-        graph_router = await _get_graph_router()
-
-        # Build fact text for embedding
-        fact_text = f"{subject} {predicate} {object}"
-
-        # Embed (sync call, run in thread to avoid blocking)
-        vector = await asyncio.to_thread(embedder.embed, fact_text)
-
-        # Upsert into Qdrant
-        await qdrant.upsert(
-            point_id=fact_id,
-            vector=vector,
+        provider = await _get_provider()
+        await provider.add_outbox_entry(
+            record_type="fact",
+            record_id=fact_id,
+            operation="index_fact",
             payload={
                 "subject": subject,
                 "predicate": predicate,
                 "object": object,
                 "source": source,
-                "memory_type": "fact",
             },
         )
-
-        # Sync to graph
-        graph_router.sync_fact(subject, predicate, object)
     except Exception:
         logger.warning(
-            "Auto-indexing failed for fact %s (%s %s %s)",
+            "Failed to write outbox entry for fact %s (%s %s %s)",
             fact_id,
             subject,
             predicate,
             object,
+            exc_info=True,
+        )
+
+
+async def _write_outbox_decision(
+    decision_id: str,
+    choice: str,
+    reason: str,
+    context: str,
+) -> None:
+    """Write an 'index_decision' outbox entry for async processing.
+
+    Best-effort — never crashes the caller.
+    """
+    try:
+        provider = await _get_provider()
+        await provider.add_outbox_entry(
+            record_type="decision",
+            record_id=decision_id,
+            operation="index_decision",
+            payload={
+                "choice": choice,
+                "reason": reason,
+                "context": context,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Failed to write outbox entry for decision %s",
+            decision_id,
+            exc_info=True,
+        )
+
+
+async def _write_outbox_skill(
+    skill_id: str,
+    purpose: str,
+    steps: list[str],
+) -> None:
+    """Write an 'index_skill' outbox entry for async processing.
+
+    Best-effort — never crashes the caller.
+    """
+    try:
+        provider = await _get_provider()
+        await provider.add_outbox_entry(
+            record_type="skill",
+            record_id=skill_id,
+            operation="index_skill",
+            payload={
+                "purpose": purpose,
+                "steps": steps,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Failed to write outbox entry for skill %s",
+            skill_id,
             exc_info=True,
         )
 

@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from storage.base import Base
+from storage.outbox import OutboxRepository
 from storage.repositories import (
     DecisionRepository,
     FactRepository,
@@ -215,3 +216,66 @@ class SQLiteProvider:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
             return await repo.search(memory_type=memory_type, source=source, limit=limit)
+
+    # --- Outbox ---
+
+    async def add_outbox_entry(
+        self,
+        record_type: str,
+        record_id: str,
+        operation: str,
+        payload: dict,
+    ) -> None:
+        """Add an outbox entry for async indexing.
+
+        Creates the entry in its own transaction. For atomicity with
+        the primary store write, use create_in_transaction() which
+        shares a single session for all operations.
+
+        Args:
+            record_type: "fact", "decision", or "skill".
+            record_id: ID of the record in the primary store.
+            operation: "index_fact", "index_decision", or "index_skill".
+            payload: Data needed for indexing.
+        """
+        async with await self._get_session() as session:
+            repo = OutboxRepository(session)
+            await repo.add_entry(
+                record_type=record_type,
+                record_id=record_id,
+                operation=operation,
+                payload=payload,
+            )
+            await session.commit()
+
+    async def create_in_transaction(
+        self,
+        fact: Optional["Fact"] = None,
+        receipt: Optional["MemoryReceipt"] = None,
+        outbox_entries: Optional[list[dict]] = None,
+    ) -> None:
+        """Create fact, receipt, and outbox entries in a single transaction.
+
+        Args:
+            fact: Optional Fact to create.
+            receipt: Optional MemoryReceipt to create.
+            outbox_entries: Optional list of outbox entry dicts, each with:
+                record_type, record_id, operation, payload.
+        """
+        async with await self._get_session() as session:
+            if fact is not None:
+                fact_repo = await self._get_fact_repo(session)
+                await fact_repo.create(fact)
+            if receipt is not None:
+                receipt_repo = await self._get_receipt_repo(session)
+                await receipt_repo.create(receipt)
+            if outbox_entries:
+                outbox_repo = OutboxRepository(session)
+                for entry in outbox_entries:
+                    await outbox_repo.add_entry(
+                        record_type=entry["record_type"],
+                        record_id=entry["record_id"],
+                        operation=entry["operation"],
+                        payload=entry["payload"],
+                    )
+            await session.commit()
