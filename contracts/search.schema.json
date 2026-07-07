@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/search.schema.json",
+  "title": "search — MCP Tool Schema",
+  "description": "Search facts by keyword text with optional filters.",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "search",
+    "description": "Search stored facts by keyword text with optional filters"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Free-text keyword to search across subject, predicate, object",
+        "default": ""
+      },
+      "subject": {
+        "type": "string",
+        "description": "Optional exact subject filter",
+        "default": ""
+      },
+      "predicate": {
+        "type": "string",
+        "description": "Optional exact predicate filter",
+        "default": ""
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results",
+        "default": 50,
+        "minimum": 1,
+        "maximum": 1000
+      }
+    },
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "results": {
+        "type": "array",
+        "items": { "$ref": "common.schema.json#/definitions/fact_response" }
+      },
+      "total": {
+        "type": "integer",
+        "description": "Total number of results returned"
+      }
+    },
+    "required": ["results", "total"],
+    "additionalProperties": false
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

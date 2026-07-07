@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/get_context.schema.json",
+  "title": "get_context — MCP Tool Schema",
+  "description": "Retrieve structured context about a task from facts and decisions.",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "get_context",
+    "description": "Retrieve structured context about a task"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "task": {
+        "type": "string",
+        "description": "The task description or search query"
+      },
+      "subject": {
+        "type": "string",
+        "description": "Optional subject filter",
+        "default": ""
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum number of facts to return",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 100
+      }
+    },
+    "required": ["task"],
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "facts": {
+        "type": "array",
+        "items": { "$ref": "common.schema.json#/definitions/fact_response" }
+      },
+      "decisions": {
+        "type": "array",
+        "items": { "type": "object" }
+      },
+      "total": {
+        "type": "integer",
+        "description": "Total number of facts returned"
+      }
+    },
+    "required": ["facts", "decisions", "total"],
+    "additionalProperties": false
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

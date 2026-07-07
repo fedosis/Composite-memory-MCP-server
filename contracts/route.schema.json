@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/route.schema.json",
+  "title": "route — MCP Tool Schema",
+  "description": "Route a query through the 4-stage hybrid router.",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "route",
+    "description": "Route a query through the 4-stage hybrid router (rules → embeddings → graph → LLM)"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Natural language query text",
+        "default": ""
+      },
+      "top_k": {
+        "type": "integer",
+        "description": "Maximum semantic search results",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 100
+      },
+      "score_threshold": {
+        "type": "number",
+        "description": "Minimum similarity score 0.0-1.0",
+        "default": 0.0,
+        "minimum": 0,
+        "maximum": 1
+      }
+    },
+    "additionalProperties": false
+  },
+
+  "output": {
+    "oneOf": [
+      {
+        "title": "Stage 1 — Rules",
+        "type": "object",
+        "properties": {
+          "stage": { "const": 1 },
+          "route": { "const": "rules" },
+          "rule_match": {
+            "type": "object",
+            "properties": {
+              "route": { "type": "string" },
+              "rule_name": { "type": "string" },
+              "matched_keyword": { "type": "string" }
+            },
+            "required": ["route", "rule_name", "matched_keyword"]
+          }
+        },
+        "required": ["stage", "route", "rule_match"],
+        "additionalProperties": false
+      },
+      {
+        "title": "Stage 2 — Semantic",
+        "type": "object",
+        "properties": {
+          "stage": { "const": 2 },
+          "route": { "const": "semantic" },
+          "semantic_results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "score": { "type": "number" },
+                "payload": { "type": "object" }
+              },
+              "required": ["id", "score", "payload"]
+            }
+          },
+          "total": { "type": "integer" }
+        },
+        "required": ["stage", "route", "semantic_results", "total"],
+        "additionalProperties": false
+      },
+      {
+        "title": "Stage 3 — Graph",
+        "type": "object",
+        "properties": {
+          "stage": { "const": 3 },
+          "route": { "const": "graph" },
+          "graph_result": {
+            "type": "object",
+            "properties": {
+              "entities": { "type": "array", "items": { "type": "object" } },
+              "relations": { "type": "array", "items": { "type": "object" } },
+              "paths": { "type": "array", "items": { "type": "array" } }
+            },
+            "required": ["entities", "relations", "paths"]
+          }
+        },
+        "required": ["stage", "route", "graph_result"],
+        "additionalProperties": false
+      },
+      {
+        "title": "Stage 4 — LLM Fallback",
+        "type": "object",
+        "properties": {
+          "stage": { "const": 4 },
+          "route": { "const": "llm_fallback" },
+          "message": { "type": "string" }
+        },
+        "required": ["stage", "route", "message"],
+        "additionalProperties": false
+      }
+    ]
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

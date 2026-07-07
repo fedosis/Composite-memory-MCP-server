@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/remember.schema.json",
+  "title": "remember — MCP Tool Schema",
+  "description": "Store a fact and generate a provenance receipt.",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "remember",
+    "description": "Store a fact and generate a provenance receipt"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "subject": {
+        "type": "string",
+        "description": "The subject of the fact"
+      },
+      "predicate": {
+        "type": "string",
+        "description": "The predicate/relation"
+      },
+      "object": {
+        "type": "string",
+        "description": "The object of the fact"
+      },
+      "confidence": {
+        "type": "number",
+        "description": "Confidence score 0.0-1.0",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 1.0
+      },
+      "source": {
+        "type": "string",
+        "description": "Source identifier",
+        "default": "user"
+      }
+    },
+    "required": ["subject", "predicate", "object"],
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "receipt": { "$ref": "common.schema.json#/definitions/receipt_response" },
+      "fact": { "$ref": "common.schema.json#/definitions/fact_response" }
+    },
+    "required": ["receipt", "fact"],
+    "additionalProperties": false
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

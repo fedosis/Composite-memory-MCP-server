@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/semantic_search.schema.json",
+  "title": "semantic_search — MCP Tool Schema",
+  "description": "Semantic search — embed a query and find similar facts via vector similarity.",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "semantic_search",
+    "description": "Semantic search — embed a query, find similar facts via vector similarity"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Natural language query text",
+        "default": ""
+      },
+      "top_k": {
+        "type": "integer",
+        "description": "Maximum number of results",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 100
+      },
+      "score_threshold": {
+        "type": "number",
+        "description": "Minimum similarity score 0.0-1.0",
+        "default": 0.0,
+        "minimum": 0,
+        "maximum": 1
+      }
+    },
+    "additionalProperties": false
+  },
+
+  "output": {
+    "oneOf": [
+      {
+        "title": "Rule Match",
+        "description": "A routing rule matched the query",
+        "type": "object",
+        "properties": {
+          "rule_match": {
+            "type": "object",
+            "properties": {
+              "route": { "type": "string" },
+              "rule_name": { "type": "string" },
+              "matched_keyword": { "type": "string" }
+            },
+            "required": ["route", "rule_name", "matched_keyword"]
+          }
+        },
+        "required": ["rule_match"],
+        "additionalProperties": false
+      },
+      {
+        "title": "Semantic Results",
+        "description": "Semantic search results from vector similarity",
+        "type": "object",
+        "properties": {
+          "semantic_results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "score": { "type": "number", "minimum": 0, "maximum": 1 },
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "subject": { "type": "string" },
+                    "predicate": { "type": "string" },
+                    "object": { "type": "string" },
+                    "source": { "type": "string" },
+                    "memory_type": { "type": "string" }
+                  }
+                }
+              },
+              "required": ["id", "score", "payload"]
+            }
+          },
+          "total": { "type": "integer" }
+        },
+        "required": ["semantic_results", "total"],
+        "additionalProperties": false
+      },
+      {
+        "title": "Error",
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" }
+        },
+        "required": ["error"],
+        "additionalProperties": false
+      }
+    ]
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

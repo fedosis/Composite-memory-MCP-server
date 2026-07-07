@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/graph_search.schema.json",
+  "title": "graph_search — MCP Tool Schema",
+  "description": "Search the knowledge graph for entities, relations, and paths.",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "graph_search",
+    "description": "Search the knowledge graph for entities and relations"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Text to extract entity references from",
+        "default": ""
+      },
+      "entity_id": {
+        "type": "string",
+        "description": "Direct node ID lookup",
+        "default": ""
+      },
+      "source_id": {
+        "type": "string",
+        "description": "Source entity for pathfinding",
+        "default": ""
+      },
+      "target_id": {
+        "type": "string",
+        "description": "Target entity for pathfinding",
+        "default": ""
+      }
+    },
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "nodes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "type": { "type": "string" },
+            "attributes": { "type": "object" }
+          },
+          "required": ["id", "name", "type"]
+        }
+      },
+      "edges": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "source_id": { "type": "string" },
+            "target_id": { "type": "string" },
+            "relation": { "type": "string" },
+            "attributes": { "type": "object" }
+          },
+          "required": ["source_id", "target_id", "relation"]
+        }
+      },
+      "paths": {
+        "type": "array",
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "type": { "type": "string" }
+            },
+            "required": ["id", "name", "type"]
+          }
+        }
+      }
+    },
+    "required": ["nodes", "edges", "paths"],
+    "additionalProperties": false
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

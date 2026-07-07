@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/learn.schema.json",
+  "title": "learn — MCP Tool Schema",
+  "description": "Extract and store facts, decisions, and skills from natural language text.",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "learn",
+    "description": "Extract and store facts, decisions, and skills from natural language text"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Natural language text to extract knowledge from"
+      },
+      "source": {
+        "type": "string",
+        "description": "Source identifier for provenance tracking",
+        "default": "user"
+      }
+    },
+    "required": ["text"],
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "facts": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "receipt": { "$ref": "common.schema.json#/definitions/receipt_response" },
+            "item": { "$ref": "common.schema.json#/definitions/fact_response" }
+          },
+          "required": ["receipt", "item"]
+        }
+      },
+      "decisions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "receipt": { "$ref": "common.schema.json#/definitions/receipt_response" },
+            "item": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "context": { "type": "string" },
+                "choice": { "type": "string" },
+                "reason": { "type": "string" },
+                "source": { "type": "string" },
+                "rejected_alternatives": { "type": "array", "items": { "type": "string" } },
+                "created_at": { "$ref": "common.schema.json#/definitions/rfc3339_timestamp" }
+              },
+              "required": ["id", "context", "choice", "reason"]
+            }
+          },
+          "required": ["receipt", "item"]
+        }
+      },
+      "skills": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "receipt": { "$ref": "common.schema.json#/definitions/receipt_response" },
+            "item": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "purpose": { "type": "string" },
+                "steps": { "type": "array", "items": { "type": "string" } },
+                "success_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+                "name": { "type": "string" },
+                "version": { "type": "string" },
+                "constraints": { "type": "array", "items": { "type": "string" } },
+                "validation": { "type": "array", "items": { "type": "string" } },
+                "created_at": { "$ref": "common.schema.json#/definitions/rfc3339_timestamp" }
+              },
+              "required": ["id", "purpose", "steps"]
+            }
+          },
+          "required": ["receipt", "item"]
+        }
+      },
+      "receipts": {
+        "type": "array",
+        "items": { "$ref": "common.schema.json#/definitions/receipt_response" }
+      }
+    },
+    "required": ["facts", "decisions", "skills", "receipts"],
+    "additionalProperties": false
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}
