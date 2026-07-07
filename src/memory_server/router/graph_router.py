@@ -200,6 +200,28 @@ class GraphRouter:
                         relation="decides",
                     )
 
+    def sync_skill(
+        self,
+        purpose: str,
+        steps: list[str],
+    ) -> None:
+        """Sync an extracted skill into the graph.
+
+        Creates a skill node with purpose and steps attributes.
+
+        Args:
+            purpose: Skill purpose description.
+            steps: List of steps for the skill.
+        """
+        skill_id = self._to_node_id(f"skill-{purpose}")
+        if self._graph.get_node(skill_id) is None:
+            self._graph.add_node(
+                id=skill_id,
+                type="skill",
+                name=purpose,
+                attributes={"steps": steps},
+            )
+
     # --- Graph access ---
 
     @property
