@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/common.schema.json",
+  "title": "Common Envelope",
+  "description": "Shared types and envelope for Composite Memory MCP Server v0.6",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "definitions": {
+    "rfc3339_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 formatted timestamp (e.g., 2026-07-07T12:00:00Z)",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+
+    "error_envelope": {
+      "type": "object",
+      "description": "Standard error response envelope",
+      "properties": {
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "description": "Machine-readable error code"
+            },
+            "message": {
+              "type": "string",
+              "description": "Human-readable error description"
+            },
+            "details": {
+              "type": "object",
+              "description": "Optional error details / stack information"
+            }
+          },
+          "required": ["code", "message"]
+        }
+      },
+      "required": ["error"]
+    },
+
+    "response_envelope": {
+      "type": "object",
+      "description": "Generic MCP response wrapper (tool output)",
+      "properties": {
+        "api_version": {
+          "type": "string",
+          "description": "Server API version",
+          "default": "0.6.0"
+        },
+        "schema_version": {
+          "type": "string",
+          "description": "Contract schema version",
+          "default": "1.0.0"
+        }
+      }
+    },
+
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "UUID v4 string"
+    },
+
+    "fact_response": {
+      "type": "object",
+      "description": "Stored fact with provenance",
+      "properties": {
+        "id": { "$ref": "#/definitions/uuid" },
+        "subject": { "type": "string" },
+        "predicate": { "type": "string" },
+        "object": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "source": { "type": "string" },
+        "created_at": { "$ref": "#/definitions/rfc3339_timestamp" },
+        "updated_at": { "$ref": "#/definitions/rfc3339_timestamp" }
+      },
+      "required": ["id", "subject", "predicate", "object", "confidence", "source", "created_at"]
+    },
+
+    "receipt_response": {
+      "type": "object",
+      "description": "Provenance receipt for a memory operation",
+      "properties": {
+        "id": { "$ref": "#/definitions/uuid" },
+        "memory_type": {
+          "type": "string",
+          "enum": ["fact", "decision", "skill", "entity"]
+        },
+        "source": { "type": "string" },
+        "created_by": { "type": "string" },
+        "timestamp": { "$ref": "#/definitions/rfc3339_timestamp" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "verification_status": {
+          "type": "string",
+          "enum": ["unverified", "candidate", "validated", "trusted", "deprecated", "archived"]
+        },
+        "history": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      },
+      "required": ["id", "memory_type", "source", "created_by", "timestamp", "confidence", "verification_status"]
+    }
+  }
+}

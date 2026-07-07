@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/audit.schema.json",
+  "title": "audit — MCP Tool Schema",
+  "description": "Run a memory audit for consistency, orphans, confidence distribution.",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "audit",
+    "description": "Run a memory audit for consistency, orphans, confidence distribution"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "audit_type": {
+        "type": "string",
+        "enum": ["full", "consistency", "orphans", "confidence"],
+        "description": "Type of audit to run",
+        "default": "full"
+      }
+    },
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "audit_type": {
+        "type": "string",
+        "enum": ["full", "consistency", "orphans", "confidence"]
+      },
+      "warnings": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "errors": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "stats": {
+        "type": "object",
+        "properties": {
+          "confidence": {
+            "type": "object",
+            "properties": {
+              "total": { "type": "integer" },
+              "buckets": {
+                "type": "object",
+                "additionalProperties": { "type": "integer" }
+              },
+              "low_confidence": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "required": ["audit_type", "warnings", "errors", "stats"],
+    "additionalProperties": false
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

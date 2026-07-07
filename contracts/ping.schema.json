@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/ping.schema.json",
+  "title": "ping — MCP Tool Schema",
+  "description": "Health check — verifies the server is running and responsive.",
+  "version": "0.6.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "ping",
+    "description": "Connectivity check — returns OK if server is alive"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "status": {
+        "type": "string",
+        "enum": ["ok"]
+      }
+    },
+    "required": ["status"],
+    "additionalProperties": false
+  },
+
+  "errors": {
+    "type": "object",
+    "description": "ping has no parameter errors, only transport-level failures",
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}
