@@ -55,6 +55,35 @@ class SQLiteProvider:
 
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # Create FTS5 virtual table on the facts table
+            await conn.exec_driver_sql(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts "
+                "USING fts5(subject, predicate, object, "
+                "content=facts, content_rowid=rowid)"
+            )
+            # Triggers to keep FTS index in sync
+            await conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN "
+                "INSERT INTO facts_fts(rowid, subject, predicate, object) "
+                "VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+            )
+            await conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN "
+                "INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) "
+                "VALUES('delete', old.rowid, old.subject, old.predicate, old.object); END"
+            )
+            await conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN "
+                "INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) "
+                "VALUES('delete', old.rowid, old.subject, old.predicate, old.object); "
+                "INSERT INTO facts_fts(rowid, subject, predicate, object) "
+                "VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+            )
+            # Populate FTS with existing data
+            await conn.exec_driver_sql(
+                "INSERT OR IGNORE INTO facts_fts(facts_fts, rowid, subject, predicate, object) "
+                "SELECT 'rebuild', rowid, subject, predicate, object FROM facts"
+            )
 
         self._session_factory = async_sessionmaker(
             self._engine,

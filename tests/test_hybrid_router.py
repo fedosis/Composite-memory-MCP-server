@@ -55,7 +55,9 @@ class TestHybridRouter:
         # Should match semantically since no rule catches it
         assert result["stage"] == 2
         assert result["route"] == "semantic"
-        assert "semantic_results" in result
+        assert "all_results" in result
+        assert len(result["all_results"]) > 0
+        assert result["all_results"][0].source == "semantic"
 
     async def test_route_falls_through_to_graph(self, router):
         """Stage 3: No rule or semantic match falls through to graph."""
@@ -67,8 +69,9 @@ class TestHybridRouter:
         # Graph should match via entity extraction
         assert result["stage"] == 3
         assert result["route"] == "graph"
-        assert "graph_result" in result
-        assert len(result["graph_result"]["entities"]) >= 1
+        assert "all_results" in result
+        assert len(result["all_results"]) > 0
+        assert result["all_results"][0].source == "graph"
 
     async def test_empty_query_returns_fallback(self, router):
         """Empty query should fall through to LLM fallback."""
@@ -117,6 +120,7 @@ class TestHybridRouter:
         router.sync_fact(subject="PostgreSQL", predicate="is", object="database")
         result = await router.route("What is PostgreSQL?")
         if result["stage"] == 3:
-            assert "entities" in result["graph_result"]
-            assert "relations" in result["graph_result"]
-            assert "paths" in result["graph_result"]
+            assert "all_results" in result
+            # At least one graph result should be present
+            graph_results = [r for r in result["all_results"] if r.source == "graph"]
+            assert len(graph_results) >= 1
