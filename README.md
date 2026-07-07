@@ -33,7 +33,7 @@ memory-server ping
 
 ## API Reference
 
-The server exposes four MCP tools:
+The server exposes five MCP tools:
 
 ### ping
 
@@ -128,6 +128,49 @@ Retrieve relevant context facts for a given task or subject.
     {"id": "uuid", "subject": "Caddy", "predicate": "uses", "object": "Port 443", "confidence": 1.0, "source": "test", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z"}
   ],
   "task": "Caddy"
+}
+```
+
+### semantic_search
+
+Semantic search — embed a query, find similar facts via vector similarity, and return ranked results with similarity scores.
+
+Per ADR-005, routing rules (keyword-based exact matches) are evaluated **before** the embedding search. If a rule matches, the result indicates which route should handle the query (e.g., `"route": "sql"`). Otherwise, semantically ranked results are returned.
+
+**Arguments:**
+| Parameter        | Type   | Required | Default | Description |
+|-----------------|--------|----------|---------|-------------|
+| `query`         | string | yes      | —       | Natural language query text |
+| `top_k`         | int    | no       | 10      | Maximum number of results |
+| `score_threshold` | float | no      | 0.0     | Minimum similarity score 0.0–1.0 |
+
+**Response (rule match):**
+```json
+{
+  "rule_match": {
+    "route": "sql",
+    "rule_name": "ip_address_query",
+    "matched_keyword": "ip of"
+  }
+}
+```
+
+**Response (semantic results):**
+```json
+{
+  "semantic_results": [
+    {
+      "id": "uuid",
+      "score": 0.92,
+      "payload": {
+        "subject": "Docker",
+        "predicate": "runs_on",
+        "object": "OMV8",
+        "content": "Docker runs on OMV8"
+      }
+    }
+  ],
+  "total": 1
 }
 ```
 

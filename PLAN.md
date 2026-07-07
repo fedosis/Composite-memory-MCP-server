@@ -13,8 +13,15 @@ Goal: MCP API + SQLite backend + get_context/search/remember
 | 006 | MCP tool: remember | — | ✅ done | — | ✅ pass | ✅ v0.1a-alpha.6 |
 | 007 | Integration tests + docs | — | ✅ done | — | ✅ pass | ✅ v0.1a-alpha.7 |
 
-## Phase: v0.2 (next)
+## Phase: v0.2 (done)
 Qdrant + embeddings + semantic router
+
+| # | Card | ID | Status | Review | Tests | Merged |
+|---|------|----|--------|--------|-------|--------|
+| 008 | Qdrant integration | — | ✅ done | — | ✅ pass | ✅ v0.2-alpha.8 |
+| 009 | Embedding provider | — | ✅ done | — | ✅ pass | ✅ v0.2-alpha.9 |
+| 010 | Semantic router | — | ✅ done | — | ✅ pass | ✅ v0.2-alpha.10 |
+| 011 | Router integration tests | — | ✅ done | — | ✅ pass | ✅ v0.2-alpha.11 |
 
 ## Phase: v0.3
 LLM extractors + learn()
