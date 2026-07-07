@@ -7,12 +7,18 @@ from mcp.server.fastmcp import FastMCP
 from memory_server.api.get_context import get_context as get_context_fn
 from memory_server.api.remember import remember as remember_fn
 from memory_server.api.search import search as search_fn
+from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.providers.sqlite_provider import SQLiteProvider
+from memory_server.router.embedding_router import EmbeddingRouter
 
 mcp = FastMCP("CompositeMemoryServer")
 
-# Lazy provider — initialized on first use
+# Lazy providers — initialized on first use
 _provider: SQLiteProvider | None = None
+_qdrant: QdrantProvider | None = None
+_embedder: SentenceTransformerEmbeddingProvider | None = None
+_router: EmbeddingRouter | None = None
 
 
 async def _get_provider() -> SQLiteProvider:
@@ -22,6 +28,19 @@ async def _get_provider() -> SQLiteProvider:
         _provider = SQLiteProvider(url="sqlite+aiosqlite:///:memory:")
         await _provider.initialize()
     return _provider
+
+
+async def _get_router() -> EmbeddingRouter:
+    """Get or create the EmbeddingRouter singleton."""
+    global _qdrant, _embedder, _router
+    if _router is None:
+        _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+        _embedder = SentenceTransformerEmbeddingProvider()
+        _router = EmbeddingRouter(
+            qdrant_provider=_qdrant,
+            embedder=_embedder,
+        )
+    return _router
 
 
 @mcp.tool()
@@ -107,6 +126,32 @@ async def remember_tool(
         "fact": result["fact"].model_dump(mode="json"),
     }
     return json.dumps(serialized)
+
+
+@mcp.tool(name="semantic_search")
+async def semantic_search_tool(
+    query: str = "",
+    top_k: int = 10,
+    score_threshold: float = 0.0,
+) -> str:
+    """Semantic search — embed a query and find similar facts via vector similarity.
+
+    First checks routing rules (keyword-based exact matches). If a rule matches,
+    the result indicates which route should handle the query. Otherwise, returns
+    semantically ranked results with similarity scores.
+
+    Args:
+        query: Natural language query text.
+        top_k: Maximum number of results (default 10).
+        score_threshold: Minimum similarity score 0.0-1.0 (default 0.0).
+    """
+    router = await _get_router()
+    results = await router.route(
+        query=query,
+        top_k=top_k,
+        score_threshold=score_threshold,
+    )
+    return json.dumps(results)
 
 
 def run():
