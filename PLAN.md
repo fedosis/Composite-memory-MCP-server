@@ -34,8 +34,16 @@ LLM extractors + learn()
 | 015 | learn() MCP tool | — | ✅ done | — | ✅ pass | ✅ v0.3-alpha.15 |
 | 016 | Integration tests + docs | — | ✅ done | — | ✅ pass | ✅ v0.3-alpha.16 |
 
-## Phase: v0.4
+## Phase: v0.4 (done)
 Graph DB + entity relations
+
+| # | Card | ID | Status | Review | Tests | Merged |
+|---|------|----|--------|--------|-------|--------|
+| 017 | In-memory graph engine | — | ✅ done | — | ✅ pass | ✅ v0.4-alpha.17 |
+| 018 | Entity relation linker | — | ✅ done | — | ✅ pass | ✅ v0.4-alpha.18 |
+| 019 | graph_search MCP tool | — | ✅ done | — | ✅ pass | ✅ v0.4-alpha.19 |
+| 020 | Hybrid router (rules→embeddings→graph→LLM) | — | ✅ done | — | ✅ pass | ✅ v0.4-alpha.20 |
+| 021 | Graph integration tests + docs | — | ✅ done | — | ✅ pass | ✅ v0.4-alpha.21 |
 
 ## Phase: v0.5+
 Confidence engine + validation + decay + memory auditor
