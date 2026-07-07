@@ -30,6 +30,12 @@ memory-server ping
 - [ADR](docs/ADR.md) — Architecture Decision Records (10 ADRs)
 - [Agent Spec](docs/agent-spec.md) — Implementation specification
 - [Technical Design](docs/technical-design.md) — Tech stack + roadmap
+- [Architecture](docs/architecture.md) — Mermaid architecture diagram
+- [Usage](docs/USAGE.md) — Full usage reference
+- [Metrics & Benchmarking](docs/metrics.md) — Metrics and benchmark framework
+- [Comparative Analysis](docs/comparative-metrics.md) — Comparative analysis with ChromaDB/SQLite
+- [Drift Matrix](docs/drift-matrix.md) — Contract audit
+- [Contracts](contracts/) — JSON Schema 2020-12 tool contracts
 
 ## API Reference
 
@@ -330,32 +336,149 @@ Returns the result from the highest-priority stage that produces meaningful outp
 }
 ```
 
+### audit
+
+Run a structured memory audit covering consistency, orphan detection, confidence analysis, lifecycle validation, and index drift detection.
+
+Supports focused sub-audits via the `audit_type` parameter, or a comprehensive `"full"` report.
+
+**Arguments:**
+| Parameter    | Type   | Required | Default | Description |
+|-------------|--------|----------|---------|-------------|
+| `audit_type` | string | no       | "full"  | One of `"full"`, `"consistency"`, `"orphans"`, `"confidence"` |
+
+**Audit checks (full mode):**
+
+| # | Check | Description |
+|---|-------|-------------|
+| 1 | **Orphan records** | Items in the validator store with no corresponding `MemoryReceipt` |
+| 2 | **Missing receipts** | Validator entries referencing receipts that don't exist |
+| 3 | **Lifecycle violations** | Items in an invalid lifecycle state or that skipped a required transition |
+| 4 | **Confidence issues** | Confidence scores that conflict with current lifecycle state |
+| 5 | **SQL/vector drift** | Consistency gaps between SQLite fact storage and Qdrant vector index |
+| 6 | **SQL/graph drift** | Consistency gaps between SQLite fact storage and the knowledge graph |
+
+When `audit_type` is set to a specific sub-audit (`"consistency"`, `"orphans"`, or `"confidence"`), only the corresponding analysis is returned:
+
+- **consistency** — Checks for deprecated facts with active receipts, zero-confidence facts not marked stale/archived/forgotten, and stale facts with full confidence.
+- **orphans** — Scans the graph for nodes with no incoming edges (unlinked facts).
+- **confidence** — Analyzes the confidence score distribution, bucket counts, and lists low-confidence items (< 0.3).
+
+**Response:**
+```json
+{
+  "audit_type": "full",
+  "warnings": [],
+  "errors": [
+    "Found 2 items without MemoryReceipt: fact_001, fact_002"
+  ],
+  "stats": {
+    "confidence": {
+      "total": 150,
+      "buckets": {"0.0-0.3": 5, "0.3-0.5": 20, "0.5-0.7": 45, "0.7-0.85": 50, "0.85-1.0": 30},
+      "low_confidence": ["fact_001", "fact_002"]
+    },
+    "sql_vector_drift": {"drift_pct": 0.0, "sql_count": 150, "vector_count": 150},
+    "sql_graph_drift": {"drift_pct": 2.0, "sql_count": 150, "graph_count": 147}
+  }
+}
+```
+
+### metrics
+
+Return a Prometheus-formatted snapshot of all observability metrics. Compatible with any Prometheus scraper or `curl | grep` workflows.
+
+**Arguments:** None
+
+**Response:** Plaintext Prometheus exposition format:
+```
+# HELP tool_calls_total Total MCP tool calls
+# TYPE tool_calls_total counter
+tool_calls_total{tool="search",status="success"} 42.0
+tool_calls_total{tool="remember",status="success"} 17.0
+# HELP search_latency_ms Search latency in ms
+# TYPE search_latency_ms histogram
+search_latency_ms_bucket{le="1.0"} 0.0
+search_latency_ms_bucket{le="5.0"} 5.0
+...
+```
+
 ## Stack
 
-Python 3.12+, MCP SDK, Pydantic, SQLAlchemy, Qdrant, Neo4j, GitPython
+Python 3.12+, MCP SDK, Pydantic, SQLAlchemy, Qdrant, Neo4j, GitPython,
+Prometheus Client, OpenTelemetry
 
-## Confidence Lifecycle
+## Storage
 
-Every fact and extracted memory item passes through a confidence lifecycle.
-The lifecycle determines how a fact moves from raw ingestion to trusted knowledge:
+The server uses a multi-tier storage architecture with SQLite as the primary durable store, backed by vector (Qdrant) and graph (Neo4j / SimpleGraph) indexes.
 
-### Verification Statuses
+### SQLite with WAL Mode
 
-| Status       | Description |
+The primary fact store uses SQLite in **WAL (Write-Ahead Logging)** mode for concurrent read performance during background indexing operations:
+
+```sql
+PRAGMA journal_mode=WAL;
+```
+
+WAL mode allows simultaneous reads while a single writer is active, which is critical for the outbox pattern and background indexing without blocking the MCP tool handler.
+
+### Alembic Migrations
+
+Database schema migrations are managed via Alembic. To apply pending migrations:
+
+```bash
+alembic upgrade head
+```
+
+Migrations live in `migrations/` and are automatically tested in CI (upgrade then downgrade -1).
+
+### FTS5 Full-Text Search
+
+The `facts_fts` virtual table provides fast keyword search across fact content:
+
+```sql
+CREATE VIRTUAL TABLE facts_fts USING fts5(
+  subject, predicate, object, content='facts', content_rowid='id'
+);
+```
+
+FTS5 enables the `search` tool's full-text capabilities with ranking, prefix queries, and snippet generation.
+
+### Outbox Pattern for Reliable Indexing
+
+Facts are written to the SQLite store first, then queued through an **outbox pattern** for background indexing to Qdrant (vector embeddings) and Neo4j (graph relations):
+
+1. Fact is inserted into SQLite (single write transaction)
+2. An outbox record is created in a dedicated table or queue
+3. A background worker picks up outbox entries and indexes them to Qdrant and Neo4j
+4. On success, the outbox record is marked as processed
+5. On failure, the outbox record is retried — the fact is never lost
+
+This ensures that even if vector or graph indexing fails, the fact data is durably stored and can be re-indexed on the next retry.
+
+## Lifecycle
+
+Every fact and extracted memory item passes through a 6-stage lifecycle.
+The lifecycle determines how a fact moves from raw ingestion to trusted knowledge and eventual retirement.
+
+### Lifecycle States (v0.6)
+
+| State        | Description |
 |-------------|-------------|
 | `candidate` | Initial state after ingestion via `remember()` or `learn()`. Low confidence (0.5 default). |
 | `validated` | Confidence >= 0.7 — fact has passed an internal quality check. |
-| `trusted`   | Confidence >= 0.85 AND corroboration >= 2 sources. High-reliability knowledge. |
-| `deprecated`| Marked obsolete due to conflict resolution or evidence change. |
-| `archived`  | Deprecated fact moved to cold storage. |
+| `active`    | Confidence >= 0.85 AND corroboration >= 2 sources. High-reliability knowledge. |
+| `stale`     | Confidence has decayed below threshold — fact may be outdated. |
+| `archived`  | Stale fact moved to cold storage. Retained for audit but excluded from active queries. |
+| `forgotten` | Permanently removed from indexes. Only receipt/provenance metadata preserved. |
 
 ### Lifecycle Flow
 
 ```
-candidate → validated → trusted
-     ↓                        ↓
-deprecated → archived    deprecated → archived
+candidate → validated → active → stale → archived → forgotten
 ```
+
+Transitions are **forward-only** — once promoted, an item can only move forward through the lifecycle. Backward compatibility maps the v0.5 states `"trusted"` → `"active"` and `"deprecated"` → `"stale"`.
 
 ### Confidence Scoring
 
@@ -384,6 +507,65 @@ When a fact is stored via `remember()` or `learn()`, the server automatically:
 
 This is best-effort — failures during auto-indexing never crash the caller.
 
+## Observability
+
+The server exposes structured observability through Prometheus metrics and OpenTelemetry instrumentation.
+
+### Prometheus Metrics
+
+A dedicated `/metrics` tool returns Prometheus-formatted output on demand. The `MetricsCollector` singleton tracks key performance indicators across all tool operations.
+
+**Key metrics:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tool_calls_total` | Counter | `tool`, `status` | Total MCP tool calls by name and success/error status |
+| `tool_error_total` | Counter | `tool` | Total errors per tool |
+| `search_latency_ms` | Histogram | — | Search latency buckets (1–500 ms) |
+| `semantic_search_latency_ms` | Histogram | — | Semantic search latency buckets (10–1000 ms) |
+| `remember_latency_ms` | Histogram | — | Remember latency buckets (5–500 ms) |
+| `derived_index_drift` | Gauge | — | SQL/vector index drift count (updated on each audit) |
+| `reindex_repair_total` | Counter | — | Reindex repairs triggered |
+| `sqlite_busy_events_total` | Counter | — | SQLite WAL busy events |
+
+### OpenTelemetry Hooks
+
+Every tool call is wrapped with OpenTelemetry tracing:
+
+```python
+tracer = trace.get_tracer(__name__)
+```
+
+Spans are created per tool invocation, capturing duration and status. The `tool_call()` context manager on `MetricsCollector` automatically records:
+- Start time and duration
+- Success/error status
+- Exception propagation for error counting
+
+## Development
+
+### Makefile Targets
+
+| Target      | Description |
+|------------|-------------|
+| `make install` | Install package with dev dependencies (`pip install -e ".[dev]"`) |
+| `make test`    | Run unit tests (`pytest tests/ -q`) |
+| `make lint`    | Run Ruff linter (`ruff check src/`) |
+| `make all`     | Run lint + test sequentially |
+| `make migrate` | Apply Alembic migrations (`alembic upgrade head`) |
+| `make build`   | Build Python package (`python3 -m build`) |
+
+### CI/CD
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on push/PR to `main`:
+
+| Job | What it runs |
+|-----|-------------|
+| **lint** | `ruff check src/` |
+| **unit-tests** | `pytest tests/ -q` |
+| **integration-tests** | `pytest tests/ -q -k "integration or e2e or benchmark"` |
+| **contract-tests** | JSON Schema validation + `pytest tests/ -q -k "schema or contract"` |
+| **migration-tests** | `alembic upgrade head && alembic downgrade -1` |
+
 ## Roadmap
 
 | Phase | Milestone |
@@ -392,4 +574,5 @@ This is best-effort — failures during auto-indexing never crash the caller.
 | v0.2  | Qdrant + embeddings + semantic router |
 | v0.3  | LLM extractors + learn() |
 | v0.4  | Graph DB + entity relations |
-| v0.5  | Confidence engine + validation + decay + auditor + auto-indexing (done) |
+| v0.5  | Confidence engine + validation + decay + auditor + auto-indexing |
+| v0.6  | 6-state lifecycle, audit tool, metrics/observability, outbox indexing, storage docs, CI/CD |
