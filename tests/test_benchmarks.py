@@ -15,7 +15,7 @@ import pytest
 
 from memory_server.api.learn import learn as learn_fn
 from memory_server.evaluation.validator import Validator
-from memory_server.models import VerificationStatus
+from memory_server.models import LifecycleState, VerificationStatus
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.server import (
     _get_graph_router,
@@ -198,36 +198,36 @@ class TestAdequacy:
         # Stage 2: confidence >= 0.7 -> validate -> validated
         v.set_confidence(fid, 0.75)
         s2_status = v.validate(fid)
-        assert s2_status == VerificationStatus.VALIDATED, (
+        assert s2_status == LifecycleState.VALIDATED, (
             f"Expected VALIDATED, got {s2_status}"
         )
         s2 = v.get_status(fid)
         assert s2["status"] == "validated"
 
-        # Stage 3: confidence >= 0.85 + corroboration >= 2 -> trust -> trusted
+        # Stage 3: confidence >= 0.85 + corroboration >= 2 -> trust -> active (was trusted)
         v.set_confidence(fid, 0.9)
         v.set_corroboration_count(fid, 3)
         s3_status = v.trust(fid)
-        assert s3_status == VerificationStatus.TRUSTED, (
-            f"Expected TRUSTED, got {s3_status}"
+        assert s3_status == LifecycleState.ACTIVE, (
+            f"Expected ACTIVE, got {s3_status}"
         )
         s3 = v.get_status(fid)
-        assert s3["status"] == "trusted"
+        assert s3["status"] == "active"
 
         # Boundary: confidence exactly 0.69 stays candidate
         v2 = Validator()
         v2.register("boundary-test", confidence=0.69)
-        assert v2.validate("boundary-test") == VerificationStatus.CANDIDATE
+        assert v2.validate("boundary-test") == LifecycleState.CANDIDATE
 
         # Boundary: confidence >= 0.7 -> validated
         v2.set_confidence("boundary-test", 0.7)
-        assert v2.validate("boundary-test") == VerificationStatus.VALIDATED
+        assert v2.validate("boundary-test") == LifecycleState.VALIDATED
 
         # Boundary: trust threshold 0.85 with corroboration 1 stays validated
         v2.register("boundary-trust", confidence=0.9)
         v2.validate("boundary-trust")
         v2.set_corroboration_count("boundary-trust", 1)
-        assert v2.trust("boundary-trust") == VerificationStatus.VALIDATED
+        assert v2.trust("boundary-trust") == LifecycleState.VALIDATED
 
     # ------------------------------------------------------------------
     # Metric 1.5: route() Fallthrough

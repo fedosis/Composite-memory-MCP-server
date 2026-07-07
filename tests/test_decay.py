@@ -1,4 +1,4 @@
-"""Tests for DecayEngine (Card 024).
+"""Tests for DecayEngine (Card 024) — v0.6 Lifecycle State transitions.
 
 Note: Tests use small hour-based TTLs for quick verification.
 """
@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from memory_server.evaluation.decay import PER_TYPE_TTL, DecayEngine
+from memory_server.evaluation.validator import Validator as EvValidator
+from memory_server.models.receipt import LifecycleState
 
 # TTLs in hours for testing — passed as days to DecayEngine
 # (decay engine works in days, so 1/24 day = 1 hour)
@@ -31,6 +33,18 @@ def hour_engine() -> DecayEngine:
             "skill": THREE_HOURS,
             "entity": THREE_HOURS,
         },
+    )
+
+
+@pytest.fixture
+def validator_engine() -> DecayEngine:
+    """Engine with a shared validator for lifecycle transition testing."""
+    v = EvValidator()
+    return DecayEngine(
+        per_type_ttl={
+            "fact": ONE_HOUR,
+        },
+        validator=v,
     )
 
 
@@ -207,3 +221,118 @@ class TestDecayEngine:
         assert engine.get_ttl("fact") == 90.0
         assert engine.get_ttl("decision") == 180.0
         assert engine.get_ttl("nonexistent") == 90.0  # default
+
+    # ================================================================
+    # Lifecycle state transitions (v0.6)
+    # ================================================================
+
+    # --- active → stale (after 70% of TTL) ---
+
+    def test_tick_active_to_stale(self, validator_engine):
+        """Active item at 70%+ TTL transitions to stale."""
+        past = datetime.now(timezone.utc) - timedelta(hours=0.75)  # 75% of ONE_HOUR
+        validator_engine.register("f1", "fact", past, lifecycle_state="active")
+        new_state = validator_engine.tick("f1")
+        assert new_state == "stale"
+        assert validator_engine.get_lifecycle_state("f1") == "stale"
+        # Validator should reflect it too
+        status = validator_engine._validator.get_status("f1")
+        assert status["status"] == "stale"
+
+    def test_tick_active_below_70(self, validator_engine):
+        """Active item below 70% TTL stays active."""
+        past = datetime.now(timezone.utc) - timedelta(hours=0.5)  # 50% of ONE_HOUR
+        validator_engine.register("f1", "fact", past, lifecycle_state="active")
+        new_state = validator_engine.tick("f1")
+        assert new_state is None
+        assert validator_engine.get_lifecycle_state("f1") == "active"
+
+    # --- stale → archived (after 100% of TTL) ---
+
+    def test_tick_stale_to_archived(self, validator_engine):
+        """Stale item at 100%+ TTL transitions to archived."""
+        past = datetime.now(timezone.utc) - timedelta(hours=1.5)  # 150% of ONE_HOUR
+        validator_engine.register("f1", "fact", past, lifecycle_state="stale")
+        new_state = validator_engine.tick("f1")
+        assert new_state == "archived"
+        assert validator_engine.get_lifecycle_state("f1") == "archived"
+
+    def test_tick_stale_below_100(self, validator_engine):
+        """Stale item below 100% TTL stays stale."""
+        past = datetime.now(timezone.utc) - timedelta(hours=0.5)  # 50% of ONE_HOUR
+        validator_engine.register("f1", "fact", past, lifecycle_state="stale")
+        new_state = validator_engine.tick("f1")
+        assert new_state is None
+
+    # --- archived → forgotten (after 200% of TTL) ---
+
+    def test_tick_archived_to_forgotten(self, validator_engine):
+        """Archived item at 200%+ TTL transitions to forgotten."""
+        past = datetime.now(timezone.utc) - timedelta(hours=3.0)  # 300% of ONE_HOUR
+        validator_engine.register("f1", "fact", past, lifecycle_state="archived")
+        new_state = validator_engine.tick("f1")
+        assert new_state == "forgotten"
+        assert validator_engine.get_lifecycle_state("f1") == "forgotten"
+
+    def test_tick_archived_at_150(self, validator_engine):
+        """Archived item at 150% TTL stays archived (< 200%)."""
+        past = datetime.now(timezone.utc) - timedelta(hours=1.5)  # 150% of ONE_HOUR
+        validator_engine.register("f1", "fact", past, lifecycle_state="archived")
+        new_state = validator_engine.tick("f1")
+        assert new_state is None
+
+    # --- tick_all ---
+
+    def test_tick_all_mixed(self, validator_engine):
+        """tick_all transitions items at the right thresholds."""
+        now = datetime.now(timezone.utc)
+        # Fresh active item — no transition
+        validator_engine.register("fresh", "fact", now, lifecycle_state="active")
+        # Active beyond 70% — should go stale
+        past_stale = now - timedelta(hours=0.75)
+        validator_engine.register("aging", "fact", past_stale, lifecycle_state="active")
+        # Already stale beyond 100% — should go archived
+        past_archived = now - timedelta(hours=1.5)
+        validator_engine.register("old", "fact", past_archived, lifecycle_state="stale")
+
+        transitions = validator_engine.tick_all()
+        trans_map = {t["id"]: t["new_state"] for t in transitions}
+
+        assert "fresh" not in trans_map
+        assert trans_map["aging"] == "stale"
+        assert trans_map["old"] == "archived"
+
+    # --- update_lifecycle_state ---
+
+    def test_update_lifecycle_state(self, engine):
+        """update_lifecycle_state updates stored state."""
+        engine.register("f1", "fact")
+        assert engine._items["f1"]["lifecycle_state"] == "active"
+        engine.update_lifecycle_state("f1", "stale")
+        assert engine._items["f1"]["lifecycle_state"] == "stale"
+
+    def test_update_lifecycle_state_nonexistent(self, engine):
+        """Updating lifecycle state for unregistered item does nothing."""
+        engine.update_lifecycle_state("nonexistent", "stale")  # no error
+
+    # --- get_lifecycle_state ---
+
+    def test_get_lifecycle_state(self, validator_engine):
+        """get_lifecycle_state returns authoritative state from validator."""
+        past = datetime.now(timezone.utc) - timedelta(hours=0.75)
+        validator_engine.register("f1", "fact", past, lifecycle_state="active")
+        # Before tick
+        assert validator_engine.get_lifecycle_state("f1") == "active"
+        # After tick
+        validator_engine.tick("f1")
+        assert validator_engine.get_lifecycle_state("f1") == "stale"
+
+    def test_get_lifecycle_state_nonexistent(self, engine):
+        """get_lifecycle_state for unregistered item returns None."""
+        assert engine.get_lifecycle_state("nonexistent") is None
+
+    # --- tick with unregistered item ---
+
+    def test_tick_unregistered(self, engine):
+        """tick on unregistered item returns None."""
+        assert engine.tick("nonexistent") is None

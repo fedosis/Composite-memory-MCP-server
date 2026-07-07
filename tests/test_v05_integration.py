@@ -19,7 +19,7 @@ from memory_server.api.learn import learn
 from memory_server.api.remember import remember
 from memory_server.evaluation.confidence import ConfidenceEngine
 from memory_server.evaluation.validator import Validator
-from memory_server.models import VerificationStatus
+from memory_server.models import LifecycleState, VerificationStatus
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
 
@@ -80,7 +80,7 @@ class TestConfidenceLifecycle:
 
         # Validate — should succeed since confidence >= 0.7
         new_status = validator.validate("fact-1")
-        assert new_status == VerificationStatus.VALIDATED
+        assert new_status == LifecycleState.VALIDATED
 
         status = validator.get_status("fact-1")
         assert status["status"] == "validated"
@@ -96,10 +96,10 @@ class TestConfidenceLifecycle:
 
         # Validate — should fail since confidence < 0.7
         new_status = validator.validate("fact-low")
-        assert new_status == VerificationStatus.CANDIDATE
+        assert new_status == LifecycleState.CANDIDATE
 
     async def test_validated_to_trusted_with_corroboration(self):
-        """validated -> trusted when confidence >= 0.85 AND corroboration >= 2."""
+        """validated -> active (was trusted) when confidence >= 0.85 AND corroboration >= 2."""
         validator = Validator()
         validator.register(
             fact_id="fact-trust",
@@ -108,17 +108,17 @@ class TestConfidenceLifecycle:
         )
 
         # First validate
-        assert validator.validate("fact-trust") == VerificationStatus.VALIDATED
+        assert validator.validate("fact-trust") == LifecycleState.VALIDATED
 
-        # Trust without corroboration should fail
-        assert validator.trust("fact-trust") == VerificationStatus.VALIDATED
+        # Activate (trust) without corroboration should fail
+        assert validator.trust("fact-trust") == LifecycleState.VALIDATED
 
         # Add corroboration
         validator.set_corroboration_count("fact-trust", 2)
-        assert validator.trust("fact-trust") == VerificationStatus.TRUSTED
+        assert validator.trust("fact-trust") == LifecycleState.ACTIVE
 
     async def test_full_lifecycle(self, provider):
-        """Full lifecycle: learn -> validate -> trust -> deprecate -> archive."""
+        """Full lifecycle: learn -> validate -> activate -> stale -> archive."""
         result = await learn(provider, text="Python is fast")
         assert len(result["facts"]) >= 1
         fact_id = result["facts"][0]["receipt"]["id"]
@@ -133,17 +133,17 @@ class TestConfidenceLifecycle:
 
         # Increase confidence and validate
         validator.set_confidence(fact_id, 0.85)
-        assert validator.validate(fact_id) == VerificationStatus.VALIDATED
+        assert validator.validate(fact_id) == LifecycleState.VALIDATED
 
-        # Add corroboration and trust
+        # Add corroboration and activate (was trust)
         validator.set_corroboration_count(fact_id, 2)
-        assert validator.trust(fact_id) == VerificationStatus.TRUSTED
+        assert validator.trust(fact_id) == LifecycleState.ACTIVE
 
-        # Deprecate
-        assert validator.deprecate(fact_id) == VerificationStatus.DEPRECATED
+        # Deprecate → stale (backward compat)
+        assert validator.deprecate(fact_id) == LifecycleState.STALE
 
         # Archive
-        assert validator.archive(fact_id) == VerificationStatus.ARCHIVED
+        assert validator.archive(fact_id) == LifecycleState.ARCHIVED
 
     async def test_confidence_scoring(self):
         """ConfidenceEngine scoring works with source, age, corroboration."""

@@ -24,12 +24,33 @@ SOURCE_RELIABILITY: dict[str, float] = {
 DEFAULT_SOURCE_TYPE = "unknown"
 DEFAULT_TTL_DAYS = 90.0
 
+# Lifecycle state multipliers for confidence scoring
+# active > stale > archived for final score weighting
+LIFECYCLE_MULTIPLIER: dict[str, float] = {
+    "active": 1.0,
+    "validated": 0.95,
+    "candidate": 0.85,
+    "stale": 0.6,
+    "archived": 0.3,
+    "forgotten": 0.0,
+    # Backward compat
+    "trusted": 1.0,
+    "deprecated": 0.6,
+}
+
+_OLD_LIFECYCLE_MAP: dict[str, str] = {
+    "trusted": "active",
+    "deprecated": "stale",
+}
+
 
 class ConfidenceEngine:
     """Heuristic confidence scoring engine.
 
     Scores facts based on source reliability, age, corroboration,
-    and conflict signals.
+    conflict signals, and lifecycle state.
+
+    Lifecycle state factor: active > stale > archived for scoring.
     """
 
     def __init__(
@@ -54,6 +75,7 @@ class ConfidenceEngine:
         - ``subject`` / ``predicate`` / ``object`` (str): the SPO triple.
         - ``corroboration_count`` (int, optional): number of corroborating sources.
         - ``conflict_count`` (int, optional): number of conflicting facts.
+        - ``lifecycle_state`` (str, optional): lifecycle state for weighting.
 
         Returns:
             A float in [0.0, 1.0].
@@ -78,7 +100,13 @@ class ConfidenceEngine:
         conflict_count = fact_data.get("conflict_count", 0)
         conflict_penalty = self._conflict_penalty(conflict_count)
 
-        score = base * age_factor + corr_boost - conflict_penalty
+        # 5. Lifecycle state multiplier
+        lifecycle_state = fact_data.get("lifecycle_state", "active")
+        # Normalize old values
+        lifecycle_state = _OLD_LIFECYCLE_MAP.get(lifecycle_state, lifecycle_state)
+        lifecycle_mult = LIFECYCLE_MULTIPLIER.get(lifecycle_state, 1.0)
+
+        score = (base * age_factor + corr_boost - conflict_penalty) * lifecycle_mult
         return max(0.0, min(1.0, score))
 
     def corroboration(

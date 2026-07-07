@@ -20,6 +20,7 @@ from memory_server.api.search import search as search_fn
 from memory_server.evaluation.auditor import MemoryAuditor
 from memory_server.evaluation.confidence import ConfidenceEngine
 from memory_server.evaluation.decay import DecayEngine
+from memory_server.evaluation.metrics import get_collector
 from memory_server.evaluation.validator import Validator
 from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
 from memory_server.providers.graph_provider import SimpleGraph
@@ -99,7 +100,9 @@ async def _get_outbox_worker() -> OutboxWorker:
 @mcp.tool()
 def ping() -> str:
     """Connectivity check — returns OK if server is alive"""
-    return json.dumps({"status": "ok"})
+    collector = get_collector()
+    with collector.tool_call("ping") as _ctx:
+        return json.dumps({"status": "ok"})
 
 
 @mcp.tool(name="search")
@@ -117,15 +120,17 @@ async def search_tool(
         predicate: Optional exact predicate filter.
         limit: Maximum number of results (default 50).
     """
-    provider = await _get_provider()
-    result = await search_fn(
-        provider,
-        query=query,
-        subject=subject if subject else None,
-        predicate=predicate if predicate else None,
-        limit=limit,
-    )
-    return json.dumps(result)
+    collector = get_collector()
+    with collector.tool_call("search") as _ctx:
+        provider = await _get_provider()
+        result = await search_fn(
+            provider,
+            query=query,
+            subject=subject if subject else None,
+            predicate=predicate if predicate else None,
+            limit=limit,
+        )
+        return json.dumps(result)
 
 
 @mcp.tool(name="get_context")
@@ -137,14 +142,16 @@ async def get_context_tool(task: str, subject: str = "", max_results: int = 10) 
         subject: Optional subject filter (pass empty string for no filter).
         max_results: Maximum number of facts to return (default 10).
     """
-    provider = await _get_provider()
-    result = await get_context_fn(
-        provider,
-        task=task,
-        subject=subject if subject else None,
-        max_results=max_results,
-    )
-    return json.dumps(result)
+    collector = get_collector()
+    with collector.tool_call("get_context") as _ctx:
+        provider = await _get_provider()
+        result = await get_context_fn(
+            provider,
+            task=task,
+            subject=subject if subject else None,
+            max_results=max_results,
+        )
+        return json.dumps(result)
 
 
 @mcp.tool(name="remember")
@@ -168,33 +175,35 @@ async def remember_tool(
         confidence: Confidence score 0.0-1.0 (default 1.0).
         source: Source identifier (default "user").
     """
-    provider = await _get_provider()
-    result = await remember_fn(
-        provider,
-        subject=subject,
-        predicate=predicate,
-        object=object,
-        confidence=confidence,
-        source=source,
-    )
+    collector = get_collector()
+    with collector.tool_call("remember") as _ctx:
+        provider = await _get_provider()
+        result = await remember_fn(
+            provider,
+            subject=subject,
+            predicate=predicate,
+            object=object,
+            confidence=confidence,
+            source=source,
+        )
 
-    # Serialize Pydantic models in result
-    fact = result["fact"]
-    serialized = {
-        "receipt": result["receipt"].model_dump(mode="json"),
-        "fact": fact.model_dump(mode="json"),
-    }
+        # Serialize Pydantic models in result
+        fact = result["fact"]
+        serialized = {
+            "receipt": result["receipt"].model_dump(mode="json"),
+            "fact": fact.model_dump(mode="json"),
+        }
 
-    # Add outbox entry for async indexing (best-effort, never crashes)
-    await _write_outbox_fact(
-        fact_id=fact.id,
-        subject=fact.subject,
-        predicate=fact.predicate,
-        object=fact.object,
-        source=fact.source,
-    )
+        # Add outbox entry for async indexing (best-effort, never crashes)
+        await _write_outbox_fact(
+            fact_id=fact.id,
+            subject=fact.subject,
+            predicate=fact.predicate,
+            object=fact.object,
+            source=fact.source,
+        )
 
-    return json.dumps(serialized)
+        return json.dumps(serialized)
 
 
 @mcp.tool(name="learn")
@@ -212,45 +221,47 @@ async def learn_tool(
         text: Natural language text to extract knowledge from.
         source: Optional source identifier (default "user").
     """
-    provider = await _get_provider()
-    result = await learn_fn(
-        provider=provider,
-        text=text,
-        source=source,
-    )
+    collector = get_collector()
+    with collector.tool_call("learn") as _ctx:
+        provider = await _get_provider()
+        result = await learn_fn(
+            provider=provider,
+            text=text,
+            source=source,
+        )
 
-    # Add outbox entries for all extracted items (best-effort, never crashes)
-    try:
-        for f in result.get("facts", []):
-            item = f.get("item", {})
-            await _write_outbox_fact(
-                fact_id=item.get("id", ""),
-                subject=item.get("subject", ""),
-                predicate=item.get("predicate", ""),
-                object=item.get("object", ""),
-                source=source,
-            )
+        # Add outbox entries for all extracted items (best-effort, never crashes)
+        try:
+            for f in result.get("facts", []):
+                item = f.get("item", {})
+                await _write_outbox_fact(
+                    fact_id=item.get("id", ""),
+                    subject=item.get("subject", ""),
+                    predicate=item.get("predicate", ""),
+                    object=item.get("object", ""),
+                    source=source,
+                )
 
-        for d in result.get("decisions", []):
-            item = d.get("item", {})
-            await _write_outbox_decision(
-                decision_id=item.get("id", ""),
-                choice=item.get("choice", ""),
-                reason=item.get("reason", ""),
-                context=item.get("context", ""),
-            )
+            for d in result.get("decisions", []):
+                item = d.get("item", {})
+                await _write_outbox_decision(
+                    decision_id=item.get("id", ""),
+                    choice=item.get("choice", ""),
+                    reason=item.get("reason", ""),
+                    context=item.get("context", ""),
+                )
 
-        for s in result.get("skills", []):
-            item = s.get("item", {})
-            await _write_outbox_skill(
-                skill_id=item.get("id", ""),
-                purpose=item.get("purpose", ""),
-                steps=item.get("steps", []),
-            )
-    except Exception:
-        logger.warning("Writing outbox entries during learn() failed", exc_info=True)
+            for s in result.get("skills", []):
+                item = s.get("item", {})
+                await _write_outbox_skill(
+                    skill_id=item.get("id", ""),
+                    purpose=item.get("purpose", ""),
+                    steps=item.get("steps", []),
+                )
+        except Exception:
+            logger.warning("Writing outbox entries during learn() failed", exc_info=True)
 
-    return json.dumps(result)
+        return json.dumps(result)
 
 
 @mcp.tool(name="semantic_search")
@@ -270,13 +281,15 @@ async def semantic_search_tool(
         top_k: Maximum number of results (default 10).
         score_threshold: Minimum similarity score 0.0-1.0 (default 0.0).
     """
-    router = await _get_router()
-    results = await router.route(
-        query=query,
-        top_k=top_k,
-        score_threshold=score_threshold,
-    )
-    return json.dumps(results)
+    collector = get_collector()
+    with collector.tool_call("semantic_search") as _ctx:
+        router = await _get_router()
+        results = await router.route(
+            query=query,
+            top_k=top_k,
+            score_threshold=score_threshold,
+        )
+        return json.dumps(results)
 
 
 async def _get_graph_router() -> GraphRouter:
@@ -308,54 +321,56 @@ async def graph_search_fn(
         source_id: Source entity for pathfinding.
         target_id: Target entity for pathfinding.
     """
-    router = await _get_graph_router()
-    graph = router.graph
+    collector = get_collector()
+    with collector.tool_call("graph_search") as _ctx:
+        router = await _get_graph_router()
+        graph = router.graph
 
-    nodes: list[dict] = []
-    edges: list[dict] = []
-    paths: list[list[dict]] = []
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        paths: list[list[dict]] = []
 
-    if entity_id:
-        node = graph.get_node(entity_id)
-        if node is not None:
-            nodes.append({
-                "id": node.id,
-                "name": node.name,
-                "type": node.type,
-                "attributes": node.attributes,
-            })
-            neighbors = graph.get_neighbors(entity_id)
-            for neighbor_node, edge in neighbors:
+        if entity_id:
+            node = graph.get_node(entity_id)
+            if node is not None:
                 nodes.append({
-                    "id": neighbor_node.id,
-                    "name": neighbor_node.name,
-                    "type": neighbor_node.type,
-                    "attributes": neighbor_node.attributes,
+                    "id": node.id,
+                    "name": node.name,
+                    "type": node.type,
+                    "attributes": node.attributes,
                 })
-                edges.append({
-                    "source_id": edge.source_id,
-                    "target_id": edge.target_id,
-                    "relation": edge.relation,
-                    "attributes": edge.attributes,
-                })
-    elif source_id and target_id:
-        found_paths = graph.find_path(source_id, target_id, max_depth=4)
-        for p in found_paths:
-            paths.append([
-                {"id": n.id, "name": n.name, "type": n.type}
-                for n in p
-            ])
-    elif query:
-        result = router.query(query)
-        nodes = result.get("entities", [])
-        edges = result.get("relations", [])
-        paths = result.get("paths", [])
+                neighbors = graph.get_neighbors(entity_id)
+                for neighbor_node, edge in neighbors:
+                    nodes.append({
+                        "id": neighbor_node.id,
+                        "name": neighbor_node.name,
+                        "type": neighbor_node.type,
+                        "attributes": neighbor_node.attributes,
+                    })
+                    edges.append({
+                        "source_id": edge.source_id,
+                        "target_id": edge.target_id,
+                        "relation": edge.relation,
+                        "attributes": edge.attributes,
+                    })
+        elif source_id and target_id:
+            found_paths = graph.find_path(source_id, target_id, max_depth=4)
+            for p in found_paths:
+                paths.append([
+                    {"id": n.id, "name": n.name, "type": n.type}
+                    for n in p
+                ])
+        elif query:
+            result = router.query(query)
+            nodes = result.get("entities", [])
+            edges = result.get("relations", [])
+            paths = result.get("paths", [])
 
-    return json.dumps({
-        "nodes": nodes,
-        "edges": edges,
-        "paths": paths,
-    })
+        return json.dumps({
+            "nodes": nodes,
+            "edges": edges,
+            "paths": paths,
+        })
 
 
 async def _get_hybrid_router() -> HybridRouter:
@@ -485,13 +500,15 @@ async def route_tool(
         top_k: Maximum semantic search results (default 10).
         score_threshold: Minimum similarity score 0.0-1.0 (default 0.0).
     """
-    router = await _get_hybrid_router()
-    result = await router.route(
-        query=query,
-        top_k=top_k,
-        score_threshold=score_threshold,
-    )
-    return json.dumps(result)
+    collector = get_collector()
+    with collector.tool_call("route") as _ctx:
+        router = await _get_hybrid_router()
+        result = await router.route(
+            query=query,
+            top_k=top_k,
+            score_threshold=score_threshold,
+        )
+        return json.dumps(result)
 
 
 @mcp.tool(name="audit")
@@ -507,19 +524,35 @@ async def audit_tool(
         Structured audit report with warnings, errors, and stats.
     """
     global _validator_store, _confidence_engine
-    if _validator_store is None:
-        _validator_store = Validator()
-    if _confidence_engine is None:
-        _confidence_engine = ConfidenceEngine()
+    collector = get_collector()
+    with collector.tool_call("audit") as _ctx:
+        if _validator_store is None:
+            _validator_store = Validator()
+        if _confidence_engine is None:
+            _confidence_engine = ConfidenceEngine()
 
-    graph = _graph or SimpleGraph()
-    auditor = MemoryAuditor(
-        validator=_validator_store,
-        confidence_engine=_confidence_engine,
-        graph=graph,
-    )
-    report = auditor.audit_report(audit_type=audit_type)
-    return json.dumps(report)
+        graph = _graph or SimpleGraph()
+        auditor = MemoryAuditor(
+            validator=_validator_store,
+            confidence_engine=_confidence_engine,
+            graph=graph,
+        )
+        report = auditor.audit_report(audit_type=audit_type)
+
+        # Integrate drift detection into metrics
+        drift_stats = report.get("stats", {}).get("sql_vector_drift", {})
+        if drift_stats and drift_stats.get("drift_pct") is not None:
+            collector.update_drift(drift_stats["drift_pct"])
+
+        return json.dumps(report)
+
+
+@mcp.tool(name="metrics")
+async def metrics_tool() -> str:
+    """Return a Prometheus-formatted snapshot of all observability metrics."""
+    from memory_server.evaluation.metrics import generate_latest
+
+    return generate_latest().decode("utf-8")
 
 
 def run():

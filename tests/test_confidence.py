@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from memory_server.evaluation.confidence import (
+    LIFECYCLE_MULTIPLIER,
     SOURCE_RELIABILITY,
     ConfidenceEngine,
 )
@@ -197,3 +198,85 @@ class TestConfidenceEngine:
             "conflict_count": 2,
         })
         assert penalised < base
+
+
+class TestLifecycleStateScoring:
+    """ConfidenceEngine — lifecycle state scoring factor."""
+
+    def test_active_scores_higher_than_stale(self, engine):
+        """Active lifecycle gets higher score than stale (same params)."""
+        base = {"source_type": "verified", "created_at": None, "conflict_count": 0}
+        active_score = engine.score_fact({**base, "lifecycle_state": "active"})
+        stale_score = engine.score_fact({**base, "lifecycle_state": "stale"})
+        assert active_score > stale_score
+
+    def test_stale_scores_higher_than_archived(self, engine):
+        """Stale gets higher score than archived."""
+        base = {"source_type": "verified", "created_at": None, "conflict_count": 0}
+        stale_score = engine.score_fact({**base, "lifecycle_state": "stale"})
+        archived_score = engine.score_fact({**base, "lifecycle_state": "archived"})
+        assert stale_score > archived_score
+
+    def test_forgotten_returns_zero(self, engine):
+        """Forgotten lifecycle returns zero score."""
+        score = engine.score_fact({
+            "source_type": "verified",
+            "lifecycle_state": "forgotten",
+        })
+        assert score == 0.0
+
+    def test_candidate_lower_than_validated(self, engine):
+        """Candidate scores lower than validated."""
+        base = {"source_type": "verified", "created_at": None}
+        candidate = engine.score_fact({**base, "lifecycle_state": "candidate"})
+        validated = engine.score_fact({**base, "lifecycle_state": "validated"})
+        assert validated > candidate
+
+    def test_candidate_lower_than_active(self, engine):
+        """Candidate scores lower than active."""
+        base = {"source_type": "verified", "created_at": None}
+        candidate = engine.score_fact({**base, "lifecycle_state": "candidate"})
+        active = engine.score_fact({**base, "lifecycle_state": "active"})
+        assert active > candidate
+
+    def test_default_lifecycle_is_active(self, engine):
+        """Omitting lifecycle_state defaults to 'active'."""
+        with_default = engine.score_fact({"source_type": "verified"})
+        with_explicit = engine.score_fact({
+            "source_type": "verified",
+            "lifecycle_state": "active",
+        })
+        assert with_default == with_explicit
+
+    def test_backward_compat_trusted(self, engine):
+        """Old 'trusted' maps to 'active' multiplier."""
+        trusted_score = engine.score_fact({
+            "source_type": "verified",
+            "lifecycle_state": "trusted",
+        })
+        active_score = engine.score_fact({
+            "source_type": "verified",
+            "lifecycle_state": "active",
+        })
+        assert trusted_score == active_score
+
+    def test_backward_compat_deprecated(self, engine):
+        """Old 'deprecated' maps to 'stale' multiplier."""
+        deprecated_score = engine.score_fact({
+            "source_type": "verified",
+            "lifecycle_state": "deprecated",
+        })
+        stale_score = engine.score_fact({
+            "source_type": "verified",
+            "lifecycle_state": "stale",
+        })
+        assert deprecated_score == stale_score
+
+    def test_lifecycle_multiplier_values(self):
+        """Lifecycle multiplier values are ordered correctly."""
+        assert LIFECYCLE_MULTIPLIER["active"] == 1.0
+        assert LIFECYCLE_MULTIPLIER["validated"] == 0.95
+        assert LIFECYCLE_MULTIPLIER["candidate"] == 0.85
+        assert LIFECYCLE_MULTIPLIER["stale"] == 0.6
+        assert LIFECYCLE_MULTIPLIER["archived"] == 0.3
+        assert LIFECYCLE_MULTIPLIER["forgotten"] == 0.0

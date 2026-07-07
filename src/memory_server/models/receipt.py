@@ -18,6 +18,40 @@ class VerificationStatus(str, Enum):
     ARCHIVED = "archived"
 
 
+class LifecycleState(str, Enum):
+    """Lifecycle state of a memory item — v0.6 spec.
+
+    States flow forward only:
+        candidate → validated → active → stale → archived → forgotten
+
+    Each state is terminal for backward transitions — once promoted,
+    an item can only move forward in the lifecycle.
+    """
+
+    CANDIDATE = "candidate"
+    VALIDATED = "validated"
+    ACTIVE = "active"
+    STALE = "stale"
+    ARCHIVED = "archived"
+    FORGOTTEN = "forgotten"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "LifecycleState | None":
+        """Handle backward compatibility with old lifecycle values.
+
+        Map:
+            "trusted"    → "active"
+            "deprecated" → "stale"
+        """
+        compat: dict[str, str] = {
+            "trusted": "active",
+            "deprecated": "stale",
+        }
+        if isinstance(value, str) and value.lower() in compat:
+            return cls(compat[value.lower()])
+        return None
+
+
 class MemoryReceipt(BaseModel):
     """Provenance receipt for every memory operation.
 
