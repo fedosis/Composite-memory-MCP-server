@@ -1,46 +1,43 @@
-"""Async SQLite provider using SQLAlchemy + aiosqlite.
+"""Legacy adapter — wraps new repository layer in old SQLiteProvider interface.
 
-Per ADR-002: Facts use SQLite/PostgreSQL storage.
-Per ADR-010: v0.1a uses SQLite only.
+This adapter implements the same async CRUD methods as the original
+SQLiteProvider but delegates to the new repository layer internally.
 
-v0.6: Refactored to delegate to the new storage layer
-(storage/models + storage/repositories) instead of maintaining
-duplicate inline ORM models.
+Keeps backward compatibility during v0.6 migration.
 """
 
 from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+from memory_server.models import Decision, Fact, MemoryReceipt, Skill
 from storage.base import Base
 from storage.repositories import (
     DecisionRepository,
     FactRepository,
+    LifecycleRepository,
     ReceiptRepository,
     SkillRepository,
 )
 
-from memory_server.models import (
-    Decision,
-    Fact,
-    MemoryReceipt,
-    Skill,
-)
 
+class LegacySQLiteProviderAdapter:
+    """Backward-compatible adapter that wraps new repository layer.
 
-class SQLiteProvider:
-    """Async SQLite provider for CRUD operations on facts and receipts.
-
-    v0.6: Delegates to the new storage layer (storage/repositories)
-    for all CRUD operations. Keeps the same public interface for
-    backward compatibility.
-
-    WAL mode is enabled on initialization for concurrent read performance.
+    Provides the same interface as the old SQLiteProvider but uses
+    the new storage architecture internally.
     """
 
     def __init__(self, url: str = "sqlite+aiosqlite:///memory.db"):
         self._url = url
         self._engine = None
         self._session_factory = None
+        self._fact_repo = None
+        self._decision_repo = None
+        self._skill_repo = None
+        self._receipt_repo = None
+        self._lifecycle_repo = None
 
     async def initialize(self):
         """Create engine, tables, and session factory with WAL mode."""
@@ -62,7 +59,6 @@ class SQLiteProvider:
         )
 
     async def close(self):
-        """Dispose of the engine."""
         if self._engine:
             await self._engine.dispose()
 
@@ -106,9 +102,7 @@ class SQLiteProvider:
     ) -> list[Fact]:
         async with await self._get_session() as session:
             repo = await self._get_fact_repo(session)
-            results = await repo.search(
-                subject=subject, predicate=predicate, text=text, limit=limit
-            )
+            results = await repo.search(subject=subject, predicate=predicate, text=text, limit=limit)
             # Apply additional filters in-memory for backward compat
             if source is not None:
                 results = [r for r in results if r.source == source]
@@ -187,11 +181,6 @@ class SQLiteProvider:
             if name is not None:
                 results = [r for r in results if r.name == name]
             return results[:limit]
-
-    async def delete_skill(self, skill_id: str) -> bool:
-        async with await self._get_session() as session:
-            repo = await self._get_skill_repo(session)
-            return await repo.delete(skill_id)
 
     # --- Receipt CRUD ---
 
