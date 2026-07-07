@@ -11,7 +11,13 @@ from sqlalchemy import Float, String, Text, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from memory_server.models import Fact, MemoryReceipt, VerificationStatus
+from memory_server.models import (
+    Decision,
+    Fact,
+    MemoryReceipt,
+    Skill,
+    VerificationStatus,
+)
 
 
 class Base(DeclarativeBase):
@@ -96,6 +102,95 @@ class MemoryReceiptORM(Base):
             confidence=receipt.confidence,
             verification_status=receipt.verification_status.value,
             history=json.dumps(receipt.history),
+        )
+
+
+class DecisionORM(Base):
+    """SQLAlchemy ORM model for Decisions."""
+
+    __tablename__ = "decisions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    context: Mapped[str] = mapped_column(String, default="")
+    choice: Mapped[str] = mapped_column(String, nullable=False)
+    rejected_alternatives: Mapped[str] = mapped_column(Text, default="[]")
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+
+    def to_pydantic(self) -> Decision:
+        import json
+
+        return Decision(
+            id=self.id,
+            context=self.context,
+            choice=self.choice,
+            rejected_alternatives=json.loads(self.rejected_alternatives),
+            reason=self.reason,
+            source=self.source,
+            created_at=self.created_at,
+        )
+
+    @classmethod
+    def from_pydantic(cls, decision: Decision) -> "DecisionORM":
+        import json
+
+        return cls(
+            id=decision.id,
+            context=decision.context,
+            choice=decision.choice,
+            rejected_alternatives=json.dumps(decision.rejected_alternatives),
+            reason=decision.reason,
+            source=decision.source,
+            created_at=decision.created_at,
+        )
+
+
+class SkillORM(Base):
+    """SQLAlchemy ORM model for Skills."""
+
+    __tablename__ = "skills"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, default="")
+    version: Mapped[str] = mapped_column(String, default="1.0.0")
+    purpose: Mapped[str] = mapped_column(String, nullable=False)
+    steps: Mapped[str] = mapped_column(Text, default="[]")
+    constraints: Mapped[str] = mapped_column(Text, default="[]")
+    validation: Mapped[str] = mapped_column(Text, default="[]")
+    success_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+
+    def to_pydantic(self) -> Skill:
+        import json
+
+        return Skill(
+            id=self.id,
+            name=self.name,
+            version=self.version,
+            purpose=self.purpose,
+            steps=json.loads(self.steps),
+            constraints=json.loads(self.constraints),
+            validation=json.loads(self.validation),
+            success_rate=self.success_rate,
+            created_at=self.created_at,
+        )
+
+    @classmethod
+    def from_pydantic(cls, skill: Skill) -> "SkillORM":
+        import json
+
+        return cls(
+            id=skill.id,
+            name=skill.name,
+            version=skill.version,
+            purpose=skill.purpose,
+            steps=json.dumps(skill.steps),
+            constraints=json.dumps(skill.constraints),
+            validation=json.dumps(skill.validation),
+            success_rate=skill.success_rate,
+            created_at=skill.created_at,
         )
 
 
@@ -201,6 +296,98 @@ class SQLiteProvider:
             await session.delete(orm)
             await session.commit()
             return True
+
+    # --- Decision CRUD ---
+
+    async def create_decision(self, decision: Decision) -> Decision:
+        async with await self._get_session() as session:
+            orm = DecisionORM.from_pydantic(decision)
+            session.add(orm)
+            await session.commit()
+            return orm.to_pydantic()
+
+    async def get_decision(self, decision_id: str) -> Optional[Decision]:
+        async with await self._get_session() as session:
+            result = await session.get(DecisionORM, decision_id)
+            if result is None:
+                return None
+            return result.to_pydantic()
+
+    async def search_decisions(
+        self,
+        context: Optional[str] = None,
+        choice: Optional[str] = None,
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
+        text: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[Decision]:
+        async with await self._get_session() as session:
+            stmt = select(DecisionORM)
+
+            if context is not None:
+                stmt = stmt.where(DecisionORM.context == context)
+            if choice is not None:
+                stmt = stmt.where(DecisionORM.choice == choice)
+            if reason is not None:
+                stmt = stmt.where(DecisionORM.reason == reason)
+            if source is not None:
+                stmt = stmt.where(DecisionORM.source == source)
+            if text is not None:
+                pattern = f"%{text}%"
+                stmt = stmt.where(
+                    DecisionORM.context.like(pattern)
+                    | DecisionORM.choice.like(pattern)
+                    | DecisionORM.reason.like(pattern)
+                )
+
+            stmt = stmt.limit(limit).order_by(DecisionORM.created_at.desc())
+            result = await session.execute(stmt)
+            return [row.to_pydantic() for row in result.scalars().all()]
+
+    # --- Skill CRUD ---
+
+    async def create_skill(self, skill: Skill) -> Skill:
+        async with await self._get_session() as session:
+            orm = SkillORM.from_pydantic(skill)
+            session.add(orm)
+            await session.commit()
+            return orm.to_pydantic()
+
+    async def get_skill(self, skill_id: str) -> Optional[Skill]:
+        async with await self._get_session() as session:
+            result = await session.get(SkillORM, skill_id)
+            if result is None:
+                return None
+            return result.to_pydantic()
+
+    async def search_skills(
+        self,
+        purpose: Optional[str] = None,
+        name: Optional[str] = None,
+        text: Optional[str] = None,
+        min_success_rate: Optional[float] = None,
+        limit: int = 50,
+    ) -> list[Skill]:
+        async with await self._get_session() as session:
+            stmt = select(SkillORM)
+
+            if purpose is not None:
+                stmt = stmt.where(SkillORM.purpose == purpose)
+            if name is not None:
+                stmt = stmt.where(SkillORM.name == name)
+            if text is not None:
+                pattern = f"%{text}%"
+                stmt = stmt.where(
+                    SkillORM.purpose.like(pattern)
+                    | SkillORM.name.like(pattern)
+                )
+            if min_success_rate is not None:
+                stmt = stmt.where(SkillORM.success_rate >= min_success_rate)
+
+            stmt = stmt.limit(limit).order_by(SkillORM.created_at.desc())
+            result = await session.execute(stmt)
+            return [row.to_pydantic() for row in result.scalars().all()]
 
     # --- Receipt CRUD ---
 
