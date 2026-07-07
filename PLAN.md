@@ -8,8 +8,8 @@ Goal: MCP API + SQLite backend + get_context/search/remember
 | 001 | Project skeleton | t_ed422770 | ✅ done | ✅ approve | ✅ pass | ✅ v0.1a-alpha.1 |
 | 002 | Pydantic data models | t_da4fd8bb | ✅ done | ✅ approve | ✅ pass | ✅ v0.1a-alpha.2 |
 | 003 | SQLite provider | — | ✅ done | ✅ approve | ✅ pass | ✅ v0.1a-alpha.3 |
-| 004 | MCP tool: get_context | — | ⏳ | — | — | — |
-| 005 | MCP tool: search | — | ⏳ | — | — | — |
+| 004 | MCP tool: get_context | — | ✅ done | ✅ approve | ✅ pass | ✅ v0.1a-alpha.4 |
+| 005 | MCP tool: search | — | ✅ done | — | ✅ pass | ✅ v0.1a-alpha.5 |
 | 006 | MCP tool: remember | — | ⏳ | — | — | — |
 | 007 | Integration tests + docs | — | ⏳ | — | — | — |
 
