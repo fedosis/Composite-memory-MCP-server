@@ -23,8 +23,16 @@ Qdrant + embeddings + semantic router
 | 010 | Semantic router | — | ✅ done | — | ✅ pass | ✅ v0.2-alpha.10 |
 | 011 | Router integration tests | — | ✅ done | — | ✅ pass | ✅ v0.2-alpha.11 |
 
-## Phase: v0.3
+## Phase: v0.3 (done)
 LLM extractors + learn()
+
+| # | Card | ID | Status | Review | Tests | Merged |
+|---|------|----|--------|--------|-------|--------|
+| 012 | FactExtractor | — | ✅ done | — | ✅ pass | ✅ v0.3-alpha.12 |
+| 013 | DecisionExtractor | — | ✅ done | — | ✅ pass | ✅ v0.3-alpha.13 |
+| 014 | SkillExtractor | — | ✅ done | — | ✅ pass | ✅ v0.3-alpha.14 |
+| 015 | learn() MCP tool | — | ✅ done | — | ✅ pass | ✅ v0.3-alpha.15 |
+| 016 | Integration tests + docs | — | ✅ done | — | ✅ pass | ✅ v0.3-alpha.16 |
 
 ## Phase: v0.4
 Graph DB + entity relations

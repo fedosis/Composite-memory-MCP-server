@@ -33,7 +33,7 @@ memory-server ping
 
 ## API Reference
 
-The server exposes five MCP tools:
+The server exposes six MCP tools:
 
 ### ping
 
@@ -171,6 +171,44 @@ Per ADR-005, routing rules (keyword-based exact matches) are evaluated **before*
     }
   ],
   "total": 1
+}
+```
+
+### learn
+
+Extract and store facts, decisions, and skills from natural language text. Runs all three extractors (FactExtractor, DecisionExtractor, SkillExtractor) on the input text, stores extracted items in the memory database, and returns structured results with receipts per item type.
+
+**Arguments:**
+| Parameter | Type   | Required | Default | Description |
+|-----------|--------|----------|---------|-------------|
+| `text`    | string | yes      | —       | Natural language text to extract knowledge from |
+| `source`  | string | no       | "user"  | Source identifier for provenance tracking |
+
+**Response:**
+```json
+{
+  "facts": [
+    {
+      "receipt": {"id": "uuid", "memory_type": "fact", "source": "user", "confidence": 0.5, "verification_status": "candidate"},
+      "item": {"id": "uuid", "subject": "Docker", "predicate": "is", "object": "container", "confidence": 0.5, "source": "user"}
+    }
+  ],
+  "decisions": [
+    {
+      "receipt": {"id": "uuid", "memory_type": "decision", "source": "user", "confidence": 0.5, "verification_status": "candidate"},
+      "item": {"id": "uuid", "context": "", "choice": "use Caddy", "reason": "it is simpler", "source": "user"}
+    }
+  ],
+  "skills": [
+    {
+      "receipt": {"id": "uuid", "memory_type": "skill", "source": "user", "confidence": 0.5, "verification_status": "candidate"},
+      "item": {"id": "uuid", "purpose": "deploy docker", "steps": ["pull image", "run container"], "success_rate": 0.5}
+    }
+  ],
+  "receipts": [
+    {"id": "uuid", "memory_type": "fact", "source": "user", "verification_status": "candidate"},
+    {"id": "uuid", "memory_type": "decision", "source": "user", "verification_status": "candidate"}
+  ]
 }
 ```
 
