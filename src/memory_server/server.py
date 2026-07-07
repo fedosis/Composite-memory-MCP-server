@@ -8,6 +8,10 @@ from memory_server.api.get_context import get_context as get_context_fn
 from memory_server.api.learn import learn as learn_fn
 from memory_server.api.remember import remember as remember_fn
 from memory_server.api.search import search as search_fn
+from memory_server.evaluation.auditor import MemoryAuditor
+from memory_server.evaluation.confidence import ConfidenceEngine
+from memory_server.evaluation.decay import DecayEngine
+from memory_server.evaluation.validator import Validator
 from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.qdrant_provider import QdrantProvider
@@ -26,6 +30,9 @@ _router: EmbeddingRouter | None = None
 _graph: SimpleGraph | None = None
 _graph_router: GraphRouter | None = None
 _hybrid_router: HybridRouter | None = None
+_validator_store: Validator | None = None
+_confidence_engine: ConfidenceEngine | None = None
+_decay_engine: DecayEngine | None = None
 
 
 async def _get_provider() -> SQLiteProvider:
@@ -304,6 +311,34 @@ async def route_tool(
         score_threshold=score_threshold,
     )
     return json.dumps(result)
+
+
+@mcp.tool(name="audit")
+async def audit_tool(
+    audit_type: str = "full",
+) -> str:
+    """Run a memory audit for consistency, orphans, confidence distribution.
+
+    Args:
+        audit_type: One of "full" (default), "consistency", "orphans", "confidence".
+
+    Returns:
+        Structured audit report with warnings, errors, and stats.
+    """
+    global _validator_store, _confidence_engine
+    if _validator_store is None:
+        _validator_store = Validator()
+    if _confidence_engine is None:
+        _confidence_engine = ConfidenceEngine()
+
+    graph = _graph or SimpleGraph()
+    auditor = MemoryAuditor(
+        validator=_validator_store,
+        confidence_engine=_confidence_engine,
+        graph=graph,
+    )
+    report = auditor.audit_report(audit_type=audit_type)
+    return json.dumps(report)
 
 
 def run():
