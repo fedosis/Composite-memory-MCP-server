@@ -5,6 +5,7 @@ import json
 from mcp.server.fastmcp import FastMCP
 
 from memory_server.api.get_context import get_context as get_context_fn
+from memory_server.api.learn import learn as learn_fn
 from memory_server.api.remember import remember as remember_fn
 from memory_server.api.search import search as search_fn
 from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
@@ -126,6 +127,29 @@ async def remember_tool(
         "fact": result["fact"].model_dump(mode="json"),
     }
     return json.dumps(serialized)
+
+
+@mcp.tool(name="learn")
+async def learn_tool(
+    text: str,
+    source: str = "user",
+) -> str:
+    """Extract and store facts, decisions, and skills from natural language text.
+
+    Runs all three extractors (FactExtractor, DecisionExtractor, SkillExtractor)
+    on the input text and stores extracted items in the memory database.
+
+    Args:
+        text: Natural language text to extract knowledge from.
+        source: Optional source identifier (default "user").
+    """
+    provider = await _get_provider()
+    result = await learn_fn(
+        provider=provider,
+        text=text,
+        source=source,
+    )
+    return json.dumps(result)
 
 
 @mcp.tool(name="semantic_search")
