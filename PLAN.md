@@ -45,5 +45,17 @@ Graph DB + entity relations
 | 020 | Hybrid router (rules→embeddings→graph→LLM) | — | ✅ done | — | ✅ pass | ✅ v0.4-alpha.20 |
 | 021 | Graph integration tests + docs | — | ✅ done | — | ✅ pass | ✅ v0.4-alpha.21 |
 
-## Phase: v0.5+
+## Phase: v0.5 (done)
 Confidence engine + validation + decay + memory auditor
+
+| # | Card | ID | Status | Review | Tests | Merged |
+|---|------|----|--------|--------|-------|--------|
+| 022 | Confidence engine | — | ✅ done | — | ✅ pass | ✅ v0.5-alpha.22 |
+| 023 | Validation/conflict detection | — | ✅ done | — | ✅ pass | ✅ v0.5-alpha.23 |
+| 024 | Decay + archival | — | ✅ done | — | ✅ pass | ✅ v0.5-alpha.24 |
+| 025 | Memory auditor | — | ✅ done | — | ✅ pass | ✅ v0.5-alpha.25 |
+| 026 | Auto-indexing (remember+learn -> Qdrant+graph) | — | ✅ done | — | ✅ pass | ✅ v0.5-alpha.26 |
+| 027 | Final integration + composite MCP | — | ✅ done | — | ✅ pass | ✅ v0.5.0 |
+
+## Phase: v0.6+
+Composite recall + multi-source fusion + performance
