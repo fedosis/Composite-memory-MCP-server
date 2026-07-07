@@ -5,6 +5,7 @@ import json
 from mcp.server.fastmcp import FastMCP
 
 from memory_server.api.get_context import get_context as get_context_fn
+from memory_server.api.remember import remember as remember_fn
 from memory_server.api.search import search as search_fn
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
@@ -72,6 +73,40 @@ async def get_context_tool(task: str, subject: str = "", max_results: int = 10) 
         max_results=max_results,
     )
     return json.dumps(result)
+
+
+@mcp.tool()
+async def remember_tool(
+    subject: str,
+    predicate: str,
+    object: str,
+    confidence: float = 1.0,
+    source: str = "user",
+) -> str:
+    """Store a fact and generate a provenance receipt.
+
+    Args:
+        subject: The subject of the fact.
+        predicate: The predicate/relation.
+        object: The object of the fact.
+        confidence: Confidence score 0.0-1.0 (default 1.0).
+        source: Source identifier (default "user").
+    """
+    provider = await _get_provider()
+    result = await remember_fn(
+        provider,
+        subject=subject,
+        predicate=predicate,
+        object=object,
+        confidence=confidence,
+        source=source,
+    )
+    # Serialize Pydantic models in result
+    serialized = {
+        "receipt": result["receipt"].model_dump(mode="json"),
+        "fact": result["fact"].model_dump(mode="json"),
+    }
+    return json.dumps(serialized)
 
 
 def run():
