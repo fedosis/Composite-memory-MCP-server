@@ -1,0 +1,17 @@
+#!/bin/bash
+# Pre-commit hook: ruff check + pytest (skip if tools not installed)
+set -e
+
+if ! command -v ruff &>/dev/null; then
+    echo "⚠ ruff not installed — skipping lint"
+    exit 0
+fi
+echo "=== ruff check ==="
+ruff check src/
+
+if ! python3 -m pytest --version &>/dev/null; then
+    echo "⚠ pytest not installed — skipping tests"
+    exit 0
+fi
+echo "=== pytest ==="
+pytest tests/ --tb=short -q

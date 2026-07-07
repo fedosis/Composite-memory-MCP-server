@@ -2,6 +2,29 @@
 
 Independent MCP memory service for AI agents. Agent-independent.
 
+## Dev Setup
+
+```bash
+# Clone and enter
+git clone git@github.com:fedosis/Composite-memory-MCP-server.git
+cd memory-server
+
+# Create venv and install
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+# Run tests
+pytest tests/ -x -q
+
+# Lint
+ruff check src/
+
+# CLI
+memory-server --help
+memory-server ping
+```
+
 ## Docs
 
 - [ADR](docs/ADR.md) — Architecture Decision Records (10 ADRs)

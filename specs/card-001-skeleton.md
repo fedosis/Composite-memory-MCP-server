@@ -21,21 +21,42 @@ for connectivity verification.
 
 ## Approach
 
-1. Create `src/memory_server/cli.py` with `typer` entry point
-2. Wire `mcp.server.Server` with a `ping` tool tool
-3. Add `[tool.ruff]` to pyproject.toml
-4. Set up virtual env + install
-5. Write `tests/test_ping.py` — starts server, sends ping, expects pong
+1. Create `src/memory_server/cli.py` with `typer` entry point wrapping `FastMCP`
+2. Wire `FastMCP` with a `@mcp.tool()` decorator for `ping`
+3. Add `[tool.ruff]` target-version and lint config to `pyproject.toml`
+4. Set up virtual environment + `pip install -e ".[dev]"`
+5. Write `tests/test_ping.py` — stdio transport, `StdioServerParameters`, `call_tool("ping")`
 6. Set up pre-commit hook (`.githooks/pre-commit` → `ruff check src/ && pytest tests/`)
-7. Update README.md with dev quickstart
+7. Update `README.md` with dev quickstart
 
 ## Architecture Review Required
 Yes — validate MCP server lifecycle and tool registration pattern.
 
 ## Tests
-- `test_server_lifecycle` — server starts, creates transport, shuts down cleanly
-- `test_ping_tool` — calls `ping`, receives `{"status": "ok"}`
+
+### test_server_lifecycle
+Server starts via stdio transport, initializes, shuts down cleanly.
+
+### test_ping_tool
+```python
+import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+@pytest.mark.asyncio
+async def test_ping():
+    server_params = StdioServerParameters(
+        command="memory-server", args=[]
+    )
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("ping", arguments={})
+            assert result.content[0].text == '{"status": "ok"}'
+```
 
 ## Dependencies
 - `mcp>=1.0.0` — already in pyproject.toml
 - `typer>=0.12.0` — add to pyproject.toml
+- `ruff>=0.6.0` — add to dev deps
+
