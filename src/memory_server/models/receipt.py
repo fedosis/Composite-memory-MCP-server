@@ -23,6 +23,10 @@ class MemoryReceipt(BaseModel):
 
     Per ADR-008: every memory object must carry source, creator,
     timestamp, confidence, verification status, and history.
+
+    Canonical fields per spec: id, type, content, source, creator,
+    created_at, updated_at, confidence, verification_status,
+    lifecycle_state, version.
     """
 
     id: str
@@ -33,5 +37,8 @@ class MemoryReceipt(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     verification_status: VerificationStatus = VerificationStatus.UNVERIFIED
     history: list[Any] = []
+    updated_at: datetime = Field(default_factory=lambda: datetime.now())
+    lifecycle_state: str = "active"
+    version: str = "0.1.0"
 
     model_config = ConfigDict(from_attributes=True)
