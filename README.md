@@ -33,7 +33,7 @@ memory-server ping
 
 ## API Reference
 
-The server exposes six MCP tools:
+The server exposes eight MCP tools:
 
 ### ping
 
@@ -209,6 +209,124 @@ Extract and store facts, decisions, and skills from natural language text. Runs 
     {"id": "uuid", "memory_type": "fact", "source": "user", "verification_status": "candidate"},
     {"id": "uuid", "memory_type": "decision", "source": "user", "verification_status": "candidate"}
   ]
+}
+```
+
+### graph_search
+
+Search the knowledge graph for entities, relations, and paths between entities.
+
+Supports three search modes depending on which parameters are provided:
+
+**Mode 1 — Query (entity lookup):** Pass a `query` string. The server extracts entity references from
+the query and returns matching entities plus their neighbors and the relations between them.
+
+**Mode 2 — Direct node lookup:** Pass an `entity_id` to look up a specific graph node by its ID
+and get its neighbors and edges.
+
+**Mode 3 — Pathfinding:** Pass `source_id` and `target_id` to find paths between two entities
+in the graph (max depth 4).
+
+**Arguments:**
+| Parameter   | Type   | Required | Description |
+|-------------|--------|----------|-------------|
+| `query`     | string | no       | Text to extract entity references from |
+| `entity_id` | string | no       | Direct node ID lookup |
+| `source_id` | string | no       | Source entity for pathfinding |
+| `target_id` | string | no       | Target entity for pathfinding |
+
+**Response:**
+```json
+{
+  "nodes": [
+    {"id": "docker", "name": "Docker", "type": "entity", "attributes": {}},
+    {"id": "omv8", "name": "OMV8", "type": "entity", "attributes": {}}
+  ],
+  "edges": [
+    {"source_id": "docker", "target_id": "omv8", "relation": "runs_on", "attributes": {}}
+  ],
+  "paths": []
+}
+```
+
+**Pathfinding response:**
+```json
+{
+  "nodes": [],
+  "edges": [],
+  "paths": [
+    [
+      {"id": "serveralpha", "name": "ServerAlpha", "type": "entity"},
+      {"id": "webapp", "name": "WebApp", "type": "entity"},
+      {"id": "postgresql", "name": "PostgreSQL", "type": "entity"}
+    ]
+  ]
+}
+```
+
+### route
+
+Route a query through the 4-stage hybrid router (rules → embeddings → graph → LLM fallback).
+
+Per ADR-005, each stage is evaluated in priority order:
+1. **Rules:** Keyword-based exact match rules.
+2. **Semantic:** Embedding similarity search via Qdrant.
+3. **Graph:** Entity relation lookup in the knowledge graph.
+4. **LLM fallback:** Placeholder for future LLM-based routing.
+
+Returns the result from the highest-priority stage that produces meaningful output.
+
+**Arguments:**
+| Parameter        | Type   | Required | Default | Description |
+|------------------|--------|----------|---------|-------------|
+| `query`          | string | yes      | —       | Natural language query text |
+| `top_k`          | int    | no       | 10      | Maximum semantic search results |
+| `score_threshold` | float | no       | 0.0     | Minimum similarity score 0.0–1.0 |
+
+**Response (rule match — stage 1):**
+```json
+{
+  "stage": 1,
+  "route": "rules",
+  "rule_match": {
+    "route": "sql",
+    "rule_name": "ip_address_query",
+    "matched_keyword": "ip of"
+  }
+}
+```
+
+**Response (semantic — stage 2):**
+```json
+{
+  "stage": 2,
+  "route": "semantic",
+  "semantic_results": [
+    {"id": "uuid", "score": 0.92, "payload": {"subject": "Docker", "predicate": "runs_on", "object": "OMV8"}}
+  ],
+  "total": 1
+}
+```
+
+**Response (graph — stage 3):**
+```json
+{
+  "stage": 3,
+  "route": "graph",
+  "graph_result": {
+    "entities": [{"id": "docker", "name": "Docker", "type": "entity"}],
+    "relations": [{"source_id": "docker", "target_id": "omv8", "relation": "runs_on"}],
+    "paths": []
+  }
+}
+```
+
+**Response (LLM fallback — stage 4):**
+```json
+{
+  "stage": 4,
+  "route": "llm_fallback",
+  "message": "LLM fallback not configured"
 }
 ```
 
