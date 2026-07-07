@@ -9,9 +9,11 @@ from memory_server.api.learn import learn as learn_fn
 from memory_server.api.remember import remember as remember_fn
 from memory_server.api.search import search as search_fn
 from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.embedding_router import EmbeddingRouter
+from memory_server.router.graph_router import GraphRouter
 
 mcp = FastMCP("CompositeMemoryServer")
 
@@ -20,6 +22,8 @@ _provider: SQLiteProvider | None = None
 _qdrant: QdrantProvider | None = None
 _embedder: SentenceTransformerEmbeddingProvider | None = None
 _router: EmbeddingRouter | None = None
+_graph: SimpleGraph | None = None
+_graph_router: GraphRouter | None = None
 
 
 async def _get_provider() -> SQLiteProvider:
@@ -176,6 +180,85 @@ async def semantic_search_tool(
         score_threshold=score_threshold,
     )
     return json.dumps(results)
+
+
+async def _get_graph_router() -> GraphRouter:
+    """Get or create the GraphRouter singleton."""
+    global _graph, _graph_router
+    if _graph_router is None:
+        _graph = SimpleGraph()
+        _graph_router = GraphRouter(graph=_graph)
+    return _graph_router
+
+
+@mcp.tool(name="graph_search")
+async def graph_search_fn(
+    query: str = "",
+    entity_id: str = "",
+    source_id: str = "",
+    target_id: str = "",
+) -> str:
+    """Search the knowledge graph for entities and relations.
+
+    Performs one of three search modes depending on parameters:
+    1. query: Extract entity references from text and find neighbors.
+    2. entity_id: Direct node lookup by ID.
+    3. source_id + target_id: Pathfinding between two entities.
+
+    Args:
+        query: Text to extract entity references from.
+        entity_id: Direct node ID lookup.
+        source_id: Source entity for pathfinding.
+        target_id: Target entity for pathfinding.
+    """
+    router = await _get_graph_router()
+    graph = router.graph
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    paths: list[list[dict]] = []
+
+    if entity_id:
+        node = graph.get_node(entity_id)
+        if node is not None:
+            nodes.append({
+                "id": node.id,
+                "name": node.name,
+                "type": node.type,
+                "attributes": node.attributes,
+            })
+            neighbors = graph.get_neighbors(entity_id)
+            for neighbor_node, edge in neighbors:
+                nodes.append({
+                    "id": neighbor_node.id,
+                    "name": neighbor_node.name,
+                    "type": neighbor_node.type,
+                    "attributes": neighbor_node.attributes,
+                })
+                edges.append({
+                    "source_id": edge.source_id,
+                    "target_id": edge.target_id,
+                    "relation": edge.relation,
+                    "attributes": edge.attributes,
+                })
+    elif source_id and target_id:
+        found_paths = graph.find_path(source_id, target_id, max_depth=4)
+        for p in found_paths:
+            paths.append([
+                {"id": n.id, "name": n.name, "type": n.type}
+                for n in p
+            ])
+    elif query:
+        result = router.query(query)
+        nodes = result.get("entities", [])
+        edges = result.get("relations", [])
+        paths = result.get("paths", [])
+
+    return json.dumps({
+        "nodes": nodes,
+        "edges": edges,
+        "paths": paths,
+    })
 
 
 def run():
