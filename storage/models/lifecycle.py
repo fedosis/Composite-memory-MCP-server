@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Float, String, Text
+from sqlalchemy import DateTime, Float, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from storage.base import Base
@@ -23,7 +23,7 @@ class LifecycleStateORM(Base):
     current_state: Mapped[str] = mapped_column(String, nullable=False)
     previous_state: Mapped[str] = mapped_column(String, nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
-    updated_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now(timezone.utc))
 
 
 class LifecycleEventORM(Base):
@@ -38,4 +38,4 @@ class LifecycleEventORM(Base):
     to_state: Mapped[str] = mapped_column(String, nullable=False)
     reason: Mapped[str] = mapped_column(String, default="")
     triggered_by: Mapped[str] = mapped_column(String, default="system")
-    timestamp: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.now(timezone.utc))

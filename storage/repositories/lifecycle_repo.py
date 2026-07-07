@@ -45,6 +45,7 @@ class LifecycleRepository:
             updated_at=datetime.now(timezone.utc),
         )
         self._session.add(orm)
+        await self._session.commit()
 
     async def record_event(
         self,
@@ -66,6 +67,7 @@ class LifecycleRepository:
             timestamp=datetime.now(timezone.utc),
         )
         self._session.add(event)
+        await self._session.commit()
 
     async def get_events(
         self,

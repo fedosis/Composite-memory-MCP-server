@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Float, String
+from sqlalchemy import DateTime, Float, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import Fact
@@ -22,8 +22,8 @@ class FactORM(Base):
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     creator: Mapped[str] = mapped_column(String, default="system")
-    created_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
-    updated_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now(timezone.utc))
     verification_status: Mapped[str] = mapped_column(String, default="candidate")
     lifecycle_state: Mapped[str] = mapped_column(String, default="active")
     version: Mapped[str] = mapped_column(String, default="0.1.0")

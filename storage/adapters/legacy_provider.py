@@ -9,7 +9,6 @@ Keeps backward compatibility during v0.6 migration.
 from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase
 
 from memory_server.models import Decision, Fact, MemoryReceipt, Skill
 from storage.base import Base

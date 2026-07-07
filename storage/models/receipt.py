@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Float, String, Text
+from sqlalchemy import DateTime, Float, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import MemoryReceipt, VerificationStatus
@@ -19,11 +19,11 @@ class MemoryReceiptORM(Base):
     memory_type: Mapped[str] = mapped_column(String, nullable=False, index=True)
     source: Mapped[str] = mapped_column(String, nullable=False, index=True)
     created_by: Mapped[str] = mapped_column(String, nullable=False)
-    timestamp: Mapped[datetime] = mapped_column(String, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     verification_status: Mapped[str] = mapped_column(String, default="unverified")
     history: Mapped[str] = mapped_column(Text, default="[]")
-    updated_at: Mapped[datetime] = mapped_column(String, default=datetime.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now())
     lifecycle_state: Mapped[str] = mapped_column(String, default="active")
     version: Mapped[str] = mapped_column(String, default="0.1.0")
 
