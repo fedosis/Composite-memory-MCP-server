@@ -25,7 +25,7 @@ class Base(DeclarativeBase):
 
 
 class FactORM(Base):
-    """SQLAlchemy ORM model for Facts."""
+    """SQLAlchemy ORM model for Facts — canonical fields."""
 
     __tablename__ = "facts"
 
@@ -35,7 +35,12 @@ class FactORM(Base):
     object: Mapped[str] = mapped_column(String, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    creator: Mapped[str] = mapped_column(String, default="system")
     created_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    verification_status: Mapped[str] = mapped_column(String, default="candidate")
+    lifecycle_state: Mapped[str] = mapped_column(String, default="active")
+    version: Mapped[str] = mapped_column(String, default="0.1.0")
 
     def to_pydantic(self) -> Fact:
         return Fact(
@@ -45,7 +50,12 @@ class FactORM(Base):
             object=self.object,
             confidence=self.confidence,
             source=self.source,
+            creator=self.creator,
             created_at=self.created_at,
+            updated_at=self.updated_at,
+            verification_status=self.verification_status,
+            lifecycle_state=self.lifecycle_state,
+            version=self.version,
         )
 
     @classmethod
@@ -57,12 +67,17 @@ class FactORM(Base):
             object=fact.object,
             confidence=fact.confidence,
             source=fact.source,
+            creator=fact.creator,
             created_at=fact.created_at,
+            updated_at=fact.updated_at,
+            verification_status=fact.verification_status,
+            lifecycle_state=fact.lifecycle_state,
+            version=fact.version,
         )
 
 
 class MemoryReceiptORM(Base):
-    """SQLAlchemy ORM model for MemoryReceipts."""
+    """SQLAlchemy ORM model for MemoryReceipts — canonical fields."""
 
     __tablename__ = "receipts"
 
@@ -74,6 +89,9 @@ class MemoryReceiptORM(Base):
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     verification_status: Mapped[str] = mapped_column(String, default="unverified")
     history: Mapped[str] = mapped_column(Text, default="[]")
+    updated_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    lifecycle_state: Mapped[str] = mapped_column(String, default="active")
+    version: Mapped[str] = mapped_column(String, default="0.1.0")
 
     def to_pydantic(self) -> MemoryReceipt:
         import json
@@ -87,6 +105,9 @@ class MemoryReceiptORM(Base):
             confidence=self.confidence,
             verification_status=VerificationStatus(self.verification_status),
             history=json.loads(self.history),
+            updated_at=self.updated_at,
+            lifecycle_state=self.lifecycle_state,
+            version=self.version,
         )
 
     @classmethod
@@ -102,11 +123,14 @@ class MemoryReceiptORM(Base):
             confidence=receipt.confidence,
             verification_status=receipt.verification_status.value,
             history=json.dumps(receipt.history),
+            updated_at=receipt.updated_at,
+            lifecycle_state=receipt.lifecycle_state,
+            version=receipt.version,
         )
 
 
 class DecisionORM(Base):
-    """SQLAlchemy ORM model for Decisions."""
+    """SQLAlchemy ORM model for Decisions — canonical fields."""
 
     __tablename__ = "decisions"
 
@@ -117,7 +141,12 @@ class DecisionORM(Base):
     reason: Mapped[str] = mapped_column(String, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    creator: Mapped[str] = mapped_column(String, default="system")
     created_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    verification_status: Mapped[str] = mapped_column(String, default="candidate")
+    lifecycle_state: Mapped[str] = mapped_column(String, default="active")
+    version: Mapped[str] = mapped_column(String, default="0.1.0")
 
     def to_pydantic(self) -> Decision:
         import json
@@ -128,8 +157,14 @@ class DecisionORM(Base):
             choice=self.choice,
             rejected_alternatives=json.loads(self.rejected_alternatives),
             reason=self.reason,
+            confidence=self.confidence,
             source=self.source,
+            creator=self.creator,
             created_at=self.created_at,
+            updated_at=self.updated_at,
+            verification_status=self.verification_status,
+            lifecycle_state=self.lifecycle_state,
+            version=self.version,
         )
 
     @classmethod
@@ -142,13 +177,19 @@ class DecisionORM(Base):
             choice=decision.choice,
             rejected_alternatives=json.dumps(decision.rejected_alternatives),
             reason=decision.reason,
+            confidence=decision.confidence,
             source=decision.source,
+            creator=decision.creator,
             created_at=decision.created_at,
+            updated_at=decision.updated_at,
+            verification_status=decision.verification_status,
+            lifecycle_state=decision.lifecycle_state,
+            version=decision.version,
         )
 
 
 class SkillORM(Base):
-    """SQLAlchemy ORM model for Skills."""
+    """SQLAlchemy ORM model for Skills — canonical fields."""
 
     __tablename__ = "skills"
 
@@ -160,7 +201,13 @@ class SkillORM(Base):
     constraints: Mapped[str] = mapped_column(Text, default="[]")
     validation: Mapped[str] = mapped_column(Text, default="[]")
     success_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    creator: Mapped[str] = mapped_column(String, default="system")
     created_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(String, default=datetime.now(timezone.utc))
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    verification_status: Mapped[str] = mapped_column(String, default="candidate")
+    lifecycle_state: Mapped[str] = mapped_column(String, default="active")
 
     def to_pydantic(self) -> Skill:
         import json
@@ -174,7 +221,13 @@ class SkillORM(Base):
             constraints=json.loads(self.constraints),
             validation=json.loads(self.validation),
             success_rate=self.success_rate,
+            source=self.source,
+            creator=self.creator,
             created_at=self.created_at,
+            updated_at=self.updated_at,
+            confidence=self.confidence,
+            verification_status=self.verification_status,
+            lifecycle_state=self.lifecycle_state,
         )
 
     @classmethod
@@ -190,7 +243,13 @@ class SkillORM(Base):
             constraints=json.dumps(skill.constraints),
             validation=json.dumps(skill.validation),
             success_rate=skill.success_rate,
+            source=skill.source,
+            creator=skill.creator,
             created_at=skill.created_at,
+            updated_at=skill.updated_at,
+            confidence=skill.confidence,
+            verification_status=skill.verification_status,
+            lifecycle_state=skill.lifecycle_state,
         )
 
 
