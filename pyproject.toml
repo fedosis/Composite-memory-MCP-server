@@ -24,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-memory-server = "memory_server.cli:main"
+memory-server = "memory_server.cli:app"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -37,6 +37,9 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "N"]
+
+[tool.black]
+target-version = ["py312"]
 
 [tool.ruff.format]
 quote-style = "double"
