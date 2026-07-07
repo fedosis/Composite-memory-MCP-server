@@ -10,8 +10,8 @@ Goal: MCP API + SQLite backend + get_context/search/remember
 | 003 | SQLite provider | — | ✅ done | ✅ approve | ✅ pass | ✅ v0.1a-alpha.3 |
 | 004 | MCP tool: get_context | — | ✅ done | ✅ approve | ✅ pass | ✅ v0.1a-alpha.4 |
 | 005 | MCP tool: search | — | ✅ done | — | ✅ pass | ✅ v0.1a-alpha.5 |
-| 006 | MCP tool: remember | — | ⏳ | — | — | — |
-| 007 | Integration tests + docs | — | ⏳ | — | — | — |
+| 006 | MCP tool: remember | — | ✅ done | — | ✅ pass | ✅ v0.1a-alpha.6 |
+| 007 | Integration tests + docs | — | ✅ done | — | ✅ pass | ✅ v0.1a-alpha.7 |
 
 ## Phase: v0.2 (next)
 Qdrant + embeddings + semantic router

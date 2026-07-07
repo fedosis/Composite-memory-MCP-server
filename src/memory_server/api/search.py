@@ -37,6 +37,6 @@ async def search(
     )
 
     return {
-        "results": [f.model_dump() for f in facts],
+        "results": [f.model_dump(mode="json") for f in facts],
         "total": len(facts),
     }
