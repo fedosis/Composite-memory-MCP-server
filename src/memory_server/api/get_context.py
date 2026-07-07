@@ -52,7 +52,7 @@ async def get_context(
     facts = facts[:max_results]
 
     return {
-        "facts": [f.model_dump() for f in facts],
+        "facts": [f.model_dump(mode="json") for f in facts],
         "decisions": decisions,
         "total": len(facts),
     }

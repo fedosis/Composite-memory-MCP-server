@@ -30,7 +30,7 @@ def ping() -> str:
     return json.dumps({"status": "ok"})
 
 
-@mcp.tool()
+@mcp.tool(name="search")
 async def search_tool(
     query: str = "",
     subject: str = "",
@@ -56,7 +56,7 @@ async def search_tool(
     return json.dumps(result)
 
 
-@mcp.tool()
+@mcp.tool(name="get_context")
 async def get_context_tool(task: str, subject: str = "", max_results: int = 10) -> str:
     """Retrieve structured context about a task.
 
@@ -75,7 +75,7 @@ async def get_context_tool(task: str, subject: str = "", max_results: int = 10) 
     return json.dumps(result)
 
 
-@mcp.tool()
+@mcp.tool(name="remember")
 async def remember_tool(
     subject: str,
     predicate: str,
