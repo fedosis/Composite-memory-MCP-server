@@ -52,8 +52,10 @@ async def _get_router() -> EmbeddingRouter:
     """Get or create the EmbeddingRouter singleton."""
     global _qdrant, _embedder, _router
     if _router is None:
-        _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
-        _embedder = SentenceTransformerEmbeddingProvider()
+        if _qdrant is None:
+            _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+        if _embedder is None:
+            _embedder = SentenceTransformerEmbeddingProvider()
         _router = EmbeddingRouter(
             qdrant_provider=_qdrant,
             embedder=_embedder,
@@ -351,16 +353,6 @@ async def _get_hybrid_router() -> HybridRouter:
     return _hybrid_router
 
 
-async def _get_qdrant_and_embedder() -> tuple[QdrantProvider, SentenceTransformerEmbeddingProvider]:
-    """Get or create the QdrantProvider and Embedder singletons."""
-    global _qdrant, _embedder
-    if _qdrant is None:
-        _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
-    if _embedder is None:
-        _embedder = SentenceTransformerEmbeddingProvider()
-    return _qdrant, _embedder
-
-
 async def _auto_index_fact(
     fact_id: str,
     subject: str,
@@ -381,7 +373,9 @@ async def _auto_index_fact(
         source: Fact source.
     """
     try:
-        qdrant, embedder = await _get_qdrant_and_embedder()
+        router = await _get_router()
+        qdrant = router._qdrant
+        embedder = router._embedder
         graph_router = await _get_graph_router()
 
         # Build fact text for embedding
