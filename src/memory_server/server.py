@@ -14,6 +14,7 @@ from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.embedding_router import EmbeddingRouter
 from memory_server.router.graph_router import GraphRouter
+from memory_server.router.hybrid_router import HybridRouter
 
 mcp = FastMCP("CompositeMemoryServer")
 
@@ -24,6 +25,7 @@ _embedder: SentenceTransformerEmbeddingProvider | None = None
 _router: EmbeddingRouter | None = None
 _graph: SimpleGraph | None = None
 _graph_router: GraphRouter | None = None
+_hybrid_router: HybridRouter | None = None
 
 
 async def _get_provider() -> SQLiteProvider:
@@ -259,6 +261,49 @@ async def graph_search_fn(
         "edges": edges,
         "paths": paths,
     })
+
+
+async def _get_hybrid_router() -> HybridRouter:
+    """Get or create the HybridRouter singleton."""
+    global _qdrant, _embedder, _graph, _hybrid_router
+    if _hybrid_router is None:
+        if _qdrant is None:
+            _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+        if _embedder is None:
+            _embedder = SentenceTransformerEmbeddingProvider()
+        if _graph is None:
+            _graph = SimpleGraph()
+        _hybrid_router = HybridRouter(
+            qdrant_provider=_qdrant,
+            embedder=_embedder,
+            graph=_graph,
+        )
+    return _hybrid_router
+
+
+@mcp.tool(name="route")
+async def route_tool(
+    query: str = "",
+    top_k: int = 10,
+    score_threshold: float = 0.0,
+) -> str:
+    """Route a query through the 4-stage hybrid router (rules -> embeddings -> graph -> LLM).
+
+    Per ADR-005, evaluates each stage in priority order and returns the
+    result from the highest-priority stage that produces meaningful output.
+
+    Args:
+        query: Natural language query text.
+        top_k: Maximum semantic search results (default 10).
+        score_threshold: Minimum similarity score 0.0-1.0 (default 0.0).
+    """
+    router = await _get_hybrid_router()
+    result = await router.route(
+        query=query,
+        top_k=top_k,
+        score_threshold=score_threshold,
+    )
+    return json.dumps(result)
 
 
 def run():
