@@ -5,6 +5,7 @@ import json
 from mcp.server.fastmcp import FastMCP
 
 from memory_server.api.get_context import get_context as get_context_fn
+from memory_server.api.search import search as search_fn
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
 mcp = FastMCP("CompositeMemoryServer")
@@ -26,6 +27,32 @@ async def _get_provider() -> SQLiteProvider:
 def ping() -> str:
     """Connectivity check — returns OK if server is alive"""
     return json.dumps({"status": "ok"})
+
+
+@mcp.tool()
+async def search_tool(
+    query: str = "",
+    subject: str = "",
+    predicate: str = "",
+    limit: int = 50,
+) -> str:
+    """Search stored facts by keyword text with optional filters.
+
+    Args:
+        query: Free-text keyword to search across subject, predicate, object.
+        subject: Optional exact subject filter.
+        predicate: Optional exact predicate filter.
+        limit: Maximum number of results (default 50).
+    """
+    provider = await _get_provider()
+    result = await search_fn(
+        provider,
+        query=query,
+        subject=subject if subject else None,
+        predicate=predicate if predicate else None,
+        limit=limit,
+    )
+    return json.dumps(result)
 
 
 @mcp.tool()
