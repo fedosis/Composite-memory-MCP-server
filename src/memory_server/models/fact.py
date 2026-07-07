@@ -1,7 +1,7 @@
 """Fact model — a verified statement (subject-predicate-object)."""
 
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
