@@ -84,4 +84,4 @@ Belief Store + Reflection
 | 002 | reflect() tool | ✅ **v0.7.0-alpha.29** | Merged. 2 code reviews — Approve с 0 замечаний. 173 теста ✅ |
 | 003 | Learn-to-belief bridge | ✅ **v0.7.0-alpha.30** | Merged. 2 code reviews — Approve с 0 замечаний. 199 тестов ✅ |
 | 004 | Belief conflict resolution | ✅ **v0.7.0-alpha.31** | Merged. 1 code review — Approve с 0 замечаний. 228 тестов ✅ |
-| 005 | Integration tests + docs | ✅ **approve** | 1 arch review — Approve. Реализация запущена |
+| 005 | Integration tests + docs | ✅ **v0.7.0** | Merged. 240 тестов, 5 ADRs (007-012), полная документация |

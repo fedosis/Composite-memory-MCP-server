@@ -33,6 +33,9 @@ memory-server = "memory_server.cli:app"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.ruff]
 target-version = "py312"
 src = ["src"]

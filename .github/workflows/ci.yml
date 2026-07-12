@@ -68,5 +68,7 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Install alembic
         run: pip install alembic
+      - name: Create tables
+        run: python3 -c "from sqlalchemy import create_engine; from storage.base import Base; engine = create_engine('sqlite:///memory.db'); Base.metadata.create_all(engine)"
       - name: Run migration test
-        run: cd migrations && alembic upgrade head && alembic downgrade -1
+        run: alembic upgrade head && alembic downgrade -1
