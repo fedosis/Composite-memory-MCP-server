@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/resolve_conflict.schema.json",
+  "title": "resolve_conflict — MCP Tool Schema",
+  "description": "Resolve a conflict between two beliefs using a transition matrix.",
+  "version": "0.7.0",
+  "api_version": "0.7.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "resolve_conflict",
+    "description": "Resolve a conflict between two beliefs"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "belief_a_id": {
+        "type": "string",
+        "description": "UUID of the first belief in the conflict"
+      },
+      "belief_b_id": {
+        "type": "string",
+        "description": "UUID of the second belief in the conflict"
+      },
+      "resolution": {
+        "type": "string",
+        "enum": ["keep_a", "keep_b", "merge", "discard_both"],
+        "description": "Resolution strategy:\n- keep_a: belief_a stays active, belief_b is discarded\n- keep_b: belief_b stays active, belief_a is discarded\n- merge: both remain active but a new merged belief is created\n- discard_both: both are discarded"
+      },
+      "new_proposition": {
+        "type": "string",
+        "description": "Proposition for a new merged belief (required when resolution=merge)",
+        "minLength": 1,
+        "maxLength": 2048
+      }
+    },
+    "required": ["belief_a_id", "belief_b_id", "resolution"],
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "belief_a": { "$ref": "common.schema.json#/definitions/belief_response" },
+      "belief_b": { "$ref": "common.schema.json#/definitions/belief_response" },
+      "resolution": {
+        "type": "string",
+        "description": "The resolution that was applied"
+      },
+      "created": {
+        "type": "object",
+        "description": "The merged belief created during resolution (only for merge resolution)",
+        "nullable": true
+      },
+      "events": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "belief_id": { "type": "string" },
+            "from_state": { "type": "string" },
+            "to_state": { "type": "string" },
+            "reason": { "type": "string" }
+          },
+          "required": ["belief_id", "from_state", "to_state"]
+        }
+      },
+      "receipt": { "$ref": "common.schema.json#/definitions/receipt_response" }
+    },
+    "required": ["belief_a", "belief_b", "resolution", "events", "receipt"],
+    "additionalProperties": false
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

@@ -1,13 +1,13 @@
 """Skill ORM model — canonical SQL storage for skills."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import DateTime, Float, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import Skill
-from storage.base import Base
+from storage.base import Base, utcnow
 
 
 class SkillORM(Base):
@@ -25,8 +25,8 @@ class SkillORM(Base):
     success_rate: Mapped[float] = mapped_column(Float, default=0.0)
     source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     creator: Mapped[str] = mapped_column(String, default="system")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now(timezone.utc))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
     verification_status: Mapped[str] = mapped_column(String, default="candidate")
     lifecycle_state: Mapped[str] = mapped_column(String, default="active")

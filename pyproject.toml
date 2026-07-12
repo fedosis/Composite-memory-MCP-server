@@ -19,6 +19,7 @@ git = ["gitpython>=3.0.0"]
 sentence = ["sentence-transformers>=3.0.0"]
 openai = ["openai>=1.0.0"]
 dev = [
+    "composite-memory-mcp-server[qdrant,sentence]",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",

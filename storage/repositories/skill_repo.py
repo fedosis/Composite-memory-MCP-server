@@ -18,7 +18,8 @@ class SkillRepository:
     async def create(self, skill: Skill) -> Skill:
         orm = SkillORM.from_pydantic(skill)
         self._session.add(orm)
-        await self._session.commit()
+        await self._session.flush()
+        await self._session.refresh(orm)
         return orm.to_pydantic()
 
     async def get(self, skill_id: str) -> Optional[Skill]:
@@ -38,5 +39,5 @@ class SkillRepository:
         if orm is None:
             return False
         await self._session.delete(orm)
-        await self._session.commit()
+        await self._session.flush()
         return True

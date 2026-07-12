@@ -33,6 +33,10 @@ LIFECYCLE_MULTIPLIER: dict[str, float] = {
     "stale": 0.6,
     "archived": 0.3,
     "forgotten": 0.0,
+    # Belief-specific multipliers
+    "superseded": 0.3,
+    "contradicted": 0.3,
+    "discarded": 0.0,
     # Backward compat
     "trusted": 1.0,
     "deprecated": 0.6,
@@ -161,6 +165,13 @@ class ConfidenceEngine:
                 ):
                     conflicts.append((i, j))
         return conflicts
+
+    def score_belief(self, evidence: list[Any]) -> float:
+        """Compute belief confidence as weighted average of evidence weights."""
+        if not evidence:
+            return 0.5
+        weights = [e.weight if hasattr(e, 'weight') else e.get('weight', 0.5) for e in evidence]
+        return max(0.0, min(1.0, sum(weights) / len(weights)))
 
     # ------------------------------------------------------------------
     # Internal helpers

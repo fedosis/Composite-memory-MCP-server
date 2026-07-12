@@ -18,7 +18,8 @@ class DecisionRepository:
     async def create(self, decision: Decision) -> Decision:
         orm = DecisionORM.from_pydantic(decision)
         self._session.add(orm)
-        await self._session.commit()
+        await self._session.flush()
+        await self._session.refresh(orm)
         return orm.to_pydantic()
 
     async def get(self, decision_id: str) -> Optional[Decision]:
@@ -50,5 +51,5 @@ class DecisionRepository:
         if orm is None:
             return False
         await self._session.delete(orm)
-        await self._session.commit()
+        await self._session.flush()
         return True

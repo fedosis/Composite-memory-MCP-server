@@ -57,5 +57,31 @@ Confidence engine + validation + decay + memory auditor
 | 026 | Auto-indexing (remember+learn -> Qdrant+graph) | — | ✅ done | — | ✅ pass | ✅ v0.5-alpha.26 |
 | 027 | Final integration + composite MCP | — | ✅ done | — | ✅ pass | ✅ v0.5.0 |
 
-## Phase: v0.6+
-Composite recall + multi-source fusion + performance
+## Phase: v0.6 (done)
+Stabilization: contract freeze → canonical data model → storage layer → outbox ingestion pipeline → lifecycle engine → FTS5 retrieval → audit system → observability → CI/CD
+
+| # | Phase | Status | Tags |
+|---|-------|--------|------|
+| 000 | Contract audit (drift-matrix.md) | ✅ done | v0.6.0-phase0 |
+| 001 | MCP contract freeze (JSON schemas) | ✅ done | v0.6.0-phase1 |
+| 002 | Canonical data model (SQLAlchemy) | ✅ done | v0.6.0-phase2 |
+| 003 | Storage layer (Alembic migrations) | ✅ done | v0.6.0-phase3 |
+| 004 | Outbox ingestion pipeline | ✅ done | v0.6.0-phase4 |
+| 005 | Lifecycle engine | ✅ done | v0.6.0-phase5 |
+| 006 | Retrieval system (FTS5) | ✅ done | v0.6.0-phase6 |
+| 007 | Audit system | ✅ done | v0.6.0-phase7 |
+| 008 | Observability (OpenTelemetry + Prometheus) | ✅ done | v0.6.0-phase8 |
+| 009 | CI/CD pipeline (lint, tests, container, SBOM) | ✅ done | v0.6.0-phase9 |
+
+Released: **v0.6.0** (latest: v0.6.0-1-gadedff5 — README update)
+
+## Phase: v0.7 (current)
+Belief Store + Reflection
+
+| # | Card | Status | Notes |
+|---|------|--------|-------|
+| 001 | Belief Model | ✅ **v0.7.0-alpha.28** | Spec v3, 3 arch reviews + 3 code reviews — все Approve с 0 замечаний. Merged ✅ |
+| 002 | reflect() tool | 📋 plan | After Card 001 |
+| 003 | Learn-to-belief bridge | 📋 plan | After Card 002 |
+| 004 | Belief conflict resolution | 📋 plan | After Card 003 |
+| 005 | Integration tests + docs | 📋 plan | After Card 004 |

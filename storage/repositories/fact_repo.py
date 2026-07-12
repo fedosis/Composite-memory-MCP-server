@@ -77,7 +77,8 @@ class FactRepository:
     async def create(self, fact: Fact) -> Fact:
         orm = FactORM.from_pydantic(fact)
         self._session.add(orm)
-        await self._session.commit()
+        await self._session.flush()
+        await self._session.refresh(orm)
         return orm.to_pydantic()
 
     async def get(self, fact_id: str) -> Optional[Fact]:
@@ -139,7 +140,8 @@ class FactRepository:
         for key, value in kwargs.items():
             if hasattr(orm, key):
                 setattr(orm, key, value)
-        await self._session.commit()
+        await self._session.flush()
+        await self._session.refresh(orm)
         return orm.to_pydantic()
 
     async def delete(self, fact_id: str) -> bool:
@@ -147,5 +149,5 @@ class FactRepository:
         if orm is None:
             return False
         await self._session.delete(orm)
-        await self._session.commit()
+        await self._session.flush()
         return True

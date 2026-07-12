@@ -1,13 +1,12 @@
 """MemoryReceipt ORM model — canonical SQL storage for receipts."""
 
 from datetime import datetime
-from typing import Any
 
 from sqlalchemy import DateTime, Float, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import MemoryReceipt, VerificationStatus
-from storage.base import Base
+from storage.base import Base, utcnow
 
 
 class MemoryReceiptORM(Base):
@@ -23,7 +22,7 @@ class MemoryReceiptORM(Base):
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     verification_status: Mapped[str] = mapped_column(String, default="unverified")
     history: Mapped[str] = mapped_column(Text, default="[]")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     lifecycle_state: Mapped[str] = mapped_column(String, default="active")
     version: Mapped[str] = mapped_column(String, default="0.1.0")
 

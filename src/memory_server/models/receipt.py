@@ -19,10 +19,16 @@ class VerificationStatus(str, Enum):
 
 
 class LifecycleState(str, Enum):
-    """Lifecycle state of a memory item — v0.6 spec.
+    """Lifecycle state of a memory item — v0.6 spec with belief states.
 
     States flow forward only:
         candidate → validated → active → stale → archived → forgotten
+
+    Belief-specific states (Card 001):
+        active ↔ superseded | contradicted | discarded
+        superseded → stale
+        contradicted → stale | discarded
+        discarded → archived
 
     Each state is terminal for backward transitions — once promoted,
     an item can only move forward in the lifecycle.
@@ -34,6 +40,10 @@ class LifecycleState(str, Enum):
     STALE = "stale"
     ARCHIVED = "archived"
     FORGOTTEN = "forgotten"
+    # Belief-specific states
+    SUPERSEDED = "superseded"
+    CONTRADICTED = "contradicted"
+    DISCARDED = "discarded"
 
     @classmethod
     def _missing_(cls, value: object) -> "LifecycleState | None":

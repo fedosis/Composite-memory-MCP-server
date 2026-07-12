@@ -15,7 +15,6 @@ from storage.base import Base
 from storage.repositories import (
     DecisionRepository,
     FactRepository,
-    LifecycleRepository,
     ReceiptRepository,
     SkillRepository,
 )
@@ -101,7 +100,9 @@ class LegacySQLiteProviderAdapter:
     ) -> list[Fact]:
         async with await self._get_session() as session:
             repo = await self._get_fact_repo(session)
-            results = await repo.search(subject=subject, predicate=predicate, text=text, limit=limit)
+            results = await repo.search(
+                subject=subject, predicate=predicate, text=text, limit=limit
+            )
             # Apply additional filters in-memory for backward compat
             if source is not None:
                 results = [r for r in results if r.source == source]

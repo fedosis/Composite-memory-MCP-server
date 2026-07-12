@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/get_belief.schema.json",
+  "title": "get_belief — MCP Tool Schema",
+  "description": "Search beliefs by proposition, lifecycle state, tags, source, creator, source_id, or minimum confidence.",
+  "version": "0.7.0",
+  "api_version": "0.7.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "get_belief",
+    "description": "Search beliefs with optional filters"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "proposition": {
+        "type": "string",
+        "description": "Search proposition text (FTS5 full-text search)",
+        "default": ""
+      },
+      "lifecycle_state": {
+        "type": "string",
+        "description": "Filter by lifecycle state (e.g. active, superseded, discarded)",
+        "default": "active"
+      },
+      "min_confidence": {
+        "type": "number",
+        "description": "Minimum confidence threshold 0.0-1.0",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "tags": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Filter by tags"
+      },
+      "source": {
+        "type": "string",
+        "description": "Filter by source identifier"
+      },
+      "creator": {
+        "type": "string",
+        "description": "Filter by creator identifier"
+      },
+      "source_id": {
+        "type": "string",
+        "description": "Filter by source_id in the belief's source_ids list"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 10
+      }
+    },
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "total": {
+        "type": "integer",
+        "description": "Total number of beliefs returned"
+      },
+      "beliefs": {
+        "type": "array",
+        "items": { "$ref": "common.schema.json#/definitions/belief_response" }
+      },
+      "query": {
+        "type": "object",
+        "description": "The query parameters that were used",
+        "properties": {
+          "proposition": { "type": "string" },
+          "lifecycle_state": { "type": "string" },
+          "min_confidence": { "type": "number" },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "source": { "type": "string" },
+          "creator": { "type": "string" },
+          "source_id": { "type": "string" },
+          "limit": { "type": "integer" }
+        }
+      }
+    },
+    "required": ["total", "beliefs", "query"],
+    "additionalProperties": false
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

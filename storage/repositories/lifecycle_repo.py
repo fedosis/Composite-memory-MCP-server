@@ -1,12 +1,13 @@
 """Lifecycle repository — lifecycle state and event tracking."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from storage.base import utcnow
 from storage.models.lifecycle import LifecycleEventORM, LifecycleStateORM
 
 
@@ -42,10 +43,10 @@ class LifecycleRepository:
             current_state=new_state,
             previous_state=previous_state,
             confidence=confidence,
-            updated_at=datetime.now(timezone.utc),
+            updated_at=utcnow(),
         )
         self._session.add(orm)
-        await self._session.commit()
+        await self._session.flush()
 
     async def record_event(
         self,
@@ -64,10 +65,10 @@ class LifecycleRepository:
             to_state=to_state,
             reason=reason,
             triggered_by=triggered_by,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=utcnow(),
         )
         self._session.add(event)
-        await self._session.commit()
+        await self._session.flush()
 
     async def get_events(
         self,
@@ -89,7 +90,11 @@ class LifecycleRepository:
                 "to_state": e.to_state,
                 "reason": e.reason,
                 "triggered_by": e.triggered_by,
-                "timestamp": e.timestamp.isoformat() if isinstance(e.timestamp, datetime) else str(e.timestamp),
+                "timestamp": (
+                e.timestamp.isoformat()
+                if isinstance(e.timestamp, datetime)
+                else str(e.timestamp)
+            ),
             }
             for e in result.scalars().all()
         ]

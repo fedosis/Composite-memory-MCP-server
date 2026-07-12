@@ -11,11 +11,8 @@ because Qdrant upsert is idempotent and graph operations are additive.
 """
 
 import asyncio
-import json
 import logging
-from datetime import datetime, timezone
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -52,30 +49,32 @@ class OutboxWorker:
 
     def __init__(
         self,
-        db_url: str,
+        db_url: str = "",
         *,
+        engine=None,
         qdrant: QdrantProvider | None = None,
         embedder: SentenceTransformerEmbeddingProvider | None = None,
         graph_router: GraphRouter | None = None,
     ):
         self._db_url = db_url
+        self._engine = engine
         self._qdrant = qdrant
         self._embedder = embedder
         self._graph_router = graph_router
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
-        self._engine = None
 
     async def initialize(self) -> None:
-        """Initialize the worker — create engine and session factory."""
-        self._engine = create_async_engine(self._db_url, echo=False)
+        """Initialize the worker — create session factory from existing engine."""
+        if self._engine is None:
+            self._engine = create_async_engine(self._db_url, echo=False)
 
-        async with self._engine.connect() as conn:
-            await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
-            await conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
-            await conn.exec_driver_sql("PRAGMA busy_timeout=5000")
+            async with self._engine.connect() as conn:
+                await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+                await conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
+                await conn.exec_driver_sql("PRAGMA busy_timeout=5000")
 
-        async with self._engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            async with self._engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
 
         self._session_factory = async_sessionmaker(
             self._engine,
@@ -134,6 +133,8 @@ class OutboxWorker:
                 await self._process_index_decision(entry)
             elif entry.operation == "index_skill":
                 await self._process_index_skill(entry)
+            elif entry.operation == "index_belief":
+                await self._process_index_belief(entry)
             else:
                 raise ValueError(f"Unknown operation: {entry.operation}")
 
@@ -236,6 +237,50 @@ class OutboxWorker:
             purpose=payload.get("purpose", ""),
             steps=payload.get("steps", []),
         )
+
+    async def _process_index_belief(self, entry: OutboxEntry) -> None:
+        """Process an index_belief entry: embed + upsert to Qdrant + sync to graph.
+
+        Indexes the belief proposition in Qdrant for semantic search.
+        Graph sync is deferred (GraphRouter.sync_belief is optional).
+
+        Idempotent: Qdrant upsert replaces by point_id, graph sync is additive.
+        """
+        import uuid
+
+        payload = entry.payload
+
+        proposition = payload.get("proposition", "")
+        confidence = payload.get("confidence", 0.5)
+        tags = payload.get("tags", [])
+        source = payload.get("source", "system")
+        belief_id = entry.record_id
+
+        # Embed and index into Qdrant
+        if self._embedder and proposition:
+            vector = await asyncio.to_thread(self._embedder.embed, proposition)
+
+            if self._qdrant:
+                point_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"belief:{belief_id}"))
+                await self._qdrant.upsert(
+                    point_id=point_uuid,
+                    vector=vector,
+                    payload={
+                        "proposition": proposition,
+                        "confidence": confidence,
+                        "tags": tags,
+                        "source": source,
+                        "memory_type": "belief",
+                    },
+                )
+
+        # Sync to graph (if GraphRouter supports it)
+        if self._graph_router and hasattr(self._graph_router, "sync_belief"):
+            await asyncio.to_thread(
+                self._graph_router.sync_belief,
+                proposition=proposition,
+                tags=tags,
+            )
 
     # ── utility for server integration ──────────────────────────────
 

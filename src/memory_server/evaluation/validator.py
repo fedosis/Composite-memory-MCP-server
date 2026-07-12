@@ -20,10 +20,14 @@ from memory_server.models.receipt import LifecycleState, VerificationStatus
 _VALID_TRANSITIONS: dict[str, set[str]] = {
     "candidate": {"validated"},
     "validated": {"active"},
-    "active": {"stale"},
+    "active": {"stale", "superseded", "contradicted", "discarded"},
     "stale": {"archived"},
     "archived": {"forgotten"},
     "forgotten": set(),  # terminal
+    # Belief-specific transitions
+    "superseded": {"stale", "discarded"},
+    "contradicted": {"active", "stale", "discarded"},
+    "discarded": {"archived"},
 }
 
 # Backward compatibility: old values that appear in stored data

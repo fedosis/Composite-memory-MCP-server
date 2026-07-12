@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/set_belief.schema.json",
+  "title": "set_belief — MCP Tool Schema",
+  "description": "Create, reinforce, or supersede a belief proposition with evidence.",
+  "version": "0.7.0",
+  "api_version": "0.7.0",
+  "schema_version": "1.0.0",
+
+  "tool": {
+    "name": "set_belief",
+    "description": "Create, reinforce, or supersede a belief proposition"
+  },
+
+  "input": {
+    "type": "object",
+    "properties": {
+      "proposition": {
+        "type": "string",
+        "description": "The belief proposition text",
+        "minLength": 1,
+        "maxLength": 2048
+      },
+      "confidence": {
+        "type": "number",
+        "description": "Confidence score 0.0-1.0",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.5
+      },
+      "sources": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "source_type": {
+              "type": "string",
+              "enum": ["fact", "decision", "observation", "user_statement"]
+            },
+            "source_id": { "type": "string" },
+            "weight": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.5
+            }
+          },
+          "required": ["source_type", "source_id"]
+        },
+        "description": "Supporting evidence sources",
+        "default": []
+      },
+      "tags": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Tags to categorise the belief",
+        "default": []
+      },
+      "source": {
+        "type": "string",
+        "description": "Source identifier",
+        "default": "system"
+      },
+      "replace_belief_id": {
+        "type": "string",
+        "description": "If set, supersede the referenced belief and link this new one"
+      }
+    },
+    "required": ["proposition"],
+    "additionalProperties": false
+  },
+
+  "output": {
+    "type": "object",
+    "properties": {
+      "belief": { "$ref": "common.schema.json#/definitions/belief_response" },
+      "receipt": { "$ref": "common.schema.json#/definitions/receipt_response" },
+      "superseded": {
+        "type": "object",
+        "description": "The original belief that was superseded (if replace_belief_id was provided)",
+        "nullable": true
+      }
+    },
+    "required": ["belief", "receipt"]
+  },
+
+  "errors": {
+    "$ref": "common.schema.json#/definitions/error_envelope"
+  }
+}

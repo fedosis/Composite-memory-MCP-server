@@ -18,7 +18,8 @@ class ReceiptRepository:
     async def create(self, receipt: MemoryReceipt) -> MemoryReceipt:
         orm = MemoryReceiptORM.from_pydantic(receipt)
         self._session.add(orm)
-        await self._session.commit()
+        await self._session.flush()
+        await self._session.refresh(orm)
         return orm.to_pydantic()
 
     async def get(self, receipt_id: str) -> Optional[MemoryReceipt]:

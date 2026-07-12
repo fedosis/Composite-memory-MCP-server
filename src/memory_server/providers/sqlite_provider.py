@@ -14,14 +14,18 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from storage.base import Base
 from storage.outbox import OutboxRepository
 from storage.repositories import (
+    BeliefRepository,
     DecisionRepository,
+    EvidenceRepository,
     FactRepository,
     ReceiptRepository,
     SkillRepository,
 )
 
 from memory_server.models import (
+    Belief,
     Decision,
+    Evidence,
     Fact,
     MemoryReceipt,
     Skill,
@@ -42,6 +46,11 @@ class SQLiteProvider:
         self._url = url
         self._engine = None
         self._session_factory = None
+
+    @property
+    def engine(self):
+        """Expose the SQLAlchemy engine for sharing with OutboxWorker."""
+        return self._engine
 
     async def initialize(self):
         """Create engine, tables, and session factory with WAL mode."""
@@ -84,6 +93,35 @@ class SQLiteProvider:
                 "INSERT OR IGNORE INTO facts_fts(facts_fts, rowid, subject, predicate, object) "
                 "SELECT 'rebuild', rowid, subject, predicate, object FROM facts"
             )
+            # Create beliefs FTS5 virtual table
+            await conn.exec_driver_sql(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS beliefs_fts "
+                "USING fts5(proposition, "
+                "content=beliefs, content_rowid=rowid)"
+            )
+            # Triggers to keep beliefs FTS index in sync
+            await conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS beliefs_ai AFTER INSERT ON beliefs BEGIN "
+                "INSERT INTO beliefs_fts(rowid, proposition) "
+                "VALUES (new.rowid, new.proposition); END"
+            )
+            await conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS beliefs_ad AFTER DELETE ON beliefs BEGIN "
+                "INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) "
+                "VALUES('delete', old.rowid, old.proposition); END"
+            )
+            await conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS beliefs_au AFTER UPDATE ON beliefs BEGIN "
+                "INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) "
+                "VALUES('delete', old.rowid, old.proposition); "
+                "INSERT INTO beliefs_fts(rowid, proposition) "
+                "VALUES (new.rowid, new.proposition); END"
+            )
+            # Populate beliefs FTS with existing data
+            await conn.exec_driver_sql(
+                "INSERT OR IGNORE INTO beliefs_fts(beliefs_fts, rowid, proposition) "
+                "SELECT 'rebuild', rowid, proposition FROM beliefs"
+            )
 
         self._session_factory = async_sessionmaker(
             self._engine,
@@ -111,12 +149,20 @@ class SQLiteProvider:
     async def _get_receipt_repo(self, session: AsyncSession) -> ReceiptRepository:
         return ReceiptRepository(session)
 
+    async def _get_belief_repo(self, session: AsyncSession) -> BeliefRepository:
+        return BeliefRepository(session)
+
+    async def _get_evidence_repo(self, session: AsyncSession) -> EvidenceRepository:
+        return EvidenceRepository(session)
+
     # --- Fact CRUD ---
 
     async def create_fact(self, fact: Fact) -> Fact:
         async with await self._get_session() as session:
             repo = await self._get_fact_repo(session)
-            return await repo.create(fact)
+            result = await repo.create(fact)
+            await session.commit()
+            return result
 
     async def get_fact(self, fact_id: str) -> Optional[Fact]:
         async with await self._get_session() as session:
@@ -151,19 +197,25 @@ class SQLiteProvider:
     async def update_fact(self, fact_id: str, **kwargs: Any) -> Optional[Fact]:
         async with await self._get_session() as session:
             repo = await self._get_fact_repo(session)
-            return await repo.update(fact_id, **kwargs)
+            result = await repo.update(fact_id, **kwargs)
+            await session.commit()
+            return result
 
     async def delete_fact(self, fact_id: str) -> bool:
         async with await self._get_session() as session:
             repo = await self._get_fact_repo(session)
-            return await repo.delete(fact_id)
+            result = await repo.delete(fact_id)
+            await session.commit()
+            return result
 
     # --- Decision CRUD ---
 
     async def create_decision(self, decision: Decision) -> Decision:
         async with await self._get_session() as session:
             repo = await self._get_decision_repo(session)
-            return await repo.create(decision)
+            result = await repo.create(decision)
+            await session.commit()
+            return result
 
     async def get_decision(self, decision_id: str) -> Optional[Decision]:
         async with await self._get_session() as session:
@@ -189,14 +241,18 @@ class SQLiteProvider:
     async def delete_decision(self, decision_id: str) -> bool:
         async with await self._get_session() as session:
             repo = await self._get_decision_repo(session)
-            return await repo.delete(decision_id)
+            result = await repo.delete(decision_id)
+            await session.commit()
+            return result
 
     # --- Skill CRUD ---
 
     async def create_skill(self, skill: Skill) -> Skill:
         async with await self._get_session() as session:
             repo = await self._get_skill_repo(session)
-            return await repo.create(skill)
+            result = await repo.create(skill)
+            await session.commit()
+            return result
 
     async def get_skill(self, skill_id: str) -> Optional[Skill]:
         async with await self._get_session() as session:
@@ -221,14 +277,18 @@ class SQLiteProvider:
     async def delete_skill(self, skill_id: str) -> bool:
         async with await self._get_session() as session:
             repo = await self._get_skill_repo(session)
-            return await repo.delete(skill_id)
+            result = await repo.delete(skill_id)
+            await session.commit()
+            return result
 
     # --- Receipt CRUD ---
 
     async def create_receipt(self, receipt: MemoryReceipt) -> MemoryReceipt:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
-            return await repo.create(receipt)
+            result = await repo.create(receipt)
+            await session.commit()
+            return result
 
     async def get_receipt(self, receipt_id: str) -> Optional[MemoryReceipt]:
         async with await self._get_session() as session:
@@ -246,6 +306,84 @@ class SQLiteProvider:
             repo = await self._get_receipt_repo(session)
             return await repo.search(memory_type=memory_type, source=source, limit=limit)
 
+    # --- Belief CRUD ---
+
+    async def create_belief(self, belief: Belief, evidence: list[Evidence] | None = None) -> Belief:
+        """Create a new belief with optional evidence entries."""
+        async with await self._get_session() as session:
+            repo = await self._get_belief_repo(session)
+            result = await repo.create(belief)
+            if evidence:
+                ev_repo = await self._get_evidence_repo(session)
+                for ev in evidence:
+                    ev.belief_id = belief.id
+                    await ev_repo.create(ev)
+            await session.commit()
+            return result
+
+    async def get_belief(self, belief_id: str) -> Optional[Belief]:
+        """Get a belief by ID."""
+        async with await self._get_session() as session:
+            repo = await self._get_belief_repo(session)
+            return await repo.get_by_id(belief_id)
+
+    async def search_beliefs(
+        self,
+        proposition: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        lifecycle_state: Optional[str] = None,
+        min_confidence: Optional[float] = None,
+        source: Optional[str] = None,
+        creator: Optional[str] = None,
+        limit: int = 10,
+    ) -> list[Belief]:
+        """Search beliefs with various filters."""
+        async with await self._get_session() as session:
+            repo = await self._get_belief_repo(session)
+            return await repo.search(
+                proposition=proposition,
+                tags=tags,
+                lifecycle_state=lifecycle_state,
+                min_confidence=min_confidence,
+                source=source,
+                creator=creator,
+                limit=limit,
+            )
+
+    async def update_belief_confidence(
+        self, belief_id: str, new_confidence: float
+    ) -> Optional[Belief]:
+        """Update the confidence of a belief."""
+        async with await self._get_session() as session:
+            repo = await self._get_belief_repo(session)
+            result = await repo.update_confidence(belief_id, new_confidence)
+            await session.commit()
+            return result
+
+    async def update_belief_lifecycle(self, belief_id: str, new_state: str) -> Optional[Belief]:
+        """Update the lifecycle state of a belief."""
+        async with await self._get_session() as session:
+            repo = await self._get_belief_repo(session)
+            result = await repo.update_lifecycle_state(belief_id, new_state)
+            await session.commit()
+            return result
+
+    async def update_belief_reinforced_at(self, belief_id: str) -> Optional[Belief]:
+        """Update the last_reinforced_at timestamp of a belief."""
+        async with await self._get_session() as session:
+            repo = await self._get_belief_repo(session)
+            result = await repo.update_reinforced_at(belief_id)
+            await session.commit()
+            return result
+
+    async def increment_belief_version(self, belief_id: str) -> Optional[Belief]:
+        """Increment the version counter of a belief."""
+        async with await self._get_session() as session:
+            repo = await self._get_belief_repo(session)
+            result = await repo.increment_version(belief_id)
+            await session.commit()
+            return result
+
     # --- Outbox ---
 
     async def add_outbox_entry(
@@ -262,9 +400,9 @@ class SQLiteProvider:
         shares a single session for all operations.
 
         Args:
-            record_type: "fact", "decision", or "skill".
+            record_type: "fact", "decision", "skill", or "belief".
             record_id: ID of the record in the primary store.
-            operation: "index_fact", "index_decision", or "index_skill".
+            operation: "index_fact", "index_decision", "index_skill", or "index_belief".
             payload: Data needed for indexing.
         """
         async with await self._get_session() as session:
@@ -282,11 +420,15 @@ class SQLiteProvider:
         fact: Optional["Fact"] = None,
         receipt: Optional["MemoryReceipt"] = None,
         outbox_entries: Optional[list[dict]] = None,
+        belief: Optional["Belief"] = None,
+        evidence_list: Optional[list["Evidence"]] = None,
     ) -> None:
-        """Create fact, receipt, and outbox entries in a single transaction.
+        """Create fact, belief, receipt, evidence, and outbox entries in a single transaction.
 
         Args:
             fact: Optional Fact to create.
+            belief: Optional Belief to create.
+            evidence_list: Optional list of Evidence entries (requires belief).
             receipt: Optional MemoryReceipt to create.
             outbox_entries: Optional list of outbox entry dicts, each with:
                 record_type, record_id, operation, payload.
@@ -295,6 +437,14 @@ class SQLiteProvider:
             if fact is not None:
                 fact_repo = await self._get_fact_repo(session)
                 await fact_repo.create(fact)
+            if belief is not None:
+                belief_repo = await self._get_belief_repo(session)
+                await belief_repo.create(belief)
+                if evidence_list:
+                    ev_repo = await self._get_evidence_repo(session)
+                    for ev in evidence_list:
+                        ev.belief_id = belief.id
+                        await ev_repo.create(ev)
             if receipt is not None:
                 receipt_repo = await self._get_receipt_repo(session)
                 await receipt_repo.create(receipt)

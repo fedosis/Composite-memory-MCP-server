@@ -20,6 +20,7 @@ PER_TYPE_TTL: dict[str, float] = {
     "decision": 180.0,  # 180 days
     "skill": 365.0,     # 365 days
     "entity": 365.0,    # 365 days
+    "belief": 180.0,    # 180 days (Card 001)
 }
 
 DEFAULT_ARCHIVE_THRESHOLD = 0.2
@@ -75,7 +76,9 @@ class DecayEngine:
         # Also register with the validator
         self._validator.register(
             item_id,
-            initial_status=LifecycleState(lifecycle_state) if lifecycle_state else LifecycleState.ACTIVE,
+            initial_status=(
+                LifecycleState(lifecycle_state) if lifecycle_state else LifecycleState.ACTIVE
+            ),
             confidence=1.0,
         )
 
@@ -219,6 +222,30 @@ class DecayEngine:
             except (ValueError, KeyError):
                 pass
 
+        elif current_state in ("superseded",) and age_ratio >= STALE_RATIO:
+            try:
+                reason = f"Superseded decay: {age_ratio:.1%} of TTL"
+                self._validator.mark_stale(item_id, reason=reason)
+                new_state = "stale"
+            except (ValueError, KeyError):
+                pass
+
+        elif current_state in ("contradicted",) and age_ratio >= STALE_RATIO:
+            try:
+                reason = f"Contradicted decay: {age_ratio:.1%} of TTL"
+                self._validator.mark_stale(item_id, reason=reason)
+                new_state = "stale"
+            except (ValueError, KeyError):
+                pass
+
+        elif current_state in ("discarded",) and age_ratio >= ARCHIVE_RATIO:
+            try:
+                reason = f"Discarded TTL expired: {age_ratio:.1%} of TTL"
+                self._validator.archive(item_id, reason=reason)
+                new_state = "archived"
+            except (ValueError, KeyError):
+                pass
+
         elif current_state in ("stale",) and age_ratio >= ARCHIVE_RATIO:
             try:
                 self._validator.archive(item_id, reason=f"TTL expired: {age_ratio:.1%} of TTL")
@@ -228,7 +255,8 @@ class DecayEngine:
 
         elif current_state in ("archived",) and age_ratio >= FORGOTTEN_RATIO:
             try:
-                self._validator.forget(item_id, reason=f"Extended TTL expired: {age_ratio:.1%} of TTL")
+                reason = f"Extended TTL expired: {age_ratio:.1%} of TTL"
+                self._validator.forget(item_id, reason=reason)
                 new_state = "forgotten"
             except (ValueError, KeyError):
                 pass

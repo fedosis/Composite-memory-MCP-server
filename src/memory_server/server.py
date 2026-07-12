@@ -9,9 +9,13 @@ v0.6 Phase 4: Uses transactional outbox pattern for async indexing.
 import asyncio
 import json
 import logging
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 from storage.outbox_worker import OutboxWorker
+from storage.repositories import LifecycleRepository
 
 from memory_server.api.get_context import get_context as get_context_fn
 from memory_server.api.learn import learn as learn_fn
@@ -22,6 +26,7 @@ from memory_server.evaluation.confidence import ConfidenceEngine
 from memory_server.evaluation.decay import DecayEngine
 from memory_server.evaluation.metrics import get_collector
 from memory_server.evaluation.validator import Validator
+from memory_server.models import Belief
 from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.qdrant_provider import QdrantProvider
@@ -31,8 +36,6 @@ from memory_server.router.graph_router import GraphRouter
 from memory_server.router.hybrid_router import HybridRouter
 
 logger = logging.getLogger(__name__)
-
-mcp = FastMCP("CompositeMemoryServer")
 
 # Lazy providers — initialized on first use
 _provider: SQLiteProvider | None = None
@@ -49,11 +52,46 @@ _outbox_worker: OutboxWorker | None = None
 _outbox_task: asyncio.Task | None = None
 
 
+@asynccontextmanager
+async def lifespan(server: FastMCP):
+    """FastMCP lifespan: start providers + outbox worker on boot, stop gracefully on shutdown."""
+    # --- Startup ---
+    logger.info("Starting Composite Memory MCP Server...")
+    provider = await _get_provider()
+    worker = await _get_outbox_worker()
+    logger.info("Server initialized — provider ready, outbox worker started")
+
+    yield {"provider": provider, "outbox_worker": worker}
+
+    # --- Shutdown ---
+    logger.info("Shutting down Composite Memory MCP Server...")
+    global _outbox_task, _outbox_worker, _provider
+
+    if _outbox_task and not _outbox_task.done():
+        _outbox_task.cancel()
+        try:
+            await _outbox_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Outbox worker task stopped")
+
+    if _outbox_worker:
+        await _outbox_worker.close()
+        logger.info("Outbox worker connection closed")
+
+    if _provider:
+        await _provider.close()
+        logger.info("SQLite provider connection closed")
+
+
+mcp = FastMCP("CompositeMemoryServer", lifespan=lifespan)
+
+
 async def _get_provider() -> SQLiteProvider:
     """Get or create the SQLiteProvider singleton."""
     global _provider
     if _provider is None:
-        _provider = SQLiteProvider(url="sqlite+aiosqlite:///:memory:")
+        _provider = SQLiteProvider(url="sqlite+aiosqlite:///data/memory.db")
         await _provider.initialize()
     return _provider
 
@@ -81,9 +119,10 @@ async def _get_outbox_worker() -> OutboxWorker:
     """
     global _outbox_worker, _outbox_task
     if _outbox_worker is None:
+        provider = await _get_provider()
         _chart_router = await _get_graph_router()
         _outbox_worker = OutboxWorker(
-            db_url=_provider._url if _provider else "sqlite+aiosqlite:///:memory:",
+            engine=provider.engine,
             qdrant=_qdrant,
             embedder=_embedder,
             graph_router=_chart_router,
@@ -95,6 +134,14 @@ async def _get_outbox_worker() -> OutboxWorker:
             _outbox_task = asyncio.create_task(_outbox_worker.run())
             logger.info("Outbox worker background task started")
     return _outbox_worker
+
+
+def _find_exact_match(beliefs: list, proposition: str):
+    norm = proposition.strip().lower()
+    for b in beliefs:
+        if b.proposition.strip().lower() == norm and b.lifecycle_state == "active":
+            return b
+    return None
 
 
 @mcp.tool()
@@ -194,15 +241,6 @@ async def remember_tool(
             "fact": fact.model_dump(mode="json"),
         }
 
-        # Add outbox entry for async indexing (best-effort, never crashes)
-        await _write_outbox_fact(
-            fact_id=fact.id,
-            subject=fact.subject,
-            predicate=fact.predicate,
-            object=fact.object,
-            source=fact.source,
-        )
-
         return json.dumps(serialized)
 
 
@@ -229,37 +267,6 @@ async def learn_tool(
             text=text,
             source=source,
         )
-
-        # Add outbox entries for all extracted items (best-effort, never crashes)
-        try:
-            for f in result.get("facts", []):
-                item = f.get("item", {})
-                await _write_outbox_fact(
-                    fact_id=item.get("id", ""),
-                    subject=item.get("subject", ""),
-                    predicate=item.get("predicate", ""),
-                    object=item.get("object", ""),
-                    source=source,
-                )
-
-            for d in result.get("decisions", []):
-                item = d.get("item", {})
-                await _write_outbox_decision(
-                    decision_id=item.get("id", ""),
-                    choice=item.get("choice", ""),
-                    reason=item.get("reason", ""),
-                    context=item.get("context", ""),
-                )
-
-            for s in result.get("skills", []):
-                item = s.get("item", {})
-                await _write_outbox_skill(
-                    skill_id=item.get("id", ""),
-                    purpose=item.get("purpose", ""),
-                    steps=item.get("steps", []),
-                )
-        except Exception:
-            logger.warning("Writing outbox entries during learn() failed", exc_info=True)
 
         return json.dumps(result)
 
@@ -391,99 +398,6 @@ async def _get_hybrid_router() -> HybridRouter:
     return _hybrid_router
 
 
-async def _write_outbox_fact(
-    fact_id: str,
-    subject: str,
-    predicate: str,
-    object: str,
-    source: str,
-) -> None:
-    """Write a 'index_fact' outbox entry for async processing.
-
-    Best-effort — never crashes the caller.
-    """
-    try:
-        provider = await _get_provider()
-        await provider.add_outbox_entry(
-            record_type="fact",
-            record_id=fact_id,
-            operation="index_fact",
-            payload={
-                "subject": subject,
-                "predicate": predicate,
-                "object": object,
-                "source": source,
-            },
-        )
-    except Exception:
-        logger.warning(
-            "Failed to write outbox entry for fact %s (%s %s %s)",
-            fact_id,
-            subject,
-            predicate,
-            object,
-            exc_info=True,
-        )
-
-
-async def _write_outbox_decision(
-    decision_id: str,
-    choice: str,
-    reason: str,
-    context: str,
-) -> None:
-    """Write an 'index_decision' outbox entry for async processing.
-
-    Best-effort — never crashes the caller.
-    """
-    try:
-        provider = await _get_provider()
-        await provider.add_outbox_entry(
-            record_type="decision",
-            record_id=decision_id,
-            operation="index_decision",
-            payload={
-                "choice": choice,
-                "reason": reason,
-                "context": context,
-            },
-        )
-    except Exception:
-        logger.warning(
-            "Failed to write outbox entry for decision %s",
-            decision_id,
-            exc_info=True,
-        )
-
-
-async def _write_outbox_skill(
-    skill_id: str,
-    purpose: str,
-    steps: list[str],
-) -> None:
-    """Write an 'index_skill' outbox entry for async processing.
-
-    Best-effort — never crashes the caller.
-    """
-    try:
-        provider = await _get_provider()
-        await provider.add_outbox_entry(
-            record_type="skill",
-            record_id=skill_id,
-            operation="index_skill",
-            payload={
-                "purpose": purpose,
-                "steps": steps,
-            },
-        )
-    except Exception:
-        logger.warning(
-            "Failed to write outbox entry for skill %s",
-            skill_id,
-            exc_info=True,
-        )
-
-
 @mcp.tool(name="route")
 async def route_tool(
     query: str = "",
@@ -553,6 +467,432 @@ async def metrics_tool() -> str:
     from memory_server.evaluation.metrics import generate_latest
 
     return generate_latest().decode("utf-8")
+
+
+@mcp.tool(name="set_belief")
+async def set_belief_tool(
+    proposition: str,
+    confidence: float = 0.5,
+    sources: str = "[]",
+    tags: str = "[]",
+    source: str = "system",
+    replace_belief_id: str = "",
+) -> str:
+    """Create, reinforce, or supersede a belief proposition with evidence.
+
+    Args:
+        proposition: The belief proposition text.
+        confidence: Confidence score 0.0-1.0 (default 0.5).
+        sources: JSON array of evidence source dicts with source_type, source_id, weight.
+        tags: JSON array of tag strings.
+        source: Source identifier (default "system").
+        replace_belief_id: If set, supersede the referenced belief and link this new one.
+    """
+    from memory_server.models.evidence import Evidence
+
+    collector = get_collector()
+    with collector.tool_call("set_belief") as _ctx:
+        provider = await _get_provider()
+
+        # Parse JSON params
+        parsed_sources = json.loads(sources) if sources else []
+        parsed_tags = json.loads(tags) if tags else []
+
+        # Reinforcement: check for existing active belief with same proposition
+        existing = await provider.search_beliefs(
+            proposition=proposition,
+            lifecycle_state=None,
+            limit=100,
+        )
+        match = _find_exact_match(existing, proposition)
+        if match:
+            # Weighted average confidence
+            new_confidence = max(0.0, min(1.0, (match.confidence + confidence) / 2))
+            await provider.update_belief_confidence(match.id, new_confidence)
+            await provider.update_belief_reinforced_at(match.id)
+            from memory_server.models.receipt import MemoryReceipt
+            receipt = MemoryReceipt(
+                id=match.id,
+                memory_type="belief",
+                source=source,
+                created_by=source,
+                timestamp=datetime.now(timezone.utc),
+                confidence=new_confidence,
+            )
+            serialized = {
+                "belief": match.model_dump(mode="json"),
+                "receipt": receipt.model_dump(mode="json"),
+                "superseded": None,
+                "reinforced": True,
+            }
+            return json.dumps(serialized)
+
+        # Create the belief
+        belief = Belief(
+            proposition=proposition,
+            confidence=confidence,
+            source=source,
+            tags=parsed_tags,
+            creator=source,
+        )
+
+        # Create evidence entries
+        evidence_list = []
+        for s in parsed_sources:
+            ev = Evidence(
+                belief_id=belief.id,
+                source_type=s.get("source_type", "observation"),
+                source_id=s.get("source_id", ""),
+                weight=s.get("weight", 0.5),
+                contributor=source,
+            )
+            evidence_list.append(ev)
+
+        # If replace_belief_id is set, supersede the old belief
+        superseded = None
+        if replace_belief_id:
+            old_belief = await provider.get_belief(replace_belief_id)
+            if old_belief:
+                superseded = old_belief.model_dump(mode="json")
+                await provider.update_belief_lifecycle(replace_belief_id, "superseded")
+                # Bump version: new belief gets old_belief.version + 1
+                belief.version = old_belief.version + 1
+
+        # Create the belief with evidence
+        from memory_server.models.receipt import MemoryReceipt
+        receipt = MemoryReceipt(
+            id=belief.id,
+            memory_type="belief",
+            source=source,
+            created_by=source,
+            timestamp=datetime.now(timezone.utc),
+            confidence=confidence,
+        )
+
+        await provider.create_in_transaction(
+            belief=belief,
+            evidence_list=evidence_list,
+            receipt=receipt,
+            outbox_entries=[
+                {
+                    "record_type": "belief",
+                    "record_id": belief.id,
+                    "operation": "index_belief",
+                    "payload": {
+                        "proposition": proposition,
+                        "tags": parsed_tags,
+                        "confidence": confidence,
+                        "source": source,
+                    },
+                }
+            ],
+        )
+
+        serialized = {
+            "belief": belief.model_dump(mode="json"),
+            "receipt": receipt.model_dump(mode="json"),
+            "superseded": superseded,
+        }
+
+        return json.dumps(serialized)
+
+
+@mcp.tool(name="get_belief")
+async def get_belief_tool(
+    proposition: str = "",
+    lifecycle_state: str = "active",
+    min_confidence: float = 0.0,
+    tags: str = "",
+    source: str = "",
+    creator: str = "",
+    source_id: str = "",
+    limit: int = 10,
+) -> str:
+    """Search beliefs with optional filters.
+
+    Args:
+        proposition: Search proposition text (FTS5 full-text search).
+        lifecycle_state: Filter by lifecycle state (default "active").
+        min_confidence: Minimum confidence threshold 0.0-1.0.
+        tags: JSON array of tag strings to filter by.
+        source: Filter by source identifier.
+        creator: Filter by creator identifier.
+        source_id: Filter by source_id in the belief's source_ids list.
+        limit: Maximum number of results (default 10, max 100).
+    """
+    collector = get_collector()
+    with collector.tool_call("get_belief") as _ctx:
+        provider = await _get_provider()
+
+        parsed_tags = json.loads(tags) if tags else None
+
+        results = await provider.search_beliefs(
+            proposition=proposition or None,
+            lifecycle_state=lifecycle_state or None,
+            min_confidence=min_confidence if min_confidence > 0 else None,
+            tags=parsed_tags,
+            source=source or None,
+            creator=creator or None,
+            limit=min(limit, 100),
+        )
+
+        # Filter by source_id if specified
+        if source_id:
+            logger.warning(
+                "source_id filter applied in-memory (deferred to SQL in v0.7+): source_id=%s",
+                source_id,
+            )
+            results = [b for b in results if source_id in b.source_ids]
+
+        serialized = {
+            "total": len(results),
+            "beliefs": [b.model_dump(mode="json") for b in results],
+            "query": {
+                "proposition": proposition,
+                "lifecycle_state": lifecycle_state,
+                "min_confidence": min_confidence,
+                "tags": parsed_tags,
+                "source": source,
+                "creator": creator,
+                "source_id": source_id,
+                "limit": limit,
+            },
+        }
+
+        return json.dumps(serialized)
+
+
+@mcp.tool(name="resolve_conflict")
+async def resolve_conflict_tool(
+    belief_a_id: str,
+    belief_b_id: str,
+    resolution: str,
+    new_proposition: str = "",
+) -> str:
+    """Resolve a conflict between two beliefs using a transition matrix.
+
+    Args:
+        belief_a_id: UUID of the first belief in the conflict.
+        belief_b_id: UUID of the second belief in the conflict.
+        resolution: Strategy: keep_a, keep_b, merge, discard_both.
+        new_proposition: Proposition for a new merged belief (required for merge).
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from memory_server.models.evidence import Evidence
+    from memory_server.models.receipt import MemoryReceipt
+
+    collector = get_collector()
+    with collector.tool_call("resolve_conflict") as _ctx:
+        provider = await _get_provider()
+
+        # Fetch both beliefs
+        belief_a = await provider.get_belief(belief_a_id)
+        belief_b = await provider.get_belief(belief_b_id)
+        if belief_a is None or belief_b is None:
+            raise ValueError("Both belief_a and belief_b must exist in the store")
+
+        events = []
+        merged = None
+
+        # Create a session for lifecycle recording
+        async with AsyncSession(provider.engine) as lc_session:
+            lifecycle_repo = LifecycleRepository(lc_session)
+
+            if resolution == "keep_a":
+                # belief_a stays active, belief_b -> discarded
+                await provider.update_belief_lifecycle(belief_b_id, "discarded")
+                await lifecycle_repo.record_event(
+                    memory_id=belief_b_id,
+                    memory_type="belief",
+                    from_state=belief_b.lifecycle_state,
+                    to_state="discarded",
+                    reason=f"Discarded in favor of {belief_a_id} via conflict resolution",
+                    triggered_by="system",
+                )
+                events.append({
+                    "belief_id": belief_b_id,
+                    "from_state": belief_b.lifecycle_state,
+                    "to_state": "discarded",
+                    "reason": f"Discarded in favor of {belief_a_id} via conflict resolution",
+                })
+
+            elif resolution == "keep_b":
+                # belief_b stays active, belief_a -> discarded
+                await provider.update_belief_lifecycle(belief_a_id, "discarded")
+                await lifecycle_repo.record_event(
+                    memory_id=belief_a_id,
+                    memory_type="belief",
+                    from_state=belief_a.lifecycle_state,
+                    to_state="discarded",
+                    reason=f"Discarded in favor of {belief_b_id} via conflict resolution",
+                    triggered_by="system",
+                )
+                events.append({
+                    "belief_id": belief_a_id,
+                    "from_state": belief_a.lifecycle_state,
+                    "to_state": "discarded",
+                    "reason": f"Discarded in favor of {belief_b_id} via conflict resolution",
+                })
+
+            elif resolution == "merge":
+                if not new_proposition:
+                    raise ValueError("new_proposition is required when resolution='merge'")
+                merged = Belief(
+                    proposition=new_proposition,
+                    confidence=min(1.0, (belief_a.confidence + belief_b.confidence) / 2),
+                    source="conflict_resolution",
+                    creator="system",
+                    tags=list(set(belief_a.tags + belief_b.tags)),
+                    source_ids=list(set(belief_a.source_ids + belief_b.source_ids)),
+                )
+
+                # Copy evidence from both original beliefs (best-effort)
+                copied_evidence = []
+                try:
+                    from sqlalchemy.ext.asyncio import AsyncSession as AsyncSessionAlias
+                    from storage.repositories import EvidenceRepository
+                    async with AsyncSessionAlias(provider.engine) as ev_session:
+                        ev_repo = EvidenceRepository(ev_session)
+                        for orig_id in (belief_a_id, belief_b_id):
+                            ev_rows = await ev_repo.get_by_belief_id(orig_id)
+                            for ev in ev_rows:
+                                new_ev = Evidence(
+                                    belief_id=merged.id,
+                                    source_type=ev.source_type,
+                                    source_id=ev.source_id,
+                                    weight=ev.weight,
+                                    contributor=ev.contributor,
+                                )
+                                copied_evidence.append(new_ev)
+                except Exception:
+                    logger.warning(
+                        "Failed to copy evidence for merged belief %s",
+                        merged.id,
+                        exc_info=True,
+                    )
+
+                # Create merged belief + evidence + receipt + outbox in one transaction
+                merged_receipt = MemoryReceipt(
+                    id=merged.id,
+                    memory_type="belief",
+                    source="conflict_resolution",
+                    created_by="system",
+                    timestamp=datetime.now(timezone.utc),
+                    confidence=merged.confidence,
+                )
+                await provider.create_in_transaction(
+                    belief=merged,
+                    evidence_list=copied_evidence,
+                    receipt=merged_receipt,
+                    outbox_entries=[
+                        {
+                            "record_type": "belief",
+                            "record_id": merged.id,
+                            "operation": "index_belief",
+                            "payload": {
+                                "proposition": merged.proposition,
+                                "tags": merged.tags,
+                                "confidence": merged.confidence,
+                                "source": "conflict_resolution",
+                            },
+                        }
+                    ],
+                )
+
+                # Transition both originals to superseded
+                await provider.update_belief_lifecycle(belief_a_id, "superseded")
+                await lifecycle_repo.record_event(
+                    memory_id=belief_a_id,
+                    memory_type="belief",
+                    from_state=belief_a.lifecycle_state,
+                    to_state="superseded",
+                    reason=f"Merged into {merged.id} via conflict resolution",
+                    triggered_by="system",
+                )
+                events.append({
+                    "belief_id": belief_a_id,
+                    "from_state": belief_a.lifecycle_state,
+                    "to_state": "superseded",
+                    "reason": f"Merged into {merged.id} via conflict resolution",
+                })
+
+                await provider.update_belief_lifecycle(belief_b_id, "superseded")
+                await lifecycle_repo.record_event(
+                    memory_id=belief_b_id,
+                    memory_type="belief",
+                    from_state=belief_b.lifecycle_state,
+                    to_state="superseded",
+                    reason=f"Merged into {merged.id} via conflict resolution",
+                    triggered_by="system",
+                )
+                events.append({
+                    "belief_id": belief_b_id,
+                    "from_state": belief_b.lifecycle_state,
+                    "to_state": "superseded",
+                    "reason": f"Merged into {merged.id} via conflict resolution",
+                })
+
+            elif resolution == "discard_both":
+                await provider.update_belief_lifecycle(belief_a_id, "discarded")
+                await lifecycle_repo.record_event(
+                    memory_id=belief_a_id,
+                    memory_type="belief",
+                    from_state=belief_a.lifecycle_state,
+                    to_state="discarded",
+                    reason="Discarded via conflict resolution",
+                    triggered_by="system",
+                )
+                events.append({
+                    "belief_id": belief_a_id,
+                    "from_state": belief_a.lifecycle_state,
+                    "to_state": "discarded",
+                    "reason": "Discarded via conflict resolution",
+                })
+
+                await provider.update_belief_lifecycle(belief_b_id, "discarded")
+                await lifecycle_repo.record_event(
+                    memory_id=belief_b_id,
+                    memory_type="belief",
+                    from_state=belief_b.lifecycle_state,
+                    to_state="discarded",
+                    reason="Discarded via conflict resolution",
+                    triggered_by="system",
+                )
+                events.append({
+                    "belief_id": belief_b_id,
+                    "from_state": belief_b.lifecycle_state,
+                    "to_state": "discarded",
+                    "reason": "Discarded via conflict resolution",
+                })
+
+            else:
+                raise ValueError(
+                    f"Unknown resolution: {resolution}. "
+                    "Must be one of: keep_a, keep_b, merge, discard_both"
+                )
+
+            await lc_session.commit()
+
+        # Create receipt with new UUID
+        receipt = MemoryReceipt(
+            id=str(uuid.uuid4()),
+            memory_type="belief",
+            source="conflict_resolution",
+            created_by="system",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        serialized = {
+            "belief_a": (await provider.get_belief(belief_a_id)).model_dump(mode="json"),
+            "belief_b": (await provider.get_belief(belief_b_id)).model_dump(mode="json"),
+            "resolution": resolution,
+            "created": merged.model_dump(mode="json") if resolution == "merge" and merged else None,
+            "events": events,
+            "receipt": receipt.model_dump(mode="json"),
+        }
+
+        return json.dumps(serialized)
 
 
 def run():

@@ -80,6 +80,33 @@
       "required": ["id", "subject", "predicate", "object", "confidence", "source", "created_at"]
     },
 
+    "belief_response": {
+      "type": "object",
+      "description": "A belief proposition with confidence and metadata",
+      "properties": {
+        "id": { "$ref": "#/definitions/uuid" },
+        "proposition": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "source": { "type": "string" },
+        "creator": { "type": "string" },
+        "source_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "created_at": { "$ref": "#/definitions/rfc3339_timestamp" },
+        "updated_at": { "$ref": "#/definitions/rfc3339_timestamp" },
+        "last_reinforced_at": { "$ref": "#/definitions/rfc3339_timestamp" },
+        "version": { "type": "integer", "minimum": 1 },
+        "verification_status": { "type": "string" },
+        "lifecycle_state": { "type": "string" }
+      },
+      "required": ["id", "proposition", "confidence", "source", "creator", "created_at", "lifecycle_state"]
+    },
+
     "receipt_response": {
       "type": "object",
       "description": "Provenance receipt for a memory operation",
@@ -87,7 +114,7 @@
         "id": { "$ref": "#/definitions/uuid" },
         "memory_type": {
           "type": "string",
-          "enum": ["fact", "decision", "skill", "entity"]
+          "enum": ["fact", "decision", "skill", "entity", "belief"]
         },
         "source": { "type": "string" },
         "created_by": { "type": "string" },

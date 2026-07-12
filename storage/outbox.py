@@ -10,7 +10,7 @@ as failed.
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -18,7 +18,7 @@ from sqlalchemy import DateTime, Integer, String, Text, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
-from storage.base import Base
+from storage.base import Base, utcnow
 
 # ──────────────────────────────────────────────────────────────────────
 # ORM Model
@@ -33,10 +33,10 @@ class OutboxEntryORM(Base):
 
     Columns:
         id:            UUID primary key.
-        record_type:   "fact", "decision", or "skill" — the kind of
+        record_type:   "fact", "decision", "skill", or "belief" — the kind of
                        record to index.
         record_id:     ID of the record in the primary store.
-        operation:     "index_fact", "index_decision", or "index_skill".
+        operation:     "index_fact", "index_decision", "index_skill", or "index_belief".
         payload_json:  JSON blob with the data needed to perform the
                        indexing (subject/predicate/object for facts,
                        choice/reason for decisions, purpose/steps for
@@ -61,7 +61,7 @@ class OutboxEntryORM(Base):
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.now(timezone.utc)
+        DateTime, default=utcnow
     )
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -95,7 +95,7 @@ class OutboxEntry:
         self.status = status
         self.retry_count = retry_count
         self.error = error
-        self.created_at = created_at or datetime.now(timezone.utc)
+        self.created_at = created_at or utcnow()
         self.processed_at = processed_at
 
     @property
@@ -150,9 +150,9 @@ class OutboxRepository:
         so the outbox write shares a transaction with the primary store write.
 
         Args:
-            record_type: "fact", "decision", or "skill".
+            record_type: "fact", "decision", "skill", or "belief".
             record_id: ID of the record in the primary store.
-            operation: "index_fact", "index_decision", or "index_skill".
+            operation: "index_fact", "index_decision", "index_skill", or "index_belief".
             payload: Data needed for indexing.
 
         Returns:
@@ -168,7 +168,7 @@ class OutboxRepository:
             status="pending",
             retry_count=0,
             error=None,
-            created_at=datetime.now(timezone.utc),
+            created_at=utcnow(),
             processed_at=None,
         )
         self._session.add(orm)
@@ -238,7 +238,7 @@ class OutboxRepository:
         if orm is None:
             return False
         orm.status = "completed"
-        orm.processed_at = datetime.now(timezone.utc)
+        orm.processed_at = utcnow()
         # Note: caller must commit
         return True
 
@@ -257,7 +257,7 @@ class OutboxRepository:
             return False
         orm.status = "failed"
         orm.error = error_message[:500]  # Truncate to column capacity
-        orm.processed_at = datetime.now(timezone.utc)
+        orm.processed_at = utcnow()
         # Note: caller must commit
         return True
 
