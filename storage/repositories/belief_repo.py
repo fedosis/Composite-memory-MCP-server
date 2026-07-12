@@ -95,9 +95,10 @@ class BeliefRepository:
             fts5_q = self._fts5_query(proposition)
             if fts5_q:
                 try:
+                    fetch_limit = limit * 5 if limit > 0 else 100000  # effectively unlimited
                     result = await self._session.execute(
                         FTS5_SEARCH_SQL,
-                        {"query": fts5_q, "limit": limit * 5},  # fetch extra for filtering
+                        {"query": fts5_q, "limit": fetch_limit},  # fetch extra for filtering
                     )
                     rows = result.mappings().all()
                     if rows:
@@ -129,7 +130,9 @@ class BeliefRepository:
 
         for cond in conditions:
             stmt = stmt.where(cond)
-        stmt = stmt.limit(limit).order_by(BeliefORM.created_at.desc())
+        if limit > 0:
+            stmt = stmt.limit(limit)
+        stmt = stmt.order_by(BeliefORM.created_at.desc())
         result = await self._session.execute(stmt)
         return [row.to_pydantic() for row in result.scalars().all()]
 
@@ -156,7 +159,9 @@ class BeliefRepository:
             filtered = [b for b in filtered if b.source == source]
         if creator is not None:
             filtered = [b for b in filtered if b.creator == creator]
-        return filtered[:limit]
+        if limit > 0:
+            filtered = filtered[:limit]
+        return filtered
 
     async def update_confidence(self, belief_id: str, new_confidence: float) -> Optional[Belief]:
         """Update the confidence of a belief."""

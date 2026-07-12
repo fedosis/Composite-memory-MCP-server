@@ -8,6 +8,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from memory_server.models.evidence import Evidence
 from storage.models.belief import BeliefORM, EvidenceORM
 
+# SQL aggregate query for evidence stats per belief
+_EVIDENCE_AGGREGATE_SQL = """
+    SELECT
+        belief_id,
+        COUNT(*) AS count,
+        AVG(weight) AS avg_weight,
+        source_type
+    FROM evidence
+    {where_clause}
+    GROUP BY belief_id, source_type
+    ORDER BY belief_id
+"""
+
 
 class EvidenceRepository:
     """Repository for evidence CRUD operations."""
@@ -45,6 +58,61 @@ class EvidenceRepository:
         )
         result = await self._session.execute(stmt)
         return [row[0] for row in result.fetchall() if row[0] is not None]
+
+    async def aggregate_stats(
+        self, belief_ids: list[str] | None = None
+    ) -> dict[str, dict]:
+        """Return {belief_id: {count, avg_weight, by_source_type}} for all or specified beliefs.
+
+        Aggregation at SQL level to avoid N+1 queries at scale.
+        """
+        import logging
+
+        logging.getLogger(__name__)
+
+        where_clause = ""
+        params: dict = {}
+        if belief_ids:
+            placeholders = ",".join(f":bid_{i}" for i in range(len(belief_ids)))
+            where_clause = f"WHERE belief_id IN ({placeholders})"
+            params = {f"bid_{i}": bid for i, bid in enumerate(belief_ids)}
+
+        sql = _EVIDENCE_AGGREGATE_SQL.format(where_clause=where_clause)
+        result = await self._session.execute(
+            __import__("sqlalchemy").text(sql), params
+        )
+        rows = result.fetchall()
+
+        stats: dict[str, dict] = {}
+        for row in rows:
+            bid = row[0]
+            if bid not in stats:
+                stats[bid] = {
+                    "count": 0,
+                    "avg_weight": 0.0,
+                    "by_source_type": {},
+                }
+            stats[bid]["count"] += row[1]
+            by_type = stats[bid]["by_source_type"]
+            by_type[row[3]] = by_type.get(row[3], 0) + row[1]
+
+        # Overall avg_weight from a separate GROUP BY (no source_type split)
+        overall_sql = """
+            SELECT belief_id, COUNT(*) AS count, AVG(weight) AS avg_weight
+            FROM evidence
+            {where_clause}
+            GROUP BY belief_id
+        """
+        overall_sql = overall_sql.format(where_clause=where_clause)
+        overall = await self._session.execute(
+            __import__("sqlalchemy").text(overall_sql), params
+        )
+        for row in overall.fetchall():
+            bid = row[0]
+            if bid in stats:
+                stats[bid]["avg_weight"] = round(float(row[2]), 4) if row[2] is not None else 0.0
+
+        return stats
 
     async def _sync_source_ids(self, belief_id: str) -> None:
         """Synchronise the denormalized source_ids field on the parent BeliefORM."""

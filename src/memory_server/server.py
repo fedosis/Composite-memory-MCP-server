@@ -895,5 +895,64 @@ async def resolve_conflict_tool(
         return json.dumps(serialized)
 
 
+@mcp.tool(name="reflect")
+async def reflect_tool(
+    mode: str = "overview",
+    topic: str = "",
+    min_confidence: float = 0.0,
+    limit: int = 50,
+) -> str:
+    """Analyse the belief store and produce structured insights.
+
+    Provides 6 analysis modes:
+    - overview: High-level summary of the belief store (counts, confidence, states)
+    - contradictions: Find beliefs with keyword-based semantic conflicts
+    - decay: Analyse which beliefs are approaching lifecycle transitions
+    - topics: Cluster beliefs by tags with counts and avg confidence
+    - evidence_audit: Audit evidence quality across beliefs
+    - confidence: Detailed confidence histogram with sorted belief list
+
+    Args:
+        mode: Analysis mode (overview, contradictions, decay, topics, evidence_audit, confidence).
+        topic: Optional topic/tag filter.
+        min_confidence: Minimum confidence threshold 0.0-1.0.
+        limit: Max beliefs to analyse (0 = all).
+    """
+    from memory_server.api.reflect import ReflectEngine
+
+    collector = get_collector()
+    with collector.tool_call("reflect") as _ctx:
+        provider = await _get_provider()
+
+        valid_modes = {
+            "overview", "contradictions", "decay", "topics",
+            "evidence_audit", "confidence",
+        }
+        if mode not in valid_modes:
+            return json.dumps({
+                "error": f"Invalid mode '{mode}'. Must be one of: {', '.join(sorted(valid_modes))}",
+            })
+
+        engine = ReflectEngine(provider)
+        topic_param = topic if topic else None
+
+        method_map = {
+            "overview": engine.overview,
+            "contradictions": engine.contradictions,
+            "decay": engine.decay_analysis,
+            "topics": engine.topics,
+            "evidence_audit": engine.evidence_audit,
+            "confidence": engine.confidence_histogram,
+        }
+
+        method = method_map[mode]
+        result = await method(
+            topic=topic_param,
+            min_confidence=min_confidence,
+            limit=limit,
+        )
+        return json.dumps(result)
+
+
 def run():
     mcp.run(transport="stdio")
