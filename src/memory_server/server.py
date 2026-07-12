@@ -678,6 +678,7 @@ async def resolve_conflict_tool(
     belief_b_id: str,
     resolution: str,
     new_proposition: str = "",
+    auto_resolve: bool = False,
 ) -> str:
     """Resolve a conflict between two beliefs using a transition matrix.
 
@@ -686,6 +687,8 @@ async def resolve_conflict_tool(
         belief_b_id: UUID of the second belief in the conflict.
         resolution: Strategy: keep_a, keep_b, merge, discard_both.
         new_proposition: Proposition for a new merged belief (required for merge).
+        auto_resolve: When True, auto-resolve by confidence threshold
+                      (never uses 'discarded' state).
     """
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -702,6 +705,104 @@ async def resolve_conflict_tool(
         if belief_a is None or belief_b is None:
             raise ValueError("Both belief_a and belief_b must exist in the store")
 
+        # Auto-resolution path (never uses "discarded")
+        if auto_resolve:
+            events = []
+            confidence_diff = abs(belief_a.confidence - belief_b.confidence)
+
+            async with AsyncSession(provider.engine) as lc_session:
+                lifecycle_repo = LifecycleRepository(lc_session)
+
+                if confidence_diff > 0.5:
+                    # Lower-confidence belief -> superseded, higher stays active
+                    if belief_a.confidence < belief_b.confidence:
+                        lower_id, lower_conf = belief_a_id, belief_a.confidence
+                        _higher_id, higher_conf = belief_b_id, belief_b.confidence
+                        lower_state = belief_a.lifecycle_state
+                    else:
+                        lower_id, lower_conf = belief_b_id, belief_b.confidence
+                        _higher_id, higher_conf = belief_a_id, belief_a.confidence
+                        lower_state = (
+                            belief_b.lifecycle_state
+                            if lower_id == belief_b_id
+                            else belief_a.lifecycle_state
+                        )
+                        # Re-fetch the correct state
+                        if lower_id == belief_b_id:
+                            lower_state = belief_b.lifecycle_state
+                        else:
+                            lower_state = belief_a.lifecycle_state
+
+                    await provider.update_belief_lifecycle(lower_id, "superseded")
+                    await lifecycle_repo.record_event(
+                        memory_id=lower_id,
+                        memory_type="belief",
+                        from_state=lower_state,
+                        to_state="superseded",
+                        reason=(
+                            f"Auto-resolved — confidence gap "
+                            f"({higher_conf:.2f} vs {lower_conf:.2f})"
+                        ),
+                        triggered_by="system",
+                    )
+                    events.append({
+                        "belief_id": lower_id,
+                        "from_state": lower_state,
+                        "to_state": "superseded",
+                        "reason": (
+                            f"Auto-resolved — confidence gap "
+                            f"({higher_conf:.2f} vs {lower_conf:.2f})"
+                        ),
+                    })
+                else:
+                    # Both -> contradicted
+                    for bid, bstate in ((belief_a_id, belief_a.lifecycle_state),
+                                        (belief_b_id, belief_b.lifecycle_state)):
+                        await provider.update_belief_lifecycle(bid, "contradicted")
+                        await lifecycle_repo.record_event(
+                            memory_id=bid,
+                            memory_type="belief",
+                            from_state=bstate,
+                            to_state="contradicted",
+                            reason=(
+                                "Auto-resolved — needs manual review "
+                                "(confidences too close or both low)"
+                            ),
+                            triggered_by="system",
+                        )
+                        events.append({
+                            "belief_id": bid,
+                            "from_state": bstate,
+                            "to_state": "contradicted",
+                            "reason": (
+                                "Auto-resolved — needs manual review "
+                                "(confidences too close or both low)"
+                            ),
+                        })
+
+                await lc_session.commit()
+
+            receipt = MemoryReceipt(
+                id=str(uuid.uuid4()),
+                memory_type="belief",
+                source="conflict_resolution",
+                created_by="system",
+                timestamp=datetime.now(timezone.utc),
+            )
+
+            serialized = {
+                "belief_a": (await provider.get_belief(belief_a_id)).model_dump(mode="json"),
+                "belief_b": (await provider.get_belief(belief_b_id)).model_dump(mode="json"),
+                "resolution": resolution,
+                "auto_resolved": True,
+                "created": None,
+                "events": events,
+                "receipt": receipt.model_dump(mode="json"),
+            }
+
+            return json.dumps(serialized)
+
+        # Manual resolution path (existing behavior) — unchanged
         events = []
         merged = None
 

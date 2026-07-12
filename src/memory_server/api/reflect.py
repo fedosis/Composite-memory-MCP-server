@@ -80,8 +80,14 @@ def _has_opposite_sentiment(a: str, b: str) -> bool:
 
 
 def detect_contradictions(beliefs: list) -> list[dict]:
-    """Find pairs of beliefs with significant keyword overlap and opposite sentiment.
+    """Find pairs of beliefs with contradictions using multiple heuristics.
 
+    Uses three detection methods:
+    - keyword: ≥2 overlapping tokens + opposite sentiment
+    - confidence_weighted: detection_score >= 0.3 AND confidence diff > 0.4
+    - source_overlap: ≥2 shared evidence source_ids + opposite sentiment
+
+    Requires detection_score >= 0.3 AND at least one condition met.
     For >447 beliefs, logs a warning — caller can sample or accept O(n²).
     """
     if len(beliefs) > _MAX_BELIEFS_FOR_CONTRADICTION:
@@ -96,8 +102,34 @@ def detect_contradictions(beliefs: list) -> list[dict]:
             tokens_a = _tokenize(a.proposition)
             tokens_b = _tokenize(b.proposition)
             overlap = tokens_a & tokens_b
-            if len(overlap) >= 2 and _has_opposite_sentiment(a.proposition, b.proposition):
-                score = len(overlap) / max(len(tokens_a | tokens_b), 1)
+            all_tokens = tokens_a | tokens_b
+
+            overlap_score = len(overlap) / max(len(all_tokens), 1)
+            confidence_diff = abs(a.confidence - b.confidence)
+            confidence_diff_weight = min(confidence_diff * 2.0, 1.0)
+            detection_score = overlap_score * confidence_diff_weight
+
+            # Check three detection conditions
+            keyword_match = len(overlap) >= 2 and _has_opposite_sentiment(
+                a.proposition, b.proposition
+            )
+            confidence_match = confidence_diff > 0.4
+            # Source overlap: check shared source_ids from the denormalized field
+            shared_sources = len(set(a.source_ids) & set(b.source_ids))
+            source_match = shared_sources >= 2 and _has_opposite_sentiment(
+                a.proposition, b.proposition
+            )
+
+            # Detection threshold: detection_score >= 0.3 AND at least one condition met
+            if detection_score >= 0.3 and (keyword_match or confidence_match or source_match):
+                # Detection method: source_overlap > confidence_weighted > keyword
+                if source_match:
+                    detection_method = "source_overlap"
+                elif confidence_match:
+                    detection_method = "confidence_weighted"
+                else:
+                    detection_method = "keyword"
+
                 results.append({
                     "belief_a_id": a.id,
                     "proposition_a": a.proposition,
@@ -105,7 +137,9 @@ def detect_contradictions(beliefs: list) -> list[dict]:
                     "belief_b_id": b.id,
                     "proposition_b": b.proposition,
                     "confidence_b": b.confidence,
-                    "overlap_score": round(score, 2),
+                    "overlap_score": round(overlap_score, 2),
+                    "detection_score": round(detection_score, 2),
+                    "detection_method": detection_method,
                     "detected_at": now,
                 })
     return results
@@ -211,6 +245,33 @@ class ReflectEngine:
         # Confidence buckets
         histogram = _build_histogram(beliefs)
 
+        # Conflicts section
+        contradicted_bs = [b for b in beliefs if b.lifecycle_state == "contradicted"]
+        total_conflicts = len(contradicted_bs)
+        unresolved = total_conflicts // 2
+
+        # auto_resolvable: active belief pairs with keyword overlap and |c1-c2| > 0.5
+        active_bs = [b for b in beliefs if b.lifecycle_state == "active"]
+        auto_resolvable = 0
+        for i in range(len(active_bs)):
+            for j in range(i + 1, len(active_bs)):
+                a, b = active_bs[i], active_bs[j]
+                tokens_a = _tokenize(a.proposition)
+                tokens_b = _tokenize(b.proposition)
+                overlap = tokens_a & tokens_b
+                if len(overlap) >= 2 and abs(a.confidence - b.confidence) > 0.5:
+                    auto_resolvable += 1
+
+        # age_hours_max for contradicted beliefs
+        age_hours_max = 0
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        for b in contradicted_bs:
+            created = _naive_dt(b.created_at)
+            if created:
+                age_hours = (now_naive - created).total_seconds() / 3600.0
+                if age_hours > age_hours_max:
+                    age_hours_max = round(age_hours, 1)
+
         # Decaying next 7d estimate: count beliefs nearing stale (age > 60% TTL for belief=180d)
         decaying_next_7d = 0
         for b in beliefs:
@@ -241,6 +302,12 @@ class ReflectEngine:
                 ),
             },
             "contradiction_count": contradiction_count,
+            "conflicts": {
+                "total": total_conflicts,
+                "unresolved": unresolved,
+                "auto_resolvable": auto_resolvable,
+                "age_hours_max": age_hours_max,
+            },
             "stale_count": stale_count,
             "decaying_next_7d": decaying_next_7d,
             "no_evidence_count": no_evidence_count,

@@ -33,6 +33,11 @@
         "description": "Proposition for a new merged belief (required when resolution=merge)",
         "minLength": 1,
         "maxLength": 2048
+      },
+      "auto_resolve": {
+        "type": "boolean",
+        "description": "Auto-resolve by confidence threshold (never uses 'discarded' state). When True: confidence diff > 0.5 → lower belief is superseded; otherwise both → contradicted",
+        "default": false
       }
     },
     "required": ["belief_a_id", "belief_b_id", "resolution"],

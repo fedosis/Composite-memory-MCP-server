@@ -77,6 +77,15 @@
           }
         },
         "contradiction_count": { "type": "integer" },
+        "conflicts": {
+          "type": "object",
+          "properties": {
+            "total": { "type": "integer" },
+            "unresolved": { "type": "integer" },
+            "auto_resolvable": { "type": "integer" },
+            "age_hours_max": { "type": "number" }
+          }
+        },
         "stale_count": { "type": "integer" },
         "decaying_next_7d": { "type": "integer" },
         "no_evidence_count": { "type": "integer" },
@@ -101,6 +110,8 @@
               "proposition_b": { "type": "string" },
               "confidence_b": { "type": "number" },
               "overlap_score": { "type": "number" },
+              "detection_score": { "type": "number" },
+              "detection_method": { "type": "string", "enum": ["keyword", "confidence_weighted", "source_overlap"] },
               "detected_at": { "type": "string" }
             }
           }
