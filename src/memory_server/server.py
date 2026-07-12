@@ -248,16 +248,24 @@ async def remember_tool(
 async def learn_tool(
     text: str,
     source: str = "user",
+    extract_beliefs: bool = False,
+    min_belief_confidence: float = 0.6,
 ) -> str:
-    """Extract and store facts, decisions, and skills from natural language text.
+    """Extract and store facts, decisions, skills, and optionally beliefs from text.
 
     Runs all three extractors (FactExtractor, DecisionExtractor, SkillExtractor)
     on the input text, stores extracted items in SQLite, and adds outbox
     entries for async indexing into Qdrant + graph.
 
+    When extract_beliefs=True, also runs BeliefExtractor after the main
+    transaction and creates or reinforces beliefs with evidence linked
+    to extracted facts.
+
     Args:
         text: Natural language text to extract knowledge from.
         source: Optional source identifier (default "user").
+        extract_beliefs: If True, also extract and store beliefs (default False).
+        min_belief_confidence: Minimum confidence to create a belief (default 0.6).
     """
     collector = get_collector()
     with collector.tool_call("learn") as _ctx:
@@ -266,6 +274,8 @@ async def learn_tool(
             provider=provider,
             text=text,
             source=source,
+            extract_beliefs=extract_beliefs,
+            min_belief_confidence=min_belief_confidence,
         )
 
         return json.dumps(result)

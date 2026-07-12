@@ -8,11 +8,15 @@ from memory_server.models.fact import Fact
 from memory_server.models.receipt import LifecycleState, MemoryReceipt, VerificationStatus
 from memory_server.models.skill import Skill
 
+# Re-export ExtractedBelief from belief_extractor (not a DB model, just a Pydantic schema)
+from memory_server.extractors.belief_extractor import ExtractedBelief
+
 __all__ = [
     "Belief",
     "Decision",
     "Entity",
     "Evidence",
+    "ExtractedBelief",
     "Fact",
     "LifecycleState",
     "MemoryReceipt",

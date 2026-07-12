@@ -23,6 +23,18 @@
         "type": "string",
         "description": "Source identifier for provenance tracking",
         "default": "user"
+      },
+      "extract_beliefs": {
+        "type": "boolean",
+        "description": "If true, also extract and store beliefs from the text",
+        "default": false
+      },
+      "min_belief_confidence": {
+        "type": "number",
+        "description": "Minimum confidence threshold for belief creation (0.0-1.0)",
+        "default": 0.6,
+        "minimum": 0.0,
+        "maximum": 1.0
       }
     },
     "required": ["text"],
@@ -91,12 +103,53 @@
           "required": ["receipt", "item"]
         }
       },
+      "beliefs": {
+        "type": "array",
+        "description": "Extracted beliefs (only present when extract_beliefs=true)",
+        "items": {
+          "type": "object",
+          "properties": {
+            "belief": {
+              "type": "object",
+              "description": "The stored Belief object",
+              "properties": {
+                "id": { "$ref": "common.schema.json#/definitions/uuid" },
+                "proposition": { "type": "string" },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                "source": { "type": "string" },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "version": { "type": "integer", "minimum": 1 },
+                "lifecycle_state": { "type": "string" },
+                "created_at": { "$ref": "common.schema.json#/definitions/rfc3339_timestamp" },
+                "last_reinforced_at": { "$ref": "common.schema.json#/definitions/rfc3339_timestamp" }
+              },
+              "required": ["id", "proposition"]
+            },
+            "extracted": {
+              "type": "object",
+              "description": "The original ExtractedBelief with reasoning",
+              "properties": {
+                "proposition": { "type": "string" },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "reasoning": { "type": "string" }
+              },
+              "required": ["proposition", "confidence"]
+            },
+            "reinforced": {
+              "type": "boolean",
+              "description": "Whether this belief was reinforced (true) or newly created (false)"
+            }
+          },
+          "required": ["belief", "extracted", "reinforced"]
+        }
+      },
       "receipts": {
         "type": "array",
         "items": { "$ref": "common.schema.json#/definitions/receipt_response" }
       }
     },
-    "required": ["facts", "decisions", "skills", "receipts"],
+    "required": ["facts", "decisions", "skills", "beliefs", "receipts"],
     "additionalProperties": false
   },
 
