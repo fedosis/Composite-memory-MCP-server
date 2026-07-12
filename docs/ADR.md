@@ -386,6 +386,153 @@ Add:
 
 ------------------------------------------------------------------------
 
+# ADR-011: Belief Model — propositional knowledge with lifecycle
+
+## Status
+
+Accepted (v0.7)
+
+## Context
+
+The original memory model (facts, decisions, skills) captures structured
+knowledge but lacks a way to represent abstract, propositional knowledge
+with quantifiable confidence — "what the agent should believe" rather
+than "what the agent observed."
+
+Beliefs differ from facts:
+- Facts are structured (subject-predicate-object) and verifiable.
+- Beliefs are unstructured propositions that may be true with some
+  confidence, derived from multiple sources of evidence.
+
+## Decision
+
+Introduce a Belief entity as a first-class memory type alongside facts,
+decisions, and skills.
+
+### Data Model
+
+```
+Belief
+├── id (UUID)
+├── proposition (str)         — Free-text belief statement
+├── confidence (float 0-1)    — How sure the agent is
+├── source (str)              — Origin identifier ("learn", "system", etc.)
+├── creator (str)             — Who created it
+├── tags (list[str])          — Categorical labels
+├── source_ids (list[str])    — Evidence source references
+├── lifecycle_state (str)     — active | superseded | contradicted | discarded | stale | archived | forgotten
+├── version (int)             — Monotonic version for supersede chain
+├── reinforced_at (datetime)  — Last reinforcement timestamp
+└── created_at / updated_at   — Timestamps
+```
+
+### Lifecycle Integration
+
+Beliefs share the same lifecycle engine as facts (DecayEngine, Validator)
+with belief-specific transitions:
+
+| From | To | Condition |
+|------|----|-----------|
+| active | superseded | Replaced by a higher-confidence belief |
+| active | contradicted | Conflicting belief with similar confidence |
+| active | stale | TTL exceeded (180 days for beliefs) |
+| superseded | stale | TTL exceeded |
+| contradicted | stale | TTL exceeded |
+| superseded | discarded | Manual cleanup |
+| contradicted | discarded | Manual cleanup |
+| discarded | archived | TTL expired |
+| stale | archived | TTL expired |
+| archived | forgotten | TTL expired |
+
+### Evidence / Outbox
+
+Beliefs use the same `Evidence` model and outbox pattern as facts:
+- Evidence entries link beliefs to their source facts (source_type, source_id, weight).
+- Outbox entries enable async indexing into vector and graph stores.
+- `create_in_transaction()` atomically writes belief + evidence + receipt + outbox.
+
+## Consequences
+
+Advantages:
+- Agents can express abstract, uncertain knowledge alongside structured facts.
+- Evidence provenance enables auditability and conflict resolution.
+- Shared lifecycle infrastructure reduces maintenance burden.
+- Outbox pattern ensures reliable async indexing.
+
+Disadvantages:
+- Additional storage for belief tables and evidence joins.
+- Conflict detection is heuristic (keyword-based, not LLM) in v0.7;
+  full semantic contradiction detection deferred to v0.8+.
+
+------------------------------------------------------------------------
+
+# ADR-012: Reflection — belief store analysis tools
+
+## Status
+
+Accepted (v0.7)
+
+## Context
+
+Agents accumulate beliefs over time, but without introspection tools
+they cannot answer questions like:
+- "What do I currently believe?"
+- "Which beliefs conflict?"
+- "Which beliefs are decaying?"
+- "Is my evidence sufficient?"
+
+## Decision
+
+Implement the `reflect()` MCP tool with 6 analysis modes, backed by the
+`ReflectEngine` class.
+
+### Reflect Modes
+
+| Mode | Function | Output |
+|------|----------|--------|
+| `overview` | `overview()` | Total count, lifecycle distribution, confidence buckets, conflict stats, decaying-next-7d estimate, oldest/newest age |
+| `contradictions` | `contradictions()` | List of contradictory belief pairs with overlap scores |
+| `decay` | `decay_analysis()` | Stale-now/7d counts, archived-7d, forgotten-7d, by-tag stale breakdown |
+| `topics` | `topics()` | Tag clusters with count, avg confidence, stale count |
+| `evidence_audit` | `evidence_audit()` | With/without evidence counts, avg per belief, by source type, zero-weight entries |
+| `confidence` | `confidence_histogram()` | Sorted belief list with evidence counts, 5-bucket histogram |
+
+### Contradiction Detection
+
+Three detection methods (heuristic, v0.7):
+
+1. **Keyword match** — ≥2 overlapping tokens + opposite sentiment
+   (stopwords filtered, sentiment pairs like better/worse, like/dislike).
+2. **Confidence-weighted** — detection_score ≥ 0.3 AND confidence diff > 0.4.
+3. **Source overlap** — ≥2 shared evidence source_ids + opposite sentiment.
+
+### Design Decisions
+
+- All modes load beliefs from the provider via `search_beliefs()` — no
+  separate aggregation tables (performance acceptable for <10K beliefs).
+- Contradiction detection uses O(n²) pairwise scan with a guard at 447
+  beliefs (~100K pairs) — a warning is logged beyond this threshold.
+- Histogram uses 5 fixed buckets (0.0-0.3, 0.3-0.5, 0.5-0.7, 0.7-0.9, 0.9-1.0).
+- Decay analysis uses belief TTL of 180 days, stale threshold at 70% (126 days).
+- All modes accept optional `topic`, `min_confidence`, and `limit` filters.
+
+## Consequences
+
+Advantages:
+- Agents gain full introspection into their belief state.
+- Contradiction detection enables proactive conflict resolution.
+- Decay analysis provides early warning for knowledge that needs refreshing.
+- Evidence audit reveals knowledge-quality gaps.
+- All modes return empty-store gracefully (no crashes on fresh databases).
+
+Disadvantages:
+- O(n²) contradiction scan does not scale to tens of thousands of beliefs.
+- Keyword-based contradiction detection has false positives/negatives.
+- Decay analysis is snapshot-based, not event-driven — requires periodic
+  polling via reflect().
+
+------------------------------------------------------------------------
+
 # General architectural principles
 
 Composite Memory MCP Server must be:

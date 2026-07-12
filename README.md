@@ -27,7 +27,7 @@ memory-server ping
 
 ## Docs
 
-- [ADR](docs/ADR.md) — Architecture Decision Records (10 ADRs)
+- [ADR](docs/ADR.md) — Architecture Decision Records (12 ADRs)
 - [Agent Spec](docs/agent-spec.md) — Implementation specification
 - [Technical Design](docs/technical-design.md) — Tech stack + roadmap
 - [Architecture](docs/architecture.md) — Mermaid architecture diagram
@@ -39,7 +39,43 @@ memory-server ping
 
 ## API Reference
 
-The server exposes nine MCP tools:
+The server exposes fourteen MCP tools (nine original + five v0.7 belief tools):
+
+| # | Tool | v0.7 | Description |
+|---|------|------|-------------|
+| 1 | `ping` | — | Health check |
+| 2 | `search` | — | Keyword search over facts |
+| 3 | `remember` | — | Store a fact with provenance |
+| 4 | `get_context` | — | Retrieve context for a task |
+| 5 | `semantic_search` | — | Vector similarity search |
+| 6 | `learn` | ✓ | Extract knowledge; optionally extract beliefs |
+| 7 | `graph_search` | — | Entity lookup + pathfinding |
+| 8 | `route` | — | 4-stage hybrid router |
+| 9 | `audit` | — | Memory health report |
+| 10 | `metrics` | — | Prometheus metrics |
+| 11 | `set_belief` | ✓ | Create, reinforce, or supersede a belief |
+| 12 | `get_belief` | ✓ | Search beliefs with filters |
+| 13 | `resolve_conflict` | ✓ | Resolve belief conflicts (manual + auto) |
+| 14 | `reflect` | ✓ | 6-mode belief store analysis |
+
+### v0.7 New Features
+
+- **Belief Model** — Propositional knowledge with confidence, evidence provenance,
+  tags, lifecycle states (active, superseded, contradicted, discarded), and
+  version tracking.
+- **Reflection** — The `reflect()` tool provides 6 analysis modes: overview,
+  contradictions, decay, topics, evidence_audit, and confidence histogram.
+- **Learn-to-Belief** — `learn(extract_beliefs=True)` automatically extracts
+  beliefs from natural language text with evidence linked to extracted facts.
+- **Conflict Resolution** — `resolve_conflict()` supports manual resolution
+  (keep_a, keep_b, merge, discard_both) and auto-resolution via confidence
+  threshold rules.
+- **Reinforcement** — `set_belief()` automatically reinforces existing beliefs
+  with the same proposition via weighted average confidence.
+- **Evidence Audit** — `reflect(mode="evidence_audit")` reports evidence quality
+  across all beliefs, detecting beliefs with missing or zero-weight evidence.
+- **Decay Analysis** — `reflect(mode="decay")` forecasts lifecycle transitions
+  (stale, archived, forgotten) within the next 7 days using belief-specific TTL.
 
 ### ping
 
