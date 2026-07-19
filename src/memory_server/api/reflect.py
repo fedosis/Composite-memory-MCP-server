@@ -1,9 +1,11 @@
 """ReflectEngine — belief store analysis and reflection.
 
-Card 002: provides 6 analysis modes (overview, contradictions, decay_analysis,
-topics, evidence_audit, confidence_histogram) that answer "what does the agent
-currently believe, how confident is it, what conflicts exist, and what should
-change?"
+Card 002: provides 7 analysis modes (overview, contradictions, relations,
+decay_analysis, topics, evidence_audit, confidence_histogram) that answer
+"what does the agent currently believe, how confident is it, what conflicts
+exist, and what should change?"
+
+Card 001 (v0.9): adds ternary relations mode.
 """
 
 from __future__ import annotations
@@ -12,6 +14,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from memory_server.evaluation.relation import (
+    RelationClassifier,
+    _tokenize,
+)
 from memory_server.models.belief import Belief
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
@@ -26,7 +32,7 @@ def _naive_dt(dt: datetime | None) -> datetime | None:
 
 
 # ---------------------------------------------------------------------------
-# Contradiction detection constants (v0.7 keyword heuristic)
+# Contradiction detection constants (v0.7 keyword heuristic, kept for compat)
 # ---------------------------------------------------------------------------
 
 # Stopwords for keyword overlap computation.
@@ -59,90 +65,40 @@ _MAX_BELIEFS_FOR_CONTRADICTION = 447  # derived: sqrt(2 * MAX_CONTRADICTION_PAIR
 
 
 # ---------------------------------------------------------------------------
-# Contradiction helper functions
+# Contradiction helper functions (kept for backward compatibility of imports)
 # ---------------------------------------------------------------------------
 
 
-def _tokenize(proposition: str) -> set[str]:
-    """Extract significant keywords from a proposition."""
-    words = proposition.lower().split()
-    return {w.strip(".,!?;:'\"()") for w in words if w not in STOPWORDS and len(w) > 2}
-
-
 def _has_opposite_sentiment(a: str, b: str) -> bool:
-    """Check if two propositions express opposing views on the same topic."""
-    words_a = set(a.lower().split())
-    words_b = set(b.lower().split())
-    for pos, neg in OPPOSITE_SENTIMENT.items():
-        if (pos in words_a and neg in words_b) or (neg in words_a and pos in words_b):
-            return True
-    return False
+    """Backward-compatible wrapper for relation module."""
+    from memory_server.evaluation.relation import _has_opposite_sentiment as _rel_opposite
+    return _rel_opposite(a, b)
 
 
 def detect_contradictions(beliefs: list) -> list[dict]:
-    """Find pairs of beliefs with contradictions using multiple heuristics.
+    """Backward-compatible wrapper for ternary classifier.
 
-    Uses three detection methods:
-    - keyword: ≥2 overlapping tokens + opposite sentiment
-    - confidence_weighted: detection_score >= 0.3 AND confidence diff > 0.4
-    - source_overlap: ≥2 shared evidence source_ids + opposite sentiment
-
-    Requires detection_score >= 0.3 AND at least one condition met.
-    For >447 beliefs, logs a warning — caller can sample or accept O(n²).
+    Delegates to RelationClassifier and returns legacy format
+    with detection_score instead of confidence.
     """
-    if len(beliefs) > _MAX_BELIEFS_FOR_CONTRADICTION:
-        logger.warning(
-            "Large contradiction scan: %s beliefs, may be slow", len(beliefs)
-        )
-    now = datetime.now(timezone.utc).isoformat()
-    results: list[dict] = []
-    for i in range(len(beliefs)):
-        for j in range(i + 1, len(beliefs)):
-            a, b = beliefs[i], beliefs[j]
-            tokens_a = _tokenize(a.proposition)
-            tokens_b = _tokenize(b.proposition)
-            overlap = tokens_a & tokens_b
-            all_tokens = tokens_a | tokens_b
-
-            overlap_score = len(overlap) / max(len(all_tokens), 1)
-            confidence_diff = abs(a.confidence - b.confidence)
-            confidence_diff_weight = min(confidence_diff * 2.0, 1.0)
-            detection_score = overlap_score * confidence_diff_weight
-
-            # Check three detection conditions
-            keyword_match = len(overlap) >= 2 and _has_opposite_sentiment(
-                a.proposition, b.proposition
-            )
-            confidence_match = confidence_diff > 0.4
-            # Source overlap: check shared source_ids from the denormalized field
-            shared_sources = len(set(a.source_ids) & set(b.source_ids))
-            source_match = shared_sources >= 2 and _has_opposite_sentiment(
-                a.proposition, b.proposition
-            )
-
-            # Detection threshold: detection_score >= 0.3 AND at least one condition met
-            if detection_score >= 0.3 and (keyword_match or confidence_match or source_match):
-                # Detection method: source_overlap > confidence_weighted > keyword
-                if source_match:
-                    detection_method = "source_overlap"
-                elif confidence_match:
-                    detection_method = "confidence_weighted"
-                else:
-                    detection_method = "keyword"
-
-                results.append({
-                    "belief_a_id": a.id,
-                    "proposition_a": a.proposition,
-                    "confidence_a": a.confidence,
-                    "belief_b_id": b.id,
-                    "proposition_b": b.proposition,
-                    "confidence_b": b.confidence,
-                    "overlap_score": round(overlap_score, 2),
-                    "detection_score": round(detection_score, 2),
-                    "detection_method": detection_method,
-                    "detected_at": now,
-                })
-    return results
+    from memory_server.evaluation.relation import RelationClassifier as _RelCls
+    classifier = _RelCls()
+    results = classifier.find_contradictions(beliefs)
+    legacy = []
+    for r in results:
+        legacy.append({
+            "belief_a_id": r["belief_a_id"],
+            "proposition_a": r["proposition_a"],
+            "confidence_a": r["confidence_a"],
+            "belief_b_id": r["belief_b_id"],
+            "proposition_b": r["proposition_b"],
+            "confidence_b": r["confidence_b"],
+            "overlap_score": r["overlap_score"],
+            "detection_score": r["confidence"],
+            "detection_method": r["detection_method"],
+            "detected_at": r["detected_at"],
+        })
+    return legacy
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +133,12 @@ def _build_histogram(beliefs: list[Belief]) -> dict[str, int]:
 class ReflectEngine:
     """Analyse the belief store and produce structured insights.
 
-    All six public methods return a dict suitable for JSON serialization.
+    All seven public methods return a dict suitable for JSON serialization.
     """
 
     def __init__(self, provider: SQLiteProvider):
         self._provider = provider
+        self._classifier = RelationClassifier()
 
     async def _fetch_beliefs(
         self, topic: str | None = None,
@@ -321,7 +278,10 @@ class ReflectEngine:
         min_confidence: float = 0.0,
         limit: int = 0,
     ) -> dict[str, Any]:
-        """Find beliefs that semantically conflict using keyword heuristic."""
+        """Find beliefs that semantically conflict using ternary classifier.
+
+        Delegates to RelationClassifier and filters for contradiction only.
+        """
         beliefs = await self._fetch_beliefs(topic, min_confidence, limit)
         # Only scan active and contradicted beliefs
         scan_beliefs = [
@@ -339,6 +299,88 @@ class ReflectEngine:
             "mode": "contradictions",
             "total": len(pairs),
             "contradictions": pairs,
+            "recommendation": recommendation,
+        }
+
+    async def relations(
+        self,
+        topic: str | None = None,
+        min_confidence: float = 0.0,
+        limit: int = 0,
+        context: str | None = None,
+        strict_same_context: bool = True,
+    ) -> dict[str, Any]:
+        """Find all ternary relations between belief pairs.
+
+        Returns contradiction, entailment, and neutral relationships
+        between all pairs of active/contradicted beliefs.
+
+        Args:
+            topic: Optional topic/tag filter.
+            min_confidence: Minimum confidence threshold.
+            limit: Maximum number of beliefs to analyse.
+            context: Optional context tag applied to all beliefs for
+                     same_context gate evaluation.
+            strict_same_context: If True, beliefs without matching context
+                                 are classified as neutral.
+
+        Returns:
+            Dict with mode, relation counts, and full relation list.
+        """
+        beliefs = await self._fetch_beliefs(topic, min_confidence, limit)
+        scan_beliefs = [
+            b for b in beliefs
+            if b.lifecycle_state in ("active", "contradicted")
+        ]
+
+        # Build contexts dict: if a global context is provided, all beliefs
+        # share it (same_context is true). Otherwise, use tags as context.
+        contexts: dict[str, str] | None = None
+        if context is not None:
+            contexts = {b.id: context for b in scan_beliefs}
+        # If no explicit context, don't pass contexts (same_context defaults to True)
+
+        all_relations = self._classifier.find_relations(
+            scan_beliefs,
+            contexts=contexts,
+            strict_same_context=strict_same_context,
+        )
+
+        # Count by relation type
+        contradictions = [r for r in all_relations if r["relation"] == "contradiction"]
+        entailments = [r for r in all_relations if r["relation"] == "entailment"]
+
+        recommendation = ""
+        if contradictions:
+            recommendation = (
+                f"Found {len(contradictions)} contradiction(s). "
+                f"Run resolve_conflict() to resolve."
+            )
+        elif entailments:
+            recommendation = (
+                f"Found {len(entailments)} entailment(s). "
+                f"Beliefs are consistent."
+            )
+
+        # Also find neutral pairs for context-gated results
+        neutral_relation_count = 0
+        if strict_same_context and context is not None:
+            # Count pairs that would be relations but were gated to neutral
+            ungated = self._classifier.find_relations(
+                scan_beliefs,
+                contexts=contexts,
+                strict_same_context=False,
+            )
+            gated_away = len(ungated) - len(all_relations)
+            neutral_relation_count = gated_away
+
+        return {
+            "mode": "relations",
+            "total": len(all_relations),
+            "contradictions": len(contradictions),
+            "entailments": len(entailments),
+            "neutral_pairs": neutral_relation_count,
+            "relations": all_relations,
             "recommendation": recommendation,
         }
 
@@ -501,15 +543,26 @@ class ReflectEngine:
                 without_evidence += 1
 
         recommendation = ""
-        if without_evidence > 0:
-            recommendation = f"Add evidence to {without_evidence} beliefs with no sources"
+        if without_evidence > total * 0.5:
+            recommendation = (
+                f"Most beliefs ({without_evidence}/{total}) lack evidence. "
+                "Consider adding source evidence via learn() with sources."
+            )
+        elif zero_weight > 0:
+            recommendation = (
+                f"{zero_weight} evidence entries have zero weight. "
+                "Run audit with --fix-zero-weight to clean."
+            )
 
         return {
             "mode": "evidence_audit",
             "total": total,
             "with_evidence": with_evidence,
             "without_evidence": without_evidence,
-            "avg_evidence_per_belief": round(total_evidence_count / max(with_evidence, 1), 2),
+            "avg_evidence_per_belief": (
+                round(total_evidence_count / max(with_evidence, 1), 2)
+                if with_evidence else 0
+            ),
             "by_source_type": dict(sorted(by_source_type.items())),
             "zero_weight_entries": zero_weight,
             "recommendation": recommendation,
@@ -521,45 +574,42 @@ class ReflectEngine:
         min_confidence: float = 0.0,
         limit: int = 0,
     ) -> dict[str, Any]:
-        """Detailed confidence histogram across beliefs."""
+        """Confidence distribution across all beliefs."""
         beliefs = await self._fetch_beliefs(topic, min_confidence, limit)
+        histogram = _build_histogram(beliefs)
 
-        # Sort by confidence descending
-        sorted_beliefs = sorted(beliefs, key=lambda b: b.confidence, reverse=True)
-
-        # Build belief list with evidence counts (optional)
-        evidence_counts: dict[str, int] = {}
-        if beliefs:
-            from storage.repositories.evidence_repo import EvidenceRepository
-
-            belief_ids = [b.id for b in beliefs]
-            try:
-                if hasattr(self._provider, "_get_session"):
-                    async with await self._provider._get_session() as session:
-                        ev_repo = EvidenceRepository(session)
-                        stats = await ev_repo.aggregate_stats(belief_ids)
-                        for bid in belief_ids:
-                            s = stats.get(bid, {"count": 0})
-                            evidence_counts[bid] = s["count"]
-            except Exception:
-                pass
-
+        # Sort beliefs by confidence descending, include evidence count
         belief_list = []
-        for b in sorted_beliefs:
+        for b in sorted(beliefs, key=lambda x: x.confidence, reverse=True):
+            ev_count = 0
+            if hasattr(self._provider, "_get_session"):
+                try:
+                    async with await self._provider._get_session() as session:
+                        from storage.repositories.evidence_repo import EvidenceRepository
+                        ev_repo = EvidenceRepository(session)
+                        stats = await ev_repo.aggregate_stats([b.id])
+                        ev_count = stats.get(b.id, {}).get("count", 0)
+                except Exception:
+                    ev_count = 0
+
             belief_list.append({
                 "id": b.id,
                 "proposition": b.proposition,
                 "confidence": b.confidence,
-                "evidence_count": evidence_counts.get(b.id, 0),
+                "evidence_count": ev_count,
                 "lifecycle_state": b.lifecycle_state,
             })
 
-        histogram = _build_histogram(beliefs)
-        lowest_count = histogram.get("0.0_0.3", 0)
+        # Find lowest-confidence bucket count (excluding empty buckets)
+        non_zero = [c for c in histogram.values() if c > 0]
+        lowest_count = min(non_zero) if non_zero else 0
 
         recommendation = ""
-        if lowest_count > 0:
-            recommendation = f"Review {lowest_count} beliefs with confidence < 0.3"
+        if lowest_count == 0:
+            recommendation = (
+                "All beliefs are in the highest confidence bucket. "
+                "Consider reinforcing or challenging them."
+            )
 
         return {
             "mode": "confidence",

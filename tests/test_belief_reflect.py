@@ -126,20 +126,20 @@ class TestDetectContradictions:
     def test_contradiction_detected(self):
         beliefs = [
             _make_belief("Docker is better than Podman", confidence=0.8),
-            _make_belief("Podman is worse than Docker", confidence=0.6),
+            _make_belief("Docker is worse than Podman", confidence=0.6),
         ]
         pairs = detect_contradictions(beliefs)
         assert len(pairs) == 1
         assert pairs[0]["overlap_score"] >= 0.5
         assert "docker" in pairs[0]["proposition_a"].lower()
-        assert "podman" in pairs[0]["proposition_b"].lower()
+        assert "docker" in pairs[0]["proposition_b"].lower()
         assert pairs[0]["confidence_a"] == 0.8
         assert pairs[0]["confidence_b"] == 0.6
 
     def test_multiple_contradictions(self):
         beliefs = [
             _make_belief("Docker is better than Podman", confidence=0.8),
-            _make_belief("Podman is worse than Docker", confidence=0.6),
+            _make_belief("Docker is worse than Podman", confidence=0.6),
             _make_belief("Caddy is good for web serving", confidence=0.9),
             _make_belief("Caddy is bad for web serving", confidence=0.3),
         ]
@@ -314,7 +314,7 @@ class TestReflectContradictions:
     async def test_contradictions_found(self):
         beliefs = [
             _make_belief("Docker is better than Podman", confidence=0.8),
-            _make_belief("Podman is worse than Docker", confidence=0.6),
+            _make_belief("Docker is worse than Podman", confidence=0.6),
             _make_belief("Caddy is good for web serving", confidence=0.9),
         ]
         engine = ReflectEngine(_MockProvider(beliefs))
@@ -400,7 +400,7 @@ class TestReflectMTool:
                 tags=["docker", "container"],
             ),
             Belief(
-                proposition="Podman is worse than Docker",
+                proposition="Docker is worse than Podman",
                 confidence=0.6,
                 tags=["podman", "container"],
             ),
@@ -666,7 +666,7 @@ class TestReflectMToolEdgeCases:
         from memory_server.server import reflect_tool
         from memory_server.models import Belief as BelModel
         b1 = BelModel(proposition="Docker is better than Podman", confidence=0.8, tags=["docker"])
-        b2 = BelModel(proposition="Podman is worse than Docker", confidence=0.6, tags=["podman"])
+        b2 = BelModel(proposition="Docker is worse than Podman", confidence=0.6, tags=["podman"])
         await provider.create_belief(b1)
         await provider.create_belief(b2)
 

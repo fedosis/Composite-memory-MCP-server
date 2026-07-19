@@ -3,13 +3,13 @@
   "$id": "https://memory-server.nousresearch.com/contracts/reflect.schema.json",
   "title": "reflect — MCP Tool Schema",
   "description": "Analyse the belief store and produce structured insights about what the agent currently believes.",
-  "version": "0.7.0",
-  "api_version": "0.7.0",
+  "version": "0.9.0",
+  "api_version": "0.9.0",
   "schema_version": "1.0.0",
 
   "tool": {
     "name": "reflect",
-    "description": "Analyse the belief store: overview, contradictions, decay, topics, evidence_audit, confidence"
+    "description": "Analyse the belief store: overview, contradictions, relations, decay, topics, evidence_audit, confidence"
   },
 
   "input": {
@@ -17,8 +17,8 @@
     "properties": {
       "mode": {
         "type": "string",
-        "enum": ["overview", "contradictions", "decay", "topics", "evidence_audit", "confidence"],
-        "description": "Analysis mode",
+        "enum": ["overview", "contradictions", "relations", "decay", "topics", "evidence_audit", "confidence"],
+        "description": "Analysis mode. 'relations' is the new ternary mode (v0.9).",
         "default": "overview"
       },
       "topic": {
@@ -37,6 +37,15 @@
         "description": "Maximum number of beliefs to analyse (0 = all)",
         "minimum": 0,
         "default": 50
+      },
+      "context": {
+        "type": "string",
+        "description": "Optional context identifier for same_context gate (v0.9)"
+      },
+      "strict_same_context": {
+        "type": "boolean",
+        "description": "If True, beliefs without matching context are neutral (v0.9)",
+        "default": true
       }
     },
     "additionalProperties": false
@@ -113,6 +122,37 @@
               "detection_score": { "type": "number" },
               "detection_method": { "type": "string", "enum": ["keyword", "confidence_weighted", "source_overlap"] },
               "detected_at": { "type": "string" }
+            }
+          }
+        },
+        "recommendation": { "type": "string" }
+      }
+    },
+    "relations": {
+      "type": "object",
+      "properties": {
+        "mode": { "type": "string", "enum": ["relations"] },
+        "total": { "type": "integer" },
+        "contradictions": { "type": "integer" },
+        "entailments": { "type": "integer" },
+        "neutral_pairs": { "type": "integer" },
+        "relations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "relation": { "type": "string", "enum": ["contradiction", "entailment", "neutral"] },
+              "confidence": { "type": "number" },
+              "same_context": { "type": "boolean" },
+              "overlap_score": { "type": "number" },
+              "detection_method": { "type": "string" },
+              "detected_at": { "type": "string" },
+              "belief_a_id": { "type": "string" },
+              "proposition_a": { "type": "string" },
+              "confidence_a": { "type": "number" },
+              "belief_b_id": { "type": "string" },
+              "proposition_b": { "type": "string" },
+              "confidence_b": { "type": "number" }
             }
           }
         },

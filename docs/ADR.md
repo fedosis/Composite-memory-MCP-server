@@ -622,6 +622,127 @@ Disadvantages:
 
 ------------------------------------------------------------------------
 
+# ADR-014: Ternary Relation Model — contradiction|entailment|neutral
+
+## Status
+
+Accepted (v0.9)
+
+## Context
+
+ADR-011 and ADR-012 established a belief store with keyword-based binary
+contradiction detection using three heuristics (keyword match,
+confidence-weighted, source overlap). This has two major flaws:
+
+1. **False positives**: "Docker is better than Podman" vs "Podman is worse
+   than Docker" is detected as a contradiction, but the second proposition
+   is logically *entailed* by the first (they express the same sentiment).
+2. **Binary only**: The system cannot distinguish between logical
+   contradiction (A = ¬A), entailment (A ⇒ B), and unrelated propositions.
+   All non-contradictions are treated identically.
+
+Additionally, there is no **context gate** — beliefs from different
+conversational contexts are compared without accounting for context
+differences, producing spurious contradictions.
+
+Curiosity worker findings:
+- CUR-CMMS-LLM-CONFLICT-001: current binary detection produces false positives
+- CUR-CMMS-RELATION-001: ternary relation model needed with same_context gate
+
+### Prior Art
+
+The Natural Language Inference (NLI) literature defines the standard
+three-way classification used by all major NLI datasets (SNLI, MNLI,
+ANLI): contradiction, entailment, and neutral. This card adopts the same
+taxonomy for belief relations.
+
+## Decision
+
+Replace the binary `detect_contradictions()` function with a ternary
+`RelationClassifier` that outputs one of:
+
+| Relation | Meaning | Example |
+|----------|---------|---------|
+| `contradiction` | Two beliefs cannot both be true | "Docker is better than Podman" vs "Docker is worse than Podman" |
+| `entailment` | One belief logically implies the other | "Docker is better than Podman" vs "Podman is worse than Docker" |
+| `neutral` | No logical relation or different context | "Docker is great" vs "Caddy is a web server" |
+
+### same_context Gate
+
+The classifier accepts `context_a` and `context_b` parameters. When
+contexts differ (different tags, source domains, or explicit context
+strings), the classifier applies the **same_context gate**:
+
+- If `context_a` and `context_b` are explicitly provided and differ, the
+  gate is `same_context: false`.
+  - With `strict_same_context=true` (default): relation → `neutral`
+    regardless of semantic content.
+  - With `strict_same_context=false`: relation is computed normally but
+    `confidence` is reduced by a context-divergence penalty.
+- If contexts are not provided or match, `same_context: true` and
+  classification proceeds normally.
+
+### Classification Algorithm (v0.9 — heuristic)
+
+No LLM is used yet (deferred to v1.0). The heuristic algorithm:
+
+1. **Tokenize** both propositions (lowercase, remove stopwords).
+2. **Compute overlap** — Jaccard similarity of keyword tokens.
+3. **Detect sentiment direction** — check OPPOSITE_SENTIMENT pairs
+   (better/worse, like/dislike, good/bad, etc.).
+4. **Detect shared sentiment** — check if both use the same direction
+   words (both positive or both negative about the same topic).
+5. **Classify**:
+   - If overlap ≥ 2 AND opposite sentiment → `contradiction`
+   - If overlap ≥ 2 AND same sentiment (both positive words OR both
+     negative words on the same topic) → `entailment`
+   - If overlap ≥ 1 AND neutral words → borderline (confidence < 0.5)
+   - Else → `neutral`
+6. **Apply same_context gate** — adjust relation/confidence based on
+   context match.
+
+### Integration
+
+- `ReflectEngine.contradictions()` is preserved for backward compatibility
+  but internally delegates to `RelationClassifier` filtering for
+  `contradiction` relations.
+- New `ReflectEngine.relations()` mode returns the full ternary output.
+- `detect_contradictions()` is replaced by `RelationClassifier.classify_pair()`
+  and `RelationClassifier.find_relations()`.
+- The `detect_contradictions` module is maintained as a thin wrapper
+  until v1.0 removal.
+
+### Schema Changes
+
+- `mode=relations` added to reflect input enum.
+- Output schema includes `relation`, `confidence`, and `same_context` fields.
+- Backward-compatible: `mode=contradictions` continues to work.
+
+## Reasons
+
+- Ternary classification matches the NLI standard and enables richer
+  belief analysis.
+- Entailment detection fixes the false positive Docker/Podman case.
+- same_context gate prevents spurious cross-context contradictions.
+- Heuristic approach is fast (no LLM calls), suitable for v0.9.
+- Backward compatibility avoids breaking existing consumers.
+
+## Consequences
+
+Advantages:
+- Correct classification of entailment (fixes false positives).
+- Context isolation prevents cross-context noise.
+- Richer introspection: agents can ask "which beliefs support which".
+- Same API contract — existing callers unchanged.
+
+Disadvantages:
+- Heuristic entailment detection is less accurate than LLM-based
+  (deferred to v1.0).
+- Additional computation for same_context comparison.
+- Tests need rewriting for the new classification.
+
+------------------------------------------------------------------------
+
 # General architectural principles
 
 Composite Memory MCP Server must be:

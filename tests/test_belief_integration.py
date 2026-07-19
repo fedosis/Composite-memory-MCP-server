@@ -150,7 +150,7 @@ class TestContradictionDetection:
             tags=["docker", "container"],
         )
         b2 = Belief(
-            proposition="Podman is worse than Docker for containers",
+            proposition="Docker is worse than Podman for containers",
             confidence=0.6,
             tags=["podman", "container"],
         )
