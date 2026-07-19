@@ -14,7 +14,19 @@ from typing import Optional
 
 import typer
 
-from .server import run as run_server
+# Lazy import: server.py imports ``storage`` which may not be installed.
+# Only load it when the ``serve`` subcommand is actually invoked.
+_run_server = None
+
+
+def _get_run_server():
+    global _run_server
+    if _run_server is None:
+        from .server import run  # type: ignore[import-untyped]
+
+        _run_server = run
+    return _run_server
+
 
 app = typer.Typer()
 
@@ -154,9 +166,6 @@ def _do_install(
 
     data = _load_config(cfg_path)
 
-    # --- backup current memory.provider ---
-    old_provider = _current_memory_provider(data)
-
     # --- add provider entry ---
     added = _add_provider_entry(data, cmms_path=cmms_path)
 
@@ -201,7 +210,7 @@ def _do_install(
         return 1
 
     out(f"✅ CMMS registered as Hermes MemoryProvider in {cfg_path}")
-    out(f"   Plugin path: memory_server.plugins.hermes.provider.HermesProvider")
+    out(f"   Plugin path: memory_server.plugins.hermes.provider.HermesProvider")  # noqa: F541
     out(f"   memory.provider: {previous!r} → 'memory_server'")
     if previous is not None:
         out(f"   Backup saved to: {back_path}")
@@ -289,13 +298,13 @@ def _do_uninstall(
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context):
     if ctx.invoked_subcommand is None:
-        run_server()
+        _get_run_server()()
 
 
 @app.command()
 def serve():
     """Start the MCP server (stdio transport)"""
-    run_server()
+    _get_run_server()()
 
 
 @app.command()
