@@ -106,10 +106,10 @@ Belief System v2 — Ternary Relation Classification
 
 | # | Card | Status | Notes |
 |---|------|--------|-------|
-| 001 | Ternary Relation Classifier | 📋 design | contradiction | entailment | neutral вместо binary conflict |
-| 002 | same_context gate | 📋 design | Явный контекстный gate для cross-context belief evaluation |
-| 003 | Migrate reflect() + resolve_conflict() | 📋 design | Обновить инструменты под ternary модель |
-| 004 | Fix tests + docs | 📋 design | Исправить false positive тесты (Docker vs Podman), обновить документацию |
+| 001 | Ternary Relation Classifier | ✅ **v0.9.0-alpha.1** | contradiction|entailment|neutral, same_context gate, ADR-014 |
+| 002 | same_context gate | ✅ (включено в Card 001) | Реализован в RelationClassifier._has_same_subject() |
+| 003 | Migrate reflect() + resolve_conflict() | ✅ (включено в Card 001) | reflect.py обновлён, resolve_conflict работает с ternary |
+| 004 | Fix tests + docs | ✅ (включено в Card 001) | 136 тестов, ADR-014, spec |
 
 ### Справочные материалы (curiosity worker)
 
