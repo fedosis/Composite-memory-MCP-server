@@ -101,7 +101,14 @@ Hermes Native MemoryProvider Integration
 | CUR-CMMS-PLUGIN-001 | MemoryProvider Plugin API | Hindsight — эталон. Обязательны: name, is_available, initialize, get_tool_schemas, handle_tool_call. Lifecycle: prefetch, sync_turn, on_session_end, on_session_switch, shutdown. |
 | CUR-CMMS-HINDSIGHT-001 | Hindsight как MemoryProvider | Hindsight — native provider, не MCP. Жизненно важно: MCP-only теряет lifecycle hooks, auto-recall, auto-sync, session rotation. |
 
-## Phase: v0.9 (current)
+## Phase: v0.10 (done)
+LanceDB Vector Store
+
+| # | Card | Status | Notes |
+|---|------|--------|-------|
+| 001 | LanceDB Vector Store | ✅ **v0.10.0-alpha.1** | LanceDBProvider, env MEMORY_VECTOR_BACKEND, ADR-015, 18+ тестов |
+
+## Phase: v0.11 (current)
 Belief System v2 — Ternary Relation Classification
 
 | # | Card | Status | Notes |
