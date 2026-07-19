@@ -91,7 +91,7 @@ Hermes Native MemoryProvider Integration
 
 | # | Card | Status | Notes |
 |---|------|--------|-------|
-| 001 | Native MemoryProvider Plugin | 📋 design | MemoryProvider ABC, lifecycle hooks, writer queue |
+|| 001 | Native MemoryProvider Plugin | ✅ **v0.8.0-alpha.1** | MemoryProvider ABC, lifecycle hooks, writer queue |
 | 002 | CLI + auto-discovery + docs | 📋 design | install-hermes-plugin, config.yaml, documentation |
 
 ### Справочные материалы (curiosity worker)
