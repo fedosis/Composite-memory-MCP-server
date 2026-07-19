@@ -75,7 +75,7 @@ Stabilization: contract freeze → canonical data model → storage layer → ou
 
 Released: **v0.6.0** (latest: v0.6.0-1-gadedff5 — README update)
 
-## Phase: v0.7 (current)
+## Phase: v0.7 (done)
 Belief Store + Reflection
 
 | # | Card | Status | Notes |
@@ -85,3 +85,18 @@ Belief Store + Reflection
 | 003 | Learn-to-belief bridge | ✅ **v0.7.0-alpha.30** | Merged. 2 code reviews — Approve с 0 замечаний. 199 тестов ✅ |
 | 004 | Belief conflict resolution | ✅ **v0.7.0-alpha.31** | Merged. 1 code review — Approve с 0 замечаний. 228 тестов ✅ |
 | 005 | Integration tests + docs | ✅ **v0.7.0** | Merged. 240 тестов, 5 ADRs (007-012), полная документация |
+
+## Phase: v0.8 (current)
+Hermes Native MemoryProvider Integration
+
+| # | Card | Status | Notes |
+|---|------|--------|-------|
+| 001 | Native MemoryProvider Plugin | 📋 design | MemoryProvider ABC, lifecycle hooks, writer queue |
+| 002 | CLI + auto-discovery + docs | 📋 design | install-hermes-plugin, config.yaml, documentation |
+
+### Справочные материалы (curiosity worker)
+
+| # | Исследование | Суть |
+|---|-------------|------|
+| CUR-CMMS-PLUGIN-001 | MemoryProvider Plugin API | Hindsight — эталон. Обязательны: name, is_available, initialize, get_tool_schemas, handle_tool_call. Lifecycle: prefetch, sync_turn, on_session_end, on_session_switch, shutdown. |
+| CUR-CMMS-HINDSIGHT-001 | Hindsight как MemoryProvider | Hindsight — native provider, не MCP. Жизненно важно: MCP-only теряет lifecycle hooks, auto-recall, auto-sync, session rotation. |
