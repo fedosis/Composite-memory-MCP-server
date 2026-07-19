@@ -2,6 +2,21 @@
 
 Independent MCP memory service for AI agents. Agent-independent.
 
+[![Hermes Native Provider](https://img.shields.io/badge/Hermes-Native_MemoryProvider-blueviolet)](docs/INTEGRATION.md)
+
+## Hermes Integration
+
+CMMS can run as a native Hermes MemoryProvider plugin — not just over MCP.
+This enables auto-recall, auto-retain, and session lifecycle hooks.
+
+```bash
+pip install -e ".[hermes]"
+memory-server install-hermes-plugin
+hermes gateway restart
+```
+
+See [Hermes Integration Guide](docs/INTEGRATION.md) for details.
+
 ## Dev Setup
 
 ```bash
@@ -27,7 +42,8 @@ memory-server ping
 
 ## Docs
 
-- [ADR](docs/ADR.md) — Architecture Decision Records (12 ADRs)
+- [ADR](docs/ADR.md) — Architecture Decision Records (13 ADRs)
+- [Integration Guide](docs/INTEGRATION.md) — Hermes MemoryProvider plugin
 - [Agent Spec](docs/agent-spec.md) — Implementation specification
 - [Technical Design](docs/technical-design.md) — Tech stack + roadmap
 - [Architecture](docs/architecture.md) — Mermaid architecture diagram
