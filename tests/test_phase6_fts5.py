@@ -342,7 +342,7 @@ class TestFTS5RouteIntegration:
         rules = RoutingRuleSet()
 
         router = HybridRouter(
-            qdrant_provider=qdrant,
+            vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
         )
@@ -366,7 +366,7 @@ class TestFTS5RouteIntegration:
         rules = RoutingRuleSet()
 
         router = HybridRouter(
-            qdrant_provider=qdrant,
+            vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
         )
@@ -389,7 +389,7 @@ class TestFTS5RouteIntegration:
         rules = RoutingRuleSet()
 
         router = HybridRouter(
-            qdrant_provider=qdrant,
+            vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
         )
@@ -414,7 +414,7 @@ class TestFTS5RouteIntegration:
         rules = RoutingRuleSet()
 
         router = HybridRouter(
-            qdrant_provider=qdrant,
+            vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
         )
@@ -439,7 +439,7 @@ class TestFTS5RouteIntegration:
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
         embedder = MockEmbeddingProvider(vector_size=384)
 
-        router = HybridRouter(qdrant_provider=qdrant, embedder=embedder)
+        router = HybridRouter(vector_provider=qdrant, embedder=embedder)
         router.fts_provider = provider
 
         result = await router.route("")
@@ -455,7 +455,7 @@ class TestFTS5RouteIntegration:
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
         embedder = MockEmbeddingProvider(vector_size=384)
 
-        router = HybridRouter(qdrant_provider=qdrant, embedder=embedder)
+        router = HybridRouter(vector_provider=qdrant, embedder=embedder)
         router.fts_provider = provider
 
         result = await router.route("xyznonexistentquerythatmatchesnothing12345!")
@@ -474,7 +474,7 @@ class TestFTS5RouteIntegration:
         rules = RoutingRuleSet()
 
         router = HybridRouter(
-            qdrant_provider=qdrant,
+            vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
         )

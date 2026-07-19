@@ -743,6 +743,123 @@ Disadvantages:
 
 ------------------------------------------------------------------------
 
+------------------------------------------------------------------------
+
+# ADR-015: LanceDB Vector Store as primary local-first vector backend
+
+## Status
+
+Accepted (v0.10)
+
+## Context
+
+Since v0.2 the project has used Qdrant as the vector database backend for
+semantic search. Qdrant works well in server-mode (Docker container) and
+in-memory mode for testing, but has several limitations:
+
+1. **Server dependency** — in production Qdrant requires a running Docker
+   container or a cloud instance, adding operational complexity.
+2. **Startup latency** — the Docker container must be healthy before the
+   memory server can serve semantic search.
+3. **Resource footprint** — Qdrant's gRPC/REST server adds memory and CPU
+   overhead even with a single collection.
+4. **No embedded mode on disk** — Qdrant's `:memory:` mode is ephemeral;
+   there is no local file-based persistent mode without running a server.
+
+Benchmark CUR-CMMS-VECTORSTORE-BENCH-001 (5K records) identified LanceDB
+as the best local-first vector storage option:
+- Zero external dependencies (no Docker, no server process).
+- Embedded mode: data stored as Arrow tables on local disk.
+- Fast cosine search with IVF-PQ index support.
+- Native Lance columnar format for efficient storage.
+- Python-native API with integrated filtering.
+- ~5× lower memory than Qdrant for the same dataset.
+- Comparable search latency for <10K vector datasets.
+
+## Decision
+
+Replace Qdrant as the default vector store with LanceDB. Qdrant is
+retained as an **optional server-mode backend** for deployments that
+prefer a dedicated vector database server.
+
+### Architecture
+
+```
+Memory Server
+├── SQLiteProvider (always: facts, beliefs, outbox)
+├── LanceDBProvider (default: vector search)    ← NEW
+├── QdrantProvider (optional: server-mode)       ← preserved
+├── SimpleGraph (in-memory graph)
+└── EmbeddingProvider (sentence-transformers / mock / OpenAI)
+```
+
+### Provider Interface
+
+LanceDBProvider implements the same async interface as QdrantProvider:
+
+| Method | QdrantProvider | LanceDBProvider |
+|--------|---------------|-----------------|
+| `create_collection()` | ✅ | ✅ |
+| `delete_collection()` | ✅ | ✅ |
+| `list_collections()` | ✅ | ✅ |
+| `upsert()` | ✅ | ✅ |
+| `upsert_batch()` | ✅ | ✅ |
+| `search()` | ✅ | ✅ |
+| `scroll()` | ✅ | ✅ |
+| `delete()` | ✅ | ✅ |
+| `close()` | ✅ | ✅ |
+
+### Embedding Dependencies
+
+Only `numpy` and `lancedb` are required. No torch or sentence-transformers
+are needed for basic vector operations — embeddings are provided by the
+existing EmbeddingProvider abstraction.
+
+### Configuration
+
+```python
+LanceDBProvider(
+    db_path="data/lancedb",      # Path to LanceDB database directory
+    table="memories",            # Table name
+    metric="cosine",             # Distance metric (cosine | l2 | dot)
+    vector_size=384,             # Vector dimensionality
+)
+```
+
+### Migration Path
+
+No automatic data migration from Qdrant to LanceDB. Users running
+production Qdrant can continue using QdrantProvider by setting
+`MEMORY_VECTOR_BACKEND=qdrant`. The LanceDBProvider starts with an
+empty table.
+
+## Reasons
+
+- **Simpler deployment** — no Docker dependency for vector search.
+- **Lower resource usage** — ~5× less memory than Qdrant for <10K vectors.
+- **Persistent by default** — data survives server restarts.
+- **Same API contract** — LanceDBProvider implements the same interface as
+  QdrantProvider, so all existing consumers (router, outbox worker) work
+  unchanged.
+- **Qdrant preserved** — users who prefer a dedicated vector server can
+  still use it.
+
+## Consequences
+
+Advantages:
+- Zero operational overhead for local vector search.
+- Data persists automatically in LanceDB directory.
+- All existing integrations work without code changes to consumers.
+- Smaller Docker image (no Qdrant client dependency in base install).
+
+Disadvantages:
+- Qdrant users must keep using the `[qdrant]` optional dependency.
+- LanceDB is younger (first stable 0.1.0 in 2024) with a smaller ecosystem.
+- Large-scale deployments (>100K vectors) may still prefer Qdrant's
+  distributed server mode.
+
+------------------------------------------------------------------------
+
 # General architectural principles
 
 Composite Memory MCP Server must be:

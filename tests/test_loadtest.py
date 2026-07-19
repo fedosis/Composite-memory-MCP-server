@@ -415,11 +415,11 @@ async def _scenario_data_integrity() -> dict:
     graph_count = len(graph_nodes)
     print(f"    Graph nodes: {graph_count}")
 
-    # Qdrant point count via scroll
-    qdrant = router._qdrant
-    qdrant_points = await qdrant.scroll(limit=100000)
+    # Vector store point count via scroll
+    vector_prov = router._vector_provider
+    qdrant_points = await vector_prov.scroll(limit=100000)
     qdrant_count = len(qdrant_points)
-    print(f"    Qdrant points: {qdrant_count}")
+    print(f"    Vector store points: {qdrant_count}")
 
     # Consistency check
     sqlite_qdrant_ok = sqlite_count == qdrant_count

@@ -131,7 +131,7 @@ class TestEmbeddingRouter:
 
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
         embedder = MockEmbeddingProvider(vector_size=384)
-        return EmbeddingRouter(qdrant_provider=qdrant, embedder=embedder)
+        return EmbeddingRouter(vector_provider=qdrant, embedder=embedder)
 
     async def test_semantic_search_no_results(self, router):
         results = await router.search("nonexistent query")
@@ -140,7 +140,7 @@ class TestEmbeddingRouter:
     async def test_semantic_search_with_stored_data(self, router):
         # Store a fact via Qdrant directly
         vec = router._embedder.embed("Docker runs on OMV8")
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=vec,
@@ -154,9 +154,9 @@ class TestEmbeddingRouter:
     async def test_semantic_search_ranking(self, router):
         # Store facts where one is an exact match for the query (identical text = identical vector)
         query_text = "programming language"
-        await router._qdrant.upsert("memories", point_id=str(uuid.uuid4()), vector=router._embedder.embed(query_text),
+        await router._vector_provider.upsert("memories", point_id=str(uuid.uuid4()), vector=router._embedder.embed(query_text),
                                      payload={"content": query_text, "subject": "ExactMatch"})
-        await router._qdrant.upsert("memories", point_id=str(uuid.uuid4()),
+        await router._vector_provider.upsert("memories", point_id=str(uuid.uuid4()),
                                      vector=router._embedder.embed("The weather is nice today"),
                                      payload={"content": "The weather is nice today", "subject": "Weather"})
 
@@ -170,7 +170,7 @@ class TestEmbeddingRouter:
     async def test_semantic_search_top_k(self, router):
         vec = router._embedder.embed("test")
         for i in range(5):
-            await router._qdrant.upsert("memories", point_id=str(uuid.uuid4()), vector=vec,
+            await router._vector_provider.upsert("memories", point_id=str(uuid.uuid4()), vector=vec,
                                          payload={"content": f"test fact {i}"})
 
         results = await router.search("test", top_k=3)
@@ -178,7 +178,7 @@ class TestEmbeddingRouter:
 
     async def test_semantic_search_score_threshold(self, router):
         vec = router._embedder.embed("exact match query")
-        await router._qdrant.upsert("memories", point_id=str(uuid.uuid4()), vector=vec,
+        await router._vector_provider.upsert("memories", point_id=str(uuid.uuid4()), vector=vec,
                                      payload={"content": "exact match query"})
 
         # Search with impossible-high threshold
@@ -196,7 +196,7 @@ class TestEmbeddingRouter:
     async def test_search_default_collection(self, router):
         """Search should work with the default 'memories' collection."""
         vec = router._embedder.embed("hello world")
-        await router._qdrant.upsert("memories", point_id=str(uuid.uuid4()), vector=vec,
+        await router._vector_provider.upsert("memories", point_id=str(uuid.uuid4()), vector=vec,
                                      payload={"content": "hello world"})
         results = await router.search("hello")
         assert len(results) >= 1
@@ -208,7 +208,7 @@ class TestEmbeddingRouter:
 
         # Store something in Qdrant
         vec = router._embedder.embed("ip of server X is 10.0.0.1")
-        await router._qdrant.upsert("memories", point_id=str(uuid.uuid4()), vector=vec,
+        await router._vector_provider.upsert("memories", point_id=str(uuid.uuid4()), vector=vec,
                                      payload={"content": "ip of server X is 10.0.0.1", "subject": "server X"})
 
         # The rule should catch "ip of" and return a rule result, not semantic
@@ -221,7 +221,7 @@ class TestEmbeddingRouter:
     async def test_no_rule_match_falls_through_to_semantic(self, router):
         """When no rule matches, semantic search should run."""
         vec = router._embedder.embed("General knowledge about Python")
-        await router._qdrant.upsert("memories", point_id="general", vector=vec,
+        await router._vector_provider.upsert("memories", point_id="general", vector=vec,
                                      payload={"content": "General knowledge about Python"})
 
         result = await router.route("What is Python?")

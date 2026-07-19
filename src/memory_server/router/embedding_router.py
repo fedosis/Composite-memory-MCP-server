@@ -14,6 +14,7 @@ from memory_server.providers.embedding_provider import (
     EmbeddingProvider,
     MockEmbeddingProvider,
 )
+from memory_server.providers.lancedb_provider import LanceDBProvider
 from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.router.rules import RoutingRuleSet
 
@@ -23,25 +24,28 @@ DEFAULT_COLLECTION = "memories"
 DEFAULT_TOP_K = 10
 DEFAULT_SCORE_THRESHOLD = 0.0
 
+# Union type for vector providers
+VectorProvider = QdrantProvider | LanceDBProvider
+
 
 class EmbeddingRouter:
     """Routes queries through rules check then semantic search.
 
     Args:
-        qdrant_provider: QdrantProvider instance for vector storage.
+        vector_provider: LanceDBProvider or QdrantProvider instance for vector storage.
         embedder: EmbeddingProvider for converting text to vectors.
         rules: Optional RoutingRuleSet (uses defaults if not provided).
-        collection: Default Qdrant collection name.
+        collection: Default collection name.
     """
 
     def __init__(
         self,
-        qdrant_provider: QdrantProvider,
+        vector_provider: VectorProvider,
         embedder: EmbeddingProvider | None = None,
         rules: RoutingRuleSet | None = None,
         collection: str = DEFAULT_COLLECTION,
     ) -> None:
-        self._qdrant = qdrant_provider
+        self._vector_provider = vector_provider
         self._embedder = embedder or MockEmbeddingProvider()
         self._rules = rules or RoutingRuleSet.default()
         self._collection = collection
@@ -120,8 +124,8 @@ class EmbeddingRouter:
         vector = self._embedder.embed(query)
         logger.debug("Embedded query '%s' to %d-dim vector", query[:50], len(vector))
 
-        # Search Qdrant
-        results = await self._qdrant.search(
+        # Search vector store
+        results = await self._vector_provider.search(
             collection=self._collection,
             vector=vector,
             limit=top_k,

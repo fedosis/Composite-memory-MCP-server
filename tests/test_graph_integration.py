@@ -52,7 +52,7 @@ class TestGraphIntegration:
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
         embedder = MockEmbeddingProvider(vector_size=384)
         return HybridRouter(
-            qdrant_provider=qdrant,
+            vector_provider=qdrant,
             embedder=embedder,
             graph=graph,
         )

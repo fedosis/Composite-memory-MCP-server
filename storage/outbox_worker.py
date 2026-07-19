@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import (
 
 from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
 from memory_server.providers.qdrant_provider import QdrantProvider
+from memory_server.providers.lancedb_provider import LanceDBProvider
 from memory_server.router.graph_router import GraphRouter
 from storage.base import Base
 from storage.outbox import OutboxEntry, OutboxRepository
@@ -52,7 +53,7 @@ class OutboxWorker:
         db_url: str = "",
         *,
         engine=None,
-        qdrant: QdrantProvider | None = None,
+        qdrant: QdrantProvider | LanceDBProvider | None = None,
         embedder: SentenceTransformerEmbeddingProvider | None = None,
         graph_router: GraphRouter | None = None,
     ):

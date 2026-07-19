@@ -27,7 +27,7 @@ class TestHybridRouter:
         ))
 
         return HybridRouter(
-            qdrant_provider=qdrant,
+            vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
         )
@@ -44,7 +44,7 @@ class TestHybridRouter:
         # Pre-populate semantic with something (Qdrant needs UUID point IDs)
         import uuid
         vec = router._embedder.embed("weather is nice today")
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=vec,
@@ -91,7 +91,7 @@ class TestHybridRouter:
         # Pre-populate semantic with a match
         import uuid
         vec = router._embedder.embed("Docker is a container platform")
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=vec,

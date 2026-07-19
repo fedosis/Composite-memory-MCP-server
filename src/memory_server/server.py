@@ -29,6 +29,7 @@ from memory_server.evaluation.validator import Validator
 from memory_server.models import Belief
 from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
 from memory_server.providers.graph_provider import SimpleGraph
+from memory_server.providers.lancedb_provider import LanceDBProvider
 from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.embedding_router import EmbeddingRouter
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 # Lazy providers — initialized on first use
 _provider: SQLiteProvider | None = None
 _qdrant: QdrantProvider | None = None
+_lancedb: LanceDBProvider | None = None
 _embedder: SentenceTransformerEmbeddingProvider | None = None
 _router: EmbeddingRouter | None = None
 _graph: SimpleGraph | None = None
@@ -96,16 +98,43 @@ async def _get_provider() -> SQLiteProvider:
     return _provider
 
 
+async def _get_lancedb_provider() -> LanceDBProvider:
+    """Get or create the LanceDBProvider singleton."""
+    global _lancedb
+    if _lancedb is None:
+        _lancedb = LanceDBProvider(db_path="data/lancedb", table="memories")
+    return _lancedb
+
+
+async def _get_qdrant_provider() -> QdrantProvider:
+    """Get or create the QdrantProvider singleton (optional server-mode backend)."""
+    global _qdrant
+    if _qdrant is None:
+        _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+    return _qdrant
+
+
+def _get_vector_provider():
+    """Get the active vector provider — LanceDB by default, Qdrant if configured.
+
+    Controlled by MEMORY_VECTOR_BACKEND env var: 'lancedb' (default) or 'qdrant'.
+    """
+    import os
+    backend = os.environ.get("MEMORY_VECTOR_BACKEND", "lancedb").lower()
+    if backend == "qdrant":
+        return _get_qdrant_provider()
+    return _get_lancedb_provider()
+
+
 async def _get_router() -> EmbeddingRouter:
     """Get or create the EmbeddingRouter singleton."""
-    global _qdrant, _embedder, _router
+    global _qdrant, _lancedb, _embedder, _router
     if _router is None:
-        if _qdrant is None:
-            _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+        vector_provider = await _get_vector_provider()
         if _embedder is None:
             _embedder = SentenceTransformerEmbeddingProvider()
         _router = EmbeddingRouter(
-            qdrant_provider=_qdrant,
+            vector_provider=vector_provider,
             embedder=_embedder,
         )
     return _router
@@ -392,16 +421,15 @@ async def graph_search_fn(
 
 async def _get_hybrid_router() -> HybridRouter:
     """Get or create the HybridRouter singleton."""
-    global _qdrant, _embedder, _graph, _hybrid_router
+    global _qdrant, _lancedb, _embedder, _graph, _hybrid_router
     if _hybrid_router is None:
-        if _qdrant is None:
-            _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+        vector_provider = await _get_vector_provider()
         if _embedder is None:
             _embedder = SentenceTransformerEmbeddingProvider()
         if _graph is None:
             _graph = SimpleGraph()
         _hybrid_router = HybridRouter(
-            qdrant_provider=_qdrant,
+            vector_provider=vector_provider,
             embedder=_embedder,
             graph=_graph,
         )

@@ -30,7 +30,7 @@ def router():
     """Create a real EmbeddingRouter with in-memory Qdrant and mock embedder."""
     qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
     embedder = MockEmbeddingProvider(vector_size=384)
-    return EmbeddingRouter(qdrant_provider=qdrant, embedder=embedder)
+    return EmbeddingRouter(vector_provider=qdrant, embedder=embedder)
 
 
 @pytest.mark.asyncio
@@ -44,19 +44,19 @@ class TestRouterPipeline:
         vec_caddy = router._embedder.embed("Caddy uses port 443")
         vec_python = router._embedder.embed("Python is a programming language")
 
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=vec_docker,
             payload={"content": "Docker runs on OMV8", "subject": "Docker"},
         )
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=vec_caddy,
             payload={"content": "Caddy uses port 443", "subject": "Caddy"},
         )
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=vec_python,
@@ -81,7 +81,7 @@ class TestRouterPipeline:
 
         # Store something in Qdrant that would match semantically
         vec = router._embedder.embed("Caddy uses port 443")
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=vec,
@@ -99,7 +99,7 @@ class TestRouterPipeline:
         """Semantic search should find closely related facts."""
         query_text = "container orchestration"
         # Store a fact with the exact same text as the query (identical vectors)
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=router._embedder.embed(query_text),
@@ -127,7 +127,7 @@ class TestRouterPipeline:
     async def test_semantic_search_with_score_threshold(self, router):
         """Score threshold should filter out low-similarity results."""
         vec = router._embedder.embed("unique specific fact")
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=vec,
@@ -146,7 +146,7 @@ class TestRouterPipeline:
         """top_k parameter should limit the number of results."""
         vec = router._embedder.embed("same text")
         for i in range(10):
-            await router._qdrant.upsert(
+            await router._vector_provider.upsert(
                 "memories",
                 point_id=str(uuid.uuid4()),
                 vector=vec,
@@ -159,7 +159,7 @@ class TestRouterPipeline:
     async def test_route_no_match_falls_through_to_semantic(self, router):
         """When no rule matches, route() should return semantic_results."""
         vec = router._embedder.embed("general knowledge about anything")
-        await router._qdrant.upsert(
+        await router._vector_provider.upsert(
             "memories",
             point_id=str(uuid.uuid4()),
             vector=vec,

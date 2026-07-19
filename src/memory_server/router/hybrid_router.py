@@ -21,6 +21,7 @@ from memory_server.providers.embedding_provider import (
     MockEmbeddingProvider,
 )
 from memory_server.providers.graph_provider import SimpleGraph
+from memory_server.providers.lancedb_provider import LanceDBProvider
 from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.router.graph_router import GraphRouter
 from memory_server.router.ranking import RankMerger, RankResult
@@ -32,6 +33,9 @@ DEFAULT_COLLECTION = "memories"
 DEFAULT_TOP_K = 10
 DEFAULT_SCORE_THRESHOLD = 0.0
 
+# Union type for vector providers
+VectorProvider = QdrantProvider | LanceDBProvider
+
 
 class HybridRouter:
     """Unified query router across rules, semantic search, graph, and LLM fallback.
@@ -41,22 +45,22 @@ class HybridRouter:
     into a unified ranked result list.
 
     Args:
-        qdrant_provider: QdrantProvider for semantic search.
+        vector_provider: LanceDBProvider or QdrantProvider for semantic search.
         embedder: EmbeddingProvider for text-to-vector conversion.
         rules: Optional RoutingRuleSet (uses defaults if not provided).
         graph: Optional SimpleGraph instance.
-        collection: Default Qdrant collection name.
+        collection: Default collection name.
     """
 
     def __init__(
         self,
-        qdrant_provider: QdrantProvider,
+        vector_provider: VectorProvider,
         embedder: EmbeddingProvider | None = None,
         rules: RoutingRuleSet | None = None,
         graph: SimpleGraph | None = None,
         collection: str = DEFAULT_COLLECTION,
     ) -> None:
-        self._qdrant = qdrant_provider
+        self._vector_provider = vector_provider
         self._embedder = embedder or MockEmbeddingProvider()
         self._rules = rules or RoutingRuleSet.default()
         self._graph = graph or SimpleGraph()
@@ -190,13 +194,13 @@ class HybridRouter:
         # Semantic search (embedding-based)
         try:
             vector = self._embedder.embed(query)
-            qdrant_results = await self._qdrant.search(
+            qdrant_results = await self._vector_provider.search(
                 collection=self._collection,
                 vector=vector,
                 limit=top_k,
                 score_threshold=score_threshold,
             )
-            semantic_results = RankMerger.semantic_from_qdrant(qdrant_results)
+            semantic_results = RankMerger.semantic_from_vector(qdrant_results)
             logger.debug("Semantic search returned %d results", len(semantic_results))
         except Exception as e:
             logger.warning("Semantic search failed: %s", e)

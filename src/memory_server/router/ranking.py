@@ -157,6 +157,16 @@ class RankMerger:
         return results
 
     @staticmethod
+    def semantic_from_vector(
+        vector_results: list[dict[str, Any]],
+    ) -> list[RankResult]:
+        """Convert vector store search results to semantic RankResults.
+
+        Works with results from both LanceDBProvider and QdrantProvider.
+        """
+        return RankMerger.semantic_from_qdrant(vector_results)
+
+    @staticmethod
     def semantic_from_qdrant(
         qdrant_results: list[dict[str, Any]],
     ) -> list[RankResult]:
