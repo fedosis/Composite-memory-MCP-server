@@ -86,7 +86,7 @@ Belief Store + Reflection
 | 004 | Belief conflict resolution | ✅ **v0.7.0-alpha.31** | Merged. 1 code review — Approve с 0 замечаний. 228 тестов ✅ |
 | 005 | Integration tests + docs | ✅ **v0.7.0** | Merged. 240 тестов, 5 ADRs (007-012), полная документация |
 
-## Phase: v0.8 (current)
+## Phase: v0.8 (done)
 Hermes Native MemoryProvider Integration
 
 | # | Card | Status | Notes |
@@ -100,3 +100,20 @@ Hermes Native MemoryProvider Integration
 |---|-------------|------|
 | CUR-CMMS-PLUGIN-001 | MemoryProvider Plugin API | Hindsight — эталон. Обязательны: name, is_available, initialize, get_tool_schemas, handle_tool_call. Lifecycle: prefetch, sync_turn, on_session_end, on_session_switch, shutdown. |
 | CUR-CMMS-HINDSIGHT-001 | Hindsight как MemoryProvider | Hindsight — native provider, не MCP. Жизненно важно: MCP-only теряет lifecycle hooks, auto-recall, auto-sync, session rotation. |
+
+## Phase: v0.9 (current)
+Belief System v2 — Ternary Relation Classification
+
+| # | Card | Status | Notes |
+|---|------|--------|-------|
+| 001 | Ternary Relation Classifier | 📋 design | contradiction | entailment | neutral вместо binary conflict |
+| 002 | same_context gate | 📋 design | Явный контекстный gate для cross-context belief evaluation |
+| 003 | Migrate reflect() + resolve_conflict() | 📋 design | Обновить инструменты под ternary модель |
+| 004 | Fix tests + docs | 📋 design | Исправить false positive тесты (Docker vs Podman), обновить документацию |
+
+### Справочные материалы (curiosity worker)
+
+| # | Исследование | Суть |
+|---|-------------|------|
+| CUR-CMMS-LLM-CONFLICT-001 | LLM contradiction detection | Нужен ternary relation classifier, не binary conflict detector. Рекомендован `contradiction|entailment|neutral` с same_context gate |
+| CUR-CMMS-RELATION-001 | Belief relation taxonomy | Миграция reflect()/resolve_conflict() обязательна. Текущий binary conflict — architectural mismatch. Тесты закрепляют ложный positive |
