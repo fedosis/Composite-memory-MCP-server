@@ -1,30 +1,31 @@
-# Card 001: Native MemoryProvider Plugin — v1
+# Card 001: Native MemoryProvider Plugin — v2 (post-arch-review)
 
 ## Objective
 
-Add a native Hermes MemoryProvider plugin to CMMS. Instead of relying solely on MCP protocol, CMMS becomes a first-class `MemoryProvider` in Hermes — gaining access to lifecycle hooks (`prefetch`, `sync_turn`, `on_session_end`, `on_session_switch`) that are unavailable over MCP.
+Add a native Hermes MemoryProvider plugin to CMMS as documented in **ADR-013**.
+Instead of relying solely on MCP protocol, CMMS becomes a first-class `MemoryProvider` in Hermes — gaining access to lifecycle hooks (`prefetch`, `queue_prefetch`, `sync_turn`, `on_session_end`, `on_session_switch`) that are unavailable over MCP.
 
 ## Motivation
 
-Currently CMMS is MCP-only. This means:
+Currently CMMS is MCP-only (per ADR-004). This means:
 - **No auto-recall**: CMMS cannot push context into the agent's system prompt before each turn (`prefetch`)
 - **No auto-retain**: CMMS cannot observe every user turn and persist relevant information automatically (`sync_turn`)
-- **No session hooks**: CMMS doesn't know when a session ends, switches, or compresses
+- **No session hooks**: CMMS doesn't know when a session ends, switches, or compresses (`on_session_end`, `on_session_switch`)
 - **No tool mirroring**: CMMS tools exist in a separate MCP namespace, not as first-class Hermes tools
 
-Hindsight (`plugins/memory/hindsight/`) proves this pattern works. CMMS needs the same.
+Per **ADR-013**, CMMS now supports **two access paths**: MCP (unchanged, for external agents) + Hermes MemoryProvider (new, v0.8). Hindsight (`plugins/memory/hindsight/`) proves this pattern works.
 
 ## Data Model — No new tables
 
-Card 001 does NOT add new database tables. It reuses all existing CMMS storage (SQLite, Qdrant/LanceDB, graph) through the existing 14 MCP tools. The MemoryProvider plugin is a thin adapter layer that:
+Card 001 does NOT add new database tables. It reuses all existing CMMS storage (SQLite, Qdrant, graph) through the existing service layer. The MemoryProvider plugin is a thin adapter that:
 
 1. Registers CMMS as `memory_server` provider in Hermes config
-2. Calls existing CMMS tools programmatically (not over HTTP/MCP) during lifecycle hooks
+2. Calls existing CMMS services programmatically during lifecycle hooks (bypassing MCP transport per ADR-013)
 3. Exposes CMMS tools as first-class Hermes tools (without `mcp_` prefix)
 
-## Hermes MemoryProvider ABC — Contract
+## Hermes MemoryProvider ABC — Real Contract
 
-Based on `agent/memory_provider.py` and the Hindsight implementation (`plugins/memory/hindsight/`):
+Based on `agent/memory_provider.py` in Hermes Agent. **All core lifecycle methods are SYNCHRONOUS** — Hermes calls them from the main thread.
 
 ```python
 class MemoryProvider(ABC):
@@ -32,51 +33,69 @@ class MemoryProvider(ABC):
     @abstractmethod
     def name(self) -> str: ...
 
-    def is_available(self) -> bool: ...        # no network calls
+    @abstractmethod
+    def is_available(self) -> bool: ...
+    def initialize(self, session_id: str, **kwargs) -> None: ...
+    def shutdown(self) -> None: ...
 
-    async def initialize(self) -> None: ...
-    async def shutdown(self) -> None: ...
+    # System prompt and turn-level hooks
+    def system_prompt_block(self) -> str: ...
+    def prefetch(self, query: str, *, session_id: str = "") -> str: ...
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None: ...
 
-    # Lifecycle hooks
-    async def prefetch(self) -> str | None: ...     # system prompt block
-    async def sync_turn(self, messages: list, turn_id: str | None = None) -> None: ...
-    async def on_session_end(self) -> None: ...
-    async def on_session_switch(
-        self, new_session_id: str,
-        parent_session_id: str | None = None,
-        reset: bool = False,
-        rewound: bool = False
+    # Turn persistence
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None: ...
 
     # Tool surface
-    def get_tool_schemas(self) -> list[dict]: ...
-    async def handle_tool_call(self, name: str, args: dict) -> str: ...
+    def get_tool_schemas(self) -> List[Dict[str, Any]]: ...
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str: ...
+
+    # Session lifecycle
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None: ...
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None: ...
 ```
 
-## Implementation Plan
+**Key implementation notes:**
+- All lifecycle methods are **sync**. Use background event loop thread (Hindsight pattern) to bridge with CMMS async services.
+- `initialize(**kwargs)` receives `hermes_home` (for profile isolation), `platform`, `agent_context` — use these for path resolution.
+- `prefetch()` should be **fast** — return cached results. Use `queue_prefetch()` for background loading.
+- `sync_turn()` should be **non-blocking** — queue writes via WriterQueue.
+- `on_session_switch()` must flush WriterQueue before updating session cache.
 
-### Step 1: Plugin package structure
+## Implementation
 
-Create `plugins/hermes/provider.py` — the MemoryProvider subclass:
+### Plugin package structure
 
 ```
-memory-server/
+src/memory_server/
 ├── plugins/
 │   ├── __init__.py
 │   ├── hermes/
 │   │   ├── __init__.py
-│   │   ├── provider.py          # HermesProvider(MemoryProvider)
-│   │   ├── config.py            # Plugin config schema
-│   │   └── writer.py            # Writer queue (async batch writer)
+│   │   ├── provider.py          # HermesProvider(MemoryProvider) — entry point
+│   │   ├── config.py            # HermesPluginConfig dataclass
+│   │   └── writer.py            # WriterQueue — async batch writer
 │   └── ...
 ```
 
-Key design decisions:
-- **No new DB tables** — reuses existing CMMS storage through the existing service layer
-- **Writer queue** — async batch writer for `sync_turn` writes (ref: Hindsight pattern)
-- **Mutable config** — `HERMES_CONFIG_PATH` env var or auto-detect via `hermes_home`
+Import path: `memory_server.plugins.hermes.provider.HermesProvider`
 
-### Step 2: HermesProvider implementation
+### HermesProvider implementation
 
 ```python
 class HermesProvider:
@@ -84,94 +103,131 @@ class HermesProvider:
 
     name = "memory_server"
 
-    async def initialize(self):
-        # Connect to CMMS storage (same engine, not a new connection)
-        self._engine = await create_async_engine(...)
-        self._writer = WriterQueue(self._engine)
-        # Start background consolidation if configured
+    def initialize(self, session_id: str, **kwargs) -> None:
+        # kwargs: hermes_home, platform, agent_context
+        self._hermes_home = kwargs.get("hermes_home", "~/.hermes")
+        # Start background event loop (Hindsight pattern)
+        self._loop = _start_background_loop()
+        # Connect to CMMS services
+        self._db_url = resolve_db_url(self._hermes_home)
+        # Start writer queue
+        self._writer = WriterQueue(flush_interval=5.0, max_batch=50)
+        self._writer.start(self._loop)
 
-    async def prefetch(self) -> str | None:
-        """Build system prompt block: recent context, active beliefs, warnings."""
-        # Calls existing CMMS get_context() service internally
-        context = await self._context_service.get_context(
-            task="auto",
-            limit=10
+    def system_prompt_block(self) -> str:
+        """Static provider info for system prompt."""
+        return "Memory provider: CMMS (Composite Memory MCP Server)"
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Fast cached recall. Returns cached context from previous queue_prefetch."""
+        return self._cached_context or ""
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Queue background context load for NEXT turn."""
+        asyncio.run_coroutine_threadsafe(
+            self._load_context_async(query), self._loop
         )
-        return context.to_system_prompt_block() if context.has_items else None
 
-    async def sync_turn(self, messages, turn_id=None):
-        """Observe turn and persist if meaningful."""
-        # Writer queue: batch observations, flush periodically or on switch
-        await self._writer.add_turn(messages, turn_id)
+    def sync_turn(self, user_content: str, assistant_content: str, *,
+                   session_id: str = "", messages=None) -> None:
+        """Queue turn for async batch writing (non-blocking)."""
+        self._writer.add_turn(user_content, assistant_content, messages)
 
-    async def on_session_switch(self, new_session_id, parent_session_id=None,
-                                reset=False, rewound=False):
-        """Flush writer queue, clear agent-specific caches."""
-        await self._writer.flush()
+    def get_tool_schemas(self) -> list[dict]:
+        """Return all 14 CMMS tools as native Hermes schemas (no mcp_ prefix)."""
+        return [...]
+
+    def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        """Route to existing CMMS service layer (in-process, no MCP transport)."""
+        return self._tool_router.call(tool_name, args)
+
+    def on_session_end(self, messages: list) -> None:
+        """Flush writer queue before session closes."""
+        self._writer.flush(timeout=30.0)
+
+    def on_session_switch(self, new_session_id: str, *,
+                           parent_session_id: str = "",
+                           reset: bool = False,
+                           rewound: bool = False,
+                           **kwargs) -> None:
+        """Flush writer queue, update session cache."""
+        self._writer.flush(timeout=30.0)
         self._session_cache.clear()
 
-    async def on_session_end(self):
-        """Final flush before session closes."""
-        await self._writer.flush()
-
-    def get_tool_schemas(self):
-        """Return CMMS MCP tools as native Hermes tool schemas (no mcp_ prefix)."""
-        return [
-            {
-                "name": "remember",
-                "description": "Store a fact with provenance",
-                "parameters": {...}  # same schema as MCP tool
-            },
-            # ... all 14 CMMS tools
-        ]
-
-    async def handle_tool_call(self, name, args):
-        """Route to existing CMMS service, bypassing the MCP transport layer."""
-        return await self._tool_router.call(name, args)
+    def shutdown(self) -> None:
+        """Flush, stop writer queue, close connections."""
+        self._writer.shutdown()
 ```
 
-### Step 3: Writer queue
+### WriterQueue
 
-Async batch writer pattern (ref: Hindsight):
+Async batch writer pattern (ref: Hindsight). **Important: WriterQueue calls `learn()` for each turn** — this triggers FactExtractor + DecisionExtractor + SkillExtractor, each making LLM calls. Cost is proportional to batch size.
 
 ```python
 class WriterQueue:
-    """Non-blocking batch writer with flush-on-switch."""
+    """Non-blocking batch writer with flush-on-switch.
 
-    def __init__(self, engine, flush_interval=5.0, max_batch=50):
+    Each turn in the batch calls learn() which triggers LLM extraction.
+    Configure max_batch to control per-flush LLM cost.
+    """
+
+    def __init__(self, flush_interval=5.0, max_batch=50):
         self._queue = asyncio.Queue()
-        self._flush_interval = flush_interval
+        self._flush_interval = flush_interval   # seconds
         self._max_batch = max_batch
         self._task = None
 
-    async def start(self):
-        self._task = asyncio.create_task(self._run())
+    def start(self, loop):
+        self._task = loop.create_task(self._run())
 
-    async def add_turn(self, messages, turn_id):
-        await self._queue.put((messages, turn_id))
+    def add_turn(self, user_content, assistant_content, messages):
+        self._queue.put_nowait((user_content, assistant_content, messages))
 
-    async def flush(self):
-        # Drain queue synchronously
-        ...
+    def flush(self, timeout=30.0):
+        """Synchronous drain of the queue with configurable timeout."""
+        future = asyncio.run_coroutine_threadsafe(self._drain(), self._loop)
+        future.result(timeout=timeout)
 
-    async def shutdown(self):
+    def shutdown(self):
+        """Flush remaining items, then cancel background task."""
+        self.flush(timeout=30.0)
         self._task.cancel()
 ```
 
-### Step 4: Integration test
+**Risks:**
+- LLM cost: each `learn()` call consumes tokens. At 50 turns/batch, expect ~50 LLM calls per flush.
+- Flush timeout: `learn()` takes ~3s per turn on average, so batch of 50 needs ~150s. Set timeout accordingly (30s default, adjustable).
+- Consider batch-learn API (one LLM call per batch) as deferred optimization.
 
-- Test that HermesProvider can be constructed and initialized
-- Test prefetch returns system prompt block (or None when empty)
-- Test sync_turn writes to writer queue
-- Test on_session_switch flushes the queue
-- Test tool schemas match existing MCP tool schemas
-- Test handle_tool_call routes correctly
+### Timeout policy
 
-**Do NOT test against a running Hermes instance** — mock the ABC.
+| Operation | Timeout | Rationale |
+|-----------|---------|-----------|
+| Tool call (`handle_tool_call`) | 60s | Interactive — user waiting |
+| WriterQueue flush (`on_session_end/switch`) | 30s | Batch of 50 learn() calls @ ~3s each = 150s worst case; timeout at 30s means partial flush |
+| Prefetch (`_load_context_async`) | 10s | Non-interactive, fast path |
+| Shutdown | 30s | Must drain before exit |
+
+### Config schema
+
+```yaml
+# In Hermes config.yaml under memory.providers.memory_server:
+memory:
+  providers:
+    memory_server:
+      plugin: memory_server.plugins.hermes.provider.HermesProvider
+      enabled: true
+      path: ~/memory-server   # auto-resolved relative to hermes_home
+      writer:
+        flush_interval: 5.0   # seconds between auto-flushes
+        max_batch: 50          # max turns per flush
+```
+
+Paths resolve relative to `hermes_home` (passed in `initialize(**kwargs)`) for profile isolation.
 
 ## Tool schemas
 
-All 14 existing CMMS tools are exposed as native Hermes tools:
+All 14 existing CMMS tools are exposed as native Hermes tools (identical schemas, no `mcp_` prefix):
 
 | MCP Tool | Native name | Same schema? | Notes |
 |----------|-------------|-------------|-------|
@@ -190,37 +246,30 @@ All 14 existing CMMS tools are exposed as native Hermes tools:
 | resolve_conflict | ✓ resolve_conflict | yes | Conflict resolution |
 | reflect | ✓ reflect | yes | Belief analysis |
 
-Schemas are identical to MCP — only the transport changes (in-process call vs MCP).
-
-## Config schema
-
-```yaml
-# In Hermes config.yaml under memory.providers.memory_server:
-memory:
-  providers:
-    memory_server:
-      plugin: memory_server.plugins.hermes.provider.HermesProvider
-      enabled: true
-      path: ~/memory-server  # or auto-discover from installation
-      writer:
-        flush_interval: 5.0
-        max_batch: 50
-```
-
 ## Acceptance Criteria
 
-1. ✅ `HermesProvider` meets ABC contract (all methods implemented, no no-op stubs)
-2. ✅ No new DB tables — 0 ALTER TABLE / CREATE TABLE
-3. ✅ `prefetch()` returns valid system prompt block or None (never crashes)
-4. ✅ `sync_turn()` adds to writer queue without blocking
-5. ✅ `on_session_switch()` flushes writer queue
-6. ✅ All 14 CMMS tools exposed as native schemas (verified by diff against MCP schemas)
-7. ✅ Writer queue flushes automatically every `flush_interval` seconds
-8. ✅ Integration tests pass (mock Hermes ABC, real CMMS services)
+1. ✅ `HermesProvider` meets ABC contract (all methods, correct sync signatures, no no-op stubs)
+2. ✅ `is_available()` returns False before `initialize()`, True after
+3. ✅ `initialize()` is idempotent (double-init doesn't crash)
+4. ✅ `initialize()` failure throws exception (no partially-initialized state)
+5. ✅ `system_prompt_block()` returns non-empty string
+6. ✅ `prefetch()` returns cached string or "" — never blocks on I/O
+7. ✅ `queue_prefetch()` returns immediately (queues background load)
+8. ✅ `sync_turn()` adds to writer queue without blocking
+9. ✅ No new DB tables — 0 ALTER TABLE / CREATE TABLE
+10. ✅ All 14 CMMS tools exposed as native schemas (verified by diff against MCP schemas)
+11. ✅ Tool names have no `mcp_` prefix, no special characters
+12. ✅ Writer queue starts/stops cleanly, auto-flushes on interval
+13. ✅ Writer queue flush drains queue, respects max_batch
+14. ✅ `on_session_switch()` flushes writer queue and clears session cache
+15. ✅ `on_session_end()` flushes writer queue
+16. ✅ `shutdown()` drains all pending writes before stopping
+17. ✅ Integration tests pass (mock Hermes ABC, real CMMS services)
+18. ✅ Config loads from dict and env vars, resolves paths relative to hermes_home
 
 ## Non-goals (explicitly deferred)
 
-- **Auto-discovery**: CLI registration (`--install-hermes-plugin`) → Card 002
-- **Dual provider mode**: Both CMMS (MemoryProvider) and built-in Hermes memory → not needed (MemoryManager allows exactly one external provider)
-- **Profile isolation**: Handled by Hermes runtime (passes `hermes_home`) — CMMS just respects it
-- **Production profiles/scripts**: `install.sh` or pip → v0.9
+- **CLI auto-discovery**: `memory-server install-hermes-plugin` → **Card 002**
+- **Batch-learn API**: single LLM call per batch instead of per-turn learn() → deferred
+- **Dual provider mode**: CMMS replaces Hermes built-in provider (MemoryManager allows exactly one external provider)
+- **Production packaging**: `install.sh` or pip extras → v0.9

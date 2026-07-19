@@ -34,3 +34,4 @@ htmlcov/
 *.db
 *.sqlite3
 data/
+.worktrees/

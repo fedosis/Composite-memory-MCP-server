@@ -533,6 +533,95 @@ Disadvantages:
 
 ------------------------------------------------------------------------
 
+# ADR-013: Hermes MemoryProvider Integration — Dual Access Path
+
+## Status
+
+Accepted (v0.8)
+
+## Context
+
+CMMS was designed as an MCP-only memory service per ADR-004 (all agents communicate with memory only through MCP). This works for external agents (Claude Code, OpenClaw) but imposes severe limitations within Hermes:
+
+- **No auto-recall**: Hermes calls `prefetch()` before every turn to inject context; MCP-only servers cannot participate
+- **No auto-retain**: Hermes calls `sync_turn()` after every turn; MCP-only servers miss ongoing conversations
+- **No session hooks**: CMMS cannot flush writer queues on session end/switch
+- **Tool isolation**: CMMS tools appear under `mcp_*` namespace
+
+Hermes already has a solved pattern: the native `MemoryProvider` ABC. Three providers (builtin, Honcho, Hindsight) implement it.
+
+## Decision
+
+CMMS supports **two access paths**:
+
+### Path 1: MCP (for external agents) — ADR-004 preserved
+- MCP transport at `src/memory_server/server.py`
+- All 14 tools available over stdio/HTTP MCP
+- JSON Schema 2020-12 contract validation (`contracts/`)
+
+### Path 2: Hermes MemoryProvider (v0.8)
+- Native `MemoryProvider` plugin at `plugins/hermes/provider.py`
+- Same 14 tools as first-class Hermes tools (no `mcp_` prefix)
+- Lifecycle: `initialize`, `prefetch`, `queue_prefetch`, `sync_turn`, `on_session_end`, `on_session_switch`, `shutdown`
+- Background writer queue for non-blocking writes
+- Single storage engine shared between both paths
+
+### Architecture
+
+```
+External Agents              Hermes Agent
+     |                            |
+     MCP                     MemoryProvider
+     |                            |
+     v                            v
+server.py                  plugins/hermes/provider.py
+     |                            |
+     +------ CMMS Service Layer --+
+                    |
+           Storage (SQLite/Qdrant/Graph)
+```
+
+### Contract Mapping
+
+| Hermes Method | CMMS Service | Description |
+|--------------|--------------|-------------|
+| `initialize(session_id, **kwargs)` | Connect + start writer queue | kwargs: `hermes_home`, `platform`, `agent_context` |
+| `system_prompt_block()` | Static provider info | Memory usage tips |
+| `prefetch(query)` | `get_context()` | Fast cached recall |
+| `queue_prefetch(query)` | Queue next-turn context load | Background |
+| `sync_turn(user, asst, *, messages)` | `learn()` via writer queue | Async batch |
+| `get_tool_schemas()` | All 14 CMMS tools | No `mcp_` prefix |
+| `handle_tool_call(name, args, **kwargs)` | Route to service layer | In-process |
+| `on_session_end(messages)` | Flush writer queue | Cleanup |
+| `on_session_switch(new_id, *, ...)` | Flush + update cache | Rotation |
+| `shutdown()` | Flush, stop, close | Clean exit |
+
+### Security Boundary
+- MemoryProvider is **in-process** (same process, same permissions)
+- No new network-accessible endpoints
+- MCP contract unchanged for external agents
+- Profile isolation via `hermes_home` in initialize kwargs
+
+## Reasons
+- Eliminates gap between "memory provider" and "MCP memory server" within Hermes
+- No data duplication — single storage engine
+- External agents continue using MCP unchanged
+- Pattern proven by Hindsight provider in production
+
+## Consequences
+
+Advantages:
+- Hermes gains auto-recall, auto-retain, session hooks
+- All 14 tools become first-class Hermes tools
+- No MCP transport overhead for Hermes-to-CMMS calls
+
+Disadvantages:
+- Two code paths to maintain (MCP + MemoryProvider)
+- Risk of divergence between paths
+- Sync ABC methods need background thread bridge for async CMMS operations
+
+------------------------------------------------------------------------
+
 # General architectural principles
 
 Composite Memory MCP Server must be:
