@@ -8,7 +8,9 @@ Covers:
 - Full lifecycle: learn -> validate -> trust -> search -> graph -> audit
 """
 
+import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
@@ -16,12 +18,10 @@ from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
 
 from memory_server.api.learn import learn
-from memory_server.api.remember import remember
 from memory_server.evaluation.confidence import ConfidenceEngine
 from memory_server.evaluation.validator import Validator
 from memory_server.models import LifecycleState, VerificationStatus
 from memory_server.providers.sqlite_provider import SQLiteProvider
-
 
 # =============================================================================
 # Direct API-level tests (validator/confidence lifecycle)
@@ -57,11 +57,7 @@ class TestConfidenceLifecycle:
             provider,
             text="Docker is container. decided to use Caddy because simple",
         )
-        total = (
-            len(result["facts"])
-            + len(result["decisions"])
-            + len(result["skills"])
-        )
+        total = len(result["facts"]) + len(result["decisions"]) + len(result["skills"])
         assert len(result["receipts"]) == total
 
     async def test_candidate_to_validated_lifecycle(self):
@@ -150,36 +146,44 @@ class TestConfidenceLifecycle:
         engine = ConfidenceEngine()
 
         # High score: verified source, fresh, corroborated
-        score = engine.score_fact({
-            "source_type": "verified",
-            "created_at": None,  # fresh = no age decay
-            "corroboration_count": 3,
-            "conflict_count": 0,
-        })
+        score = engine.score_fact(
+            {
+                "source_type": "verified",
+                "created_at": None,  # fresh = no age decay
+                "corroboration_count": 3,
+                "conflict_count": 0,
+            }
+        )
         assert score > 0.8
 
         # Low score: unknown source, conflicted
-        score = engine.score_fact({
-            "source_type": "unknown",
-            "created_at": None,
-            "corroboration_count": 0,
-            "conflict_count": 2,
-        })
+        score = engine.score_fact(
+            {
+                "source_type": "unknown",
+                "created_at": None,
+                "corroboration_count": 0,
+                "conflict_count": 2,
+            }
+        )
         assert score < 0.5
 
         # Corroboration detection
-        strength = engine.corroboration([
-            {"subject": "A", "predicate": "is", "object": "X", "source": "s1"},
-            {"subject": "A", "predicate": "is", "object": "X", "source": "s2"},
-            {"subject": "A", "predicate": "is", "object": "X", "source": "s3"},
-        ])
+        strength = engine.corroboration(
+            [
+                {"subject": "A", "predicate": "is", "object": "X", "source": "s1"},
+                {"subject": "A", "predicate": "is", "object": "X", "source": "s2"},
+                {"subject": "A", "predicate": "is", "object": "X", "source": "s3"},
+            ]
+        )
         assert strength == 1.0
 
         # Conflict detection
-        conflicts = engine.conflict_detection([
-            {"subject": "A", "predicate": "is", "object": "X"},
-            {"subject": "A", "predicate": "is", "object": "Y"},
-        ])
+        conflicts = engine.conflict_detection(
+            [
+                {"subject": "A", "predicate": "is", "object": "X"},
+                {"subject": "A", "predicate": "is", "object": "Y"},
+            ]
+        )
         assert len(conflicts) == 1
 
 
@@ -189,8 +193,14 @@ class TestConfidenceLifecycle:
 
 
 @pytest.fixture
-def server_params():
-    return StdioServerParameters(command="memory-server", args=["serve"])
+def server_params(tmp_path: Path) -> StdioServerParameters:
+    """Return isolated server params — each test gets a unique DB file in tmp_path."""
+    return StdioServerParameters(
+        command="memory-server",
+        args=["serve"],
+        cwd=str(tmp_path),
+        env={"MEMORY_SERVER_DB_URL": f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}"},
+    )
 
 
 @pytest.mark.asyncio
@@ -207,7 +217,11 @@ class TestV05MCPIntegration:
         return json.loads(text)
 
     async def test_remember_auto_indexed_semantic_search_finds_it(self, server_params):
-        """remember() -> auto-indexed -> semantic_search finds it."""
+        """remember() -> auto-indexed -> semantic_search finds it.
+
+        Uses MCP subprocess (clean interpreter, no env_logger conflicts) with
+        a retry loop for the background outbox worker's 1s poll interval.
+        """
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -225,15 +239,22 @@ class TestV05MCPIntegration:
                 )
                 assert "receipt" in remember_data
 
-                # Semantic search should find it by meaning
-                search_data = await self._call_and_parse(
-                    session,
-                    "semantic_search",
-                    arguments={"query": "PostgreSQL stores", "top_k": 5},
-                )
-                # Could be a rule match or semantic result
-                if "semantic_results" in search_data:
-                    assert len(search_data["semantic_results"]) > 0
+                # Retry semantic_search until the background outbox worker
+                # has processed the entry (1s poll interval, so 5s is safe).
+                found = False
+                for attempt in range(5):
+                    search_data = await self._call_and_parse(
+                        session,
+                        "semantic_search",
+                        arguments={"query": "PostgreSQL stores", "top_k": 5},
+                    )
+                    if "semantic_results" in search_data:
+                        if len(search_data["semantic_results"]) > 0:
+                            found = True
+                            break
+                    await asyncio.sleep(1)
+
+                assert found, "semantic_search should find the indexed fact after background outbox worker processes it"
 
     async def test_learn_auto_synced_graph_search_finds_entities(self, server_params):
         """learn() -> auto-synced to graph -> graph_search finds entities."""

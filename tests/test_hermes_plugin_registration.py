@@ -23,6 +23,13 @@ import pytest
 
 from memory_server.plugins.hermes import HermesProvider, register
 
+# Import Hermes plugin stubs so tests are hermetic (no dependency on Hermes' plugins.memory).
+from tests._hermes_plugin_stubs import (
+    _FakeCollector,
+    _is_memory_provider_dir,
+    _load_provider_from_dir,
+)
+
 # ===========================================================================
 # Test 1: register() with a _ProviderCollector mock
 # ===========================================================================
@@ -81,19 +88,6 @@ class TestProviderCollectorIntegration:
         provider.shutdown()
 
 
-class _FakeCollector:
-    """Minimal replica of Hermes's _ProviderCollector (plugins/memory/__init__.py)."""
-
-    def __init__(self):
-        self.provider = None
-
-    def register_memory_provider(self, provider):
-        self.provider = provider
-
-    def register_tool(self, *args, **kwargs):
-        pass
-
-
 # ===========================================================================
 # Test 3: Full Hermes discovery from a temp HERMES_HOME
 # ===========================================================================
@@ -133,9 +127,7 @@ def register(ctx) -> None:
 
             self._make_shim(plugin_dir)
 
-            # Simulate Hermes discovery
-            from plugins.memory import _load_provider_from_dir
-
+            # Simulate Hermes discovery (using hermetic stubs)
             provider = _load_provider_from_dir(plugin_dir)
             assert provider is not None
             assert provider.name == "memory_server"
@@ -149,10 +141,7 @@ def register(ctx) -> None:
             plugin_dir.mkdir(parents=True)
             self._make_shim(plugin_dir)
 
-            # We can't monkeypatch _get_user_plugins_dir here,
-            # but we can call the lower-level functions directly.
-            from plugins.memory import _load_provider_from_dir
-
+            # Use hermetic stubs instead of Hermes' internal plugins.memory
             provider = _load_provider_from_dir(plugin_dir)
             assert provider is not None
             assert provider.name == "memory_server"
@@ -175,8 +164,7 @@ def register(ctx) -> None:
             plugin_dir.mkdir(parents=True)
             self._make_shim(plugin_dir)
 
-            from plugins.memory import _is_memory_provider_dir
-
+            # Use hermetic stubs instead of Hermes' internal plugins.memory
             assert _is_memory_provider_dir(plugin_dir) is True
 
 
@@ -204,7 +192,8 @@ def register(ctx):
             )
 
             spec = importlib.util.spec_from_file_location(
-                "test_shim", str(init_file),
+                "test_shim",
+                str(init_file),
                 submodule_search_locations=[str(plugin_dir)],
             )
             mod = importlib.util.module_from_spec(spec)
@@ -273,6 +262,7 @@ class TestHermesProviderAbcCompliance:
             config={"db_url": "sqlite+aiosqlite://"},
         )
         import json
+
         result = json.loads(provider.handle_tool_call("ping", {}))
         assert result["status"] == "ok"
         provider.shutdown()

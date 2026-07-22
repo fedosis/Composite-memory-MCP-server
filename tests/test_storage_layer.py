@@ -7,21 +7,13 @@
 """
 
 import os
-import tempfile
 
 import pytest
-
-from memory_server.models import Decision, Entity, Fact, MemoryReceipt, Skill, VerificationStatus
-from memory_server.providers.sqlite_provider import SQLiteProvider
 from storage.base import Base as StorageBase
 from storage.models import (
-    DecisionORM,
     EntityORM,
-    FactORM,
     LifecycleEventORM,
     LifecycleStateORM,
-    MemoryReceiptORM,
-    SkillORM,
 )
 from storage.repositories import (
     DecisionRepository,
@@ -31,6 +23,8 @@ from storage.repositories import (
     SkillRepository,
 )
 
+from memory_server.models import Decision, Fact, MemoryReceipt, Skill
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 # =============================================================================
 # Migration tests
@@ -131,11 +125,24 @@ class TestMigration:
 
         project_dir = os.path.join(os.path.dirname(__file__), "..")
 
-        # Find the migration file
+        # Find the initial migration file (the root revision with down_revision = None)
         migration_dir = os.path.join(project_dir, "migrations", "versions")
-        migration_files = [f for f in os.listdir(migration_dir) if f.endswith(".py")]
-        assert len(migration_files) == 1, f"Expected 1 migration file, got {len(migration_files)}"
-        migration_path = os.path.join(migration_dir, migration_files[0])
+        migration_files = sorted(f for f in os.listdir(migration_dir) if f.endswith(".py"))
+        assert len(migration_files) >= 1, f"Expected >=1 migration file, got {len(migration_files)}"
+        # The initial migration has down_revision = None (root revision);
+        migration_path = migration_dir
+        initial_migration = None
+        for f in migration_files:
+            fp = os.path.join(migration_dir, f)
+            with open(fp) as fh:
+                content = fh.read()
+            if re.search(r"down_revision[^=]*=\s*None\b", content):
+                initial_migration = fp
+                break
+        assert initial_migration is not None, (
+            f"No initial migration found (down_revision = None) among {migration_files}"
+        )
+        migration_path = initial_migration
 
         # Read the migration file to verify downgrade has all DROP TABLEs
         with open(migration_path) as f:
@@ -154,8 +161,15 @@ class TestMigration:
 
             sql_output = result.stdout
             # Verify upgrade creates all 7 tables
-            for table in ["facts", "decisions", "skills", "receipts", "entities",
-                          "lifecycle_events", "lifecycle_states"]:
+            for table in [
+                "facts",
+                "decisions",
+                "skills",
+                "receipts",
+                "entities",
+                "lifecycle_events",
+                "lifecycle_states",
+            ]:
                 assert f"CREATE TABLE {table}" in sql_output, f"Missing CREATE TABLE {table}"
         finally:
             memory_db = os.path.join(project_dir, "memory.db")
@@ -165,8 +179,13 @@ class TestMigration:
         # Verify downgrade function drops all 7 tables
         assert "def downgrade()" in content
         expected_drops = [
-            "skills", "receipts", "lifecycle_states", "lifecycle_events",
-            "facts", "entities", "decisions",
+            "skills",
+            "receipts",
+            "lifecycle_states",
+            "lifecycle_events",
+            "facts",
+            "entities",
+            "decisions",
         ]
         for table in expected_drops:
             assert f"drop_table('{table}')" in content or f'drop_table("{table}")' in content
@@ -358,7 +377,6 @@ class TestReceiptRepositoryCRUD:
 
     @pytest.fixture
     async def repo(self):
-        from datetime import datetime, timezone
         from sqlalchemy.ext.asyncio import (
             AsyncSession,
             async_sessionmaker,
@@ -391,14 +409,20 @@ class TestReceiptRepositoryCRUD:
 
         await repo.create(
             MemoryReceipt(
-                id="rs1", memory_type="fact", source="s1",
-                created_by="u1", timestamp=datetime.now(timezone.utc),
+                id="rs1",
+                memory_type="fact",
+                source="s1",
+                created_by="u1",
+                timestamp=datetime.now(timezone.utc),
             )
         )
         await repo.create(
             MemoryReceipt(
-                id="rs2", memory_type="skill", source="s2",
-                created_by="u1", timestamp=datetime.now(timezone.utc),
+                id="rs2",
+                memory_type="skill",
+                source="s2",
+                created_by="u1",
+                timestamp=datetime.now(timezone.utc),
             )
         )
         results = await repo.search(memory_type="fact")
@@ -483,7 +507,6 @@ class TestSQLiteProviderBackwardCompat:
         assert await provider.delete_fact("bc-f5") is True
 
     async def test_create_decision(self, provider):
-        from datetime import datetime, timezone
 
         d = Decision(id="bc-d1", context="Test", choice="A", reason="R")
         created = await provider.create_decision(d)
@@ -532,8 +555,11 @@ class TestSQLiteProviderBackwardCompat:
         from datetime import datetime, timezone
 
         r = MemoryReceipt(
-            id="bc-r1", memory_type="fact", source="agent",
-            created_by="test", timestamp=datetime.now(timezone.utc),
+            id="bc-r1",
+            memory_type="fact",
+            source="agent",
+            created_by="test",
+            timestamp=datetime.now(timezone.utc),
         )
         created = await provider.create_receipt(r)
         assert created.id == "bc-r1"
@@ -542,8 +568,11 @@ class TestSQLiteProviderBackwardCompat:
         from datetime import datetime, timezone
 
         r = MemoryReceipt(
-            id="bc-r2", memory_type="decision", source="user",
-            created_by="alice", timestamp=datetime.now(timezone.utc),
+            id="bc-r2",
+            memory_type="decision",
+            source="user",
+            created_by="alice",
+            timestamp=datetime.now(timezone.utc),
         )
         await provider.create_receipt(r)
         retrieved = await provider.get_receipt("bc-r2")
@@ -554,8 +583,11 @@ class TestSQLiteProviderBackwardCompat:
 
         await provider.create_receipt(
             MemoryReceipt(
-                id="bc-r3", memory_type="fact", source="src1",
-                created_by="u1", timestamp=datetime.now(timezone.utc),
+                id="bc-r3",
+                memory_type="fact",
+                source="src1",
+                created_by="u1",
+                timestamp=datetime.now(timezone.utc),
             )
         )
         results = await provider.search_receipts(source="src1")

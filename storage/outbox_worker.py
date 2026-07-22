@@ -115,7 +115,10 @@ class OutboxWorker:
             if not entries:
                 return
 
-            logger.debug("Outbox worker processing %d entries", len(entries))
+            logger.debug(
+                "Outbox worker found %d pending entries",
+                len(entries),
+            )
 
             for entry in entries:
                 await self._process_entry(session, repo, entry)
@@ -202,6 +205,8 @@ class OutboxWorker:
                         "memory_type": "fact",
                     },
                 )
+            else:
+                logger.warning("_process_index_fact: no vector provider — skipping upsert")
 
         # Sync to graph (idempotent — additive)
         if self._graph_router:

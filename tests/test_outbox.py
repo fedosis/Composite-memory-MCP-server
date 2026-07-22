@@ -11,27 +11,25 @@ import asyncio
 import json
 import os
 import subprocess
-import sys
 import uuid
 from datetime import datetime, timezone
 
 import pytest
-
-from memory_server.models import Fact, MemoryReceipt, VerificationStatus
-from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
-from memory_server.providers.qdrant_provider import QdrantProvider
-from memory_server.providers.graph_provider import SimpleGraph
-from memory_server.providers.sqlite_provider import SQLiteProvider
-from memory_server.router.graph_router import GraphRouter
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 from storage.base import Base
-from storage.outbox import OutboxEntryORM, OutboxEntry, OutboxRepository
+from storage.outbox import OutboxEntry, OutboxEntryORM, OutboxRepository
 from storage.outbox_worker import OutboxWorker
 
+from memory_server.models import Fact, MemoryReceipt, VerificationStatus
+from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+from memory_server.providers.graph_provider import SimpleGraph
+from memory_server.providers.qdrant_provider import QdrantProvider
+from memory_server.providers.sqlite_provider import SQLiteProvider
+from memory_server.router.graph_router import GraphRouter
 
 # =============================================================================
 # Fixtures
@@ -258,9 +256,7 @@ class TestOutboxRepository:
 class TestOutboxWorker:
     """Test the outbox worker processes entries correctly."""
 
-    async def test_process_fact_index_updates_qdrant_and_graph(
-        self, outbox_worker, qdrant_provider, embedder
-    ):
+    async def test_process_fact_index_updates_qdrant_and_graph(self, outbox_worker, qdrant_provider, embedder):
         """Add a fact outbox entry → worker processes it → Qdrant + graph updated."""
         graph = outbox_worker._graph_router.graph
 
@@ -295,10 +291,7 @@ class TestOutboxWorker:
             limit=5,
             score_threshold=0.0,
         )
-        found = any(
-            r["payload"].get("subject") == "Docker"
-            for r in search_results
-        )
+        found = any(r["payload"].get("subject") == "Docker" for r in search_results)
         assert found, "Fact should be indexed in Qdrant"
 
         # Verify graph was updated
@@ -306,9 +299,7 @@ class TestOutboxWorker:
         assert subject_node is not None, "Subject should exist in graph (id='docker')"
         assert subject_node.type == "entity"
 
-    async def test_process_decision_index_updates_graph(
-        self, outbox_worker
-    ):
+    async def test_process_decision_index_updates_graph(self, outbox_worker):
         """Add a decision outbox entry → worker processes it → graph updated."""
         graph = outbox_worker._graph_router.graph
         async with outbox_worker._session_factory() as session:
@@ -334,9 +325,7 @@ class TestOutboxWorker:
         assert decision_node is not None, "Decision node should exist in graph"
         assert decision_node.type == "decision"
 
-    async def test_process_skill_index_updates_graph(
-        self, outbox_worker
-    ):
+    async def test_process_skill_index_updates_graph(self, outbox_worker):
         """Add a skill outbox entry → worker processes it → graph updated."""
         graph = outbox_worker._graph_router.graph
         async with outbox_worker._session_factory() as session:
@@ -428,7 +417,7 @@ class TestOutboxWorker:
             repo = OutboxRepository(session)
 
             for i in range(3):
-                c = await repo.increment_retry(entry_id, f"error #{i + 1}")
+                _ = await repo.increment_retry(entry_id, f"error #{i + 1}")
                 await session.commit()
 
             await repo.mark_failed(entry_id, "exhausted all retries")
@@ -557,9 +546,7 @@ class TestServerOutboxIntegration:
             record_type="fact",
             record_id="f1",
             operation="index_fact",
-            payload_json=json.dumps(
-                {"subject": "Test", "predicate": "is", "object": "Val"}
-            ),
+            payload_json=json.dumps({"subject": "Test", "predicate": "is", "object": "Val"}),
         )
         payload = entry.payload
         assert payload["subject"] == "Test"
@@ -595,17 +582,13 @@ class TestServerOutboxIntegration:
         project_dir = os.path.join(os.path.dirname(__file__), "..")
 
         result = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
+            ["alembic", "upgrade", "head", "--sql"],
             cwd=project_dir,
             capture_output=True,
             text=True,
             timeout=30,
         )
-        assert result.returncode == 0, (
-            f"alembic upgrade --sql failed: {result.stderr}"
-        )
+        assert result.returncode == 0, f"alembic upgrade --sql failed: {result.stderr}"
 
         sql_output = result.stdout
-        assert "CREATE TABLE outbox_entries" in sql_output, (
-            "Migration should create outbox_entries table"
-        )
+        assert "CREATE TABLE outbox_entries" in sql_output, "Migration should create outbox_entries table"

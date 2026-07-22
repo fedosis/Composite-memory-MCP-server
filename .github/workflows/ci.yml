@@ -55,7 +55,7 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
       - name: Validate JSON schemas
-        run: python3 -c "import json, os; [json.load(open(f'contracts/{f}')) for f in os.listdir('contracts')]"
+        run: python3 -c "import json, glob; [json.load(open(f)) for f in glob.glob('contracts/*.schema.json')]"
       - name: Run schema / contract tests
         run: pytest tests/ -q -k "schema or contract"
 
@@ -94,6 +94,7 @@ jobs:
           /tmp/cmms-wheel-smoke/bin/memory-server --help
           /tmp/cmms-wheel-smoke/bin/python - <<'PY'
           import asyncio
+          import os
           import tempfile
 
           from mcp import ClientSession, StdioServerParameters
@@ -102,7 +103,13 @@ jobs:
 
           async def main() -> None:
               with tempfile.TemporaryDirectory() as tmpdir:
-                  params = StdioServerParameters(command="memory-server", args=["serve"], cwd=tmpdir)
+                  venv_bin = "/tmp/cmms-wheel-smoke/bin"
+                  params = StdioServerParameters(
+                      command=os.path.join(venv_bin, "memory-server"),
+                      args=["serve"],
+                      cwd=tmpdir,
+                      env={"PATH": venv_bin + ":" + os.environ.get("PATH", "")},
+                  )
                   async with stdio_client(params) as (read, write):
                       async with ClientSession(read, write) as session:
                           await session.initialize()

@@ -64,17 +64,23 @@ _outbox_task: asyncio.Task | None = None
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     """FastMCP lifespan: start providers + outbox worker on boot, stop gracefully on shutdown."""
+    global _outbox_task, _outbox_worker, _provider
     # --- Startup ---
     logger.info("Starting Composite Memory MCP Server...")
     provider = await _get_provider()
     worker = await _get_outbox_worker()
+
+    # Start background polling task (only in lifespan — tests use process_all_pending directly)
+    if _outbox_task is None or _outbox_task.done():
+        _outbox_task = asyncio.create_task(worker.run())
+        logger.info("Outbox worker background task started")
+
     logger.info("Server initialized — provider ready, outbox worker started")
 
     yield {"provider": provider, "outbox_worker": worker}
 
     # --- Shutdown ---
     logger.info("Shutting down Composite Memory MCP Server...")
-    global _outbox_task, _outbox_worker, _provider
 
     if _outbox_task and not _outbox_task.done():
         _outbox_task.cancel()
@@ -172,22 +178,28 @@ async def _get_outbox_worker() -> OutboxWorker:
     Starts the worker as a background asyncio task on first access.
     The worker polls the outbox table and processes pending entries.
     """
-    global _outbox_worker, _outbox_task
+    global _outbox_worker, _outbox_task, _embedder
     if _outbox_worker is None:
         provider = await _get_provider()
         _chart_router = await _get_graph_router()
+
+        # Resolve the active vector provider (LanceDB by default) and
+        # embedder so the outbox worker actually writes vectors instead
+        # of silently no-oping because both were module-level None.
+        vector_provider = await _get_vector_provider()
+        if _embedder is None:
+            from memory_server.providers.embedding_provider import (
+                SentenceTransformerEmbeddingProvider,
+            )
+            _embedder = SentenceTransformerEmbeddingProvider()
+
         _outbox_worker = OutboxWorker(
             engine=provider.engine,
-            qdrant=_qdrant,
+            qdrant=vector_provider,
             embedder=_embedder,
             graph_router=_chart_router,
         )
         await _outbox_worker.initialize()
-
-        # Start background polling task
-        if _outbox_task is None or _outbox_task.done():
-            _outbox_task = asyncio.create_task(_outbox_worker.run())
-            logger.info("Outbox worker background task started")
     return _outbox_worker
 
 
@@ -336,6 +348,20 @@ async def learn_tool(
         return json.dumps(result)
 
 
+def _serialize_route_result(result: dict) -> str:
+    """Serialize a route/semantic-search result dict, converting RankResult objects to dicts.
+
+    HybridRouter.route() returns ``all_results`` as ``list[RankResult]`` (dataclass
+    instances) alongside the already-serialized ``ranked_results`` (``list[dict]``).
+    Python's JSON encoder cannot serialize dataclasses, so we convert
+    ``all_results`` to plain dicts before calling ``json.dumps``.
+    """
+    if isinstance(result, dict) and "all_results" in result:
+        result = dict(result)  # shallow copy — don't mutate caller's dict
+        result["all_results"] = [r.__dict__ for r in result["all_results"]]
+    return json.dumps(result)
+
+
 @mcp.tool(name="semantic_search")
 async def semantic_search_tool(
     query: str = "",
@@ -361,7 +387,7 @@ async def semantic_search_tool(
             top_k=top_k,
             score_threshold=score_threshold,
         )
-        return json.dumps(results)
+        return _serialize_route_result(results)
 
 
 async def _get_graph_router() -> GraphRouter:
@@ -490,7 +516,7 @@ async def route_tool(
             top_k=top_k,
             score_threshold=score_threshold,
         )
-        return json.dumps(result)
+        return _serialize_route_result(result)
 
 
 @mcp.tool(name="audit")

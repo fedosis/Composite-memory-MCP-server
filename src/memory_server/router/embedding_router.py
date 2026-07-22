@@ -137,4 +137,9 @@ class EmbeddingRouter:
             limit=top_k,
             score_threshold=score_threshold,
         )
+        logger.debug(
+            "semantic_search: query=%r top_k=%d found=%d provider=%s",
+            query, top_k, len(results),
+            type(self._vector_provider).__name__,
+        )
         return results

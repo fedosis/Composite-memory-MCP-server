@@ -8,7 +8,6 @@ Run: pytest tests/test_comparative.py -v -s
 
 import asyncio
 import json
-import logging
 import os
 import statistics
 import time
@@ -88,26 +87,26 @@ ALL_FACTS: list[tuple[str, str, str]] = []
 for _facts in TOPICS.values():
     ALL_FACTS.extend(_facts)
 
-ALL_FACTS_KEYS = {
-    i: f"{s}|{p}|{o}" for i, (s, p, o) in enumerate(ALL_FACTS)
-}
+ALL_FACTS_KEYS = {i: f"{s}|{p}|{o}" for i, (s, p, o) in enumerate(ALL_FACTS)}
 
 PROBE_QUERIES: list[dict[str, Any]] = [
     {"query": "Docker container setup", "expected_facts": set(range(0, 10))},
     {"query": "database connection PostgreSQL", "expected_facts": set(range(10, 20))},
-    {"query": "web server port configuration", "expected_facts": set(list(range(20, 30)) + list(range(40, 50)) + list(range(30, 40)))},
+    {
+        "query": "web server port configuration",
+        "expected_facts": set(list(range(20, 30)) + list(range(40, 50)) + list(range(30, 40))),
+    },
     {"query": "postgreSQL backup", "expected_facts": set(list(range(10, 20)) + list(range(45, 50)))},
     {"query": "nginx reverse proxy", "expected_facts": set(list(range(30, 35)) + list(range(20, 30)))},
 ]
 
-NOISE_FACTS: list[tuple[str, str, str]] = [
-    (f"syslog-{i}", "level", "info") for i in range(50)
-] + [
+NOISE_FACTS: list[tuple[str, str, str]] = [(f"syslog-{i}", "level", "info") for i in range(50)] + [
     (f"tempfile-{i}", "owner", "root") for i in range(50)
 ]
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────
+
 
 def _fact_key_from_dict(r: dict) -> str:
     return f"{r.get('subject', '')}|{r.get('predicate', '')}|{r.get('object', '')}"
@@ -142,19 +141,21 @@ def _get_vmrss_kb() -> int:
 
 # ─── Provider Wrappers ──────────────────────────────────────────────────
 
+
 class CMMSProvider:
     """In-process CMMS via mcp.call_tool using file-based DB."""
 
     def __init__(self):
         from memory_server.server import mcp
+
         self._mcp = mcp
         self._db_path = f"/tmp/cmms_benchmark_{uuid4().hex}.db"
 
     async def initialize(self):
         # Override the global provider singleton with a file-based DB
         # (avoiding :memory: pool issues with aiosqlite)
-        from memory_server.providers.sqlite_provider import SQLiteProvider
         import memory_server.server as srv
+        from memory_server.providers.sqlite_provider import SQLiteProvider
 
         p = SQLiteProvider(url=f"sqlite+aiosqlite:///{self._db_path}")
         await p.initialize()
@@ -162,6 +163,7 @@ class CMMSProvider:
 
     async def close(self):
         from memory_server.server import _provider, _qdrant
+
         if _provider:
             await _provider.close()
         if _qdrant:
@@ -180,9 +182,14 @@ class CMMSProvider:
         return json.loads(content_list[0].text)
 
     async def remember(self, subject: str, predicate: str, object_: str) -> dict:
-        return await self._call("remember", {
-            "subject": subject, "predicate": predicate, "object": object_,
-        })
+        return await self._call(
+            "remember",
+            {
+                "subject": subject,
+                "predicate": predicate,
+                "object": object_,
+            },
+        )
 
     async def search(self, query: str, limit: int = 10) -> list[dict]:
         """CMMS hybrid search via semantic_search (rules + embeddings)."""
@@ -197,10 +204,12 @@ class CMMSProvider:
         semantic = result.get("semantic_results", [])
         if semantic:
             return [
-                {"subject": s.get("payload", {}).get("subject", ""),
-                 "predicate": s.get("payload", {}).get("predicate", ""),
-                 "object": s.get("payload", {}).get("object", ""),
-                 "score": s.get("score", 0.0)}
+                {
+                    "subject": s.get("payload", {}).get("subject", ""),
+                    "predicate": s.get("payload", {}).get("predicate", ""),
+                    "object": s.get("payload", {}).get("object", ""),
+                    "score": s.get("score", 0.0),
+                }
                 for s in semantic
             ]
         return []
@@ -216,9 +225,11 @@ class CMMSProvider:
         semantic = result.get("semantic_results", [])
         if semantic:
             return [
-                {"subject": s.get("payload", {}).get("subject", ""),
-                 "predicate": s.get("payload", {}).get("predicate", ""),
-                 "object": s.get("payload", {}).get("object", "")}
+                {
+                    "subject": s.get("payload", {}).get("subject", ""),
+                    "predicate": s.get("payload", {}).get("predicate", ""),
+                    "object": s.get("payload", {}).get("object", ""),
+                }
                 for s in semantic
             ]
         # Stage 3 (graph): parse entities/relations
@@ -230,7 +241,13 @@ class CMMSProvider:
             for e in entities:
                 out.append({"subject": e.get("name", ""), "predicate": "entity", "object": e.get("type", "")})
             for r in relations:
-                out.append({"subject": r.get("source_id", ""), "predicate": r.get("relation", ""), "object": r.get("target_id", "")})
+                out.append(
+                    {
+                        "subject": r.get("source_id", ""),
+                        "predicate": r.get("relation", ""),
+                        "object": r.get("target_id", ""),
+                    }
+                )
             return out[:limit]
         return []
 
@@ -247,10 +264,9 @@ class ChromaDBProvider:
     async def initialize(self):
         import chromadb
         from sentence_transformers import SentenceTransformer
+
         loop = asyncio.get_event_loop()
-        self._embedder = await loop.run_in_executor(
-            None, lambda: SentenceTransformer("all-MiniLM-L6-v2")
-        )
+        self._embedder = await loop.run_in_executor(None, lambda: SentenceTransformer("all-MiniLM-L6-v2"))
         self._client = await loop.run_in_executor(
             None,
             lambda: chromadb.Client(chromadb.Settings(anonymized_telemetry=False)),
@@ -259,9 +275,7 @@ class ChromaDBProvider:
             await loop.run_in_executor(None, self._client.delete_collection, "memories")
         except Exception:
             pass
-        self._collection = await loop.run_in_executor(
-            None, lambda: self._client.create_collection("memories")
-        )
+        self._collection = await loop.run_in_executor(None, lambda: self._client.create_collection("memories"))
 
     async def close(self):
         pass
@@ -276,7 +290,10 @@ class ChromaDBProvider:
         await loop.run_in_executor(
             None,
             lambda: self._collection.add(
-                ids=[doc_id], embeddings=[emb.tolist()], metadatas=[metadata], documents=[text],
+                ids=[doc_id],
+                embeddings=[emb.tolist()],
+                metadatas=[metadata],
+                documents=[text],
             ),
         )
         return {"id": doc_id, "subject": subject, "predicate": predicate, "object": object_}
@@ -287,18 +304,21 @@ class ChromaDBProvider:
         result = await loop.run_in_executor(
             None,
             lambda: self._collection.query(
-                query_embeddings=[emb.tolist()], n_results=min(limit, 100),
+                query_embeddings=[emb.tolist()],
+                n_results=min(limit, 100),
             ),
         )
         results = []
         metadatas = result.get("metadatas", [[]])[0]
         if metadatas:
             for m in metadatas:
-                results.append({
-                    "subject": m.get("subject", ""),
-                    "predicate": m.get("predicate", ""),
-                    "object": m.get("object", ""),
-                })
+                results.append(
+                    {
+                        "subject": m.get("subject", ""),
+                        "predicate": m.get("predicate", ""),
+                        "object": m.get("object", ""),
+                    }
+                )
         return results
 
 
@@ -310,6 +330,7 @@ class SQLiteOnlyProvider:
 
     async def initialize(self):
         from memory_server.providers.sqlite_provider import SQLiteProvider
+
         self._provider = SQLiteProvider(url="sqlite+aiosqlite:///:memory:")
         await self._provider.initialize()
 
@@ -319,7 +340,9 @@ class SQLiteOnlyProvider:
 
     async def remember(self, subject: str, predicate: str, object_: str) -> dict:
         from datetime import datetime, timezone
+
         from memory_server.models import Fact
+
         fact = Fact(
             id=str(uuid4()),
             subject=subject,
@@ -330,16 +353,15 @@ class SQLiteOnlyProvider:
             created_at=datetime.now(timezone.utc),
         )
         stored = await self._provider.create_fact(fact)
-        return {"id": stored.id, "subject": stored.subject,
-                "predicate": stored.predicate, "object": stored.object}
+        return {"id": stored.id, "subject": stored.subject, "predicate": stored.predicate, "object": stored.object}
 
     async def search(self, query: str, limit: int = 10) -> list[dict]:
         facts = await self._provider.search_facts(text=query, limit=limit)
-        return [{"subject": f.subject, "predicate": f.predicate, "object": f.object}
-                for f in facts]
+        return [{"subject": f.subject, "predicate": f.predicate, "object": f.object} for f in facts]
 
 
 # ─── Provider factory ───────────────────────────────────────────────────
+
 
 async def _make_provider(name: str):
     if name == "cmms":
@@ -429,18 +451,17 @@ async def _run_multi_hop():
                 facts = await p.search("What runs on the machine that hosts Docker?", limit=10)
 
             result_text = " ".join(
-                f"{f.get('subject','')} {f.get('predicate','')} {f.get('object','')}"
-                for f in facts
+                f"{f.get('subject', '')} {f.get('predicate', '')} {f.get('object', '')}" for f in facts
             ).lower()
             has_postgres = "postgresql" in result_text or "16.1" in result_text
             has_ip = "10.0.0.42" in result_text
             has_server = any(
-                "server" in str(f.get("subject","")).lower()
-                or "server" in str(f.get("object","")).lower()
+                "server" in str(f.get("subject", "")).lower()
+                or "server" in str(f.get("object", "")).lower()
                 or "server-alpha" in result_text
                 for f in facts
             )
-            has_docker = any("docker" in str(f.get("subject","")).lower() for f in facts)
+            has_docker = any("docker" in str(f.get("subject", "")).lower() for f in facts)
 
             if has_postgres or has_ip:
                 score = 3
@@ -451,13 +472,15 @@ async def _run_multi_hop():
             else:
                 score = 0
 
-            label = {3: "✅ 2+ hops (PostgreSQL/IP found)",
-                     2: "⚠  1 hop (server-alpha found)",
-                     1: "❌ Docker only (0 hops)",
-                     0: "❌ No results"}[score]
+            label = {
+                3: "✅ 2+ hops (PostgreSQL/IP found)",
+                2: "⚠  1 hop (server-alpha found)",
+                1: "❌ Docker only (0 hops)",
+                0: "❌ No results",
+            }[score]
             print(f"  {prov_name:<8} score={score}/3  {label}")
             for f in facts[:5]:
-                print(f"             {f.get('subject','')} → {f.get('predicate','')} → {f.get('object','')}")
+                print(f"             {f.get('subject', '')} → {f.get('predicate', '')} → {f.get('object', '')}")
             results[prov_name] = score
         finally:
             await p.close()
@@ -497,7 +520,7 @@ async def _run_noise_resilience():
 
 async def _run_hybrid_routing():
     """Exact IP query — tests whether CMMS rules catch it before vector search.
-    
+
     CMMS should route to Stage 1 (rules engine, microsecond-fast) for queries
     matching the ip_address_query rule, avoiding vector search entirely.
     """
@@ -524,7 +547,9 @@ async def _run_hybrid_routing():
                 kw_facts = await p._call("search", {"query": "ip_address", "limit": 5})
                 kw_results = kw_facts.get("results", [])
                 correct = any("10.0.0.42" in f.get("object", "") for f in kw_results)
-                print(f"             SQL fallback: {'✅ found' if correct else '❌ not found'} via keyword 'ip_address'")
+                print(
+                    f"             SQL fallback: {'✅ found' if correct else '❌ not found'} via keyword 'ip_address'"
+                )
                 results[prov_name] = {"stage": stage, "latency_ms": route_latency, "correct": correct}
             else:
                 facts = await p.search("What is the IP of server-alpha?", limit=5)
@@ -551,17 +576,26 @@ async def _run_performance():
         p = await _make_provider(prov_name)
         try:
             # ── Throughput ──
-            N = 100
+            n = 100
             t0 = time.perf_counter()
-            for i in range(N):
+            for i in range(n):
                 await p.remember(f"perf-{i}", "attr", f"val-{i}")
             elapsed = time.perf_counter() - t0
-            fps = N / elapsed if elapsed > 0 else 0
+            fps = n / elapsed if elapsed > 0 else 0
 
             # ── Latency ──
-            queries = ["Docker", "PostgreSQL", "nginx", "Redis", "backup",
-                       "server-alpha", "Grafana", "proxy", "system config",
-                       "database port"]
+            queries = [
+                "Docker",
+                "PostgreSQL",
+                "nginx",
+                "Redis",
+                "backup",
+                "server-alpha",
+                "Grafana",
+                "proxy",
+                "system config",
+                "database port",
+            ]
             lats = []
             for _ in range(100):
                 q = queries[_ % len(queries)]
@@ -586,7 +620,16 @@ async def _run_performance():
 
 # ─── Main comparison test ──────────────────────────────────────────────
 
+try:
+    import chromadb  # noqa: F401
+
+    _HAS_CHROMADB = True
+except ImportError:
+    _HAS_CHROMADB = False
+
+
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _HAS_CHROMADB, reason="chromadb not installed (optional dependency)")
 async def test_comparative_benchmark():
     """Run all quality + performance comparisons and print summary tables."""
     print("\n" + "=" * 70)

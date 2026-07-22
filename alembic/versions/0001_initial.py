@@ -1,8 +1,8 @@
 """Initial schema — tracked by Alembic.
 
-This revision creates the initial tables. The project uses
-SQLAlchemy's Base.metadata.create_all() for initial table creation
-in production, so this migration is informational.
+Creates all tables defined in storage.models using SQLAlchemy's
+Base.metadata.create_all(), so that Alembic migrations are self-contained
+and do not rely on the application having created tables first.
 
 Revision ID: 0001
 Revises:
@@ -20,10 +20,19 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Tables are created by SQLAlchemy's create_all() in SQLiteProvider.initialize().
-    # This revision exists only to anchor the Alembic chain.
-    pass
+    # Import models to register them with Base.metadata, then create all tables.
+    import storage.models  # noqa: F401
+    from storage.base import Base
+
+    bind = op.get_bind()
+    Base.metadata.create_all(bind)
 
 
 def downgrade() -> None:
-    pass
+    # Drop all tables in reverse dependency order.
+    # SQLite doesn't support DROP ... CASCADE, so we drop in order.
+    import storage.models  # noqa: F401
+    from storage.base import Base
+
+    bind = op.get_bind()
+    Base.metadata.drop_all(bind)

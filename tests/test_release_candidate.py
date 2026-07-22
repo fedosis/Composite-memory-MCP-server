@@ -152,7 +152,7 @@ def test_ci_clean_wheel_smoke_exercises_serve_startup():
 
     assert "StdioServerParameters" in ci
     assert "ClientSession" in ci
-    assert 'command="memory-server", args=["serve"]' in ci
+    assert 'os.path.join(venv_bin, "memory-server")' in ci
     assert "asyncio.wait_for(main(), timeout=15)" in ci
     assert "cwd=tmpdir" in ci
     assert 'await session.call_tool("ping", arguments={})' in ci

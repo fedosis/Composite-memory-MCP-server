@@ -15,11 +15,13 @@ import pytest
 
 from memory_server.api.learn import learn as learn_fn
 from memory_server.evaluation.validator import Validator
-from memory_server.models import LifecycleState, VerificationStatus
+from memory_server.models import LifecycleState
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.server import (
     _get_graph_router,
+    _get_outbox_worker,
     _get_provider,
+    _get_router,
     mcp,
 )
 
@@ -71,21 +73,24 @@ class TestAdequacy:
     async def test_benchmark_remember_search_roundtrip(self):
         """Store 10 facts via remember(), verify search() finds ALL (precision=1.0, recall=1.0)."""
         stored = []
-        N = 10
+        n = 10
 
-        for i in range(N):
+        for i in range(n):
             subj = f"bench-entity-{i}"
             obj = f"bench-value-{i}"
-            result = await _call_tool("remember", {
-                "subject": subj,
-                "predicate": "has_property",
-                "object": obj,
-                "confidence": 1.0,
-                "source": "bench",
-            })
+            result = await _call_tool(
+                "remember",
+                {
+                    "subject": subj,
+                    "predicate": "has_property",
+                    "object": obj,
+                    "confidence": 1.0,
+                    "source": "bench",
+                },
+            )
             stored.append((subj, obj, result["fact"]["id"]))
 
-        assert len(stored) == N
+        assert len(stored) == n
 
         hits = 0
         total = len(stored)
@@ -99,9 +104,7 @@ class TestAdequacy:
                 hits += 1
 
         recall = hits / total
-        assert recall == 1.0, (
-            f"Expected recall=1.0, got {recall} ({hits}/{total} found)"
-        )
+        assert recall == 1.0, f"Expected recall=1.0, got {recall} ({hits}/{total} found)"
 
         # Precision: each specific entity query should find our fact
         for subj, obj, fid in stored:
@@ -117,9 +120,7 @@ class TestAdequacy:
     async def test_benchmark_learn_extraction(self, provider):
         """Inject 3 known facts into text via learn(), verify extraction of each."""
         sentences = (
-            "Python is programming-language.\n"
-            "Docker is container-technology.\n"
-            "PostgreSQL is relational-database.\n"
+            "Python is programming-language.\nDocker is container-technology.\nPostgreSQL is relational-database.\n"
         )
         result = await learn_fn(provider, text=sentences, source="bench")
         extracted = result.get("facts", [])
@@ -133,9 +134,7 @@ class TestAdequacy:
             )
 
         extraction_rate = len(extracted) / 3
-        assert extraction_rate >= 0.95, (
-            f"Extraction rate too low: {extraction_rate} ({len(extracted)}/3)"
-        )
+        assert extraction_rate >= 0.95, f"Extraction rate too low: {extraction_rate} ({len(extracted)}/3)"
 
     # ------------------------------------------------------------------
     # Metric 1.7: Auto-Indexing
@@ -147,39 +146,48 @@ class TestAdequacy:
         pred = "has_feature"
         obj = "verified-indexing"
 
-        result = await _call_tool("remember", {
-            "subject": subj,
-            "predicate": pred,
-            "object": obj,
-            "confidence": 1.0,
-            "source": "bench",
-        })
-        fact_id = result["fact"]["id"]
+        result = await _call_tool(
+            "remember",
+            {
+                "subject": subj,
+                "predicate": pred,
+                "object": obj,
+                "confidence": 1.0,
+                "source": "bench",
+            },
+        )
+        _ = result["fact"]["id"]  # noqa: F841
+
+        # Process outbox synchronously — in-process call_tool does NOT trigger
+        # the FastMCP lifespan handler, so the background outbox worker never
+        # starts. Initialize the vector/embedding infrastructure (needed by
+        # the outbox worker) and drain pending entries before searching.
+        await _get_router()  # initialize _qdrant/_lancedb + _embedder
+        worker = await _get_outbox_worker()
+        summary = await worker.process_all_pending()
+        assert summary["processed"] >= 1, f"Expected >=1 outbox entry processed, got {summary}"
 
         # Check semantic_search (Qdrant)
-        semantic = await _call_tool("semantic_search", {
-            "query": f"{subj} {pred} {obj}",
-            "top_k": 10,
-        })
+        semantic = await _call_tool(
+            "semantic_search",
+            {
+                "query": f"{subj} {pred} {obj}",
+                "top_k": 10,
+            },
+        )
 
         semantic_found = False
         if "semantic_results" in semantic:
-            semantic_found = any(
-                p.get("payload", {}).get("subject") == subj
-                for p in semantic["semantic_results"]
-            )
+            semantic_found = any(p.get("payload", {}).get("subject") == subj for p in semantic["semantic_results"])
         assert semantic_found, (
-            f"Fact '{subj}' not found in semantic_search results: "
-            f"{json.dumps(semantic, indent=2)[:300]}"
+            f"Fact '{subj}' not found in semantic_search results: {json.dumps(semantic, indent=2)[:300]}"
         )
 
         # Check graph_search via entity_id
         node_id = subj.lower().replace(" ", "-")
         graph = await _call_tool("graph_search", {"entity_id": node_id})
         graph_found = any(n["name"] == subj for n in graph.get("nodes", []))
-        assert graph_found, (
-            f"Entity '{subj}' not found in graph nodes: {graph.get('nodes', [])}"
-        )
+        assert graph_found, f"Entity '{subj}' not found in graph nodes: {graph.get('nodes', [])}"
 
     # ------------------------------------------------------------------
     # Metric 1.6: Validation Lifecycle
@@ -198,9 +206,7 @@ class TestAdequacy:
         # Stage 2: confidence >= 0.7 -> validate -> validated
         v.set_confidence(fid, 0.75)
         s2_status = v.validate(fid)
-        assert s2_status == LifecycleState.VALIDATED, (
-            f"Expected VALIDATED, got {s2_status}"
-        )
+        assert s2_status == LifecycleState.VALIDATED, f"Expected VALIDATED, got {s2_status}"
         s2 = v.get_status(fid)
         assert s2["status"] == "validated"
 
@@ -208,9 +214,7 @@ class TestAdequacy:
         v.set_confidence(fid, 0.9)
         v.set_corroboration_count(fid, 3)
         s3_status = v.trust(fid)
-        assert s3_status == LifecycleState.ACTIVE, (
-            f"Expected ACTIVE, got {s3_status}"
-        )
+        assert s3_status == LifecycleState.ACTIVE, f"Expected ACTIVE, got {s3_status}"
         s3 = v.get_status(fid)
         assert s3["status"] == "active"
 
@@ -239,20 +243,29 @@ class TestAdequacy:
         Per ADR-005: rules -> semantic -> graph -> LLM fallback.
         """
         # Pre-populate: store a fact so semantic/graph stages have data
-        await _call_tool("remember", {
-            "subject": "database-server",
-            "predicate": "runs_on",
-            "object": "port-5432",
-            "confidence": 1.0,
-            "source": "bench",
-        })
+        await _call_tool(
+            "remember",
+            {
+                "subject": "database-server",
+                "predicate": "runs_on",
+                "object": "port-5432",
+                "confidence": 1.0,
+                "source": "bench",
+            },
+        )
+
+        # Process outbox synchronously — graph sync now happens in the
+        # outbox worker, not inline in remember(). Drain pending entries
+        # before checking graph entities.
+        await _get_router()  # initialize vector + embedder infrastructure
+        worker = await _get_outbox_worker()
+        summary = await worker.process_all_pending()
+        assert summary["processed"] >= 1, f"Expected >=1 outbox entry processed, got {summary}"
 
         # (a) Query with known keyword from default rules -> stage 1
         rule_query = "what is the IP of main server"
         rule_result = await _call_tool("route", {"query": rule_query})
-        assert rule_result.get("stage") == 1, (
-            f"Rule query expected stage=1, got stage={rule_result.get('stage')}"
-        )
+        assert rule_result.get("stage") == 1, f"Rule query expected stage=1, got stage={rule_result.get('stage')}"
         assert rule_result.get("route") == "rules"
         assert "rule_match" in rule_result
 
@@ -266,18 +279,20 @@ class TestAdequacy:
         graph_router = await _get_graph_router()
         graph_result = graph_router.query("database-server")
         assert len(graph_result.get("entities", [])) >= 1, (
-            f"GraphRouter should find entity 'database-server' in query: "
-            f"{json.dumps(graph_result)[:200]}"
+            f"GraphRouter should find entity 'database-server' in query: {json.dumps(graph_result)[:200]}"
         )
 
         # (c) Query with gibberish / no matches -> stage 4 (LLM fallback)
         # With score_threshold=1.0, no Qdrant results pass and graph finds
         # nothing, so the route falls through to LLM fallback.
         gibberish = "xyznonexistentgibberish12345"
-        fallback_result = await _call_tool("route", {
-            "query": gibberish,
-            "score_threshold": 1.0,
-        })
+        fallback_result = await _call_tool(
+            "route",
+            {
+                "query": gibberish,
+                "score_threshold": 1.0,
+            },
+        )
         assert fallback_result.get("stage") == 4, (
             f"Gibberish query expected stage=4, got stage={fallback_result.get('stage')}"
         )
@@ -297,66 +312,74 @@ class TestPerformance:
 
         Expected baseline (mock embedding): p50 < 50ms, p95 < 100ms.
         """
-        N = 50
+        n = 50
         latencies = []
 
         # Warmup: one call to ensure providers are initialized
-        await _call_tool("remember", {
-            "subject": "warmup", "predicate": "is", "object": "ready",
-            "confidence": 1.0, "source": "bench",
-        })
-
-        for i in range(N):
-            t0 = time.perf_counter()
-            await _call_tool("remember", {
-                "subject": f"perf-entity-{i}",
-                "predicate": "has_value",
-                "object": f"perf-val-{i}",
+        await _call_tool(
+            "remember",
+            {
+                "subject": "warmup",
+                "predicate": "is",
+                "object": "ready",
                 "confidence": 1.0,
                 "source": "bench",
-            })
+            },
+        )
+
+        for i in range(n):
+            t0 = time.perf_counter()
+            await _call_tool(
+                "remember",
+                {
+                    "subject": f"perf-entity-{i}",
+                    "predicate": "has_value",
+                    "object": f"perf-val-{i}",
+                    "confidence": 1.0,
+                    "source": "bench",
+                },
+            )
             latencies.append((time.perf_counter() - t0) * 1000)
 
         sorted_lat = sorted(latencies)
-        p50 = sorted_lat[int(N * 0.50)]
-        p95 = sorted_lat[int(N * 0.95)]
+        p50 = sorted_lat[int(n * 0.50)]
+        p95 = sorted_lat[int(n * 0.95)]
         mean_lat = statistics.mean(latencies)
 
         print(f"\n  [remember latency] p50={p50:.1f}ms  p95={p95:.1f}ms  mean={mean_lat:.1f}ms")
 
-        assert p50 < 2000, (
-            f"remember() p50 latency too high: {p50:.1f}ms (threshold: 2000ms)"
-        )
-        assert p95 < 5000, (
-            f"remember() p95 latency too high: {p95:.1f}ms (threshold: 5000ms)"
-        )
+        assert p50 < 2000, f"remember() p50 latency too high: {p50:.1f}ms (threshold: 2000ms)"
+        assert p95 < 5000, f"remember() p95 latency too high: {p95:.1f}ms (threshold: 5000ms)"
 
     async def test_benchmark_search_latency(self):
         """search() latency: p50 over 50 queries.
 
         Expected: p50 < 100ms for exact matches at low volume.
         """
-        N = 50
+        n = 50
 
         # Pre-populate some data
         for i in range(20):
-            await _call_tool("remember", {
-                "subject": f"latency-entity-{i}",
-                "predicate": "has_attr",
-                "object": f"latency-val-{i}",
-                "confidence": 1.0,
-                "source": "bench",
-            })
+            await _call_tool(
+                "remember",
+                {
+                    "subject": f"latency-entity-{i}",
+                    "predicate": "has_attr",
+                    "object": f"latency-val-{i}",
+                    "confidence": 1.0,
+                    "source": "bench",
+                },
+            )
 
         latencies = []
-        for i in range(N):
+        for i in range(n):
             t0 = time.perf_counter()
             await _call_tool("search", {"query": f"latency-entity-{i % 20}"})
             latencies.append((time.perf_counter() - t0) * 1000)
 
         sorted_lat = sorted(latencies)
-        p50 = sorted_lat[int(N * 0.50)]
-        p95 = sorted_lat[int(N * 0.95)]
+        p50 = sorted_lat[int(n * 0.50)]
+        p95 = sorted_lat[int(n * 0.95)]
 
         print(f"\n  [search latency] p50={p50:.1f}ms  p95={p95:.1f}ms")
 
@@ -372,9 +395,7 @@ class TestPerformance:
         assert result.get("status") == "ok", f"ping failed: {result}"
         print(f"\n  [cold start] first ping response: {elapsed_ms:.1f}ms")
 
-        assert elapsed_ms < 2000, (
-            f"Cold start too slow: {elapsed_ms:.1f}ms (threshold: 2000ms)"
-        )
+        assert elapsed_ms < 2000, f"Cold start too slow: {elapsed_ms:.1f}ms (threshold: 2000ms)"
 
 
 # =============================================================================
@@ -392,8 +413,11 @@ class TestStability:
 
         for field_name in ("subject", "predicate", "object"):
             args = {
-                "subject": "test", "predicate": "is", "object": "test",
-                "confidence": 1.0, "source": "bench",
+                "subject": "test",
+                "predicate": "is",
+                "object": "test",
+                "confidence": 1.0,
+                "source": "bench",
             }
             args[field_name] = ""  # Empty string = missing required field
             try:
@@ -402,9 +426,7 @@ class TestStability:
                 errors_raised += 1
 
         # All three should raise errors
-        assert errors_raised == 3, (
-            f"Expected 3 errors for empty fields, got {errors_raised}"
-        )
+        assert errors_raised == 3, f"Expected 3 errors for empty fields, got {errors_raised}"
 
         # After errors, server should still work
         result = await _call_tool("ping", {})
@@ -416,17 +438,24 @@ class TestStability:
         graph_router = await _get_graph_router()
         graph = graph_router.graph
 
+        # Record pre-existing orphans (from earlier tests using shared global graph)
+        all_nodes_before = graph.get_all_nodes()
+        pre_existing_orphans = {n.id for n in all_nodes_before if not graph.get_neighbors(n.id)}
+
         cycles = 10
         fact_ids = []
 
         for i in range(cycles):
-            result = await _call_tool("remember", {
-                "subject": f"integrity-entity-{i}",
-                "predicate": "is",
-                "object": f"integrity-val-{i}",
-                "confidence": 1.0,
-                "source": "bench",
-            })
+            result = await _call_tool(
+                "remember",
+                {
+                    "subject": f"integrity-entity-{i}",
+                    "predicate": "is",
+                    "object": f"integrity-val-{i}",
+                    "confidence": 1.0,
+                    "source": "bench",
+                },
+            )
             fact_ids.append(result["fact"]["id"])
 
         # Delete each fact directly via provider
@@ -444,22 +473,35 @@ class TestStability:
         all_nodes = graph.get_all_nodes()
         orphans = [n for n in all_nodes if not graph.get_neighbors(n.id)]
 
-        print(f"\n  [data integrity] total graph nodes: {len(all_nodes)}, orphans: {len(orphans)}")
+        # Exclude pre-existing orphans (from shared global graph state)
+        new_orphans = [n for n in orphans if n.id not in pre_existing_orphans]
 
-        # Current behavior: edges persist, so all nodes have neighbors -> 0 orphans
-        assert len(orphans) == 0, (
-            f"Expected 0 orphans (edges persist after delete — known limitation), "
-            f"got {len(orphans)}"
+        print(
+            f"\n  [data integrity] total graph nodes: {len(all_nodes)}, "
+            f"new orphans: {len(new_orphans)}, "
+            f"pre-existing orphans: {len(pre_existing_orphans)}"
+        )
+
+        # Current behavior: edges persist after delete, so no new orphans
+        assert len(new_orphans) == 0, (
+            f"Expected 0 new orphans (edges persist after delete — known limitation), "
+            f"got {len(new_orphans)}: {[n.name for n in new_orphans]}"
         )
 
     async def test_benchmark_long_session(self):
         """20 rapid tool calls through rotating types, verify no crashes."""
         tool_cycle = [
             ("ping", {}),
-            ("remember", {
-                "subject": "longrun-server", "predicate": "cycle",
-                "object": "test", "confidence": 1.0, "source": "bench",
-            }),
+            (
+                "remember",
+                {
+                    "subject": "longrun-server",
+                    "predicate": "cycle",
+                    "object": "test",
+                    "confidence": 1.0,
+                    "source": "bench",
+                },
+            ),
             ("search", {"query": "longrun"}),
             ("semantic_search", {"query": "long run test", "top_k": 3}),
             ("graph_search", {"query": "longrun"}),
