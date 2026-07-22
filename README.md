@@ -49,6 +49,7 @@ memory-server ping
 - [Architecture](docs/architecture.md) — Mermaid architecture diagram
 - [Usage](docs/USAGE.md) — Full usage reference
 - [Metrics & Benchmarking](docs/metrics.md) — Metrics and benchmark framework
+- [LongMemEval Harness](docs/longmemeval-harness.md) — v0.11 raw/source/canonical retrieval scoring
 - [Comparative Analysis](docs/comparative-metrics.md) — Comparative analysis with ChromaDB/SQLite
 - [Drift Matrix](docs/drift-matrix.md) — Contract audit
 - [Contracts](contracts/) — JSON Schema 2020-12 tool contracts

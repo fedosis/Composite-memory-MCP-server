@@ -126,3 +126,10 @@ LanceDB Vector Store
 | 001 | LanceDB Vector Store | ✅ **v0.10.0-alpha.1** | LanceDBProvider, env MEMORY_VECTOR_BACKEND, ADR-015, 18+ тестов |
 
 ## Phase: v0.11 (current)
+LongMemEval-S Benchmark Harness
+
+| # | Card | ID | Status | Review | Tests | Merged |
+|---|------|----|--------|--------|-------|--------|
+| 001 | LongMemEval Benchmark Harness | t_ee797b52 | 🔄 running | pending | ✅ targeted | pending |
+
+Scope: lineage-aware LongMemEval-S harness with Raw/Source/Canonical retrieval scoring and a deterministic Hermes built-in lexical baseline.

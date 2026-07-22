@@ -7,6 +7,7 @@ Commands:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -347,6 +348,26 @@ def install_hermes_plugin(
         sys.exit(_do_uninstall(resolved, dry_run, out=typer.echo))
     else:
         sys.exit(_do_install(resolved, dry_run, out=typer.echo))
+
+
+@app.command("benchmark-longmemeval")
+def benchmark_longmemeval(
+    dataset: Path = typer.Argument(..., help="Path to longmemeval_s_cleaned.json"),
+    output: Path = typer.Option(
+        Path("benchmark-results/longmemeval_builtin.jsonl"),
+        "--output",
+        "-o",
+        help="JSONL output path for traces, target sets, and scores",
+    ),
+    top_k: int = typer.Option(10, "--top-k", min=1, help="Retrieval cutoff for metrics"),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Optional number of queries to run"),
+) -> None:
+    """Run the LongMemEval-S built-in baseline with raw/source/canonical scoring."""
+
+    from memory_server.benchmarks.longmemeval import run_builtin_baseline
+
+    summary = run_builtin_baseline(dataset, output_path=output, top_k=top_k, limit=limit)
+    typer.echo(json.dumps(summary, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
