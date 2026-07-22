@@ -6,6 +6,7 @@ the entire write (fact + receipt + outbox) in one transaction.
 
 from typing import Any, Optional
 
+from memory_server.admission import AdmissionDecision
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.services.ingestion_service import MemoryIngestionService
 
@@ -18,6 +19,7 @@ async def remember(
     confidence: float = 1.0,
     source: str = "user",
     metadata: Optional[dict[str, Any]] = None,
+    admission: AdmissionDecision | None = None,
 ) -> dict:
     """Store a fact and return a provenance receipt.
 
@@ -32,6 +34,8 @@ async def remember(
         confidence: Confidence score 0.0-1.0 (default 1.0).
         source: Source identifier (default "user").
         metadata: Optional extra metadata (stored in receipt history).
+        admission: Optional write-time admission/tagging decision. When
+            supplied, its metadata is persisted under ``metadata.admission``.
 
     Returns:
         Dict with 'receipt' (MemoryReceipt) and 'fact' (Fact).
@@ -40,6 +44,10 @@ async def remember(
         ValueError: If subject, predicate, or object are empty, or
                     confidence is outside [0, 1].
     """
+    receipt_metadata: dict[str, Any] = dict(metadata or {})
+    if admission is not None:
+        receipt_metadata["admission"] = admission.to_metadata()
+
     svc = MemoryIngestionService(provider._session_factory)
     return await svc.remember(
         subject=subject,
@@ -47,5 +55,5 @@ async def remember(
         object=object,
         confidence=confidence,
         source=source,
-        metadata=metadata,
+        metadata=receipt_metadata or None,
     )

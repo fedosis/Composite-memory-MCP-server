@@ -8,10 +8,15 @@ v0.6: Refactored to delegate to the new storage layer
 duplicate inline ORM models.
 """
 
+import json
+from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from storage.base import Base
+from storage.models.fact import FactORM
+from storage.models.receipt import MemoryReceiptORM
 from storage.outbox import OutboxRepository
 from storage.repositories import (
     BeliefRepository,
@@ -305,6 +310,67 @@ class SQLiteProvider:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
             return await repo.search(memory_type=memory_type, source=source, limit=limit)
+
+    async def prune_expired_memories(self, now: datetime | None = None) -> dict[str, Any]:
+        """Archive memories whose write-time admission TTL has expired.
+
+        TTL metadata is stored in receipt history under
+        ``metadata.admission.expires_at``. Pruning is lifecycle-preserving:
+        facts and receipts are marked ``archived`` rather than physically
+        deleted, so provenance remains auditable.
+        """
+        clock = now or datetime.now(timezone.utc)
+        pruned_ids: list[str] = []
+
+        async with await self._get_session() as session:
+            result = await session.execute(
+                select(MemoryReceiptORM).where(MemoryReceiptORM.lifecycle_state != "archived")
+            )
+            receipts = result.scalars().all()
+            for receipt in receipts:
+                expires_at = self._receipt_expires_at(receipt)
+                if expires_at is None or expires_at > clock:
+                    continue
+
+                receipt.lifecycle_state = "archived"
+                receipt.verification_status = "archived"
+                receipt.updated_at = clock
+                fact = await session.get(FactORM, receipt.id)
+                if fact is not None:
+                    fact.lifecycle_state = "archived"
+                    fact.updated_at = clock
+                pruned_ids.append(receipt.id)
+
+            await session.commit()
+
+        return {"pruned": len(pruned_ids), "ids": pruned_ids}
+
+    @staticmethod
+    def _receipt_expires_at(receipt: MemoryReceiptORM) -> datetime | None:
+        try:
+            history = json.loads(receipt.history or "[]")
+        except json.JSONDecodeError:
+            return None
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            metadata = entry.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            admission = metadata.get("admission")
+            if not isinstance(admission, dict):
+                continue
+            raw_expires = admission.get("expires_at") or admission.get("valid_to")
+            if not raw_expires:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw_expires).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        return None
 
     # --- Belief CRUD ---
 
