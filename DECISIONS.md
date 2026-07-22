@@ -75,3 +75,37 @@ Each entry: decision, alternatives considered, rationale, outcome.
 3. 7 small cards as above — chosen, each is independently reviewable and testable
 
 **Outcome:** 7 cards for v0.1a. Card 001 starts execution.
+
+---
+
+## 2026-07-22 — Operations governance
+
+### Decision 005: Normalisation of external signals into roadmap decisions
+
+**Context:** The project receives feature suggestions, complaints, and change requests from multiple channels — Moltbook, Reddit, GitHub issues, and the team's own operational pain. Without a consistent filter, roadmap priority is determined by whoever shouts loudest or whichever channel has the most upvotes. This is unsustainable for a project that aims at a narrow, stable core.
+
+**Proposed approach (normalisation chain):** Every external signal MUST pass through a 6-stage normalisation pipeline before it enters the roadmap:
+
+1. **Signal** — raw input (e.g. "add batch delete", "search is too slow", "why no Redis backend")
+2. **Problem** — what _actual_ user pain or operational gap does this signal reveal?
+3. **Proposed approach** — what concrete change would address the problem (not necessarily the one suggested by the signal)
+4. **Evidence** — data or reasoning supporting the problem and the proposed approach (metrics, user count, logs, discussion link)
+5. **Confidence** — low / medium / high, based on evidence quality and sample size
+6. **Roadmap impact** — what gets deferred or dropped if this is accepted
+
+Only entries with **Confidence ≥ medium** and an explicit **roadmap impact** assessment proceed into roadmap grooming.
+
+**Rationale:**
+- Feature requests by vote alone introduce survivorship bias — the most vocal users are not representative. Moltbook posts reflect a power-user subset; Reddit upvotes reflect a drive-by audience; GitHub stars reflect passive interest, not committed users.
+- The project goal is a **narrow, stable core** with replaceable policies/adapters. Every added feature is a permanent maintenance liability that narrows the space for future adapters.
+- This is a project-governance decision for Composite Memory MCP Server: it governs how the project translates external noise into bounded work assignments without architectural change.
+- Source bias is explicitly tracked: each entry records where the signal originated so patterns can be audited later.
+
+**Alternatives considered:**
+1. Accept all requests and prioritise by community votes — rejected, amplifies vocal minority, works against narrow-core principle
+2. Gate all requests behind a paid sponsorship — rejected, premature monetisation for v0.1a
+3. Direct maintainer veto on everything — rejected, single point of failure, undermines community trust
+4. **normalisation chain (chosen)** — objective, auditable, reproducible filter
+
+**Outcome:**
+External signals are no longer accepted as direct roadmap items. Every signal → problem translation is recorded as a short entry with the 6-field header (signal → problem → proposed approach → evidence → confidence → roadmap impact). Roadmap grooming runs against those entries, not against raw GitHub issues or social-media posts. Feature requests must be backed by evidence; no upvote count alone qualifies.
