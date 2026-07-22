@@ -28,10 +28,25 @@ class TestHermesProviderLifecycle:
         provider = HermesProvider()
         assert provider.name == "memory_server"
 
-    def test_is_available_returns_false_before_init(self):
-        """Verify is_available returns False before initialize()."""
+    def test_is_available_returns_true_before_init(self):
+        """Verify is_available returns True before initialize() when CMMS deps are present.
+
+        After Hermes v0.19, is_available() is called during discovery
+        *before* initialize(). It must report availability based on
+        dependency presence, not initialization state.
+        """
         provider = HermesProvider()
-        assert provider.is_available() is False
+        assert provider.is_available() is True
+
+    def test_is_available_does_not_init_db(self):
+        """Verify is_available() does NOT initialize the DB or set _initialized."""
+        provider = HermesProvider()
+        # Call is_available() to simulate discovery
+        result = provider.is_available()
+        assert result is True
+        # Verify no initialization side-effects
+        assert provider._initialized is False
+        assert provider._provider is None
 
     def test_is_available_returns_true_after_init(self):
         """Verify is_available returns True after successful initialize()."""
@@ -91,6 +106,30 @@ class TestHermesProviderLifecycle:
         """Verify shutdown is safe to call without initialize."""
         provider = HermesProvider()
         provider.shutdown()  # Should not raise
+
+    def test_is_available_returns_false_when_cmms_missing(self):
+        """Verify is_available returns False when CMMS package cannot be imported.
+
+        This is the regression test for the ``ImportError`` path — when
+        ``memory_server`` is genuinely absent, is_available() must not
+        lie about it.
+        """
+        import builtins
+        from unittest.mock import patch
+
+        original_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "memory_server":
+                raise ImportError("No module named memory_server")
+            return original_import(name, *args, **kwargs)
+
+        provider = HermesProvider()
+        with patch.object(builtins, "__import__", mock_import):
+            assert provider.is_available() is False
+
+        # After the patch is removed, it should be available again
+        assert provider.is_available() is True
 
 
 class TestHermesProviderToolSchemas:

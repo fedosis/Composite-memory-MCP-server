@@ -95,6 +95,7 @@ class HermesProvider:
 
     def __init__(self):
         self._initialized = False
+        self._shut_down = False
         self._provider = None  # SQLiteProvider
         self._qdrant = None
         self._embedder = None
@@ -111,8 +112,25 @@ class HermesProvider:
     # ------------------------------------------------------------------
 
     def is_available(self) -> bool:
-        """Return True if the provider is initialized and ready."""
-        return self._initialized and self._provider is not None
+        """Return True if CMMS dependencies are available.
+
+        After Hermes v0.19, ``is_available()`` is called during discovery
+        *before* ``initialize()``.  The method must return ``True`` when
+        the CMMS package can be imported (dependencies are present) even
+        if the provider hasn't been started yet, and ``False`` only when
+        the dependency is genuinely missing or the provider was shut down.
+
+        Does NOT perform DB or network I/O — only checks importability.
+        """
+        if self._initialized:
+            return self._provider is not None
+        if self._shut_down:
+            return False
+        try:
+            import memory_server  # noqa: F401
+            return True
+        except ImportError:
+            return False
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize the CMMS provider, writer queue, and services.
@@ -193,6 +211,7 @@ class HermesProvider:
         self._provider = None
         self._writer = None
         self._initialized = False
+        self._shut_down = True
         self._context_cache.clear()
         logger.info("HermesProvider: shutdown complete")
 
