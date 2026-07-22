@@ -1,10 +1,35 @@
 # Composite Memory MCP Server (CMMS)
 
-Independent MCP memory service for AI agents. Agent-independent.
+Composite Memory MCP Server (CMMS) is a beta local-first memory service for AI
+agents. It exposes an MCP stdio server plus an optional Hermes native
+MemoryProvider integration, with structured storage for facts, beliefs,
+provenance receipts, audit data, optional vector retrieval, and graph lookup.
+
+CMMS is meant for agents that need more than a generic vector-only memory layer:
+explicit facts remain queryable in SQLite, receipts preserve provenance, vector
+and graph retrieval are separate optional layers, and v0.11 adds deterministic
+memory admission plus LongMemEval-S benchmark tooling.
 
 [![Hermes Native Provider](https://img.shields.io/badge/Hermes-Native_MemoryProvider-blueviolet)](docs/INTEGRATION.md)
 [![version](https://img.shields.io/badge/version-0.11.0b1-blue)]()
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue)]()
+
+## Publication status and channel order
+
+Current public source of truth: the GitHub repository and the GitHub prerelease
+tag `v0.11.0b1`.
+
+Publication boundary for `v0.11.0b1`:
+
+1. **GitHub** — published source and prerelease artifacts.
+2. **PyPI** — not published yet; add package-manager install instructions only
+   after verifying package publication.
+3. **Official MCP Registry** — not published; `server.json` is conservative
+   metadata for future submission, not a registry listing.
+4. **Smithery / Glama** — not published; `docs/DIRECTORY_SUBMISSIONS.md` is
+   draft copy only.
+5. **Hermes community** — optional integration documentation only; not a
+   distribution channel for this release.
 
 ## First-run install
 
@@ -12,14 +37,14 @@ Independent MCP memory service for AI agents. Agent-independent.
 
 - **Python 3.11+**
 - **SQLite** (bundled with Python)
-- Optional: [Qdrant](https://qdrant.tech/) for vector search, [Neo4j](https://neo4j.com/) for graph support
+- Optional: LanceDB/Qdrant extras for vector search; graph lookup uses the current SimpleGraph layer
 
 ### Install
 
 ```bash
 # Clone the repository
-git clone git@github.com:fedosis/Composite-memory-MCP-server.git
-cd memory-server
+git clone https://github.com/fedosis/Composite-memory-MCP-server.git
+cd Composite-memory-MCP-server
 
 # Create and activate a virtual environment
 python3.11 -m venv .venv
@@ -65,10 +90,10 @@ tools, connect through an MCP-compatible client and call the `ping` tool.
 | `ping` | Health check / connectivity test |
 | `remember` | Store a fact with provenance |
 | `search` | Keyword search over stored facts |
-| `semantic_search` | Vector similarity search (requires Qdrant) |
+| `semantic_search` | Vector similarity search (LanceDB default; Qdrant optional) |
 | `get_context` | Retrieve context for a task |
 | `learn` | Extract knowledge from natural language |
-| `graph_search` | Entity lookup + pathfinding (requires Neo4j/SimpleGraph) |
+| `graph_search` | Entity lookup + pathfinding through the current SimpleGraph layer |
 | `route` | 4-stage hybrid router |
 | `audit` | Memory health report |
 | `metrics` | Prometheus metrics |
@@ -87,8 +112,11 @@ ruff check src/
 
 ## Hermes Integration
 
-CMMS can run as a native Hermes MemoryProvider plugin — not just over MCP.
-This enables auto-recall, auto-retain, and session lifecycle hooks.
+CMMS can optionally run as a native Hermes MemoryProvider plugin via the
+`[hermes]` extra. Hermes is not a base runtime dependency of the MCP stdio
+server. The implemented integration enables Hermes lifecycle hooks such as
+auto-recall, auto-retain, and session-boundary flushing. It is a separate
+in-process Hermes path, not a remote MCP transport.
 
 ```bash
 pip install -e ".[hermes]"
@@ -96,14 +124,15 @@ memory-server install-hermes-plugin --hermes-home ~/.hermes/profiles/coder
 hermes gateway restart
 ```
 
-See [Hermes Integration Guide](docs/INTEGRATION.md) for details.
+See [Hermes Integration Guide](docs/INTEGRATION.md) for supported Hermes setup
+and v0.19 compatibility notes.
 
 ## Dev Setup
 
 ```bash
 # Clone and enter
-git clone git@github.com:fedosis/Composite-memory-MCP-server.git
-cd memory-server
+git clone https://github.com/fedosis/Composite-memory-MCP-server.git
+cd Composite-memory-MCP-server
 
 # Create venv and install
 python -m venv .venv
@@ -122,6 +151,8 @@ memory-server --help
 
 ## Docs
 
+- [Agent Discovery](docs/AGENT_DISCOVERY.md) — concise MCP/client/directory metadata, capabilities, transports, and limitations
+- [Directory Submission Text](docs/DIRECTORY_SUBMISSIONS.md) — Smithery/Glama-ready draft copy; no external publication performed
 - [ADR](docs/ADR.md) — Architecture Decision Records (13 ADRs)
 - [Changelog](CHANGELOG.md) — Release notes and known limitations
 - [Integration Guide](docs/INTEGRATION.md) — Hermes MemoryProvider plugin
@@ -137,7 +168,7 @@ memory-server --help
 
 ## API Reference
 
-The server exposes fourteen MCP tools (nine original + five v0.7 belief tools):
+The server exposes fourteen MCP tools in v0.11.0b1:
 
 | # | Tool | v0.7 | Description |
 |---|------|------|-------------|
@@ -410,7 +441,7 @@ Route a query through the 4-stage hybrid router (rules → embeddings → graph 
 
 Per ADR-005, each stage is evaluated in priority order:
 1. **Rules:** Keyword-based exact match rules.
-2. **Semantic:** Embedding similarity search via Qdrant.
+2. **Semantic:** Embedding similarity search via the configured vector backend.
 3. **Graph:** Entity relation lookup in the knowledge graph.
 4. **LLM fallback:** Placeholder for future LLM-based routing.
 
@@ -489,7 +520,7 @@ Supports focused sub-audits via the `audit_type` parameter, or a comprehensive `
 | 2 | **Missing receipts** | Validator entries referencing receipts that don't exist |
 | 3 | **Lifecycle violations** | Items in an invalid lifecycle state or that skipped a required transition |
 | 4 | **Confidence issues** | Confidence scores that conflict with current lifecycle state |
-| 5 | **SQL/vector drift** | Consistency gaps between SQLite fact storage and Qdrant vector index |
+| 5 | **SQL/vector drift** | Consistency gaps between SQLite fact storage and the vector index |
 | 6 | **SQL/graph drift** | Consistency gaps between SQLite fact storage and the knowledge graph |
 
 When `audit_type` is set to a specific sub-audit (`"consistency"`, `"orphans"`, or `"confidence"`), only the corresponding analysis is returned:
@@ -539,12 +570,12 @@ search_latency_ms_bucket{le="5.0"} 5.0
 
 ## Stack
 
-Python 3.11+, MCP SDK, Pydantic, SQLAlchemy, Qdrant, Neo4j, GitPython,
-Prometheus Client, OpenTelemetry
+Python 3.11+, MCP SDK, Pydantic, SQLAlchemy, LanceDB/Qdrant vector providers,
+SimpleGraph, GitPython, Prometheus Client, OpenTelemetry
 
 ## Storage
 
-The server uses a multi-tier storage architecture with SQLite as the primary durable store, backed by vector (Qdrant) and graph (Neo4j / SimpleGraph) indexes.
+The server uses a multi-tier storage architecture with SQLite/FTS5 as the primary durable and keyword-search store, backed by optional vector indexes (LanceDB by default for semantic search, Qdrant optional via `MEMORY_VECTOR_BACKEND=qdrant`) and the current in-memory SimpleGraph graph layer. Neo4j is declared only as a future/optional graph dependency and is not wired into the v0.11 runtime.
 
 ### SQLite with WAL Mode
 
@@ -580,11 +611,11 @@ FTS5 enables the `search` tool's full-text capabilities with ranking, prefix que
 
 ### Outbox Pattern for Reliable Indexing
 
-Facts are written to the SQLite store first, then queued through an **outbox pattern** for background indexing to Qdrant (vector embeddings) and Neo4j (graph relations):
+Facts are written to the SQLite store first, then queued through an **outbox pattern** for background indexing. In v0.11.0b1 the server keeps the SQLite write durable even if optional vector indexing or in-memory SimpleGraph indexing is unavailable:
 
 1. Fact is inserted into SQLite (single write transaction)
 2. An outbox record is created in a dedicated table or queue
-3. A background worker picks up outbox entries and indexes them to Qdrant and Neo4j
+3. A background worker picks up outbox entries and indexes available secondary paths (Qdrant only when that provider/embedder has been initialized in the worker path, plus SimpleGraph relations)
 4. On success, the outbox record is marked as processed
 5. On failure, the outbox record is retried — the fact is never lost
 
@@ -635,9 +666,9 @@ The `DecayEngine` applies time-based decay to all stored facts:
 
 When a fact is stored via `remember()` or `learn()`, the server automatically:
 
-1. **Embeds** the fact text using SentenceTransformer (`all-MiniLM-L6-v2`)
-2. **Upserts** the embedding into Qdrant for semantic search
-3. **Syncs** to the knowledge graph (creates entity nodes + relation edges)
+1. **Embeds** the fact text using SentenceTransformer (`all-MiniLM-L6-v2`) when an embedder is initialized
+2. **Upserts** the embedding into the initialized outbox vector path (currently Qdrant when available; `semantic_search` itself uses LanceDB by default or Qdrant if configured)
+3. **Syncs** to the in-memory SimpleGraph knowledge graph (creates entity nodes + relation edges)
 
 This is best-effort — failures during auto-indexing never crash the caller.
 

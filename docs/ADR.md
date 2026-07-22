@@ -76,9 +76,9 @@ Use specialized memory backends:
 
     Facts       SQLite/PostgreSQL
 
-    Semantic    Qdrant
+    Semantic    LanceDB/Qdrant
 
-    Graph       Neo4j/Graphiti
+    Graph       SimpleGraph now; Neo4j/Graphiti future/optional
 
     Skills      Git
 
@@ -106,7 +106,7 @@ Accepted
 
 ## Decision
 
-Use Python 3.12+.
+Use Python 3.11+.
 
 ## Reasons
 

@@ -32,7 +32,11 @@ def test_changelog_documents_v011_beta_features_and_limits():
     assert "LongMemEval-S" in changelog
     assert "Memory Admission Gate" in changelog
     assert "Known limitations" in changelog
-    assert "not tagged" in changelog.lower()
+    assert "github prerelease tag" in changelog.lower()
+    assert "not published to pypi" in changelog.lower()
+    assert "official mcp registry" in changelog.lower()
+    assert "smithery" in changelog.lower()
+    assert "glama" in changelog.lower()
     assert "not published" in changelog.lower()
 
 

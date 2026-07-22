@@ -11,7 +11,9 @@ versioning with SemVer-like semantics.
 First CMMS beta release. Shifts from the `alpha` pre-release track to `beta`,
 marking API stability sufficient for early integration testing.
 
-This release candidate is prepared for reproducible validation only: it is not tagged and not published to PyPI or GitHub Releases yet.
+This beta is published as a GitHub prerelease tag. It is not published to PyPI,
+the official MCP Registry, Smithery, or Glama yet; install from source or
+explicit GitHub release artifacts until package publication is verified.
 
 ### Added
 
@@ -55,6 +57,9 @@ This release candidate is prepared for reproducible validation only: it is not t
 - **LongMemEval-S requires an external dataset** — the harness does not bundle
   the LongMemEval JSON. Users must download `longmemeval_s_cleaned.json`
   separately.
+- **Public directory/package publication is pending** — `server.json` and
+  directory text are draft metadata only until explicit publication to PyPI,
+  the official MCP Registry, Smithery, or Glama is verified.
 - **No retrieval plug-in API** — the built-in baseline is the only retriever
   in this release. Custom retrievers require subclassing `BuiltInMemoryBaseline`.
 - **No full suite green**: Unit tests pass (~240+ tests), but integration,

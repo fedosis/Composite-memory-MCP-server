@@ -2,6 +2,16 @@
 
 ## Agent Implementation Specification
 
+> **Status note for v0.11.0b1:** this file is an implementation specification
+> plus historical roadmap. Current public facts: GitHub prerelease is published;
+> PyPI, official MCP Registry, Smithery, and Glama are not published. Current
+> runtime uses SQLite/FTS5 as the durable and keyword-search base, LanceDB by
+> default or Qdrant optionally for semantic search, and in-memory SimpleGraph
+> for graph lookup. Neo4j remains future/optional and is not wired in v0.11.
+> Hermes support is an optional `[hermes]` integration; see `docs/INTEGRATION.md`.
+
+> **Status:** Historical/spec reference document. Core architectural principles are current; the Required Stack and Storage Mapping have been updated for v0.11 (LanceDB by default, Qdrant optional, SimpleGraph in-memory graph). Development Roadmap reflects original planned milestones with current-technology annotations.
+
 ## Mission
 
 Implement an independent MCP memory service for AI agents.
@@ -34,8 +44,8 @@ The server MUST NOT depend on a specific agent.
     │   skill_extractor.py
     ├── providers/
     │   sqlite_provider.py
-    │   postgres_provider.py
     │   qdrant_provider.py
+    │   lancedb_provider.py
     │   graph_provider.py
     │   git_provider.py
     └── evaluation/
@@ -45,10 +55,11 @@ The server MUST NOT depend on a specific agent.
 
 ## Required Stack
 
-Language: Python 3.12+
+Language: Python 3.11+
 
-Libraries: - MCP SDK - Pydantic - SQLAlchemy - Qdrant client - Neo4j
-driver - GitPython
+Libraries: - MCP SDK - Pydantic - SQLAlchemy - aiosqlite - LanceDB/Qdrant
+client extras - SimpleGraph currently, Neo4j driver only for future/optional
+graph work - GitPython optional
 
 ## MCP Tools
 
@@ -109,23 +120,29 @@ Priority:
 
 LLM must not be the first routing layer.
 
-## Storage Mapping
+## Storage Mapping (v0.11)
 
-Facts: SQLite/PostgreSQL
+*Note: This section reflects the originally designed architecture. Current v0.11 implementation uses the technologies noted.*
 
-Semantic: Qdrant
-
-Relations: Graph DB
-
-Skills: Git repository
+| Layer        | v0.11 Implementation                    | Future / Optional             |
+|-------------|----------------------------------------|------------------------------|
+| Facts       | SQLite via SQLAlchemy async            | PostgreSQL                    |
+| Semantic    | LanceDB (default); Qdrant optional    | —                            |
+| Relations   | SimpleGraph (in-memory dict+set)      | Neo4j / Graphiti (declared dependency, not wired) |
+| Skills      | Git repository                        | —                            |
 
 ## Lifecycle
 
 States:
 
-candidate validated trusted deprecated archived
+candidate validated active stale archived forgotten
 
-## Development Roadmap
+Compatibility note: older docs/specs may say `trusted`/`deprecated`; v0.11 maps
+those concepts to `active`/`stale`.
+
+## Development Roadmap (historical record)
+
+*Note: These were the original planned milestones. Current v0.11 implementation uses LanceDB (default) with Qdrant optional for vector, and SimpleGraph for in-memory graph relations.*
 
 ### v0.1a
 
@@ -134,7 +151,7 @@ search - remember
 
 ### v0.2
 
-Implement: - embeddings - Qdrant - semantic routing
+Implement: - embeddings - LanceDB/Qdrant - semantic routing
 
 ### v0.3
 

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.fedosis/composite-memory-mcp-server",
+  "description": "Local-first composite memory MCP server for agent facts, beliefs, recall, and audit",
+  "title": "Composite Memory MCP Server",
+  "version": "0.11.0b1",
+  "repository": {
+    "url": "https://github.com/fedosis/Composite-memory-MCP-server",
+    "source": "github",
+    "id": "1292124328"
+  },
+  "websiteUrl": "https://github.com/fedosis/Composite-memory-MCP-server#readme",
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "releaseStage": "beta",
+      "githubRelease": "https://github.com/fedosis/Composite-memory-MCP-server/releases/tag/v0.11.0b1",
+      "packageStatus": "PyPI package not published for v0.11.0b1; packages intentionally omitted",
+      "registryStatus": "Not published to the official MCP Registry, Smithery, or Glama",
+      "implementedTransports": ["stdio"],
+      "notes": "Repository-only discovery metadata. Add a packages entry only after verifying a public package or MCPB asset."
+    }
+  }
+}

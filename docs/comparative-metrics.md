@@ -1,6 +1,8 @@
 # Comparative Benchmark Framework: CMMS vs External Memory Providers
 
-> v0.5.3 — Hybrid 4-stage router (Rules → Embeddings → Graph → LLM) baseline
+> Historical v0.5.3 benchmark baseline. For v0.11.0b1, read CMMS backend
+> references as SQLite/FTS5 plus optional LanceDB/Qdrant vectors and in-memory
+> SimpleGraph unless a scenario explicitly initializes Qdrant.
 
 ## Overview
 
@@ -9,7 +11,7 @@ Composite Memory MCP Server (CMMS) against two baseline external memory provider
 
 | Provider | Description | Strengths |
 |----------|-------------|-----------|
-| **CMMS** (hybrid) | SQLite + Qdrant + Graph + 4-stage router | Hybrid routing, entity relations, knowledge extraction |
+| **CMMS** (hybrid) | SQLite/FTS5 + optional LanceDB/Qdrant vectors + in-memory SimpleGraph + 4-stage router | Hybrid routing, entity relations, knowledge extraction |
 | **ChromaDB** (pure vector) | Vector-only semantic retrieval | Fast similarity search, simple API |
 | **SQLite-only** (pure keyword) | LIKE-based exact/keyword matching | Deterministic, no dependencies |
 
@@ -138,7 +140,7 @@ throughput = 1000 / elapsed_seconds  (facts/second)
 ```
 
 **Systems:**
-- CMMS: `remember()` — writes SQLite + auto-indexes Qdrant + graph edges
+- CMMS: `remember()` — writes SQLite + queues best-effort secondary vector/graph indexing
 - ChromaDB: `collection.add()` — pure vector upsert
 - SQLite: `INSERT INTO facts ...` — bare SQL write
 
@@ -160,7 +162,7 @@ wall-clock time for each. Report p50 and p95 latencies in milliseconds.
 
 For CMMS + ChromaDB this includes:
 - Loading SentenceTransformer model (≈2–5 sec on first load)
-- Creating Qdrant/ChromaDB collection in memory
+- Creating the active vector collection (LanceDB by default, Qdrant if configured, ChromaDB for the external baseline)
 
 For SQLite-only, this is near-instant.
 
@@ -171,14 +173,14 @@ For SQLite-only, this is near-instant.
 | Feature | CMMS | ChromaDB | SQLite-only |
 |---------|------|----------|-------------|
 | Exact keyword match | ✅ rules engine (Stage 1) | ❌ vector only | ✅ LIKE |
-| Semantic similarity | ✅ Qdrant (Stage 2) | ✅ default | ❌ |
+| Semantic similarity | ✅ LanceDB/Qdrant (Stage 2) | ✅ default | ❌ |
 | Entity relations | ✅ graph engine (Stage 3) | ❌ | ❌ |
 | Pathfinding / multi-hop | ✅ graph BFS traversal | ❌ | ❌ |
 | Knowledge extraction | ✅ learn() with 3 extractors | ❌ | ❌ |
 | Validation lifecycle | ✅ candidate→trusted | ❌ | ❌ |
 | Audit trail | ✅ receipts + history | ❌ | ❌ |
 | MCP interface | ✅ native FastMCP | ❌ | ❌ |
-| Auto-indexing | ✅ remember→all backends | ❌ manual only | ❌ |
+| Secondary indexing | ✅ remember/learn queue vector+graph indexing where configured | ❌ manual only | ❌ |
 | LLM fallback | ✅ Stage 4 (placeholder) | ❌ | ❌ |
 | Configurable rules | ✅ RoutingRuleSet | ❌ | ❌ |
 | In-process Python API | ✅ mcp.call_tool() | ✅ collection API | ✅ raw SQL |

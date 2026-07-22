@@ -4,7 +4,7 @@
 
 ```bash
 # Setup
-python3.12 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
@@ -48,7 +48,7 @@ Store a fact with provenance.
 | subject | str | yes | — |
 | predicate | str | yes | — |
 | object | str | yes | — |
-| confidence | float | no | 0.8 |
+| confidence | float | no | 1.0 |
 | source | str | no | "user" |
 
 ```
@@ -57,17 +57,17 @@ Store a fact with provenance.
      "verification_status": "candidate"}, "fact": {...}}
 ```
 
-Auto-indexes into Qdrant + graph on store.
+Queues best-effort secondary indexing after the durable SQLite write.
 
 ### search
-Keyword search over facts (SQL LIKE on subject/predicate/object).
+Keyword search over facts (SQLite FTS5 first, with LIKE fallback on
+subject/predicate/object).
 
 | Param | Type | Required |
 |-------|------|----------|
 | query | str | yes |
 | subject | str | no |
 | predicate | str | no |
-| object | str | no |
 
 ```
 → search(query="Docker")
@@ -75,7 +75,7 @@ Keyword search over facts (SQL LIKE on subject/predicate/object).
 ```
 
 ### semantic_search
-Vector similarity search via Qdrant + sentence-transformers.
+Vector similarity search via the configured vector backend + sentence-transformers.
 
 | Param | Type | Required | Default |
 |-------|------|----------|---------|
@@ -89,7 +89,7 @@ Vector similarity search via Qdrant + sentence-transformers.
 ```
 
 ### learn
-Extract knowledge from raw text. Runs all extractors, stores results, auto-indexes.
+Extract knowledge from raw text. Runs all extractors, stores results, and queues best-effort secondary indexing.
 
 | Param | Type | Required | Default |
 |-------|------|----------|---------|
@@ -107,7 +107,8 @@ Retrieve relevant context for a task. Searches facts + graph.
 | Param | Type | Required |
 |-------|------|----------|
 | task | str | yes |
-| agent | str | no |
+| subject | str | no |
+| max_results | int | no |
 
 ```
 → get_context(task="deploy database")
@@ -374,7 +375,7 @@ deprecate(fact_id)
     ↓ (TTL expired)
 archive(fact_id)
     ↓
-[status=archived, removed from Qdrant + graph]
+[status=archived, removed from secondary indexes where supported]
 ```
 
 ## File Structure

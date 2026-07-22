@@ -2,7 +2,17 @@
 
 ## Техническое описание и план реализации
 
+> **Статус:** Исторический/справочный документ. Основные архитектурные решения актуальны для v0.11; технологический стек и roadmap обновлены в соответствии с текущей реализацией (LanceDB по умолчанию, SimpleGraph).
+
 Версия документа: 0.1 Draft
+
+> **Статус v0.11.0b1:** этот документ сохраняет исходный дизайн и roadmap, но
+> ниже явно отмечены текущие границы runtime. GitHub prerelease опубликован;
+> PyPI, официальный MCP Registry, Smithery и Glama не опубликованы. Базовый
+> runtime использует SQLite/FTS5, LanceDB по умолчанию или Qdrant опционально
+> для semantic search, и in-memory SimpleGraph для графа. Neo4j/Graphiti —
+> будущая линия развития, не подключенная в v0.11. Hermes — опциональная
+> интеграция `[hermes]`, см. `docs/INTEGRATION.md`.
 
 ## 1. Назначение
 
@@ -28,19 +38,21 @@ MCP-совместимые агенты
         |
     +---------+---------+---------+
     |         |         |         |
-    Facts   Vector    Graph    Skills
-    SQL     Qdrant    DB       Git
+    Facts   Vector              Graph              Skills
+    SQL/FTS5 LanceDB/Qdrant     SimpleGraph memory Git
 
 ## 3. Технологический стек
 
-Основной язык: - Python 3.12+
+Основной язык: - Python 3.11+
 
 Причины: - MCP SDK; - Pydantic; - AI/ML ecosystem; - LLM API
 integration.
 
-Хранилища: - SQLite/PostgreSQL --- факты и метаданные; - Qdrant ---
-embeddings и semantic search; - Neo4j/Graphiti --- граф знаний; - Git
---- версии skills.
+Хранилища: - SQLite/FTS5 --- факты, метаданные и базовый keyword search; -
+LanceDB/Qdrant --- опциональные embeddings и semantic search (LanceDB по
+умолчанию в server mode, Qdrant через `MEMORY_VECTOR_BACKEND=qdrant`); -
+SimpleGraph сейчас как in-memory graph layer, Neo4j/Graphiti как дальнейшая
+линия развития графа, не подключенная в runtime v0.11; - Git --- версии skills.
 
 ## 4. Внешний интерфейс MCP
 
@@ -133,10 +145,12 @@ Session -\> Extractor -\> Validation -\> Storage
 
 ## 7. Lifecycle памяти
 
-Рекомендуемые состояния:
+Текущие состояния v0.11:
 
-Captured -\> Candidate -\> Validated -\> Trusted -\> Deprecated -\>
-Archived
+Candidate -\> Validated -\> Active -\> Stale -\> Archived -\> Forgotten
+
+Исторические названия `Trusted` и `Deprecated` соответствуют текущим
+`Active` и `Stale`.
 
 ## 8. Conflict resolution
 
@@ -162,7 +176,7 @@ Archived
 
 ### v0.2
 
--   Qdrant
+-   LanceDB (по умолчанию) + Qdrant (опционально)
 -   embeddings
 -   semantic router
 
@@ -173,7 +187,7 @@ Archived
 
 ### v0.4
 
--   graph database
+-   SimpleGraph (in-memory) — граф знаний
 -   entity relations
 
 ### v0.5+

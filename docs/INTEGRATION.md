@@ -1,19 +1,23 @@
 # Hermes Integration Guide
 
-> **Version:** v0.8 — Native MemoryProvider Plugin
-> **Status:** ✅ Production-ready
+> **Version:** v0.11.0b1 — optional `[hermes]` Native MemoryProvider Plugin
+> **Status:** ✅ Implemented for beta / early integration testing; Hermes v0.19
+> provider discovery compatibility is documented in the changelog
 > **ADR:** [ADR-013](ADR.md#adr-013-hermes-memoryprovider-integration--dual-access-path)
 
 ## Overview
 
-CMMS (Composite Memory MCP Server) can integrate with Hermes in **two ways**:
+CMMS (Composite Memory MCP Server) can integrate with Hermes in **two ways**.
+Hermes is not a base runtime dependency of the MCP stdio server; install the
+optional `[hermes]` extra only when using the native provider path:
 
 | Path | Transport | Lifecycle Hooks | Auto-Recall | Auto-Retain | Tools |
 |------|-----------|-----------------|-------------|-------------|-------|
 | **MCP** (external agents) | stdio MCP | ❌ No | ❌ No | ❌ No | `mcp_*` prefixed |
 | **Native MemoryProvider** (v0.8+) | In-process | ✅ Yes | ✅ Yes | ✅ Yes | First-class tools |
 
-The **Native MemoryProvider** path is **strictly more capable** — it enables:
+The **Native MemoryProvider** path exposes Hermes lifecycle features that MCP
+stdio does not provide — it enables:
 
 - **Auto-recall** — Hermes calls `prefetch()` before every turn to inject relevant context
 - **Auto-retain** — Hermes calls `sync_turn()` after every turn to persist observations
@@ -25,7 +29,8 @@ The **Native MemoryProvider** path is **strictly more capable** — it enables:
 
 ### Prerequisites
 
-- Hermes **v0.8+** installed and configured
+- Hermes installed and configured; v0.19 provider discovery is supported by the
+  current plugin shim
 - CMMS installed (`pip install -e ".[hermes]"`)
 - A valid `~/.hermes/config.yaml`
 
