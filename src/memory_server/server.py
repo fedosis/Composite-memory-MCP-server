@@ -6,12 +6,17 @@ v0.6 Phase 4: Uses transactional outbox pattern for async indexing.
 - Failed entries are retried 3 times, then marked as failed
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
 from storage.outbox_worker import OutboxWorker
@@ -27,14 +32,16 @@ from memory_server.evaluation.decay import DecayEngine
 from memory_server.evaluation.metrics import get_collector
 from memory_server.evaluation.validator import Validator
 from memory_server.models import Belief
-from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
 from memory_server.providers.graph_provider import SimpleGraph
-from memory_server.providers.lancedb_provider import LanceDBProvider
-from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.providers.sqlite_provider import SQLiteProvider
-from memory_server.router.embedding_router import EmbeddingRouter
 from memory_server.router.graph_router import GraphRouter
-from memory_server.router.hybrid_router import HybridRouter
+
+if TYPE_CHECKING:
+    from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+    from memory_server.providers.qdrant_provider import QdrantProvider
+    from memory_server.router.embedding_router import EmbeddingRouter
+    from memory_server.router.hybrid_router import HybridRouter
 
 logger = logging.getLogger(__name__)
 
@@ -93,15 +100,28 @@ async def _get_provider() -> SQLiteProvider:
     """Get or create the SQLiteProvider singleton."""
     global _provider
     if _provider is None:
-        _provider = SQLiteProvider(url="sqlite+aiosqlite:///data/memory.db")
+        _provider = SQLiteProvider(url=_get_sqlite_db_url())
         await _provider.initialize()
     return _provider
+
+
+def _get_sqlite_db_url() -> str:
+    """Return the server SQLite URL and ensure file-backed parent dirs exist."""
+    db_url = os.environ.get("MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///data/memory.db")
+    prefix = "sqlite+aiosqlite:///"
+    if db_url.startswith(prefix):
+        db_path = db_url.removeprefix(prefix)
+        if db_path and db_path != ":memory:":
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    return db_url
 
 
 async def _get_lancedb_provider() -> LanceDBProvider:
     """Get or create the LanceDBProvider singleton."""
     global _lancedb
     if _lancedb is None:
+        from memory_server.providers.lancedb_provider import LanceDBProvider
+
         _lancedb = LanceDBProvider(db_path="data/lancedb", table="memories")
     return _lancedb
 
@@ -110,6 +130,8 @@ async def _get_qdrant_provider() -> QdrantProvider:
     """Get or create the QdrantProvider singleton (optional server-mode backend)."""
     global _qdrant
     if _qdrant is None:
+        from memory_server.providers.qdrant_provider import QdrantProvider
+
         _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
     return _qdrant
 
@@ -130,8 +152,12 @@ async def _get_router() -> EmbeddingRouter:
     """Get or create the EmbeddingRouter singleton."""
     global _qdrant, _lancedb, _embedder, _router
     if _router is None:
+        from memory_server.router.embedding_router import EmbeddingRouter
+
         vector_provider = await _get_vector_provider()
         if _embedder is None:
+            from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+
             _embedder = SentenceTransformerEmbeddingProvider()
         _router = EmbeddingRouter(
             vector_provider=vector_provider,
@@ -423,8 +449,12 @@ async def _get_hybrid_router() -> HybridRouter:
     """Get or create the HybridRouter singleton."""
     global _qdrant, _lancedb, _embedder, _graph, _hybrid_router
     if _hybrid_router is None:
+        from memory_server.router.hybrid_router import HybridRouter
+
         vector_provider = await _get_vector_provider()
         if _embedder is None:
+            from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+
             _embedder = SentenceTransformerEmbeddingProvider()
         if _graph is None:
             _graph = SimpleGraph()

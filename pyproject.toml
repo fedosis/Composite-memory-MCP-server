@@ -3,7 +3,22 @@ name = "composite-memory-mcp-server"
 version = "0.11.0b1"
 description = "Independent MCP memory service for AI agents"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
+authors = [
+    { name = "Shtorm" },
+    { name = "FedosIS", email = "fedosis@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 dependencies = [
     "mcp>=1.0.0",
     "pydantic>=2.0.0",
@@ -11,6 +26,8 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "aiosqlite>=0.20.0",
     "typer>=0.12.0",
+    "prometheus-client>=0.19.0",
+    "opentelemetry-api>=1.22.0",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +48,11 @@ dev = [
 
 [project.scripts]
 memory-server = "memory_server.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/fedosis/Composite-memory-MCP-server"
+Repository = "https://github.com/fedosis/Composite-memory-MCP-server"
+Documentation = "https://github.com/fedosis/Composite-memory-MCP-server/blob/main/README.md"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

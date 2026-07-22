@@ -8,15 +8,17 @@ Per ADR-005 routing order:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from memory_server.providers.embedding_provider import (
     EmbeddingProvider,
     MockEmbeddingProvider,
 )
-from memory_server.providers.lancedb_provider import LanceDBProvider
-from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.router.rules import RoutingRuleSet
+
+if TYPE_CHECKING:
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+    from memory_server.providers.qdrant_provider import QdrantProvider
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +26,12 @@ DEFAULT_COLLECTION = "memories"
 DEFAULT_TOP_K = 10
 DEFAULT_SCORE_THRESHOLD = 0.0
 
-# Union type for vector providers
-VectorProvider = QdrantProvider | LanceDBProvider
+# Union type for vector providers. Keep runtime as Any so importing the router
+# does not import optional vector backend packages in clean base installs.
+if TYPE_CHECKING:
+    VectorProvider = QdrantProvider | LanceDBProvider
+else:
+    VectorProvider = Any
 
 
 class EmbeddingRouter:

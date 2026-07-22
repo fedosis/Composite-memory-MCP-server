@@ -15,8 +15,6 @@ import logging
 import uuid
 from typing import Any
 
-import numpy as np
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_TABLE = "memories"
@@ -335,6 +333,7 @@ class LanceDBProvider:
 
         table = await self._get_table(collection)
         try:
+            import numpy as np  # lazy: optional dep, only needed for search
             lance_filter = _dict_to_filter(filter_) if isinstance(filter_, dict) else filter_
             query = table.search(np.array(vector, dtype=np.float32))
 

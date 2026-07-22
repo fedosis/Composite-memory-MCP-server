@@ -10,8 +10,11 @@ Processing is idempotent — processing the same entry twice is safe
 because Qdrant upsert is idempotent and graph operations are additive.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -19,10 +22,12 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
-from memory_server.providers.qdrant_provider import QdrantProvider
-from memory_server.providers.lancedb_provider import LanceDBProvider
-from memory_server.router.graph_router import GraphRouter
+if TYPE_CHECKING:
+    from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+    from memory_server.providers.qdrant_provider import QdrantProvider
+    from memory_server.router.graph_router import GraphRouter
+
 from storage.base import Base
 from storage.outbox import OutboxEntry, OutboxRepository
 

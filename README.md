@@ -741,3 +741,11 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on push/PR to `main`:
 | v0.4  | Graph DB + entity relations |
 | v0.5  | Confidence engine + validation + decay + auditor + auto-indexing |
 | v0.6  | 6-state lifecycle, audit tool, metrics/observability, outbox indexing, storage docs, CI/CD |
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+## Authors
+
+See [AUTHORS.md](AUTHORS.md) for contributor and attribution information.
