@@ -185,9 +185,7 @@ class MemoryAdmissionGate:
         risk_tags = self._risk_tags(lower)
         admission_tags = self._admission_tags(memory_kind, tag, risk_tags)
         authority_level = self._authority_level(memory_kind, tag)
-        epistemic_status = (
-            "migrated/imported" if source_scope in {"import", "MEMORY.md"} else "explicit_user_statement"
-        )
+        epistemic_status = "migrated/imported" if source_scope in {"import", "MEMORY.md"} else "explicit_user_statement"
         expires_at = None
         if ttl_days is not None:
             expires_at = (timestamp + timedelta(days=ttl_days)).isoformat()
@@ -234,7 +232,7 @@ class MemoryAdmissionGate:
                 return "user_preference_style"
             if any(term in lower for term in _WORKFLOW_TERMS):
                 return "user_preference_workflow"
-            return "user_preference_workflow"
+            return "user_preference"
         if tag is MemoryTag.EPHEMERAL:
             return "episodic_observation"
         if any(term in lower for term in {"project", "repo", "docker", "python", "postgres", "sqlite"}):
@@ -251,8 +249,7 @@ class MemoryAdmissionGate:
         if any(term in lower for term in {"delete", "destructive", "overwrite", "reset"}):
             tags.append("destructive_sensitive")
         if any(
-            term in lower
-            for term in {"secret", "password", "token", "api key", "credential", "security", "safety"}
+            term in lower for term in {"secret", "password", "token", "api key", "credential", "security", "safety"}
         ):
             tags.append("security_sensitive")
         if any(term in lower for term in {"logging", "rollback"}):

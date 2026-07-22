@@ -58,6 +58,44 @@ def test_admission_gate_tags_important_policy_without_ttl():
     assert "security_sensitive" in decision.metadata["risk_tags"]
 
 
+def test_admission_gate_force_admits_ephemeral():
+    """force=True admits low-signal text while keeping EPHEMERAL tag and TTL."""
+    gate = MemoryAdmissionGate()
+
+    decision = gate.classify("thanks, ok", force=True)
+
+    assert decision.admitted is True
+    assert decision.tag == MemoryTag.EPHEMERAL
+    assert decision.ttl_days == 1
+    assert "low_signal" in decision.reason_codes
+
+
+def test_admission_gate_rejects_empty_or_whitespace():
+    """Empty and whitespace-only input is rejected as low_signal."""
+    gate = MemoryAdmissionGate()
+
+    empty = gate.classify("")
+    ws = gate.classify("   ")
+
+    for d in (empty, ws):
+        assert d.admitted is False
+        assert d.tag == MemoryTag.EPHEMERAL
+        assert d.ttl_days == 1
+        assert "low_signal" in d.reason_codes
+
+
+def test_admission_gate_tags_transient_terms():
+    """Text with transient/temporary terms gets EPHEMERAL tag regardless of length."""
+    gate = MemoryAdmissionGate()
+
+    decision = gate.classify("temporary scratch note for today")
+
+    assert decision.admitted is False
+    assert decision.tag == MemoryTag.EPHEMERAL
+    assert decision.ttl_days == 1
+    assert "low_signal" in decision.reason_codes
+
+
 @pytest.mark.asyncio
 async def test_remember_with_admission_metadata_persists_tag_and_ttl(provider):
     gate = MemoryAdmissionGate()
