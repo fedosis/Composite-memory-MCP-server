@@ -1,17 +1,64 @@
 #!/bin/bash
-# Pre-commit hook: ruff check + pytest (skip if tools not installed)
-set -e
+# Pre-commit hook: staged-aware gate — ruff + fast smoke tests
+#
+# - Docs-only commits skip all checks (fast exit 0).
+# - Python changes: Ruff only on staged *existing* files, then a bounded
+#   smoke-test run (release-candidate + ping) instead of the full suite.
+# - Full suite belongs in CI.
+set -euo pipefail
 
-if ! command -v ruff &>/dev/null; then
-    echo "⚠ ruff not installed — skipping lint"
+mapfile -t STAGED_PY < <(
+    git diff --cached --name-only --diff-filter=ACMR \
+    | grep -E '\.py$' \
+    | grep -E '^(src/|storage/|tests/)' \
+    || true
+)
+
+if [ ${#STAGED_PY[@]} -eq 0 ]; then
+    echo "✔ No staged Python files — skipping pre-commit checks"
     exit 0
 fi
-echo "=== ruff check ==="
-ruff check src/
 
+# ---- ruff (only on staged files that still exist on disk) ----
+if command -v ruff &>/dev/null; then
+    EXISTING_PY=()
+    for f in "${STAGED_PY[@]}"; do
+        [ -f "$f" ] && EXISTING_PY+=("$f")
+    done
+    if [ ${#EXISTING_PY[@]} -gt 0 ]; then
+        echo "=== ruff check (staged files) ==="
+        ruff check "${EXISTING_PY[@]}"
+    else
+        echo "✔ All staged Python files were deleted/renamed — skipping ruff"
+    fi
+else
+    echo "⚠ ruff not installed — skipping lint"
+fi
+
+# ---- pytest: fast smoke tests only ----
 if ! python3 -m pytest --version &>/dev/null; then
     echo "⚠ pytest not installed — skipping tests"
     exit 0
 fi
-echo "=== pytest ==="
-pytest tests/ --tb=short -q
+
+SMOKE_TESTS=("tests/test_release_candidate.py" "tests/test_ping.py")
+MISSING=()
+for t in "${SMOKE_TESTS[@]}"; do
+    [ -f "$t" ] || MISSING+=("$t")
+done
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "⚠ Smoke test files missing, skipping pytest: ${MISSING[*]}"
+    exit 0
+fi
+
+echo "=== pytest (fast smoke: release-candidate + ping, 30s timeout) ==="
+set +e
+timeout --foreground 30s pytest "${SMOKE_TESTS[@]}" --tb=short -q
+RC=$?
+set -e
+if [ $RC -eq 124 ]; then
+    echo "❌ Smoke tests timed out after 30s — aborting commit" >&2
+    exit 124
+elif [ $RC -ne 0 ]; then
+    exit $RC
+fi
