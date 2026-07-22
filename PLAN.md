@@ -134,3 +134,43 @@ LongMemEval-S Benchmark Harness
 | 002 | Memory Admission Gate + Tagging | t_855a2392 | ✅ done | ✅ approve | ✅ pass | ✅ v0.11.0b1 |
 
 Scope: lineage-aware LongMemEval-S harness with Raw/Source/Canonical retrieval scoring and a deterministic Hermes built-in lexical baseline. Memory Admission Gate with rule-based write-time tagging, TTL-aware lifecycle, and structured admission metadata.
+
+---
+
+## ⚡ Priority Research Direction: Multi-Agent Memory Sharing & Access Control
+
+**Status:** Research/planning only — NOT implemented. This section captures architectural reasoning for post-v0.11 investigation.
+
+### Problem
+
+CMMS is currently a single-agent memory server. As Hermes evolves into multi-agent/multi-tenant setups (subagents, cron workers, delegated tasks, shared project memory), the memory server must support **controlled memory sharing across agents** without leaking private context, corrupting shared state, or allowing unauthorized reads.
+
+### Design Principles (draft, for validation)
+
+1. **Default-private** — every memory write is private to the originating agent by default. Sharing is opt-in.
+2. **Visibility levels** — a hierarchy of scope: `private → agent-shared → project-shared → team-shared → public`.
+3. **Permission primitives** — `read`, `write`, `derive` (create derived memory from shared), `share` (grant access), `revoke` (withdraw granted access).
+4. **Auth-before-retrieval** — permission check must precede every retrieval access. Shared read should fail closed if no explicit grant.
+5. **Provenance + Confidence + Lifecycle** — every shared memory item carries provenance (who wrote it), confidence (how reliable), lifecycle (TTL, staleness).
+6. **Guard against shared hallucinations** — shared memory derived by agent A should not be treated as truth by agent B without confidence/evidence anchoring.
+
+### Key Research Questions
+
+- What existing approaches exist for access control / tenant isolation inside a single memory server (not database-level, but semantic/application-level)?
+- Current standards/patterns for multi-agent memory sharing?
+- How to enforce ACL at the retrieval level, not just the storage level?
+- Derived-memory leakage: when agent B reads a belief derived from agent A's private raw data, what leaks?
+- Revocation semantics: what happens to derived memories after the source is revoked?
+- Audit trail for shared memory access — who read what, when, with what derived memory?
+
+### Canonical Findings Location
+
+All CMMS research findings live under:
+
+```
+~/.hermes/workspace/cmms/research/<branch>/
+```
+
+Branches: `memory-architecture/`, `evaluation/`, `storage/`, `provider-integration/`, `access-control/`.
+
+See `~/.hermes/workspace/cmms/README.md` for full catalog.
