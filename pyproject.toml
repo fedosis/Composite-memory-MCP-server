@@ -1,8 +1,9 @@
 [project]
 name = "composite-memory-mcp-server"
-version = "0.1.0"
+version = "0.11.0b1"
 description = "Independent MCP memory service for AI agents"
-requires-python = ">=3.12"
+readme = "README.md"
+requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.0.0",
     "pydantic>=2.0.0",
@@ -35,11 +36,28 @@ memory-server = "memory_server.cli:app"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = [
+    "memory_server",
+    "memory_server.api",
+    "memory_server.benchmarks",
+    "memory_server.evaluation",
+    "memory_server.extractors",
+    "memory_server.models",
+    "memory_server.plugins",
+    "memory_server.plugins.hermes",
+    "memory_server.providers",
+    "memory_server.router",
+    "memory_server.services",
+    "storage",
+    "storage.adapters",
+    "storage.models",
+    "storage.repositories",
+]
+package-dir = {"memory_server" = "src/memory_server", "storage" = "storage"}
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py311"
 src = ["src"]
 line-length = 120
 
@@ -47,7 +65,7 @@ line-length = 120
 select = ["E", "F", "I", "W", "N"]
 
 [tool.black]
-target-version = ["py312"]
+target-version = ["py311"]
 
 [tool.ruff.format]
 quote-style = "double"

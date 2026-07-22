@@ -3,6 +3,87 @@
 Independent MCP memory service for AI agents. Agent-independent.
 
 [![Hermes Native Provider](https://img.shields.io/badge/Hermes-Native_MemoryProvider-blueviolet)](docs/INTEGRATION.md)
+[![version](https://img.shields.io/badge/version-0.11.0b1-blue)]()
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue)]()
+
+## First-run install
+
+### Prerequisites
+
+- **Python 3.11+**
+- **SQLite** (bundled with Python)
+- Optional: [Qdrant](https://qdrant.tech/) for vector search, [Neo4j](https://neo4j.com/) for graph support
+
+### Install
+
+```bash
+# Clone the repository
+git clone git@github.com:fedosis/Composite-memory-MCP-server.git
+cd memory-server
+
+# Create and activate a virtual environment
+python3.11 -m venv .venv
+source .venv/bin/activate
+
+# Install base package exactly as a clean user would
+pip install .
+
+# Or install with all extras (recommended for development/full functionality)
+pip install -e ".[dev]"
+```
+
+### Run the server
+
+```bash
+# Start the MCP server (stdio transport)
+memory-server serve
+```
+
+### Use the tools
+
+The server exposes MCP tools over stdio. For a local MCP client, point the
+server command at the virtualenv executable:
+
+```json
+{
+  "mcpServers": {
+    "memory-server": {
+      "command": "/absolute/path/to/memory-server/.venv/bin/memory-server",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+For a quick local smoke check, run `memory-server --help`. To exercise the MCP
+tools, connect through an MCP-compatible client and call the `ping` tool.
+
+### What you can do
+
+| Tool | Purpose |
+|------|---------|
+| `ping` | Health check / connectivity test |
+| `remember` | Store a fact with provenance |
+| `search` | Keyword search over stored facts |
+| `semantic_search` | Vector similarity search (requires Qdrant) |
+| `get_context` | Retrieve context for a task |
+| `learn` | Extract knowledge from natural language |
+| `graph_search` | Entity lookup + pathfinding (requires Neo4j/SimpleGraph) |
+| `route` | 4-stage hybrid router |
+| `audit` | Memory health report |
+| `metrics` | Prometheus metrics |
+| `set_belief` / `get_belief` | Belief store management |
+| `resolve_conflict` | Resolve belief conflicts |
+| `reflect` | 6-mode belief store analysis |
+
+### Run tests and lint
+
+```bash
+pytest tests/ -q
+ruff check src/
+```
+
+---
 
 ## Hermes Integration
 
@@ -11,7 +92,7 @@ This enables auto-recall, auto-retain, and session lifecycle hooks.
 
 ```bash
 pip install -e ".[hermes]"
-memory-server install-hermes-plugin
+memory-server install-hermes-plugin --hermes-home ~/.hermes/profiles/coder
 hermes gateway restart
 ```
 
@@ -37,12 +118,12 @@ ruff check src/
 
 # CLI
 memory-server --help
-memory-server ping
 ```
 
 ## Docs
 
 - [ADR](docs/ADR.md) — Architecture Decision Records (13 ADRs)
+- [Changelog](CHANGELOG.md) — Release notes and known limitations
 - [Integration Guide](docs/INTEGRATION.md) — Hermes MemoryProvider plugin
 - [Agent Spec](docs/agent-spec.md) — Implementation specification
 - [Technical Design](docs/technical-design.md) — Tech stack + roadmap
@@ -458,7 +539,7 @@ search_latency_ms_bucket{le="5.0"} 5.0
 
 ## Stack
 
-Python 3.12+, MCP SDK, Pydantic, SQLAlchemy, Qdrant, Neo4j, GitPython,
+Python 3.11+, MCP SDK, Pydantic, SQLAlchemy, Qdrant, Neo4j, GitPython,
 Prometheus Client, OpenTelemetry
 
 ## Storage

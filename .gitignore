@@ -32,6 +32,8 @@ htmlcov/
 
 # Project specific
 *.db
+*.db-*
 *.sqlite3
+=*.0
 data/
 .worktrees/

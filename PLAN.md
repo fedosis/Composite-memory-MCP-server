@@ -130,6 +130,7 @@ LongMemEval-S Benchmark Harness
 
 | # | Card | ID | Status | Review | Tests | Merged |
 |---|------|----|--------|--------|-------|--------|
-| 001 | LongMemEval Benchmark Harness | t_ee797b52 | 🔄 running | pending | ✅ targeted | pending |
+| 001 | LongMemEval Benchmark Harness | t_ee797b52 | ✅ done | ✅ approve | ✅ pass | ✅ v0.11.0b1 |
+| 002 | Memory Admission Gate + Tagging | t_855a2392 | ✅ done | ✅ approve | ✅ pass | ✅ v0.11.0b1 |
 
-Scope: lineage-aware LongMemEval-S harness with Raw/Source/Canonical retrieval scoring and a deterministic Hermes built-in lexical baseline.
+Scope: lineage-aware LongMemEval-S harness with Raw/Source/Canonical retrieval scoring and a deterministic Hermes built-in lexical baseline. Memory Admission Gate with rule-based write-time tagging, TTL-aware lifecycle, and structured admission metadata.
