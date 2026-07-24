@@ -243,7 +243,7 @@ class HermesProvider:
         try:
             loop = _get_loop()
             asyncio.run_coroutine_threadsafe(
-                self._queue_prefetch_async(query, max_results=10),
+                self._queue_prefetch_async(query, max_results=5),
                 loop,
             )
         except Exception:
@@ -267,7 +267,7 @@ class HermesProvider:
         # Fallback: sync load (first turn, no prior queue_prefetch)
         try:
             result = _run_async(
-                self._prefetch_async(query, max_results=10),
+                self._prefetch_async(query, max_results=5),
                 timeout=10.0,
             )
             if result:
@@ -278,13 +278,13 @@ class HermesProvider:
 
         return ""
 
-    async def _queue_prefetch_async(self, query: str, max_results: int = 10) -> None:
+    async def _queue_prefetch_async(self, query: str, max_results: int = 5) -> None:
         """Async prefetch that caches result in _context_cache."""
         result = await self._prefetch_async(query, max_results=max_results)
         if result:
             self._context_cache["prefetch"] = result
 
-    async def _prefetch_async(self, query: str, max_results: int = 10) -> str:
+    async def _prefetch_async(self, query: str, max_results: int = 5) -> str:
         """Async prefetch implementation.
 
         Calls the get_context API and returns a formatted block.
@@ -304,10 +304,20 @@ class HermesProvider:
         if not context.get("facts") and not context.get("decisions"):
             return ""
 
+        # Filter by minimum confidence
+        min_confidence = 0.8
+        filtered_facts = [
+            f for f in context.get("facts", [])
+            if f.get("confidence", 1.0) >= min_confidence
+        ]
+
+        if not filtered_facts and not context.get("decisions"):
+            return ""
+
         # Format as a system prompt block
         lines: list[str] = []
         lines.append("--- Memory Context ---")
-        for fact in context["facts"]:
+        for fact in filtered_facts:
             lines.append(
                 f"  {fact.get('subject', '?')} {fact.get('predicate', '?')} "
                 f"{fact.get('object', '?')}"
