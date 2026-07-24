@@ -923,7 +923,7 @@ class HermesProvider:
             self._embedder = SentenceTransformerEmbeddingProvider()
 
         router = EmbeddingRouter(
-            qdrant_provider=self._qdrant,
+            vector_provider=self._qdrant,
             embedder=self._embedder,
         )
         results = await router.route(
@@ -1013,7 +1013,7 @@ class HermesProvider:
             self._graph = SimpleGraph()
 
         router = HybridRouter(
-            qdrant_provider=self._qdrant,
+            vector_provider=self._qdrant,
             embedder=self._embedder,
             graph=self._graph,
         )
