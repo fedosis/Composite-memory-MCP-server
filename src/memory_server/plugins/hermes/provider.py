@@ -160,7 +160,7 @@ class HermesProvider:
 
         # Initialize SQLiteProvider on the background loop
         try:
-            self._provider = _run_async(self._init_provider(db_url))
+            self._provider = _run_async(self._init_provider(db_url), timeout=60.0)
         except Exception:
             logger.exception("HermesProvider: failed to initialize SQLiteProvider")
             self._initialized = False
