@@ -3,7 +3,7 @@
 import pytest
 
 from memory_server.api.remember import remember
-from memory_server.models import Fact, MemoryReceipt, VerificationStatus
+from memory_server.models import MemoryReceipt, VerificationStatus
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
 
@@ -47,6 +47,80 @@ class TestRemember:
         assert receipt.confidence == 0.9
         assert receipt.source == "manual"
 
+    async def test_store_with_evidence_chain(self, provider):
+        parent = await remember(
+            provider,
+            subject="Docker",
+            predicate="runs_on",
+            object="OMV8",
+        )
+        parent_id = parent["receipt"].id
+
+        result = await remember(
+            provider,
+            subject="OMV8",
+            predicate="runs",
+            object="Docker",
+            metadata={
+                "evidence": {
+                    "method": "inference",
+                    "sources": ["parent-fact"],
+                    "session_id": "session-123",
+                    "confidence": 0.8,
+                    "source_date": "2026-08-13",
+                    "derived_from": [parent_id],
+                    "claim_type": "fact",
+                },
+                "scope": "derived",
+                "ttl_days": 30,
+            },
+        )
+
+        receipt = result["receipt"]
+        assert receipt.history
+        assert receipt.history[0]["metadata"]["evidence"]["derived_from"] == [parent_id]
+        assert receipt.history[0]["metadata"]["evidence"]["claim_type"] == "fact"
+        assert receipt.history[0]["metadata"]["scope"] == "derived"
+        assert receipt.history[0]["metadata"]["ttl_days"] == 30
+
+    async def test_store_with_backward_compatible_metadata(self, provider):
+        result = await remember(
+            provider,
+            subject="Caddy",
+            predicate="listens_on",
+            object="443",
+            metadata={
+                "method": "web_search",
+                "sources": ["https://example.com"],
+                "session_id": "sess-1",
+                "confidence": 0.7,
+                "source_date": "2026-08-13",
+                "scope": "user",
+                "ttl_days": 7,
+            },
+        )
+
+        receipt = result["receipt"]
+        assert receipt.history
+        assert receipt.history[0]["metadata"]["scope"] == "user"
+        assert receipt.history[0]["metadata"]["ttl_days"] == 7
+        assert "evidence" not in receipt.history[0]["metadata"]
+
+    async def test_invalid_derived_from_raises_error(self, provider):
+        with pytest.raises(ValueError, match="derived_from"):
+            await remember(
+                provider,
+                subject="X",
+                predicate="is",
+                object="Y",
+                metadata={
+                    "evidence": {
+                        "derived_from": "not-a-list",
+                        "claim_type": "fact",
+                    }
+                },
+            )
+
     async def test_retrieve_and_verify_receipt(self, provider):
         result = await remember(
             provider,
@@ -68,6 +142,24 @@ class TestRemember:
         stored_receipt = await provider.get_receipt(fact_id)
         assert stored_receipt is not None
         assert stored_receipt.verification_status == VerificationStatus.CANDIDATE
+
+    async def test_search_fts5_still_works_after_evidence_metadata(self, provider):
+        await remember(
+            provider,
+            subject="Docker",
+            predicate="runs_on",
+            object="OMV8",
+            metadata={
+                "evidence": {
+                    "derived_from": [],
+                    "claim_type": "fact",
+                }
+            },
+        )
+
+        results = await provider.search_facts(text="Docker")
+        assert results
+        assert any(f.subject == "Docker" for f in results)
 
     async def test_store_invalid_data_raises_error(self, provider):
         with pytest.raises(ValueError, match="subject"):
