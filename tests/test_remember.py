@@ -92,6 +92,9 @@ class TestRemember:
         assert edge is not None
         assert edge.relation == "derived_from"
 
+        sql_dependents = await provider.get_claim_dependents(parent_id)
+        assert child_fact.id in sql_dependents
+
     async def test_store_with_backward_compatible_metadata(self, provider):
         result = await remember(
             provider,

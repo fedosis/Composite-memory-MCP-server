@@ -150,6 +150,7 @@ class ReflectEngine:
             tags=[topic] if topic else None,
             min_confidence=min_confidence if min_confidence > 0 else None,
             lifecycle_state=None,  # all states
+            include_inactive=True,
             limit=limit if limit > 0 else 10000,  # effectively unlimited
         )
 

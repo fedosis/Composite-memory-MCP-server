@@ -248,3 +248,113 @@ class TestLifecycleServiceP3:
         assert events[0]["from_state"] == "active"
         assert events[0]["to_state"] == "superseded"
         assert events[0]["reason"] == f"Replaced by {payload['belief']['id']}"
+
+    async def test_set_belief_replace_rolls_back_when_creation_fails(
+        self, provider, monkeypatch
+    ):
+        old = Belief(proposition="Rollback policy", confidence=0.6)
+        await provider.create_belief(old)
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        graph = SimpleGraph()
+        monkeypatch.setattr(server_module, "_provider", provider)
+        monkeypatch.setattr(server_module, "_graph", graph)
+        monkeypatch.setattr(server_module, "_graph_router", None)
+        monkeypatch.setattr(provider, "create_in_transaction", boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await server_module.set_belief_tool(
+                proposition="New rollback policy",
+                confidence=0.9,
+                replace_belief_id=old.id,
+            )
+
+        reloaded = await provider.get_belief(old.id)
+        assert reloaded is not None
+        assert reloaded.lifecycle_state == "active"
+        assert reloaded.version == 1
+
+    async def test_resolve_conflict_merge_rolls_back_when_creation_fails(
+        self, provider, monkeypatch
+    ):
+        belief_a = Belief(proposition="A policy", confidence=0.8)
+        belief_b = Belief(proposition="B policy", confidence=0.6)
+        await provider.create_belief(belief_a)
+        await provider.create_belief(belief_b)
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        graph = SimpleGraph()
+        monkeypatch.setattr(server_module, "_provider", provider)
+        monkeypatch.setattr(server_module, "_graph", graph)
+        monkeypatch.setattr(server_module, "_graph_router", None)
+        monkeypatch.setattr(provider, "create_in_transaction", boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await server_module.resolve_conflict_tool(
+                belief_a_id=belief_a.id,
+                belief_b_id=belief_b.id,
+                resolution="merge",
+                new_proposition="Combined policy",
+            )
+
+        reloaded_a = await provider.get_belief(belief_a.id)
+        reloaded_b = await provider.get_belief(belief_b.id)
+        assert reloaded_a is not None and reloaded_a.lifecycle_state == "active"
+        assert reloaded_b is not None and reloaded_b.lifecycle_state == "active"
+
+    async def test_propagation_uses_sql_relations_when_graph_unavailable(
+        self, provider, monkeypatch
+    ):
+        parent = Fact(
+            id="fact-parent-sql",
+            subject="Source",
+            predicate="supports",
+            object="Claim",
+            confidence=1.0,
+        )
+        child = Fact(
+            id="fact-child-sql",
+            subject="Derived",
+            predicate="depends_on",
+            object="Parent",
+            confidence=0.5,
+        )
+        await provider.create_fact(parent)
+        await provider.create_fact(child)
+        await provider.create_in_transaction(
+            relation_entries=[
+                {
+                    "source_id": child.id,
+                    "target_id": parent.id,
+                    "relation_type": "derived_from",
+                }
+            ]
+        )
+
+        class BrokenGraph:
+            def search_by_relation(self, relation: str):
+                raise RuntimeError("graph unavailable")
+
+        monkeypatch.setattr(server_module, "_provider", provider)
+        monkeypatch.setattr(server_module, "_graph", BrokenGraph())
+        monkeypatch.setattr(server_module, "_graph_router", None)
+
+        payload = json.loads(
+            await server_module.invalidate_tool(
+                memory_id=parent.id,
+                memory_type="fact",
+                reason="parent invalidated",
+            )
+        )
+
+        assert payload["propagated"]
+        assert payload["propagated"][0]["memory_id"] == child.id
+
+        updated_child = await provider.get_fact(child.id)
+        assert updated_child is not None
+        assert updated_child.confidence == pytest.approx(0.4)
+        assert updated_child.version == 2

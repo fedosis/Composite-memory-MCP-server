@@ -47,8 +47,8 @@ class TestBeliefProviderCRUD:
 
     async def test_search_beliefs_default(self, provider):
         """Search without filters returns active beliefs."""
-        b1 = await provider.create_belief(Belief(proposition="First", lifecycle_state="active"))
-        b2 = await provider.create_belief(Belief(proposition="Second", lifecycle_state="superseded"))
+        await provider.create_belief(Belief(proposition="First", lifecycle_state="active"))
+        await provider.create_belief(Belief(proposition="Second", lifecycle_state="superseded"))
 
         results = await provider.search_beliefs()
         assert len(results) >= 1
@@ -105,6 +105,17 @@ class TestBeliefProviderCRUD:
         results = await provider.search_beliefs(limit=3)
         assert len(results) == 3
 
+    async def test_search_beliefs_excludes_inactive_by_default(self, provider):
+        active = await provider.create_belief(Belief(proposition="Active belief"))
+        inactive = await provider.create_belief(Belief(proposition="Old belief"))
+        await provider.update_belief_lifecycle(inactive.id, "superseded")
+
+        default_results = await provider.search_beliefs()
+        assert [belief.id for belief in default_results] == [active.id]
+
+        all_results = await provider.search_beliefs(include_inactive=True)
+        assert {belief.id for belief in all_results} == {active.id, inactive.id}
+
     async def test_update_belief_confidence(self, provider):
         b = await provider.create_belief(Belief(proposition="Test", confidence=0.5))
         updated = await provider.update_belief_confidence(b.id, 0.9)
@@ -118,8 +129,9 @@ class TestBeliefProviderCRUD:
         assert updated.lifecycle_state == "superseded"
 
     async def test_create_in_transaction(self, provider):
-        from memory_server.models.receipt import MemoryReceipt
         from datetime import datetime, timezone
+
+        from memory_server.models.receipt import MemoryReceipt
 
         b = Belief(proposition="Transaction test")
         r = MemoryReceipt(

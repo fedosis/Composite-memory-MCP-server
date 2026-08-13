@@ -21,6 +21,7 @@ from storage.repositories import (
     EvidenceRepository,
     FactRepository,
     ReceiptRepository,
+    RelationRepository,
     SkillRepository,
 )
 
@@ -127,6 +128,30 @@ class MemoryIngestionService:
                 )
                 receipt_repo = ReceiptRepository(session)
                 stored_receipt = await receipt_repo.create(receipt)
+
+                relation_entries: list[dict[str, Any]] = []
+                evidence_metadata = metadata.get("evidence") if metadata else None
+                derived_from = (
+                    evidence_metadata.get("derived_from")
+                    if isinstance(evidence_metadata, dict)
+                    else None
+                )
+                if derived_from:
+                    relation_entries = [
+                        {
+                            "source_id": fact_id,
+                            "target_id": parent_id,
+                            "relation_type": "derived_from",
+                        }
+                        for parent_id in derived_from
+                    ]
+                    relation_repo = RelationRepository(session)
+                    for entry in relation_entries:
+                        await relation_repo.create(
+                            source_id=entry["source_id"],
+                            target_id=entry["target_id"],
+                            relation_type=entry["relation_type"],
+                        )
 
                 # Write outbox entry (same transaction!)
                 outbox_repo = OutboxRepository(session)

@@ -6,14 +6,14 @@ All scenarios exercise the same provider API that the MCP tools use, giving
 end-to-end coverage of the belief subsystem.
 """
 
-import json
-import pytest
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
+from memory_server.api.reflect import ReflectEngine
 from memory_server.models import Belief, Evidence
 from memory_server.models.receipt import MemoryReceipt
 from memory_server.providers.sqlite_provider import SQLiteProvider
-from memory_server.api.reflect import ReflectEngine
 
 
 @pytest.fixture
@@ -128,6 +128,7 @@ class TestDuplicateLearnReinforces:
         all_beliefs = await provider.search_beliefs(
             proposition="User prefers Debian over Ubuntu",
             lifecycle_state=None,
+            include_inactive=True,
             limit=100,
         )
         assert len(all_beliefs) == 1
@@ -420,7 +421,11 @@ class TestGetBeliefBySource:
         await provider.create_belief(b)
 
         # get_belief with source_id filter (in-memory filter, as in server.py get_belief_tool)
-        results = await provider.search_beliefs(lifecycle_state=None, limit=100)
+        results = await provider.search_beliefs(
+            lifecycle_state=None,
+            include_inactive=True,
+            limit=100,
+        )
         filtered = [x for x in results if "fact-specific-001" in x.source_ids]
         assert len(filtered) == 1
         assert filtered[0].id == b.id

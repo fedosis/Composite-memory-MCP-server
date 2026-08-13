@@ -85,6 +85,21 @@ class TestFactCRUD:
         results = await provider.search_facts(subject="DoesNotExist")
         assert results == []
 
+    async def test_search_facts_excludes_inactive_by_default(self, provider):
+        active = await provider.create_fact(
+            Fact(id="f-inactive-1", subject="Active", predicate="is", object="Visible")
+        )
+        inactive = await provider.create_fact(
+            Fact(id="f-inactive-2", subject="Old", predicate="is", object="Hidden")
+        )
+        await provider.update_fact(inactive.id, lifecycle_state="superseded")
+
+        default_results = await provider.search_facts(limit=10)
+        assert [fact.id for fact in default_results] == [active.id]
+
+        all_results = await provider.search_facts(limit=10, include_inactive=True)
+        assert {fact.id for fact in all_results} == {active.id, inactive.id}
+
     async def test_update_fact(self, provider):
         f = Fact(id="f12", subject="Old", predicate="is", object="Value")
         await provider.create_fact(f)

@@ -6,7 +6,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from storage.repositories import BeliefRepository, FactRepository, LifecycleRepository
+from storage.repositories import (
+    BeliefRepository,
+    FactRepository,
+    LifecycleRepository,
+    RelationRepository,
+)
 
 from memory_server.evaluation.validator import (
     is_valid_transition,
@@ -82,6 +87,49 @@ class LifecycleService:
         )
         results = await self.transition_many([request], graph=graph)
         return results[0]
+
+    async def transition_in_session(
+        self,
+        session,
+        request: LifecycleTransitionRequest,
+        graph: SimpleGraph | None = None,
+    ) -> LifecycleTransitionResult:
+        """Transition a single memory using an existing DB session."""
+        lifecycle_repo = LifecycleRepository(session)
+        fact_repo = FactRepository(session)
+        belief_repo = BeliefRepository(session)
+        return await self._transition_in_session(
+            session=session,
+            lifecycle_repo=lifecycle_repo,
+            fact_repo=fact_repo,
+            belief_repo=belief_repo,
+            request=request,
+            graph=graph,
+        )
+
+    async def transition_many_in_session(
+        self,
+        session,
+        requests: list[LifecycleTransitionRequest],
+        graph: SimpleGraph | None = None,
+    ) -> list[LifecycleTransitionResult]:
+        """Transition multiple memories using an existing DB session."""
+        lifecycle_repo = LifecycleRepository(session)
+        fact_repo = FactRepository(session)
+        belief_repo = BeliefRepository(session)
+        results: list[LifecycleTransitionResult] = []
+        for request in requests:
+            results.append(
+                await self._transition_in_session(
+                    session=session,
+                    lifecycle_repo=lifecycle_repo,
+                    fact_repo=fact_repo,
+                    belief_repo=belief_repo,
+                    request=request,
+                    graph=graph,
+                )
+            )
+        return results
 
     async def transition_many(
         self,
@@ -200,25 +248,38 @@ class LifecycleService:
         triggered_by: str,
         graph: SimpleGraph | None,
     ) -> list[dict[str, Any]]:
-        if graph is None:
-            return []
-
-        try:
-            edges = graph.search_by_relation("derived_from")
-        except Exception:
-            logger.exception("Lifecycle propagation skipped: graph relation search failed")
-            return []
-
         dependent_ids: list[str] = []
         seen: set[str] = set()
-        for edge in edges:
-            if edge.target_id == invalidated_id and edge.source_id not in seen:
-                dependent_ids.append(edge.source_id)
-                seen.add(edge.source_id)
-            elif edge.source_id == invalidated_id and edge.target_id not in seen:
-                # Defensive fallback for legacy reversed edges.
-                dependent_ids.append(edge.target_id)
-                seen.add(edge.target_id)
+
+        try:
+            relation_repo = RelationRepository(session)
+            for dependent_id in await relation_repo.get_dependents(
+                target_id=invalidated_id,
+                relation_type="derived_from",
+            ):
+                if dependent_id not in seen:
+                    dependent_ids.append(dependent_id)
+                    seen.add(dependent_id)
+        except Exception:
+            logger.exception("Lifecycle propagation SQL lookup failed")
+
+        if not dependent_ids and graph is not None:
+            try:
+                edges = graph.search_by_relation("derived_from")
+            except Exception:
+                logger.exception(
+                    "Lifecycle propagation skipped: graph relation search failed"
+                )
+                return []
+
+            for edge in edges:
+                if edge.target_id == invalidated_id and edge.source_id not in seen:
+                    dependent_ids.append(edge.source_id)
+                    seen.add(edge.source_id)
+                elif edge.source_id == invalidated_id and edge.target_id not in seen:
+                    # Defensive fallback for legacy reversed edges.
+                    dependent_ids.append(edge.target_id)
+                    seen.add(edge.target_id)
 
         propagated: list[dict[str, Any]] = []
         for dependent_id in dependent_ids:
@@ -234,8 +295,10 @@ class LifecycleService:
             new_confidence = max(0.1, round(float(dependent.confidence) * 0.8, 6))
             if dependent_type == "belief":
                 await belief_repo.update_confidence(dependent_id, new_confidence)
+                updated_dependent = await belief_repo.increment_version(dependent_id)
             else:
                 await fact_repo.update(dependent_id, confidence=new_confidence)
+                updated_dependent = await fact_repo.increment_version(dependent_id)
 
             await lifecycle_repo.record_event(
                 memory_id=dependent_id,
@@ -250,6 +313,7 @@ class LifecycleService:
                     "memory_id": dependent_id,
                     "memory_type": dependent_type,
                     "confidence": new_confidence,
+                    "version": updated_dependent.version if updated_dependent is not None else None,
                     "reason": reason,
                 }
             )

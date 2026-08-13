@@ -5,11 +5,9 @@ by exercising their underlying provider methods (the tools are thin
 wrappers that call the same provider API).
 """
 
-import json
 import pytest
 
 from memory_server.models import Belief, Evidence
-from memory_server.models.receipt import MemoryReceipt
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
 
@@ -70,7 +68,11 @@ class TestSetBeliefTool:
         b2 = Belief(proposition="user prefers docker", confidence=0.9)
         await provider.create_belief(b2)
 
-        all_beliefs = await provider.search_beliefs(lifecycle_state=None, limit=20)
+        all_beliefs = await provider.search_beliefs(
+            lifecycle_state=None,
+            include_inactive=True,
+            limit=20,
+        )
         assert len(all_beliefs) == 2  # Two separate beliefs
 
     async def test_supersede_with_replace_belief_id(self, provider):
@@ -128,12 +130,20 @@ class TestGetBeliefTool:
 
     async def test_search_all_states(self, provider):
         await self._seed(provider)
-        results = await provider.search_beliefs(lifecycle_state=None, limit=20)
+        results = await provider.search_beliefs(
+            lifecycle_state=None,
+            include_inactive=True,
+            limit=20,
+        )
         assert len(results) == 4  # all beliefs regardless of lifecycle_state
 
     async def test_search_limit(self, provider):
         await self._seed(provider)
-        results = await provider.search_beliefs(lifecycle_state=None, limit=2)
+        results = await provider.search_beliefs(
+            lifecycle_state=None,
+            include_inactive=True,
+            limit=2,
+        )
         assert len(results) == 2
 
 

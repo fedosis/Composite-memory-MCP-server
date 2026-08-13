@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from memory_server.providers.graph_provider import SimpleGraph
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 _ALLOWED_RELATION_TYPES = {"supports", "contradicts", "derives"}
 
@@ -14,6 +15,7 @@ async def add_relation(
     source_id: str,
     target_id: str,
     relation_type: str,
+    provider: SQLiteProvider | None = None,
 ) -> dict[str, Any]:
     """Create a typed relation edge between two existing graph nodes."""
     normalized = relation_type.strip().lower()
@@ -30,11 +32,28 @@ async def add_relation(
     if target_node is None:
         raise KeyError(f"Target node '{target_id}' not found")
 
-    edge = graph.add_edge(
-        source_id=source_id,
-        target_id=target_id,
-        relation=normalized,
-    )
+    if provider is not None:
+        await provider.create_in_transaction(
+            relation_entries=[
+                {
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "relation_type": normalized,
+                }
+            ]
+        )
+
+    edge = None
+    for candidate in graph.search_by_relation(normalized):
+        if candidate.source_id == source_id and candidate.target_id == target_id:
+            edge = candidate
+            break
+    if edge is None:
+        edge = graph.add_edge(
+            source_id=source_id,
+            target_id=target_id,
+            relation=normalized,
+        )
 
     return {
         "edge": {

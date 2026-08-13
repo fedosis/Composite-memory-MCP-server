@@ -14,6 +14,7 @@ async def get_context(
     task: str,
     subject: Optional[str] = None,
     max_results: int = 10,
+    include_inactive: bool = False,
 ) -> dict:
     """Retrieve structured context for a task.
 
@@ -31,6 +32,7 @@ async def get_context(
         text=task if task else None,
         subject=subject,
         limit=max_results,
+        include_inactive=include_inactive,
     )
 
     # Also search by subject if task is a name or entity
@@ -38,6 +40,7 @@ async def get_context(
         subject_facts = await provider.search_facts(
             subject=task,
             limit=max_results,
+            include_inactive=include_inactive,
         )
         # Merge deduped
         existing_ids = {f.id for f in facts}

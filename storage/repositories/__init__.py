@@ -6,6 +6,7 @@ from storage.repositories.evidence_repo import EvidenceRepository
 from storage.repositories.fact_repo import FactRepository
 from storage.repositories.lifecycle_repo import LifecycleRepository
 from storage.repositories.receipt_repo import ReceiptRepository
+from storage.repositories.relation_repo import RelationRepository
 from storage.repositories.skill_repo import SkillRepository
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "EvidenceRepository",
     "FactRepository",
     "LifecycleRepository",
+    "RelationRepository",
     "ReceiptRepository",
     "SkillRepository",
 ]

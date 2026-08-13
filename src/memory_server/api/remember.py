@@ -110,12 +110,6 @@ async def remember(
     if derived_from:
         try:
             if graph is None:
-                from memory_server.server import _get_graph_router
-
-                graph_router = await _get_graph_router()
-                graph = graph_router.graph
-
-            if graph is None:
                 return result
 
             fact = result["fact"]

@@ -16,6 +16,7 @@ async def search(
     subject: Optional[str] = None,
     predicate: Optional[str] = None,
     limit: int = 50,
+    include_inactive: bool = False,
 ) -> dict:
     """Search facts by keyword text with optional filters.
 
@@ -34,6 +35,7 @@ async def search(
         subject=subject,
         predicate=predicate,
         limit=limit,
+        include_inactive=include_inactive,
     )
 
     return {

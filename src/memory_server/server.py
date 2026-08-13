@@ -544,11 +544,13 @@ async def add_relation_tool(
     collector = get_collector()
     with collector.tool_call("add_relation") as _ctx:
         router = await _get_graph_router()
+        provider = await _get_provider()
         result = await add_relation_fn(
             router.graph,
             source_id=source_id,
             target_id=target_id,
             relation_type=relation_type,
+            provider=provider,
         )
         return json.dumps(result)
 
@@ -695,6 +697,7 @@ async def set_belief_tool(
         replace_belief_id: If set, supersede the referenced belief and link this new one.
     """
     from memory_server.models.evidence import Evidence
+    from memory_server.services.lifecycle_service import LifecycleTransitionRequest
 
     collector = get_collector()
     with collector.tool_call("set_belief") as _ctx:
@@ -754,23 +757,14 @@ async def set_belief_tool(
             )
             evidence_list.append(ev)
 
-        # If replace_belief_id is set, supersede the old belief
         superseded = None
+        old_belief = None
+        graph = await _get_graph()
+        lifecycle_service = LifecycleService(provider)
         if replace_belief_id:
             old_belief = await provider.get_belief(replace_belief_id)
             if old_belief:
                 superseded = old_belief.model_dump(mode="json")
-                lifecycle_service = await _get_lifecycle_service()
-                graph = await _get_graph()
-                await lifecycle_service.transition(
-                    memory_id=replace_belief_id,
-                    memory_type="belief",
-                    to_state="superseded",
-                    reason=f"Replaced by {belief.id}",
-                    triggered_by=source,
-                    expected_version=old_belief.version,
-                    graph=graph,
-                )
                 # Preserve the historical pattern that the replacement is one
                 # revision ahead of the superseded belief.
                 belief.version = old_belief.version + 1
@@ -785,6 +779,22 @@ async def set_belief_tool(
             timestamp=datetime.now(timezone.utc),
             confidence=confidence,
         )
+
+        async def _transaction_callback(session) -> None:
+            if not replace_belief_id or old_belief is None:
+                return
+            await lifecycle_service.transition_in_session(
+                session,
+                LifecycleTransitionRequest(
+                    memory_id=replace_belief_id,
+                    memory_type="belief",
+                    to_state="superseded",
+                    reason=f"Replaced by {belief.id}",
+                    triggered_by=source,
+                    expected_version=old_belief.version,
+                ),
+                graph=graph,
+            )
 
         await provider.create_in_transaction(
             belief=belief,
@@ -803,6 +813,7 @@ async def set_belief_tool(
                     },
                 }
             ],
+            transaction_callback=_transaction_callback if old_belief is not None else None,
         )
 
         serialized = {
@@ -905,7 +916,7 @@ async def resolve_conflict_tool(
     with collector.tool_call("resolve_conflict") as _ctx:
         provider = await _get_provider()
         graph = await _get_graph()
-        lifecycle_service = await _get_lifecycle_service()
+        lifecycle_service = LifecycleService(provider)
 
         # Fetch both beliefs
         belief_a = await provider.get_belief(belief_a_id)
@@ -999,6 +1010,7 @@ async def resolve_conflict_tool(
 
         # Manual resolution path.
         events = []
+        merge_events: list[dict[str, str]] | None = None
         merged = None
         transition_requests: list[LifecycleTransitionRequest] = []
 
@@ -1070,6 +1082,31 @@ async def resolve_conflict_tool(
                 timestamp=datetime.now(timezone.utc),
                 confidence=merged.confidence,
             )
+
+            async def _merge_callback(session) -> None:
+                await lifecycle_service.transition_many_in_session(
+                    session,
+                    [
+                        LifecycleTransitionRequest(
+                            memory_id=belief_a_id,
+                            memory_type="belief",
+                            to_state="superseded",
+                            reason=f"Merged into {merged.id} via conflict resolution",
+                            triggered_by="system",
+                            expected_version=belief_a.version,
+                        ),
+                        LifecycleTransitionRequest(
+                            memory_id=belief_b_id,
+                            memory_type="belief",
+                            to_state="superseded",
+                            reason=f"Merged into {merged.id} via conflict resolution",
+                            triggered_by="system",
+                            expected_version=belief_b.version,
+                        ),
+                    ],
+                    graph=graph,
+                )
+
             await provider.create_in_transaction(
                 belief=merged,
                 evidence_list=copied_evidence,
@@ -1087,6 +1124,7 @@ async def resolve_conflict_tool(
                         },
                     }
                 ],
+                transaction_callback=_merge_callback,
             )
             transition_requests = [
                 LifecycleTransitionRequest(
@@ -1105,6 +1143,15 @@ async def resolve_conflict_tool(
                     triggered_by="system",
                     expected_version=belief_b.version,
                 ),
+            ]
+            merge_events = [
+                {
+                    "belief_id": request.memory_id,
+                    "from_state": "active",
+                    "to_state": "superseded",
+                    "reason": request.reason,
+                }
+                for request in transition_requests
             ]
         elif resolution == "discard_both":
             transition_requests = [
@@ -1131,16 +1178,19 @@ async def resolve_conflict_tool(
                 "Must be one of: keep_a, keep_b, merge, discard_both"
             )
 
-        results = await lifecycle_service.transition_many(transition_requests, graph=graph)
-        events = [
-            {
-                "belief_id": result.event["memory_id"],
-                "from_state": result.from_state,
-                "to_state": result.to_state,
-                "reason": result.event["reason"],
-            }
-            for result in results
-        ]
+        if resolution == "merge" and merged is not None:
+            events = merge_events or []
+        else:
+            results = await lifecycle_service.transition_many(transition_requests, graph=graph)
+            events = [
+                {
+                    "belief_id": result.event["memory_id"],
+                    "from_state": result.from_state,
+                    "to_state": result.to_state,
+                    "reason": result.event["reason"],
+                }
+                for result in results
+            ]
 
         # Create receipt with new UUID
         receipt = MemoryReceipt(

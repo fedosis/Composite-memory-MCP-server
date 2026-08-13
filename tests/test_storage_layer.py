@@ -113,6 +113,7 @@ class TestMigration:
             "entities",
             "lifecycle_events",
             "lifecycle_states",
+            "claim_relations",
         ]
         for table in expected_tables:
             assert f"CREATE TABLE {table}" in sql_output, f"Missing table: {table}"
@@ -169,6 +170,7 @@ class TestMigration:
                 "entities",
                 "lifecycle_events",
                 "lifecycle_states",
+                "claim_relations",
             ]:
                 assert f"CREATE TABLE {table}" in sql_output, f"Missing CREATE TABLE {table}"
         finally:

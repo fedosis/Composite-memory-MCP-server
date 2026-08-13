@@ -10,7 +10,7 @@ duplicate inline ORM models.
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -24,6 +24,7 @@ from storage.repositories import (
     EvidenceRepository,
     FactRepository,
     ReceiptRepository,
+    RelationRepository,
     SkillRepository,
 )
 
@@ -35,6 +36,8 @@ from memory_server.models import (
     MemoryReceipt,
     Skill,
 )
+
+T = TypeVar("T")
 
 
 class SQLiteProvider:
@@ -215,12 +218,16 @@ class SQLiteProvider:
         min_confidence: Optional[float] = None,
         max_confidence: Optional[float] = None,
         limit: int = 50,
+        include_inactive: bool = False,
     ) -> list[Fact]:
         async with await self._get_session() as session:
             repo = await self._get_fact_repo(session)
             results = await repo.search(
                 subject=subject, predicate=predicate, text=text, limit=limit
             )
+            if not include_inactive:
+                active_states = {"candidate", "validated", "active"}
+                results = [r for r in results if r.lifecycle_state in active_states]
             # Apply additional filters in-memory for backward compat
             if source is not None:
                 results = [r for r in results if r.source == source]
@@ -445,14 +452,18 @@ class SQLiteProvider:
         source: Optional[str] = None,
         creator: Optional[str] = None,
         limit: int = 10,
+        include_inactive: bool = False,
     ) -> list[Belief]:
         """Search beliefs with various filters."""
         async with await self._get_session() as session:
             repo = await self._get_belief_repo(session)
+            effective_state = lifecycle_state
+            if effective_state is None and not include_inactive:
+                effective_state = "active"
             return await repo.search(
                 proposition=proposition,
                 tags=tags,
-                lifecycle_state=lifecycle_state,
+                lifecycle_state=effective_state,
                 min_confidence=min_confidence,
                 source=source,
                 creator=creator,
@@ -476,6 +487,16 @@ class SQLiteProvider:
             result = await repo.update_lifecycle_state(belief_id, new_state)
             await session.commit()
             return result
+
+    async def get_claim_dependents(
+        self,
+        target_id: str,
+        relation_type: str = "derived_from",
+    ) -> list[str]:
+        """Return canonical dependents for a claim relation target."""
+        async with await self._get_session() as session:
+            repo = RelationRepository(session)
+            return await repo.get_dependents(target_id=target_id, relation_type=relation_type)
 
     async def update_belief_reinforced_at(self, belief_id: str) -> Optional[Belief]:
         """Update the last_reinforced_at timestamp of a belief."""
@@ -531,8 +552,10 @@ class SQLiteProvider:
         outbox_entries: Optional[list[dict]] = None,
         belief: Optional["Belief"] = None,
         evidence_list: Optional[list["Evidence"]] = None,
+        relation_entries: Optional[list[dict[str, Any]]] = None,
+        transaction_callback: Optional[Callable[[AsyncSession], Awaitable[None]]] = None,
     ) -> None:
-        """Create fact, belief, receipt, evidence, and outbox entries in a single transaction.
+        """Create memory records in a single transaction.
 
         Args:
             fact: Optional Fact to create.
@@ -541,6 +564,10 @@ class SQLiteProvider:
             receipt: Optional MemoryReceipt to create.
             outbox_entries: Optional list of outbox entry dicts, each with:
                 record_type, record_id, operation, payload.
+            relation_entries: Optional list of claim relation dicts with
+                source_id, target_id, relation_type.
+            transaction_callback: Optional async callback executed before
+                commit while the same session is still open.
         """
         async with await self._get_session() as session:
             if fact is not None:
@@ -566,4 +593,14 @@ class SQLiteProvider:
                         operation=entry["operation"],
                         payload=entry["payload"],
                     )
+            if relation_entries:
+                relation_repo = RelationRepository(session)
+                for entry in relation_entries:
+                    await relation_repo.create(
+                        source_id=entry["source_id"],
+                        target_id=entry["target_id"],
+                        relation_type=entry["relation_type"],
+                    )
+            if transaction_callback is not None:
+                await transaction_callback(session)
             await session.commit()

@@ -9,6 +9,7 @@ from storage.models.entity import EntityORM  # noqa: F401, E402
 from storage.models.fact import FactORM  # noqa: F401, E402
 from storage.models.lifecycle import LifecycleEventORM, LifecycleStateORM  # noqa: F401, E402
 from storage.models.receipt import MemoryReceiptORM  # noqa: F401, E402
+from storage.models.relation import ClaimRelationORM  # noqa: F401, E402
 from storage.models.skill import SkillORM  # noqa: F401, E402
 from storage.outbox import OutboxEntryORM  # noqa: F401, E402
 
@@ -17,6 +18,7 @@ __all__ = [
     "BeliefORM",
     "DecisionORM",
     "EntityORM",
+    "ClaimRelationORM",
     "EvidenceORM",
     "FactORM",
     "LifecycleEventORM",
