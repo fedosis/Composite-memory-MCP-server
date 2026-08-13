@@ -237,6 +237,18 @@ class SQLiteProvider:
             await session.commit()
             return result
 
+    async def increment_fact_version(self, fact_id: str) -> Optional[Fact]:
+        """Increment the revision counter of a fact.
+
+        Backward-compatible with legacy string versions: non-numeric values
+        are normalized to revision 1 before incrementing.
+        """
+        async with await self._get_session() as session:
+            repo = await self._get_fact_repo(session)
+            result = await repo.increment_version(fact_id)
+            await session.commit()
+            return result
+
     async def delete_fact(self, fact_id: str) -> bool:
         async with await self._get_session() as session:
             repo = await self._get_fact_repo(session)

@@ -58,5 +58,5 @@ class FactORM(Base):
             updated_at=fact.updated_at,
             verification_status=fact.verification_status,
             lifecycle_state=fact.lifecycle_state,
-            version=fact.version,
+            version=str(fact.version),
         )

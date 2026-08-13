@@ -4,6 +4,7 @@ v0.6 Phase 6: Uses SQLite FTS5 full-text search when available,
 with backward-compatible LIKE fallback.
 """
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select, text
@@ -140,6 +141,31 @@ class FactRepository:
         for key, value in kwargs.items():
             if hasattr(orm, key):
                 setattr(orm, key, value)
+        await self._session.flush()
+        await self._session.refresh(orm)
+        return orm.to_pydantic()
+
+    async def update_lifecycle_state(self, fact_id: str, new_state: str) -> Optional[Fact]:
+        orm = await self._session.get(FactORM, fact_id)
+        if orm is None:
+            return None
+        orm.lifecycle_state = new_state
+        orm.updated_at = datetime.now(timezone.utc)
+        await self._session.flush()
+        await self._session.refresh(orm)
+        return orm.to_pydantic()
+
+    async def increment_version(self, fact_id: str) -> Optional[Fact]:
+        orm = await self._session.get(FactORM, fact_id)
+        if orm is None:
+            return None
+        raw_version = orm.version
+        try:
+            current_version = int(str(raw_version).strip())
+        except (TypeError, ValueError):
+            current_version = 0
+        orm.version = str(max(1, current_version + 1))
+        orm.updated_at = datetime.now(timezone.utc)
         await self._session.flush()
         await self._session.refresh(orm)
         return orm.to_pydantic()
