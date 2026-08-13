@@ -1,7 +1,9 @@
 """Tests for SQLite provider (Card 003)."""
 
 import pytest
+from sqlalchemy import event
 
+import memory_server.providers.sqlite_provider as sqlite_provider_module
 from memory_server.models import Fact, MemoryReceipt, VerificationStatus
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
@@ -108,6 +110,82 @@ class TestFactCRUD:
     async def test_delete_fact_not_found(self, provider):
         result = await provider.delete_fact("nonexistent")
         assert result is False
+
+
+@pytest.mark.asyncio
+class TestProviderInitialization:
+    async def test_initialize_skips_facts_fts_rebuild_when_index_already_populated(self, tmp_path, monkeypatch):
+        db_url = f"sqlite+aiosqlite:///{tmp_path / 'provider.db'}"
+
+        provider = SQLiteProvider(url=db_url)
+        await provider.initialize()
+        await provider.create_fact(
+            Fact(id="fts-existing", subject="Docker", predicate="runs_on", object="OMV")
+        )
+        await provider.close()
+
+        executed_sql: list[str] = []
+        original_create_async_engine = sqlite_provider_module.create_async_engine
+
+        def instrumented_create_async_engine(*args, **kwargs):
+            engine = original_create_async_engine(*args, **kwargs)
+
+            def capture_sql(conn, cursor, statement, parameters, context, executemany):
+                executed_sql.append(statement)
+
+            event.listen(engine.sync_engine, "before_cursor_execute", capture_sql)
+            return engine
+
+        monkeypatch.setattr(
+            sqlite_provider_module,
+            "create_async_engine",
+            instrumented_create_async_engine,
+        )
+
+        provider = SQLiteProvider(url=db_url)
+        await provider.initialize()
+        results = await provider.search_facts(text="Docker")
+        await provider.close()
+
+        assert [fact.id for fact in results] == ["fts-existing"]
+        assert not any(
+            "facts_fts" in statement and "'rebuild'" in statement
+            for statement in executed_sql
+        )
+
+    async def test_initialize_rebuilds_facts_fts_when_index_is_missing(self, tmp_path):
+        db_url = f"sqlite+aiosqlite:///{tmp_path / 'provider.db'}"
+
+        provider = SQLiteProvider(url=db_url)
+        await provider.initialize()
+        await provider.create_fact(
+            Fact(id="fts-rebuild", subject="Docker", predicate="runs_on", object="OMV")
+        )
+
+        engine = provider.engine
+        assert engine is not None
+        async with engine.begin() as conn:
+            await conn.exec_driver_sql("DROP TRIGGER IF EXISTS facts_ai")
+            await conn.exec_driver_sql("DROP TRIGGER IF EXISTS facts_ad")
+            await conn.exec_driver_sql("DROP TRIGGER IF EXISTS facts_au")
+            await conn.exec_driver_sql("DROP TABLE IF EXISTS facts_fts")
+
+        await provider.close()
+
+        provider = SQLiteProvider(url=db_url)
+        await provider.initialize()
+        results = await provider.search_facts(text="Docker")
+
+        engine = provider.engine
+        assert engine is not None
+        async with engine.connect() as conn:
+            facts_fts_count = await conn.exec_driver_sql("SELECT count(*) FROM facts_fts")
+            count = facts_fts_count.scalar_one()
+
+        await provider.close()
+
+        assert [fact.id for fact in results] == ["fts-rebuild"]
+        assert count == 1
 
 
 @pytest.mark.asyncio

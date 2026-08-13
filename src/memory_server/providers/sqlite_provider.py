@@ -57,6 +57,31 @@ class SQLiteProvider:
         """Expose the SQLAlchemy engine for sharing with OutboxWorker."""
         return self._engine
 
+    async def _fts_rebuild_required(
+        self,
+        conn,
+        *,
+        source_table: str,
+        fts_table: str,
+    ) -> bool:
+        """Return True when an external-content FTS table needs initial backfill.
+
+        We only rebuild when source rows already exist and the FTS table is still
+        empty. This keeps normal startup fast for already-indexed databases while
+        preserving correctness for fresh/migrated databases that need an initial
+        backfill.
+        """
+        source_has_rows = bool(
+            (await conn.exec_driver_sql(f"SELECT 1 FROM {source_table} LIMIT 1")).first()
+        )
+        if not source_has_rows:
+            return False
+
+        fts_has_rows = bool(
+            (await conn.exec_driver_sql(f"SELECT 1 FROM {fts_table} LIMIT 1")).first()
+        )
+        return not fts_has_rows
+
     async def initialize(self):
         """Create engine, tables, and session factory with WAL mode."""
         self._engine = create_async_engine(self._url, echo=False)
@@ -93,11 +118,14 @@ class SQLiteProvider:
                 "INSERT INTO facts_fts(rowid, subject, predicate, object) "
                 "VALUES (new.rowid, new.subject, new.predicate, new.object); END"
             )
-            # Populate FTS with existing data
-            await conn.exec_driver_sql(
-                "INSERT OR IGNORE INTO facts_fts(facts_fts, rowid, subject, predicate, object) "
-                "SELECT 'rebuild', rowid, subject, predicate, object FROM facts"
-            )
+            if await self._fts_rebuild_required(
+                conn,
+                source_table="facts",
+                fts_table="facts_fts",
+            ):
+                await conn.exec_driver_sql(
+                    "INSERT INTO facts_fts(facts_fts) VALUES ('rebuild')"
+                )
             # Create beliefs FTS5 virtual table
             await conn.exec_driver_sql(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS beliefs_fts "
@@ -122,11 +150,14 @@ class SQLiteProvider:
                 "INSERT INTO beliefs_fts(rowid, proposition) "
                 "VALUES (new.rowid, new.proposition); END"
             )
-            # Populate beliefs FTS with existing data
-            await conn.exec_driver_sql(
-                "INSERT OR IGNORE INTO beliefs_fts(beliefs_fts, rowid, proposition) "
-                "SELECT 'rebuild', rowid, proposition FROM beliefs"
-            )
+            if await self._fts_rebuild_required(
+                conn,
+                source_table="beliefs",
+                fts_table="beliefs_fts",
+            ):
+                await conn.exec_driver_sql(
+                    "INSERT INTO beliefs_fts(beliefs_fts) VALUES ('rebuild')"
+                )
 
         self._session_factory = async_sessionmaker(
             self._engine,
