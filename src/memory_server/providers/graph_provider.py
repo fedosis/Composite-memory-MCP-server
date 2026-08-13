@@ -6,8 +6,13 @@ Designed for fast testing and simple persistence via JSON dump/load.
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,9 +42,11 @@ class SimpleGraph:
     Supports JSON serialization for persistence.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, snapshot_path: str | Path | None = None) -> None:
         self._nodes: dict[str, GraphNode] = {}
         self._edges: dict[str, dict[str, list[GraphEdge]]] = {}  # source -> target -> [edges]
+        self._snapshot_path = Path(snapshot_path) if snapshot_path else None
+        self._suspend_persistence = False
 
     # --- Node operations ---
 
@@ -68,6 +75,7 @@ class SimpleGraph:
             raise ValueError(f"Node '{id}' already exists")
         node = GraphNode(id=id, type=type, name=name, attributes=attributes or {})
         self._nodes[id] = node
+        self._persist_if_needed()
         return node
 
     def get_node(self, id: str) -> Optional[GraphNode]:
@@ -99,6 +107,7 @@ class SimpleGraph:
             if not self._edges[source]:
                 del self._edges[source]
         del self._nodes[id]
+        self._persist_if_needed()
 
     def get_all_nodes(self) -> list[GraphNode]:
         """Get all nodes in the graph.
@@ -148,6 +157,7 @@ class SimpleGraph:
         if target_id not in self._edges[source_id]:
             self._edges[source_id][target_id] = []
         self._edges[source_id][target_id].append(edge)
+        self._persist_if_needed()
 
         return edge
 
@@ -185,6 +195,7 @@ class SimpleGraph:
         del self._edges[source_id][target_id]
         if not self._edges[source_id]:
             del self._edges[source_id]
+        self._persist_if_needed()
 
     # --- Neighbor traversal ---
 
@@ -343,19 +354,65 @@ class SimpleGraph:
         Args:
             data: Dict with "nodes" and "edges" keys.
         """
-        self._nodes.clear()
-        self._edges.clear()
-        for nid, ndata in data.get("nodes", {}).items():
-            self.add_node(
-                id=ndata["id"],
-                type=ndata.get("type", ""),
-                name=ndata.get("name", ""),
-                attributes=ndata.get("attributes", {}),
-            )
-        for edata in data.get("edges", []):
-            self.add_edge(
-                source_id=edata["source_id"],
-                target_id=edata["target_id"],
-                relation=edata.get("relation", ""),
-                attributes=edata.get("attributes", {}),
-            )
+        self._suspend_persistence = True
+        try:
+            self._nodes.clear()
+            self._edges.clear()
+            for nid, ndata in data.get("nodes", {}).items():
+                self.add_node(
+                    id=ndata["id"],
+                    type=ndata.get("type", ""),
+                    name=ndata.get("name", ""),
+                    attributes=ndata.get("attributes", {}),
+                )
+            for edata in data.get("edges", []):
+                self.add_edge(
+                    source_id=edata["source_id"],
+                    target_id=edata["target_id"],
+                    relation=edata.get("relation", ""),
+                    attributes=edata.get("attributes", {}),
+                )
+        finally:
+            self._suspend_persistence = False
+        self._persist_snapshot()
+
+    def load_snapshot(self, path: str | Path | None = None) -> None:
+        """Load graph state from a JSON snapshot file if it exists."""
+        snapshot_path = Path(path) if path is not None else self._snapshot_path
+        if snapshot_path is None:
+            return
+        if not snapshot_path.exists():
+            return
+        try:
+            data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("Failed to load graph snapshot from %s", snapshot_path)
+            return
+        self.from_dict(data)
+
+    def save_snapshot(self, path: str | Path | None = None) -> None:
+        """Write the graph state to a JSON snapshot file."""
+        snapshot_path = Path(path) if path is not None else self._snapshot_path
+        if snapshot_path is None:
+            return
+        self._write_snapshot(snapshot_path)
+
+    def _persist_if_needed(self) -> None:
+        if self._suspend_persistence:
+            return
+        self._persist_snapshot()
+
+    def _persist_snapshot(self) -> None:
+        if self._snapshot_path is None:
+            return
+        self._write_snapshot(self._snapshot_path)
+
+    def _write_snapshot(self, snapshot_path: Path) -> None:
+        try:
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
+            tmp_path = snapshot_path.with_suffix(snapshot_path.suffix + ".tmp")
+            tmp_path.write_text(payload, encoding="utf-8")
+            tmp_path.replace(snapshot_path)
+        except Exception:
+            logger.exception("Failed to persist graph snapshot to %s", snapshot_path)

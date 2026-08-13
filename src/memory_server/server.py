@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from storage.outbox_worker import OutboxWorker
 from storage.repositories import LifecycleRepository
 
+from memory_server.api.add_relation import add_relation as add_relation_fn
 from memory_server.api.get_context import get_context as get_context_fn
 from memory_server.api.learn import learn as learn_fn
 from memory_server.api.remember import remember as remember_fn
@@ -120,6 +121,15 @@ def _get_sqlite_db_url() -> str:
         if db_path and db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     return db_url
+
+
+def _get_graph_snapshot_path() -> Path:
+    """Return the snapshot file path for the graph store."""
+    snapshot_path = Path(
+        os.environ.get("MEMORY_GRAPH_SNAPSHOT_PATH", "data/graph.json")
+    )
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    return snapshot_path
 
 
 async def _get_lancedb_provider() -> LanceDBProvider:
@@ -292,6 +302,7 @@ async def remember_tool(
     collector = get_collector()
     with collector.tool_call("remember") as _ctx:
         provider = await _get_provider()
+        graph_router = await _get_graph_router()
         result = await remember_fn(
             provider,
             subject=subject,
@@ -299,6 +310,7 @@ async def remember_tool(
             object=object,
             confidence=confidence,
             source=source,
+            graph=graph_router.graph,
         )
 
         # Serialize Pydantic models in result
@@ -394,9 +406,18 @@ async def _get_graph_router() -> GraphRouter:
     """Get or create the GraphRouter singleton."""
     global _graph, _graph_router
     if _graph_router is None:
-        _graph = SimpleGraph()
+        _graph = await _get_graph()
         _graph_router = GraphRouter(graph=_graph)
     return _graph_router
+
+
+async def _get_graph() -> SimpleGraph:
+    """Get or create the shared graph singleton, loading a snapshot if present."""
+    global _graph
+    if _graph is None:
+        _graph = SimpleGraph(snapshot_path=_get_graph_snapshot_path())
+        _graph.load_snapshot()
+    return _graph
 
 
 @mcp.tool(name="graph_search")
@@ -405,6 +426,7 @@ async def graph_search_fn(
     entity_id: str = "",
     source_id: str = "",
     target_id: str = "",
+    relation_type: str = "",
 ) -> str:
     """Search the knowledge graph for entities and relations.
 
@@ -412,12 +434,14 @@ async def graph_search_fn(
     1. query: Extract entity references from text and find neighbors.
     2. entity_id: Direct node lookup by ID.
     3. source_id + target_id: Pathfinding between two entities.
+    4. relation_type: Return all edges for a typed relation.
 
     Args:
         query: Text to extract entity references from.
         entity_id: Direct node ID lookup.
         source_id: Source entity for pathfinding.
         target_id: Target entity for pathfinding.
+        relation_type: Relation name to search by.
     """
     collector = get_collector()
     with collector.tool_call("graph_search") as _ctx:
@@ -428,7 +452,37 @@ async def graph_search_fn(
         edges: list[dict] = []
         paths: list[list[dict]] = []
 
-        if entity_id:
+        if relation_type:
+            normalized_relation = relation_type.strip().lower()
+            matched_edges = graph.search_by_relation(normalized_relation)
+            seen_nodes: dict[str, dict] = {}
+            for edge in matched_edges:
+                source_node = graph.get_node(edge.source_id)
+                target_node = graph.get_node(edge.target_id)
+                if source_node is not None:
+                    seen_nodes[source_node.id] = {
+                        "id": source_node.id,
+                        "name": source_node.name,
+                        "type": source_node.type,
+                        "attributes": source_node.attributes,
+                    }
+                if target_node is not None:
+                    seen_nodes[target_node.id] = {
+                        "id": target_node.id,
+                        "name": target_node.name,
+                        "type": target_node.type,
+                        "attributes": target_node.attributes,
+                    }
+                edges.append({
+                    "source_id": edge.source_id,
+                    "source_name": source_node.name if source_node is not None else edge.source_id,
+                    "target_id": edge.target_id,
+                    "target_name": target_node.name if target_node is not None else edge.target_id,
+                    "relation": edge.relation,
+                    "attributes": edge.attributes,
+                })
+            nodes = list(seen_nodes.values())
+        elif entity_id:
             node = graph.get_node(entity_id)
             if node is not None:
                 nodes.append({
@@ -471,6 +525,25 @@ async def graph_search_fn(
         })
 
 
+@mcp.tool(name="add_relation")
+async def add_relation_tool(
+    source_id: str,
+    target_id: str,
+    relation_type: str,
+) -> str:
+    """Create a typed inter-claim relation between two graph nodes."""
+    collector = get_collector()
+    with collector.tool_call("add_relation") as _ctx:
+        router = await _get_graph_router()
+        result = await add_relation_fn(
+            router.graph,
+            source_id=source_id,
+            target_id=target_id,
+            relation_type=relation_type,
+        )
+        return json.dumps(result)
+
+
 async def _get_hybrid_router() -> HybridRouter:
     """Get or create the HybridRouter singleton."""
     global _qdrant, _lancedb, _embedder, _graph, _hybrid_router
@@ -483,7 +556,7 @@ async def _get_hybrid_router() -> HybridRouter:
 
             _embedder = SentenceTransformerEmbeddingProvider()
         if _graph is None:
-            _graph = SimpleGraph()
+            _graph = await _get_graph()
         _hybrid_router = HybridRouter(
             vector_provider=vector_provider,
             embedder=_embedder,
@@ -539,7 +612,7 @@ async def audit_tool(
         if _confidence_engine is None:
             _confidence_engine = ConfidenceEngine()
 
-        graph = _graph or SimpleGraph()
+        graph = await _get_graph()
         auditor = MemoryAuditor(
             validator=_validator_store,
             confidence_engine=_confidence_engine,

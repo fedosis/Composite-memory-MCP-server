@@ -7,6 +7,7 @@ the entire write (fact + receipt + outbox) in one transaction.
 from typing import Any, Optional
 
 from memory_server.admission import AdmissionDecision
+from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.services.ingestion_service import MemoryIngestionService
 
@@ -53,6 +54,7 @@ async def remember(
     source: str = "user",
     metadata: Optional[dict[str, Any]] = None,
     admission: AdmissionDecision | None = None,
+    graph: SimpleGraph | None = None,
 ) -> dict:
     """Store a fact and return a provenance receipt.
 
@@ -94,7 +96,7 @@ async def remember(
         receipt_metadata["admission"] = admission.to_metadata()
 
     svc = MemoryIngestionService(provider._session_factory)
-    return await svc.remember(
+    result = await svc.remember(
         subject=subject,
         predicate=predicate,
         object=object,
@@ -102,3 +104,76 @@ async def remember(
         source=source,
         metadata=receipt_metadata or None,
     )
+
+    evidence = receipt_metadata.get("evidence") if receipt_metadata else None
+    derived_from = evidence.get("derived_from") if isinstance(evidence, dict) else None
+    if derived_from:
+        try:
+            if graph is None:
+                from memory_server.server import _get_graph_router
+
+                graph_router = await _get_graph_router()
+                graph = graph_router.graph
+
+            if graph is None:
+                return result
+
+            fact = result["fact"]
+            fact_node_name = f"{fact.subject} {fact.predicate} {fact.object}"
+
+            if graph.get_node(fact.id) is None:
+                graph.add_node(
+                    id=fact.id,
+                    type="fact",
+                    name=fact_node_name,
+                    attributes={
+                        "subject": fact.subject,
+                        "predicate": fact.predicate,
+                        "object": fact.object,
+                        "confidence": fact.confidence,
+                        "source": fact.source,
+                    },
+                )
+
+            for parent_id in derived_from:
+                if graph.get_node(parent_id) is None:
+                    try:
+                        parent_fact = await provider.get_fact(parent_id)
+                    except Exception:
+                        parent_fact = None
+                    parent_name = (
+                        f"{parent_fact.subject} {parent_fact.predicate} {parent_fact.object}"
+                        if parent_fact is not None
+                        else parent_id
+                    )
+                    parent_attrs = {
+                        "subject": parent_fact.subject,
+                        "predicate": parent_fact.predicate,
+                        "object": parent_fact.object,
+                        "confidence": parent_fact.confidence,
+                        "source": parent_fact.source,
+                    } if parent_fact is not None else {}
+                    graph.add_node(
+                        id=parent_id,
+                        type="fact",
+                        name=parent_name,
+                        attributes=parent_attrs,
+                    )
+
+                edge_exists = any(
+                    edge.source_id == fact.id
+                    and edge.target_id == parent_id
+                    and edge.relation == "derived_from"
+                    for edge in graph.search_by_relation("derived_from")
+                )
+                if not edge_exists:
+                    graph.add_edge(
+                        source_id=fact.id,
+                        target_id=parent_id,
+                        relation="derived_from",
+                    )
+        except Exception:
+            # Graph sync is best-effort; SQL write has already succeeded.
+            pass
+
+    return result

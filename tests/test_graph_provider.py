@@ -1,9 +1,10 @@
 """Tests for in-memory graph engine (Card 017)."""
 
-import pytest
 import json
 
-from memory_server.providers.graph_provider import SimpleGraph, GraphNode, GraphEdge
+import pytest
+
+from memory_server.providers.graph_provider import SimpleGraph
 
 
 class TestSimpleGraph:
@@ -201,6 +202,25 @@ class TestSimpleGraph:
         g2.from_dict(loaded)
         assert len(g2.get_all_nodes()) == 5
         assert g2.get_neighbors("server1")[0][0].name == "Docker Host 2"
+
+    def test_snapshot_persistence_roundtrip(self, tmp_path):
+        snapshot_path = tmp_path / "graph.json"
+
+        g = SimpleGraph(snapshot_path=snapshot_path)
+        g.add_node(id="a", type="fact", name="Claim A")
+        g.add_node(id="b", type="fact", name="Claim B")
+        g.add_edge(source_id="a", target_id="b", relation="derived_from")
+
+        assert snapshot_path.exists()
+
+        g2 = SimpleGraph(snapshot_path=snapshot_path)
+        g2.load_snapshot()
+
+        assert g2.get_node("a") is not None
+        assert g2.get_node("b") is not None
+        edge = g2.get_edge("a", "b")
+        assert edge is not None
+        assert edge.relation == "derived_from"
 
     def test_empty_graph(self):
         g = SimpleGraph()

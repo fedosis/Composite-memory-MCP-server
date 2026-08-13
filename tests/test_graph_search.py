@@ -4,7 +4,10 @@ import json
 
 import pytest
 
-from memory_server.server import graph_search_fn, _get_graph_router
+import memory_server.server as server_module
+from memory_server.providers.graph_provider import SimpleGraph
+from memory_server.router.graph_router import GraphRouter
+from memory_server.server import _get_graph_router, graph_search_fn
 
 
 @pytest.mark.asyncio
@@ -97,3 +100,23 @@ class TestGraphSearchTool:
         assert "source_id" in edge
         assert "target_id" in edge
         assert "relation" in edge
+
+    async def test_search_by_relation_type(self, monkeypatch):
+        """Relation-aware search returns typed relation pairs."""
+        graph = SimpleGraph()
+        graph.add_node(id="claim-a", type="fact", name="Claim A")
+        graph.add_node(id="claim-b", type="fact", name="Claim B")
+        graph.add_node(id="claim-c", type="fact", name="Claim C")
+        graph.add_edge(source_id="claim-a", target_id="claim-b", relation="contradicts")
+        graph.add_edge(source_id="claim-a", target_id="claim-c", relation="supports")
+
+        monkeypatch.setattr(server_module, "_graph", graph)
+        monkeypatch.setattr(server_module, "_graph_router", GraphRouter(graph=graph))
+
+        result = json.loads(await graph_search_fn(relation_type="contradicts"))
+        assert result["paths"] == []
+        assert len(result["edges"]) == 1
+        edge = result["edges"][0]
+        assert edge["relation"] == "contradicts"
+        assert edge["source_name"] == "Claim A"
+        assert edge["target_name"] == "Claim B"

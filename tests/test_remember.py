@@ -4,6 +4,7 @@ import pytest
 
 from memory_server.api.remember import remember
 from memory_server.models import MemoryReceipt, VerificationStatus
+from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
 
@@ -48,11 +49,13 @@ class TestRemember:
         assert receipt.source == "manual"
 
     async def test_store_with_evidence_chain(self, provider):
+        graph = SimpleGraph()
         parent = await remember(
             provider,
             subject="Docker",
             predicate="runs_on",
             object="OMV8",
+            graph=graph,
         )
         parent_id = parent["receipt"].id
 
@@ -74,6 +77,7 @@ class TestRemember:
                 "scope": "derived",
                 "ttl_days": 30,
             },
+            graph=graph,
         )
 
         receipt = result["receipt"]
@@ -82,6 +86,11 @@ class TestRemember:
         assert receipt.history[0]["metadata"]["evidence"]["claim_type"] == "fact"
         assert receipt.history[0]["metadata"]["scope"] == "derived"
         assert receipt.history[0]["metadata"]["ttl_days"] == 30
+
+        child_fact = result["fact"]
+        edge = graph.get_edge(child_fact.id, parent_id)
+        assert edge is not None
+        assert edge.relation == "derived_from"
 
     async def test_store_with_backward_compatible_metadata(self, provider):
         result = await remember(
