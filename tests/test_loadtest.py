@@ -10,16 +10,17 @@ Scenarios (all in one session):
 
 import asyncio
 import json
-import os
-import re
 import statistics
 import time
 from uuid import uuid4
 
 import pytest
+from storage.outbox import OutboxRepository
 
+from memory_server import server as server_module
 from memory_server.server import (
     _get_graph_router,
+    _get_outbox_worker,
     _get_provider,
     _get_router,
     mcp,
@@ -34,6 +35,70 @@ async def _call_tool(name: str, args: dict) -> dict:
     """Call an MCP tool and parse the JSON result."""
     content_list, _ = await mcp.call_tool(name, args)
     return json.loads(content_list[0].text)
+
+
+async def _reset_isolated_server(tmp_path, monkeypatch) -> None:
+    """Reset shared server singletons and point tests at a fresh backend."""
+    monkeypatch.setenv("MEMORY_SERVER_DB_URL", f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}")
+    monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "qdrant")
+
+    for attr in (
+        "_outbox_task",
+        "_outbox_worker",
+        "_router",
+        "_graph_router",
+        "_graph",
+        "_qdrant",
+        "_lancedb",
+        "_embedder",
+        "_provider",
+        "_hybrid_router",
+    ):
+        value = getattr(server_module, attr)
+        if attr == "_outbox_task" and value is not None and not value.done():
+            value.cancel()
+            try:
+                await value
+            except asyncio.CancelledError:
+                pass
+            setattr(server_module, attr, None)
+            continue
+        if hasattr(value, "close"):
+            try:
+                await value.close()
+            except Exception:
+                pass
+        setattr(server_module, attr, None)
+
+
+async def _drain_outbox(timeout_s: float = 60.0) -> dict:
+    """Process all pending outbox entries until the queue is empty."""
+    worker = await _get_outbox_worker()
+    deadline = time.monotonic() + timeout_s
+    total_processed = 0
+    total_failed = 0
+
+    while True:
+        summary = await worker.process_all_pending()
+        total_processed += summary.get("processed", 0)
+        total_failed += summary.get("failed", 0)
+
+        async with worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            pending = await repo.get_pending_count()
+
+        if pending == 0:
+            return {
+                "processed": total_processed,
+                "failed": total_failed,
+                "pending": pending,
+            }
+
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for outbox drain: {pending} pending entries "
+                f"after processing {total_processed}"
+            )
 
 
 def _get_vmrss_kb() -> int:
@@ -66,11 +131,11 @@ def _percentile(sorted_data: list[float], p: float) -> float:
 async def _scenario_volume() -> dict:
     """Store 1000 unique facts, measure latency, verify retrieval."""
     report = {}
-    N = 1000
+    n = 1000
     batch_size = 50
 
     facts = []
-    for i in range(N):
+    for i in range(n):
         facts.append({
             "subject": f"subject_{i}",
             "predicate": "has_property",
@@ -86,7 +151,7 @@ async def _scenario_volume() -> dict:
     t0 = time.perf_counter()
 
     # Store in batches
-    for batch_start in range(0, N, batch_size):
+    for batch_start in range(0, n, batch_size):
         batch = facts[batch_start:batch_start + batch_size]
         for fact in batch:
             t_start = time.perf_counter()
@@ -105,14 +170,14 @@ async def _scenario_volume() -> dict:
     report["p95_ms"] = round(_percentile(sorted_lat, 95), 2)
     report["p99_ms"] = round(_percentile(sorted_lat, 99), 2)
 
-    print(f"\n  [volume] {N} facts stored in {total_time:.2f}s")
+    print(f"\n  [volume] {n} facts stored in {total_time:.2f}s")
     print(f"    avg={report['avg_latency_ms']:.1f}ms p50={report['p50_ms']:.1f}ms "
           f"p95={report['p95_ms']:.1f}ms p99={report['p99_ms']:.1f}ms")
 
     # Verify 10 random facts via search
     import random
     random.seed(42)
-    search_indices = random.sample(range(N), 10)
+    search_indices = random.sample(range(n), 10)
     search_hits = 0
     for idx in search_indices:
         subj, obj = stored_subject_obj[idx]
@@ -124,7 +189,7 @@ async def _scenario_volume() -> dict:
     print(f"    search verification: {search_hits}/10 found")
 
     # Verify semantic_search for a known pattern
-    semantic_pivot = random.randint(0, N - 1)
+    semantic_pivot = random.randint(0, n - 1)
     sem_subj = f"subject_{semantic_pivot}"
     sem_result = await _call_tool("semantic_search", {
         "query": sem_subj,
@@ -147,15 +212,14 @@ async def _scenario_volume() -> dict:
 
 async def _scenario_learn() -> dict:
     """Call learn() 100 times with synthetic text, measure extraction rate."""
-    N = 100
-    facts_per_text = 3  # 2-3 facts per snippet
+    n = 100
     total_injected = 0
     total_extracted = 0
     latencies = []
 
     t0 = time.perf_counter()
 
-    for i in range(N):
+    for i in range(n):
         # Build a text snippet with 3 "X is Y" facts and 1 decision
         prefix = f"project_{i}_{uuid4().hex[:6]}"
         snippet = (
@@ -178,7 +242,7 @@ async def _scenario_learn() -> dict:
 
     report = {
         "total_time_s": round(total_time, 2),
-        "learn_calls": N,
+        "learn_calls": n,
         "total_injected_facts": total_injected,
         "total_extracted_facts": total_extracted,
         "extraction_rate_pct": round(total_extracted / total_injected * 100, 1),
@@ -188,7 +252,7 @@ async def _scenario_learn() -> dict:
         "p95_ms": round(_percentile(sorted_lat, 95), 2),
     }
 
-    print(f"\n  [learn] {N} calls in {total_time:.2f}s")
+    print(f"\n  [learn] {n} calls in {total_time:.2f}s")
     print(f"    extracted {total_extracted}/{total_injected} facts "
           f"({report['extraction_rate_pct']}%) at {report['extraction_facts_per_sec']}/s")
     print(f"    avg={report['avg_latency_ms']:.1f}ms p50={report['p50_ms']:.1f}ms "
@@ -207,12 +271,12 @@ async def _scenario_learn() -> dict:
 
 async def _scenario_search_stress() -> dict:
     """500 search() calls with random queries, mix of hit/partial/no-match."""
-    N = 500
+    n = 500
     queries = []
     expected_hits = []
 
     # Queries: 40% exact-match, 30% partial-match, 30% no-match
-    for i in range(N):
+    for i in range(n):
         if i < 200:
             # Exact match: existing subject
             idx = i % 1000
@@ -220,7 +284,7 @@ async def _scenario_search_stress() -> dict:
             expected_hits.append(True)
         elif i < 350:
             # Partial match
-            queries.append({"query": f"loadtest", "limit": 5})
+            queries.append({"query": "loadtest", "limit": 5})
             expected_hits.append(True)
         else:
             # No-match
@@ -233,7 +297,7 @@ async def _scenario_search_stress() -> dict:
 
     t0 = time.perf_counter()
 
-    for i in range(N):
+    for i in range(n):
         t_start = time.perf_counter()
         try:
             result = await _call_tool("search", queries[i])
@@ -246,22 +310,22 @@ async def _scenario_search_stress() -> dict:
             latencies.append(0)
 
     total_time = time.perf_counter() - t0
-    sorted_lat = sorted([l for l in latencies if l > 0])
+    sorted_lat = sorted([lat for lat in latencies if lat > 0])
 
     report = {
-        "total_calls": N,
+        "total_calls": n,
         "total_time_s": round(total_time, 2),
-        "throughput_calls_per_sec": round(N / total_time, 1),
+        "throughput_calls_per_sec": round(n / total_time, 1),
         "p50_ms": round(_percentile(sorted_lat, 50), 2),
         "p95_ms": round(_percentile(sorted_lat, 95), 2),
         "p99_ms": round(_percentile(sorted_lat, 99), 2),
         "errors": errors,
-        "error_rate_pct": round(errors / N * 100, 2),
+        "error_rate_pct": round(errors / n * 100, 2),
         "zero_result_count": zero_results,
-        "zero_result_rate_pct": round(zero_results / N * 100, 2),
+        "zero_result_rate_pct": round(zero_results / n * 100, 2),
     }
 
-    print(f"\n  [search-stress] {N} calls in {total_time:.2f}s "
+    print(f"\n  [search-stress] {n} calls in {total_time:.2f}s "
           f"({report['throughput_calls_per_sec']}/s)")
     print(f"    p50={report['p50_ms']:.1f}ms p95={report['p95_ms']:.1f}ms "
           f"p99={report['p99_ms']:.1f}ms")
@@ -277,8 +341,8 @@ async def _scenario_search_stress() -> dict:
 
 async def _scenario_mixed_workload() -> dict:
     """Rotate through all 9 tools for 1000 iterations, measure per-tool latency."""
-    MAX_ITERATIONS = 1000
-    MAX_DURATION = 600  # 10 minutes in seconds
+    max_iterations = 1000
+    max_duration = 600  # 10 minutes in seconds
 
     # Tool distribution: remember=20%, search=20%, semantic_search=10%,
     # learn=10%, graph_search=10%, route=10%, get_context=10%, audit=5%, ping=5%
@@ -297,10 +361,10 @@ async def _scenario_mixed_workload() -> dict:
     # Build a cyclic schedule
     schedule = []
     for tool_name, weight in tool_weights:
-        count = int(weight * MAX_ITERATIONS)
+        count = int(weight * max_iterations)
         schedule.extend([tool_name] * count)
     # Fill remaining slots with ping
-    while len(schedule) < MAX_ITERATIONS:
+    while len(schedule) < max_iterations:
         schedule.append("ping")
 
     import random
@@ -324,7 +388,7 @@ async def _scenario_mixed_workload() -> dict:
     t_start = time.perf_counter()
 
     for idx, tool_name in enumerate(schedule):
-        if time.perf_counter() - t_start >= MAX_DURATION:
+        if time.perf_counter() - t_start >= max_duration:
             iterations_done = idx
             break
         iterations_done = idx + 1
@@ -355,7 +419,7 @@ async def _scenario_mixed_workload() -> dict:
         try:
             await _call_tool(tool_name, args)
             per_tool[tool_name].append((time.perf_counter() - t0) * 1000)
-        except Exception as e:
+        except Exception:
             per_tool_errors[tool_name] += 1
             per_tool[tool_name].append((time.perf_counter() - t0) * 1000)
 
@@ -462,8 +526,9 @@ async def _measure_memory() -> dict:
 class TestLoadTest:
     """Full load test suite — all scenarios in sequence."""
 
-    async def test_full_loadtest(self):
+    async def test_full_loadtest(self, tmp_path, monkeypatch):
         """Run all 5 load test scenarios sequentially and report results."""
+        await _reset_isolated_server(tmp_path, monkeypatch)
         print("\n" + "=" * 72)
         print("  COMPOSITE MEMORY MCP SERVER — LOAD TEST")
         print("=" * 72)
@@ -539,6 +604,11 @@ class TestLoadTest:
         print("\n" + "-" * 72)
         print("  SCENARIO 5: DATA INTEGRITY AFTER LOAD")
         print("-" * 72)
+        outbox_summary = await _drain_outbox()
+        print(
+            "  Outbox drained before integrity check: "
+            f"processed={outbox_summary['processed']} failed={outbox_summary['failed']}"
+        )
         results["integrity"] = await _scenario_data_integrity()
 
         # ── Final summary ──
@@ -557,11 +627,11 @@ class TestLoadTest:
         )
 
         # Learn
-        l = results["learn"]
+        learn = results["learn"]
         summary_parts.append(
-            f"Learn: {l['learn_calls']} calls in {l['total_time_s']}s, "
-            f"{l['total_extracted_facts']}/{l['total_injected_facts']} facts "
-            f"({l['extraction_rate_pct']}%) at {l['extraction_facts_per_sec']}/s"
+            f"Learn: {learn['learn_calls']} calls in {learn['total_time_s']}s, "
+            f"{learn['total_extracted_facts']}/{learn['total_injected_facts']} facts "
+            f"({learn['extraction_rate_pct']}%) at {learn['extraction_facts_per_sec']}/s"
         )
 
         # Search stress

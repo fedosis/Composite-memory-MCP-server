@@ -6,13 +6,16 @@ P1 (Daily): Performance + Stability — how fast, does it stay up?
 Implements the highest-priority metrics from the metrics framework.
 """
 
+import asyncio
 import json
 import statistics
 import time
 from uuid import uuid4
 
 import pytest
+from storage.outbox import OutboxRepository
 
+from memory_server import server as server_module
 from memory_server.api.learn import learn as learn_fn
 from memory_server.evaluation.validator import Validator
 from memory_server.models import LifecycleState
@@ -42,6 +45,69 @@ async def _call_tool(name: str, args: dict) -> dict:
     content_list, _ = await mcp.call_tool(name, args)
     # content_list is a list of TextContent objects
     return json.loads(content_list[0].text)
+
+
+async def _reset_isolated_server(tmp_path, monkeypatch) -> None:
+    """Reset shared server singletons and point tests at a fresh backend."""
+    monkeypatch.setenv("MEMORY_SERVER_DB_URL", f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}")
+    monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "qdrant")
+
+    for attr in (
+        "_outbox_task",
+        "_outbox_worker",
+        "_router",
+        "_graph_router",
+        "_graph",
+        "_qdrant",
+        "_lancedb",
+        "_embedder",
+        "_provider",
+        "_hybrid_router",
+    ):
+        value = getattr(server_module, attr)
+        if attr == "_outbox_task" and value is not None and not value.done():
+            value.cancel()
+            try:
+                await value
+            except asyncio.CancelledError:
+                pass
+            continue
+        if hasattr(value, "close"):
+            try:
+                await value.close()
+            except Exception:
+                pass
+        setattr(server_module, attr, None)
+
+
+async def _drain_outbox(timeout_s: float = 30.0) -> dict:
+    """Process outbox entries until no pending rows remain."""
+    worker = await _get_outbox_worker()
+    deadline = time.monotonic() + timeout_s
+    total_processed = 0
+    total_failed = 0
+
+    while True:
+        summary = await worker.process_all_pending()
+        total_processed += summary.get("processed", 0)
+        total_failed += summary.get("failed", 0)
+
+        async with worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            pending = await repo.get_pending_count()
+
+        if pending == 0:
+            return {
+                "processed": total_processed,
+                "failed": total_failed,
+                "pending": pending,
+            }
+
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for outbox drain: {pending} pending entries "
+                f"after processing {total_processed}"
+            )
 
 
 # =============================================================================
@@ -140,8 +206,9 @@ class TestAdequacy:
     # Metric 1.7: Auto-Indexing
     # ------------------------------------------------------------------
 
-    async def test_benchmark_auto_indexing(self):
+    async def test_benchmark_auto_indexing(self, tmp_path, monkeypatch):
         """remember() -> verify fact visible in both semantic_search and graph_search."""
+        await _reset_isolated_server(tmp_path, monkeypatch)
         subj = "auto-index-target"
         pred = "has_feature"
         obj = "verified-indexing"
@@ -163,8 +230,7 @@ class TestAdequacy:
         # starts. Initialize the vector/embedding infrastructure (needed by
         # the outbox worker) and drain pending entries before searching.
         await _get_router()  # initialize _qdrant/_lancedb + _embedder
-        worker = await _get_outbox_worker()
-        summary = await worker.process_all_pending()
+        summary = await _drain_outbox()
         assert summary["processed"] >= 1, f"Expected >=1 outbox entry processed, got {summary}"
 
         # Check semantic_search (Qdrant)
@@ -237,11 +303,12 @@ class TestAdequacy:
     # Metric 1.5: route() Fallthrough
     # ------------------------------------------------------------------
 
-    async def test_benchmark_route_fallthrough(self):
+    async def test_benchmark_route_fallthrough(self, tmp_path, monkeypatch):
         """Rule query -> RulesEngine stage, unknown query -> LLM fallback.
 
         Per ADR-005: rules -> semantic -> graph -> LLM fallback.
         """
+        await _reset_isolated_server(tmp_path, monkeypatch)
         # Pre-populate: store a fact so semantic/graph stages have data
         await _call_tool(
             "remember",
@@ -258,8 +325,7 @@ class TestAdequacy:
         # outbox worker, not inline in remember(). Drain pending entries
         # before checking graph entities.
         await _get_router()  # initialize vector + embedder infrastructure
-        worker = await _get_outbox_worker()
-        summary = await worker.process_all_pending()
+        summary = await _drain_outbox()
         assert summary["processed"] >= 1, f"Expected >=1 outbox entry processed, got {summary}"
 
         # (a) Query with known keyword from default rules -> stage 1
