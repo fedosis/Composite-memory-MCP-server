@@ -12,6 +12,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import exc as sa_exc
 
 revision: str = "0004"
 down_revision: Union[str, None] = "0003"
@@ -21,8 +22,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    if "claim_relations" in inspector.get_table_names():
+    try:
+        inspector = sa.inspect(bind)
+        table_names = inspector.get_table_names()
+    except (sa_exc.NoInspectionAvailable, AttributeError):
+        # Offline mode (`alembic upgrade --sql`) binds a MockConnection
+        # that has no inspection system. Nothing exists yet in that mode —
+        # fall through and create the table.
+        table_names = []
+    if "claim_relations" in table_names:
         # The table may already exist: ClaimRelationORM is registered in
         # Base.metadata and SQLiteProvider.initialize() runs create_all()
         # before alembic on a mixed rollout. Make this migration idempotent.
