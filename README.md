@@ -88,18 +88,32 @@ tools, connect through an MCP-compatible client and call the `ping` tool.
 | Tool | Purpose |
 |------|---------|
 | `ping` | Health check / connectivity test |
-| `remember` | Store a fact with provenance |
-| `search` | Keyword search over stored facts |
+| `remember` | Store a fact with provenance (supports `evidence.derived_from` chain + `claim_type`) |
+| `search` | Keyword search over stored facts (active-only by default) |
 | `semantic_search` | Vector similarity search (LanceDB default; Qdrant optional) |
-| `get_context` | Retrieve context for a task |
+| `get_context` | Retrieve context for a task (active-only by default) |
 | `learn` | Extract knowledge from natural language |
-| `graph_search` | Entity lookup + pathfinding through the current SimpleGraph layer |
+| `graph_search` | Entity lookup + pathfinding through the current SimpleGraph layer (supports `relation_type` filter) |
+| `add_relation` | Create typed inter-claim relation: `supports` / `contradicts` / `derives` |
+| `invalidate` | Discard a fact/belief + demote derived dependents (lifecycle transition) |
 | `route` | 4-stage hybrid router |
 | `audit` | Memory health report |
 | `metrics` | Prometheus metrics |
 | `set_belief` / `get_belief` | Belief store management |
 | `resolve_conflict` | Resolve belief conflicts |
 | `reflect` | 6-mode belief store analysis |
+
+### Claim stacks (provenance chains + typed relations + lifecycle)
+
+CMMS treats memory as atomic **claims**, not opaque essays. Each fact can carry
+an evidence trail with a provenance chain, relations to other claims, and an
+active lifecycle so stale knowledge can be discarded without archaeology.
+
+- **Provenance chain** — `remember(metadata={"evidence": {"derived_from": [fact_id, ...], "claim_type": "fact|authority|state"}})` records *why* a claim exists. `derived_from` links a fact to its parents; `claim_type` selects the invalidation class.
+- **Typed relations** — `add_relation(source_id, target_id, "supports"|"contradicts"|"derives")` connects claims. Relations are **canonically stored in SQLite** (`claim_relations` table); the in-memory graph is a projection/cache for fast traversal.
+- **Active lifecycle** — facts and beliefs transition `candidate → validated → active → stale → archived → forgotten` (plus belief states `superseded/contradicted/discarded`) through an atomic `LifecycleService` that writes `lifecycle_events`, bumps `version`, and checks `expected_version` for race safety.
+- **Point discard + propagation** — `invalidate(memory_id, memory_type, reason)` discards a claim and **demotes derived dependents** (confidence × 0.8, floor 0.1) instead of cascading deletion.
+- **Live knowledge** — `search`, `get_context`, and belief search return **active-only** by default; pass `include_inactive=True` to see archived/discarded items.
 
 ### Run tests and lint
 
@@ -575,7 +589,7 @@ SimpleGraph, GitPython, Prometheus Client, OpenTelemetry
 
 ## Storage
 
-The server uses a multi-tier storage architecture with SQLite/FTS5 as the primary durable and keyword-search store, backed by optional vector indexes (LanceDB by default for semantic search, Qdrant optional via `MEMORY_VECTOR_BACKEND=qdrant`) and the current in-memory SimpleGraph graph layer. Neo4j is declared only as a future/optional graph dependency and is not wired into the v0.11 runtime.
+The server uses a multi-tier storage architecture with SQLite/FTS5 as the primary durable and keyword-search store, backed by optional vector indexes (LanceDB by default for semantic search, Qdrant optional via `MEMORY_VECTOR_BACKEND=qdrant`), a canonical `claim_relations` table for typed inter-claim relations, and the in-memory SimpleGraph graph layer (persisted to a JSON snapshot, `MEMORY_GRAPH_SNAPSHOT_PATH`, default `data/graph.json`) as a fast traversal projection. Neo4j is declared only as a future/optional graph dependency and is not wired into the v0.11 runtime.
 
 ### SQLite with WAL Mode
 
