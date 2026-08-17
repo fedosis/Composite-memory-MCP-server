@@ -192,6 +192,7 @@ async def _build_auditor() -> MemoryAuditor:
         receipt_ids=persisted["receipt_ids"],
         sqlite_counts=persisted["sqlite_counts"],
         vector_point_count=persisted["vector_point_count"],
+        persisted_records=persisted["records"],
     )
 
 

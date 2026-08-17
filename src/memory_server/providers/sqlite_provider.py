@@ -403,6 +403,76 @@ class SQLiteProvider:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def list_audit_records(self, include_inactive: bool = True) -> list[dict[str, Any]]:
+        active_states = ("candidate", "validated", "active")
+
+        async with await self._get_session() as session:
+            receipt_stmt = select(
+                MemoryReceiptORM.id,
+                MemoryReceiptORM.memory_type,
+            )
+            if not include_inactive:
+                receipt_stmt = receipt_stmt.where(
+                    MemoryReceiptORM.lifecycle_state.in_(active_states)
+                )
+            receipt_rows = await session.execute(receipt_stmt)
+            receipt_map = {
+                receipt_id: memory_type
+                for receipt_id, memory_type in receipt_rows.all()
+            }
+
+            def _normalize_rows(rows, memory_type: str) -> list[dict[str, Any]]:
+                normalized: list[dict[str, Any]] = []
+                for row in rows:
+                    normalized.append(
+                        {
+                            "fact_id": row.id,
+                            "memory_type": memory_type,
+                            "status": row.lifecycle_state,
+                            "confidence": row.confidence,
+                            "lifecycle_state": row.lifecycle_state,
+                            "verification_status": row.verification_status,
+                            "receipt_id": row.id if receipt_map.get(row.id) == memory_type else None,
+                            "has_receipt": receipt_map.get(row.id) == memory_type,
+                        }
+                    )
+                return normalized
+
+            fact_stmt = select(
+                FactORM.id,
+                FactORM.confidence,
+                FactORM.lifecycle_state,
+                FactORM.verification_status,
+            )
+            decision_stmt = select(
+                DecisionORM.id,
+                DecisionORM.confidence,
+                DecisionORM.lifecycle_state,
+                DecisionORM.verification_status,
+            )
+            skill_stmt = select(
+                SkillORM.id,
+                SkillORM.confidence,
+                SkillORM.lifecycle_state,
+                SkillORM.verification_status,
+            )
+            if not include_inactive:
+                fact_stmt = fact_stmt.where(FactORM.lifecycle_state.in_(active_states))
+                decision_stmt = decision_stmt.where(
+                    DecisionORM.lifecycle_state.in_(active_states)
+                )
+                skill_stmt = skill_stmt.where(SkillORM.lifecycle_state.in_(active_states))
+
+            fact_rows = (await session.execute(fact_stmt)).all()
+            decision_rows = (await session.execute(decision_stmt)).all()
+            skill_rows = (await session.execute(skill_stmt)).all()
+
+            return [
+                *_normalize_rows(fact_rows, "fact"),
+                *_normalize_rows(decision_rows, "decision"),
+                *_normalize_rows(skill_rows, "skill"),
+            ]
+
     async def prune_expired_memories(self, now: datetime | None = None) -> dict[str, Any]:
         """Archive memories whose write-time admission TTL has expired.
 

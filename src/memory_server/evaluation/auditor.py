@@ -9,7 +9,7 @@ import inspect
 from typing import Any
 
 from memory_server.evaluation.confidence import ConfidenceEngine
-from memory_server.evaluation.validator import Validator
+from memory_server.evaluation.validator import Validator, normalize_lifecycle_state
 from memory_server.models.receipt import LifecycleState
 
 _VALID_LIFECYCLE_STATES = {s.value for s in LifecycleState}
@@ -36,6 +36,7 @@ async def collect_persisted_audit_state(
     state: dict[str, Any] = {
         "sqlite_counts": {},
         "receipt_ids": set(),
+        "records": None,
         "vector_point_count": None,
     }
 
@@ -66,6 +67,16 @@ async def collect_persisted_audit_state(
                 ids = await _maybe_await(receipt_id_method())
             state["receipt_ids"] = set(ids or [])
 
+        audit_record_method = getattr(sqlite, "list_audit_records", None)
+        if audit_record_method is not None:
+            try:
+                records = await _maybe_await(
+                    audit_record_method(include_inactive=include_inactive)
+                )
+            except TypeError:
+                records = await _maybe_await(audit_record_method())
+            state["records"] = list(records or [])
+
     if vector_provider is not None and hasattr(vector_provider, "count_points"):
         try:
             state["vector_point_count"] = int(
@@ -95,6 +106,7 @@ class MemoryAuditor:
         receipt_ids: set[str] | None = None,
         sqlite_counts: dict[str, int] | None = None,
         vector_point_count: int | None = None,
+        persisted_records: list[dict[str, Any]] | None = None,
     ) -> None:
         self._validator = validator
         self._engine = confidence_engine or ConfidenceEngine()
@@ -104,6 +116,11 @@ class MemoryAuditor:
         self._receipt_ids = receipt_ids or set()
         self._sqlite_counts = sqlite_counts or {}
         self._vector_point_count = vector_point_count
+        self._persisted_records = (
+            [self._normalize_audit_entry(entry) for entry in persisted_records]
+            if persisted_records is not None
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Audit methods
@@ -121,7 +138,7 @@ class MemoryAuditor:
             List of warning strings.
         """
         warnings: list[str] = []
-        for entry in self._validator.get_all():
+        for entry in self._audit_entries():
             fid = entry["fact_id"]
             status = entry["status"]
             confidence = entry["confidence"]
@@ -174,7 +191,7 @@ class MemoryAuditor:
         Returns:
             Dict with keys: ``total``, ``buckets``, ``low_confidence``.
         """
-        entries = self._validator.get_all()
+        entries = self._audit_entries()
         if not entries:
             return {
                 "total": 0,
@@ -227,15 +244,22 @@ class MemoryAuditor:
             List of orphan record IDs.
         """
         orphans: list[str] = []
+        entries = self._audit_entries()
+        if self._using_persisted_entries():
+            for entry in entries:
+                if not self._entry_has_receipt(entry):
+                    orphans.append(entry["fact_id"])
+            return orphans
+
         if not self._receipt_ids:
             # No receipt store available — flag all items as potential orphans
-            for entry in self._validator.get_all():
+            for entry in entries:
                 orphans.append(entry["fact_id"])
             if orphans:
                 return [f"No receipt store available — {len(orphans)} items unchecked"]
             return ["No receipt store available — no items to check"]
 
-        for entry in self._validator.get_all():
+        for entry in entries:
             fid = entry["fact_id"]
             if fid not in self._receipt_ids:
                 orphans.append(fid)
@@ -252,14 +276,21 @@ class MemoryAuditor:
             List of item IDs missing receipts.
         """
         missing: list[str] = []
+        entries = self._audit_entries()
+        if self._using_persisted_entries():
+            for entry in entries:
+                if not self._entry_has_receipt(entry):
+                    missing.append(entry["fact_id"])
+            return missing
+
         if not self._receipt_ids:
-            for entry in self._validator.get_all():
+            for entry in entries:
                 missing.append(entry["fact_id"])
             if missing:
                 return [f"No receipt store available — {len(missing)} items unchecked"]
             return ["No receipt store available — no items to check"]
 
-        for entry in self._validator.get_all():
+        for entry in entries:
             fid = entry["fact_id"]
             if fid not in self._receipt_ids:
                 missing.append(fid)
@@ -279,9 +310,10 @@ class MemoryAuditor:
             List of error strings describing violations.
         """
         errors: list[str] = []
-        for entry in self._validator.get_all():
+        for entry in self._audit_entries():
             fid = entry["fact_id"]
-            status = entry["status"]
+            raw_state = entry.get("lifecycle_state")
+            status = raw_state if isinstance(raw_state, str) and raw_state else entry["status"]
             if status not in _VALID_LIFECYCLE_STATES:
                 errors.append(
                     f"Item '{fid}' has invalid lifecycle state '{status}'"
@@ -298,7 +330,7 @@ class MemoryAuditor:
             List of warning strings for low-confidence items.
         """
         warnings: list[str] = []
-        for entry in self._validator.get_all():
+        for entry in self._audit_entries():
             fid = entry["fact_id"]
             conf = entry["confidence"]
             if conf < 0.3:
@@ -413,6 +445,54 @@ class MemoryAuditor:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _normalize_audit_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        raw_lifecycle_state = entry.get("lifecycle_state")
+        if isinstance(raw_lifecycle_state, LifecycleState):
+            raw_lifecycle_state = raw_lifecycle_state.value
+        raw_status = entry.get("status") or raw_lifecycle_state or "candidate"
+        if isinstance(raw_status, LifecycleState):
+            raw_status = raw_status.value
+        verification_status = entry.get("verification_status")
+        if verification_status is not None and hasattr(verification_status, "value"):
+            verification_status = verification_status.value
+        confidence = entry.get("confidence", 0.0)
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        receipt_id = entry.get("receipt_id")
+        has_receipt = entry.get("has_receipt")
+        if has_receipt is None:
+            has_receipt = bool(receipt_id) or entry.get("fact_id") in self._receipt_ids
+        return {
+            "fact_id": str(entry.get("fact_id", "")),
+            "memory_type": str(entry.get("memory_type", "fact")),
+            "status": normalize_lifecycle_state(str(raw_status)),
+            "confidence": confidence,
+            "verification_status": verification_status,
+            "lifecycle_state": raw_lifecycle_state if isinstance(raw_lifecycle_state, str) else None,
+            "receipt_id": str(receipt_id) if receipt_id else None,
+            "has_receipt": bool(has_receipt),
+        }
+
+    def _validator_entries(self) -> list[dict[str, Any]]:
+        return [
+            self._normalize_audit_entry({**entry, "memory_type": entry.get("memory_type", "fact")})
+            for entry in self._validator.get_all()
+        ]
+
+    def _audit_entries(self) -> list[dict[str, Any]]:
+        if self._persisted_records is not None:
+            return self._persisted_records
+        return self._validator_entries()
+
+    def _using_persisted_entries(self) -> bool:
+        return self._persisted_records is not None
+
+    @staticmethod
+    def _entry_has_receipt(entry: dict[str, Any]) -> bool:
+        return bool(entry.get("has_receipt") or entry.get("receipt_id"))
 
     def _sqlite_fact_count(self) -> int | None:
         """Get the count of facts from the SQLite provider.
@@ -599,19 +679,21 @@ class MemoryAuditor:
             stats["sql_graph_drift"] = graph_drift_stats
 
             # Aggregate summary stats
-            all_entries = self._validator.get_all()
+            all_entries = self._audit_entries()
             fact_count = self._sqlite_fact_count()
             if fact_count is None:
-                fact_count = len(all_entries)
+                fact_count = sum(
+                    1 for entry in all_entries if entry.get("memory_type") == "fact"
+                )
             decision_count = self._sqlite_decision_count()
             if decision_count is None:
                 decision_count = sum(
-                    1 for e in all_entries if "decision" in e.get("fact_id", "")
+                    1 for entry in all_entries if entry.get("memory_type") == "decision"
                 )
             skill_count = self._sqlite_skill_count()
             if skill_count is None:
                 skill_count = sum(
-                    1 for e in all_entries if "skill" in e.get("fact_id", "")
+                    1 for entry in all_entries if entry.get("memory_type") == "skill"
                 )
             receipt_count = self._receipt_count()
             stats["total_facts"] = fact_count

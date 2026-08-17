@@ -68,6 +68,45 @@ async def test_server_audit_uses_persisted_sql_state(tmp_path, monkeypatch):
         "No receipt store available" not in warning
         for warning in audit_result["warnings"]
     )
+    assert all("orphan records" not in warning for warning in audit_result["warnings"])
+    assert all("MemoryReceipt" not in error for error in audit_result["errors"])
+
+    await _reset_server_state(server)
+
+
+@pytest.mark.asyncio
+async def test_server_full_audit_surfaces_persisted_low_confidence_and_lifecycle(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "MEMORY_SERVER_DB_URL",
+        f"sqlite+aiosqlite:///{tmp_path / 'server-persisted-audit.db'}",
+    )
+    monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "qdrant")
+
+    import memory_server.server as server
+
+    await _reset_server_state(server)
+    provider = await server._get_provider()
+    stored = await remember(
+        provider,
+        subject="ServerLowConfidence",
+        predicate="needs",
+        object="audit coverage",
+        confidence=0.1,
+        source="test",
+    )
+    await provider.update_fact(stored["fact"].id, lifecycle_state="invalid_state")
+
+    audit_result = json.loads(await server.audit_tool(audit_type="full"))
+
+    assert audit_result["stats"]["confidence"]["total"] >= 1
+    assert stored["fact"].id in audit_result["stats"]["confidence"]["low_confidence"]
+    assert any(stored["fact"].id in warning for warning in audit_result["warnings"])
+    assert any(
+        error == f"Item '{stored['fact'].id}' has invalid lifecycle state 'invalid_state'"
+        for error in audit_result["errors"]
+    )
 
     await _reset_server_state(server)
 
@@ -106,6 +145,40 @@ def test_hermes_provider_audit_uses_persisted_sql_state(tmp_path):
         "No receipt store available" not in warning
         for warning in audit_result["warnings"]
     )
+    assert all("orphan records" not in warning for warning in audit_result["warnings"])
+    assert all("MemoryReceipt" not in error for error in audit_result["errors"])
+
+    provider.shutdown()
+
+
+def test_hermes_provider_full_audit_surfaces_persisted_low_confidence(tmp_path):
+    provider = HermesProvider()
+    provider.initialize(
+        session_id="audit-low-confidence",
+        config={
+            "db_url": f"sqlite+aiosqlite:///{tmp_path / 'plugin-low-confidence.db'}",
+        },
+    )
+
+    remember_result = json.loads(
+        provider.handle_tool_call(
+            "remember",
+            {
+                "subject": "PluginLowConfidence",
+                "predicate": "needs",
+                "object": "audit coverage",
+                "confidence": 0.1,
+                "source": "test",
+            },
+        )
+    )
+    fact_id = remember_result["fact"]["id"]
+
+    audit_result = json.loads(provider.handle_tool_call("audit", {"audit_type": "full"}))
+
+    assert audit_result["stats"]["confidence"]["total"] >= 1
+    assert fact_id in audit_result["stats"]["confidence"]["low_confidence"]
+    assert any(fact_id in warning for warning in audit_result["warnings"])
 
     provider.shutdown()
 

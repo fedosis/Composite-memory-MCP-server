@@ -311,6 +311,78 @@ class TestPhase7ConfidenceFlags:
         assert "high-conf" not in flagged_ids
 
 
+class TestPersistedAuditEntries:
+    """Persisted audit snapshots should drive record-level checks when present."""
+
+    def test_persisted_entries_drive_confidence_stats(self):
+        auditor = MemoryAuditor(
+            validator=Validator(),
+            persisted_records=[
+                {
+                    "fact_id": "persisted-low",
+                    "memory_type": "fact",
+                    "status": "active",
+                    "confidence": 0.1,
+                    "lifecycle_state": "active",
+                    "verification_status": "candidate",
+                    "receipt_id": "persisted-low",
+                    "has_receipt": True,
+                }
+            ],
+        )
+
+        stats = auditor.audit_confidence()
+
+        assert stats["total"] == 1
+        assert stats["low_confidence"] == ["persisted-low"]
+        assert auditor.check_confidence_issues() == [
+            "Item 'persisted-low' has low confidence (0.1)"
+        ]
+
+    def test_persisted_entries_handle_receipt_linkage_and_lifecycle(self):
+        auditor = MemoryAuditor(
+            validator=Validator(),
+            persisted_records=[
+                {
+                    "fact_id": "persisted-ok",
+                    "memory_type": "fact",
+                    "status": "active",
+                    "confidence": 0.8,
+                    "lifecycle_state": "active",
+                    "verification_status": "validated",
+                    "receipt_id": "persisted-ok",
+                    "has_receipt": True,
+                },
+                {
+                    "fact_id": "persisted-bad",
+                    "memory_type": "fact",
+                    "status": "active",
+                    "confidence": 0.8,
+                    "lifecycle_state": "invalid_state",
+                    "verification_status": "validated",
+                    "receipt_id": None,
+                    "has_receipt": False,
+                },
+            ],
+        )
+
+        assert auditor.check_orphan_records() == ["persisted-bad"]
+        assert auditor.check_missing_receipts() == ["persisted-bad"]
+        assert auditor.check_lifecycle_violations() == [
+            "Item 'persisted-bad' has invalid lifecycle state 'invalid_state'"
+        ]
+
+    def test_validator_fallback_remains_available_without_persisted_records(self):
+        validator = Validator()
+        validator.register("fallback-low", confidence=0.2)
+        auditor = MemoryAuditor(validator=validator)
+
+        stats = auditor.audit_confidence()
+
+        assert stats["total"] == 1
+        assert stats["low_confidence"] == ["fallback-low"]
+
+
 class TestPhase7DriftDetection:
     """Phase 7 — SQL/vector and SQL/graph drift."""
 
