@@ -26,7 +26,7 @@ from memory_server.api.get_context import get_context as get_context_fn
 from memory_server.api.learn import learn as learn_fn
 from memory_server.api.remember import remember as remember_fn
 from memory_server.api.search import search as search_fn
-from memory_server.evaluation.auditor import MemoryAuditor
+from memory_server.evaluation.auditor import MemoryAuditor, collect_persisted_audit_state
 from memory_server.evaluation.confidence import ConfidenceEngine
 from memory_server.evaluation.decay import DecayEngine
 from memory_server.evaluation.metrics import get_collector
@@ -165,6 +165,34 @@ def _get_vector_provider():
     if backend == "qdrant":
         return _get_qdrant_provider()
     return _get_lancedb_provider()
+
+
+async def _build_auditor() -> MemoryAuditor:
+    """Assemble a MemoryAuditor wired to persisted CMMS state."""
+    global _validator_store, _confidence_engine
+
+    if _validator_store is None:
+        _validator_store = Validator()
+    if _confidence_engine is None:
+        _confidence_engine = ConfidenceEngine()
+
+    sqlite = await _get_provider()
+    graph = await _get_graph()
+    vector_provider = await _get_vector_provider()
+    persisted = await collect_persisted_audit_state(
+        sqlite=sqlite,
+        vector_provider=vector_provider,
+    )
+    return MemoryAuditor(
+        validator=_validator_store,
+        confidence_engine=_confidence_engine,
+        graph=graph,
+        sqlite=sqlite,
+        qdrant=vector_provider,
+        receipt_ids=persisted["receipt_ids"],
+        sqlite_counts=persisted["sqlite_counts"],
+        vector_point_count=persisted["vector_point_count"],
+    )
 
 
 async def _get_router() -> EmbeddingRouter:
@@ -645,20 +673,9 @@ async def audit_tool(
     Returns:
         Structured audit report with warnings, errors, and stats.
     """
-    global _validator_store, _confidence_engine
     collector = get_collector()
     with collector.tool_call("audit") as _ctx:
-        if _validator_store is None:
-            _validator_store = Validator()
-        if _confidence_engine is None:
-            _confidence_engine = ConfidenceEngine()
-
-        graph = await _get_graph()
-        auditor = MemoryAuditor(
-            validator=_validator_store,
-            confidence_engine=_confidence_engine,
-            graph=graph,
-        )
+        auditor = await _build_auditor()
         report = auditor.audit_report(audit_type=audit_type)
 
         # Integrate drift detection into metrics

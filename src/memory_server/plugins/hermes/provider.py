@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from memory_server.plugins.hermes.config import HermesPluginConfig
@@ -67,6 +69,100 @@ def _run_async(coro, timeout: float = 30.0):
 DEFAULT_DB_URL = "sqlite+aiosqlite:///data/memory.db"
 
 
+def _cmms_repo_root() -> Path:
+    """Return the checked-out CMMS repository root."""
+    import memory_server
+
+    return Path(memory_server.__file__).resolve().parents[2]
+
+
+def _resolve_cmms_data_path(
+    provider: "HermesProvider",
+    relative_path: str,
+    *,
+    env_var: str | None = None,
+) -> Path:
+    """Resolve CMMS data paths relative to config/env/repo root."""
+    raw_path = os.environ.get(env_var, relative_path) if env_var else relative_path
+    path = Path(raw_path)
+
+    if not path.is_absolute():
+        base_root = None
+        if provider._config and provider._config.cmms_path:
+            base_root = Path(provider._config.cmms_path)
+        elif provider._hermes_home:
+            candidate = Path(provider._hermes_home)
+            if (candidate / "data").exists():
+                base_root = candidate
+        if base_root is None:
+            base_root = _cmms_repo_root()
+        path = (base_root / path).resolve()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+async def _get_graph(provider: "HermesProvider"):
+    """Return a snapshot-backed graph instance for Hermes audit/tools."""
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    if provider._graph is None:
+        snapshot_path = _resolve_cmms_data_path(
+            provider,
+            "data/graph.json",
+            env_var="MEMORY_GRAPH_SNAPSHOT_PATH",
+        )
+        provider._graph = SimpleGraph(snapshot_path=snapshot_path)
+        provider._graph.load_snapshot()
+    return provider._graph
+
+
+async def _get_vector_provider(provider: "HermesProvider"):
+    """Resolve the active vector backend for Hermes audit/tools."""
+    backend = os.environ.get("MEMORY_VECTOR_BACKEND", "lancedb").lower()
+
+    if backend == "qdrant":
+        if provider._qdrant is None:
+            from memory_server.providers.qdrant_provider import QdrantProvider
+
+            provider._qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+        return provider._qdrant
+
+    if provider._lancedb is None:
+        from memory_server.providers.lancedb_provider import LanceDBProvider
+
+        db_path = _resolve_cmms_data_path(provider, "data/lancedb")
+        provider._lancedb = LanceDBProvider(db_path=str(db_path), table="memories")
+    return provider._lancedb
+
+
+async def _build_auditor(provider: "HermesProvider"):
+    """Assemble a MemoryAuditor over persisted CMMS state for Hermes tools."""
+    from memory_server.evaluation.auditor import (
+        MemoryAuditor,
+        collect_persisted_audit_state,
+    )
+    from memory_server.evaluation.confidence import ConfidenceEngine
+    from memory_server.evaluation.validator import Validator
+
+    graph = await _get_graph(provider)
+    vector_provider = await _get_vector_provider(provider)
+    persisted = await collect_persisted_audit_state(
+        sqlite=provider._provider,
+        vector_provider=vector_provider,
+    )
+    return MemoryAuditor(
+        validator=Validator(),
+        confidence_engine=ConfidenceEngine(),
+        graph=graph,
+        sqlite=provider._provider,
+        qdrant=vector_provider,
+        receipt_ids=persisted["receipt_ids"],
+        sqlite_counts=persisted["sqlite_counts"],
+        vector_point_count=persisted["vector_point_count"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # HermesProvider
 # ---------------------------------------------------------------------------
@@ -98,6 +194,7 @@ class HermesProvider:
         self._shut_down = False
         self._provider = None  # SQLiteProvider
         self._qdrant = None
+        self._lancedb: Any | None = None
         self._embedder = None
         self._graph = None
         self._router = None
@@ -208,7 +305,21 @@ class HermesProvider:
             except Exception:
                 logger.exception("HermesProvider: error closing provider")
 
+        if self._qdrant is not None:
+            try:
+                _run_async(self._qdrant.close(), timeout=10.0)
+            except Exception:
+                logger.exception("HermesProvider: error closing Qdrant provider")
+
+        if self._lancedb is not None:
+            try:
+                _run_async(self._lancedb.close(), timeout=10.0)
+            except Exception:
+                logger.exception("HermesProvider: error closing LanceDB provider")
+
         self._provider = None
+        self._qdrant = None
+        self._lancedb = None
         self._writer = None
         self._initialized = False
         self._shut_down = True
@@ -1038,20 +1149,7 @@ class HermesProvider:
         self,
         audit_type: str = "full",
     ) -> str:
-        from memory_server.evaluation.auditor import MemoryAuditor
-        from memory_server.evaluation.confidence import ConfidenceEngine
-        from memory_server.evaluation.validator import Validator
-        from memory_server.providers.graph_provider import SimpleGraph
-
-        validator = Validator()
-        confidence_engine = ConfidenceEngine()
-        graph = self._graph or SimpleGraph()
-
-        auditor = MemoryAuditor(
-            validator=validator,
-            confidence_engine=confidence_engine,
-            graph=graph,
-        )
+        auditor = await _build_auditor(self)
         report = auditor.audit_report(audit_type=audit_type)
         return json.dumps(report)
 

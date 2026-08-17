@@ -232,6 +232,11 @@ class LanceDBProvider:
             logger.error("Failed to list tables: %s", exc)
             return []
 
+    async def count_points(self, collection: str | None = None) -> int:
+        """Return the number of vector rows in the collection/table."""
+        table = await self._get_table(collection)
+        return int(await asyncio.to_thread(table.count_rows))
+
     # ------------------------------------------------------------------
     # Point operations
     # ------------------------------------------------------------------

@@ -12,11 +12,13 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from storage.base import Base
+from storage.models.decision import DecisionORM
 from storage.models.fact import FactORM
 from storage.models.receipt import MemoryReceiptORM
+from storage.models.skill import SkillORM
 from storage.outbox import OutboxRepository
 from storage.repositories import (
     BeliefRepository,
@@ -360,6 +362,46 @@ class SQLiteProvider:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
             return await repo.search(memory_type=memory_type, source=source, limit=limit)
+
+    async def count_facts(self, include_inactive: bool = True) -> int:
+        async with await self._get_session() as session:
+            stmt = select(func.count()).select_from(FactORM)
+            if not include_inactive:
+                stmt = stmt.where(FactORM.lifecycle_state.in_(("candidate", "validated", "active")))
+            result = await session.execute(stmt)
+            return int(result.scalar_one() or 0)
+
+    async def count_decisions(self, include_inactive: bool = True) -> int:
+        async with await self._get_session() as session:
+            stmt = select(func.count()).select_from(DecisionORM)
+            if not include_inactive:
+                stmt = stmt.where(DecisionORM.lifecycle_state.in_(("candidate", "validated", "active")))
+            result = await session.execute(stmt)
+            return int(result.scalar_one() or 0)
+
+    async def count_skills(self, include_inactive: bool = True) -> int:
+        async with await self._get_session() as session:
+            stmt = select(func.count()).select_from(SkillORM)
+            if not include_inactive:
+                stmt = stmt.where(SkillORM.lifecycle_state.in_(("candidate", "validated", "active")))
+            result = await session.execute(stmt)
+            return int(result.scalar_one() or 0)
+
+    async def count_receipts(self, include_inactive: bool = True) -> int:
+        async with await self._get_session() as session:
+            stmt = select(func.count()).select_from(MemoryReceiptORM)
+            if not include_inactive:
+                stmt = stmt.where(MemoryReceiptORM.lifecycle_state.in_(("candidate", "validated", "active")))
+            result = await session.execute(stmt)
+            return int(result.scalar_one() or 0)
+
+    async def list_receipt_ids(self, include_inactive: bool = True) -> list[str]:
+        async with await self._get_session() as session:
+            stmt = select(MemoryReceiptORM.id)
+            if not include_inactive:
+                stmt = stmt.where(MemoryReceiptORM.lifecycle_state.in_(("candidate", "validated", "active")))
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
 
     async def prune_expired_memories(self, now: datetime | None = None) -> dict[str, Any]:
         """Archive memories whose write-time admission TTL has expired.

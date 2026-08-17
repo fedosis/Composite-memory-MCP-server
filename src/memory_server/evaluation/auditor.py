@@ -5,6 +5,7 @@ Produces structured audit reports with warnings, errors, and stats.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 from memory_server.evaluation.confidence import ConfidenceEngine
@@ -12,6 +13,68 @@ from memory_server.evaluation.validator import Validator
 from memory_server.models.receipt import LifecycleState
 
 _VALID_LIFECYCLE_STATES = {s.value for s in LifecycleState}
+
+
+async def collect_persisted_audit_state(
+    *,
+    sqlite: Any = None,
+    vector_provider: Any = None,
+    include_inactive: bool = True,
+) -> dict[str, Any]:
+    """Collect persisted counts/receipt IDs for a synchronous ``MemoryAuditor``.
+
+    Audit report generation is synchronous, but the canonical storage providers
+    are async. This helper preloads the persisted state so audit consumers can
+    inject it as immutable snapshots.
+    """
+
+    async def _maybe_await(value):
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    state: dict[str, Any] = {
+        "sqlite_counts": {},
+        "receipt_ids": set(),
+        "vector_point_count": None,
+    }
+
+    if sqlite is not None:
+        count_methods = {
+            "facts": getattr(sqlite, "count_facts", None),
+            "decisions": getattr(sqlite, "count_decisions", None),
+            "skills": getattr(sqlite, "count_skills", None),
+            "receipts": getattr(sqlite, "count_receipts", None),
+        }
+        sqlite_counts: dict[str, int] = {}
+        for key, method in count_methods.items():
+            if method is None:
+                continue
+            try:
+                sqlite_counts[key] = int(
+                    await _maybe_await(method(include_inactive=include_inactive))
+                )
+            except TypeError:
+                sqlite_counts[key] = int(await _maybe_await(method()))
+        state["sqlite_counts"] = sqlite_counts
+
+        receipt_id_method = getattr(sqlite, "list_receipt_ids", None)
+        if receipt_id_method is not None:
+            try:
+                ids = await _maybe_await(receipt_id_method(include_inactive=include_inactive))
+            except TypeError:
+                ids = await _maybe_await(receipt_id_method())
+            state["receipt_ids"] = set(ids or [])
+
+    if vector_provider is not None and hasattr(vector_provider, "count_points"):
+        try:
+            state["vector_point_count"] = int(
+                await _maybe_await(vector_provider.count_points())
+            )
+        except Exception:
+            state["vector_point_count"] = None
+
+    return state
 
 
 class MemoryAuditor:
@@ -30,6 +93,8 @@ class MemoryAuditor:
         sqlite: Any = None,
         qdrant: Any = None,
         receipt_ids: set[str] | None = None,
+        sqlite_counts: dict[str, int] | None = None,
+        vector_point_count: int | None = None,
     ) -> None:
         self._validator = validator
         self._engine = confidence_engine or ConfidenceEngine()
@@ -37,6 +102,8 @@ class MemoryAuditor:
         self._sqlite = sqlite  # optional SQLiteProvider
         self._qdrant = qdrant  # optional QdrantProvider
         self._receipt_ids = receipt_ids or set()
+        self._sqlite_counts = sqlite_counts or {}
+        self._vector_point_count = vector_point_count
 
     # ------------------------------------------------------------------
     # Audit methods
@@ -352,31 +419,67 @@ class MemoryAuditor:
 
         Returns None if no SQLite provider is configured.
         """
+        if "facts" in self._sqlite_counts:
+            return self._sqlite_counts["facts"]
         if self._sqlite is None:
             return None
         try:
-            # If it's an async provider, we need to run it synchronously
-            # For test mocks, check if count_facts exists directly
             if hasattr(self._sqlite, "count_facts"):
                 return self._sqlite.count_facts()
-            # Fallback: try to count from validator entries
-            entries = self._validator.get_all()
-            return len(entries)
         except Exception:
             return None
+        return None
+
+    def _sqlite_decision_count(self) -> int | None:
+        if "decisions" in self._sqlite_counts:
+            return self._sqlite_counts["decisions"]
+        if self._sqlite is None:
+            return None
+        try:
+            if hasattr(self._sqlite, "count_decisions"):
+                return self._sqlite.count_decisions()
+        except Exception:
+            return None
+        return None
+
+    def _sqlite_skill_count(self) -> int | None:
+        if "skills" in self._sqlite_counts:
+            return self._sqlite_counts["skills"]
+        if self._sqlite is None:
+            return None
+        try:
+            if hasattr(self._sqlite, "count_skills"):
+                return self._sqlite.count_skills()
+        except Exception:
+            return None
+        return None
+
+    def _receipt_count(self) -> int | None:
+        if self._receipt_ids:
+            return len(self._receipt_ids)
+        if "receipts" in self._sqlite_counts:
+            return self._sqlite_counts["receipts"]
+        if self._sqlite is None:
+            return None
+        try:
+            if hasattr(self._sqlite, "count_receipts"):
+                return self._sqlite.count_receipts()
+        except Exception:
+            return None
+        return None
 
     def _qdrant_point_count(self) -> int | None:
         """Get the count of points from the Qdrant provider.
 
         Returns None if no Qdrant provider is configured.
         """
+        if self._vector_point_count is not None:
+            return self._vector_point_count
         if self._qdrant is None:
             return None
         try:
-            # For test mocks, check if count_points exists directly
             if hasattr(self._qdrant, "count_points"):
                 return self._qdrant.count_points()
-            # Try to access the underlying client for a real QdrantProvider
             if hasattr(self._qdrant, "_client") and hasattr(self._qdrant, "_collection"):
                 _client = self._qdrant._client
                 try:
@@ -497,17 +600,24 @@ class MemoryAuditor:
 
             # Aggregate summary stats
             all_entries = self._validator.get_all()
-            fact_count = len(all_entries)
-            decision_count = sum(
-                1 for e in all_entries if "decision" in e.get("fact_id", "")
-            )
-            skill_count = sum(
-                1 for e in all_entries if "skill" in e.get("fact_id", "")
-            )
+            fact_count = self._sqlite_fact_count()
+            if fact_count is None:
+                fact_count = len(all_entries)
+            decision_count = self._sqlite_decision_count()
+            if decision_count is None:
+                decision_count = sum(
+                    1 for e in all_entries if "decision" in e.get("fact_id", "")
+                )
+            skill_count = self._sqlite_skill_count()
+            if skill_count is None:
+                skill_count = sum(
+                    1 for e in all_entries if "skill" in e.get("fact_id", "")
+                )
+            receipt_count = self._receipt_count()
             stats["total_facts"] = fact_count
             stats["total_decisions"] = decision_count
             stats["total_skills"] = skill_count
-            stats["total_receipts"] = len(self._receipt_ids)
+            stats["total_receipts"] = receipt_count if receipt_count is not None else 0
             stats["total_graph_nodes"] = self._graph_node_count() or 0
             qdrant_count = self._qdrant_point_count()
             stats["total_qdrant_points"] = qdrant_count if qdrant_count is not None else 0

@@ -162,6 +162,15 @@ class QdrantProvider:
             logger.error("Failed to list collections: %s", exc)
             return []
 
+    async def count_points(self, collection: str | None = None) -> int:
+        """Return the number of indexed vector points in a collection."""
+        result = await self._run(
+            self._client.count,
+            collection_name=collection or self._collection,
+            exact=True,
+        )
+        return int(result.count)
+
     # ------------------------------------------------------------------
     # Point operations
     # ------------------------------------------------------------------
