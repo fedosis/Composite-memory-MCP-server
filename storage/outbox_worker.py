@@ -39,6 +39,10 @@ MAX_RETRIES = 3
 # Polling interval in seconds
 POLL_INTERVAL_SECONDS = 1.0
 
+# Maximum entries to claim per poll cycle. Sized to drain the backlog fast
+# while keeping each cycle bounded for the event loop.
+POLL_BATCH_SIZE = 200
+
 
 class OutboxWorker:
     """Background worker that processes outbox entries.
@@ -68,6 +72,17 @@ class OutboxWorker:
         self._embedder = embedder
         self._graph_router = graph_router
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        self._stop_requested = False
+
+    def stop(self) -> None:
+        """Signal the run loop to exit after the current iteration.
+
+        Unlike ``asyncio.Task.cancel()`` this works across threads and event
+        loops: ``run()`` checks the flag each cycle, so a worker scheduled via
+        ``asyncio.run_coroutine_threadsafe()`` (HermesProvider path) exits
+        cleanly instead of polling a disposed engine forever.
+        """
+        self._stop_requested = True
 
     async def initialize(self) -> None:
         """Initialize the worker — create session factory from existing engine."""
@@ -94,26 +109,38 @@ class OutboxWorker:
             await self._engine.dispose()
 
     async def run(self) -> None:
-        """Main loop — poll outbox forever."""
+        """Main loop — poll outbox until ``stop()`` is requested."""
         logger.info("Outbox worker started, polling every %ss", POLL_INTERVAL_SECONDS)
-        while True:
+        while not self._stop_requested:
             try:
-                await self._poll_once()
+                processed = await self._poll_once()
             except Exception:
                 logger.exception("Outbox worker poll cycle failed")
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                processed = 0
+            # Adaptive backoff: keep draining while there is work, only sleep
+            # the full interval when the queue is empty. With a large backlog
+            # this avoids wasting ~50% of wall time in asyncio.sleep.
+            if processed == 0:
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            else:
+                await asyncio.sleep(0)
+        logger.info("Outbox worker stopped")
 
-    async def _poll_once(self) -> None:
-        """Single poll cycle: fetch pending entries and process them."""
+    async def _poll_once(self) -> int:
+        """Single poll cycle: fetch pending entries and process them.
+
+        Returns:
+            Number of entries processed (0 when the queue was empty).
+        """
         if self._session_factory is None:
-            return
+            return 0
 
         async with self._session_factory() as session:
             repo = OutboxRepository(session)
-            entries = await repo.get_pending(limit=50)
+            entries = await repo.get_pending(limit=POLL_BATCH_SIZE)
 
             if not entries:
-                return
+                return 0
 
             logger.debug(
                 "Outbox worker found %d pending entries",
@@ -124,6 +151,7 @@ class OutboxWorker:
                 await self._process_entry(session, repo, entry)
 
             await session.commit()
+            return len(entries)
 
     async def _process_entry(
         self,

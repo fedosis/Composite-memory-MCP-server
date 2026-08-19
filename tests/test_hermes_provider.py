@@ -11,6 +11,7 @@ These tests mock the CMMS backend (SQLiteProvider) and Hermes ABC contract.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -18,6 +19,7 @@ from memory_server.plugins.hermes.config import (
     HermesPluginConfig,
 )
 from memory_server.plugins.hermes.provider import HermesProvider
+from memory_server.providers.embedding_provider import MockEmbeddingProvider
 
 
 class TestHermesProviderLifecycle:
@@ -333,6 +335,148 @@ class TestHermesProviderToolRouting:
             for f in result["results"]
         )
         provider.shutdown()
+
+    def test_semantic_search_uses_persistent_backend_and_outbox_worker(
+        self, tmp_path, monkeypatch
+    ):
+        """remember() should become visible to native semantic_search via persisted vectors."""
+        monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "lancedb")
+
+        import memory_server.providers.embedding_provider as embedding_module
+
+        monkeypatch.setattr(
+            embedding_module,
+            "SentenceTransformerEmbeddingProvider",
+            MockEmbeddingProvider,
+        )
+
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="semantic-native",
+            config={
+                "db_url": f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}",
+                "path": str(tmp_path),
+            },
+            hermes_home=str(tmp_path),
+        )
+        try:
+            provider.handle_tool_call(
+                "remember",
+                {
+                    "subject": "HermesSemanticUnique",
+                    "predicate": "stores",
+                    "object": "persistent vectors",
+                    "confidence": 1.0,
+                    "source": "test",
+                },
+            )
+
+            found = False
+            for _ in range(6):
+                result = json.loads(
+                    provider.handle_tool_call(
+                        "semantic_search",
+                        {"query": "HermesSemanticUnique persistent", "top_k": 5},
+                    )
+                )
+                hits = result.get("semantic_results", [])
+                if any(hit.get("payload", {}).get("subject") == "HermesSemanticUnique" for hit in hits):
+                    found = True
+                    break
+                time.sleep(1)
+
+            assert found, "native semantic_search should see facts after outbox indexing"
+            assert (tmp_path / "data" / "lancedb").exists()
+        finally:
+            provider.shutdown()
+
+    def test_shutdown_stops_outbox_worker(self, tmp_path, monkeypatch):
+        """shutdown() must actually terminate the outbox run loop.
+
+        Regression: the task is scheduled via run_coroutine_threadsafe, whose
+        concurrent.futures.Future.cancel() does not cancel the coroutine —
+        without the stop flag the worker keeps polling a disposed engine.
+        """
+        monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "lancedb")
+
+        import memory_server.providers.embedding_provider as embedding_module
+
+        monkeypatch.setattr(
+            embedding_module,
+            "SentenceTransformerEmbeddingProvider",
+            MockEmbeddingProvider,
+        )
+
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="shutdown-outbox",
+            config={
+                "db_url": f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}",
+                "path": str(tmp_path),
+            },
+            hermes_home=str(tmp_path),
+        )
+        try:
+            assert provider._outbox_worker is not None
+            assert provider._outbox_task is not None
+            assert not provider._outbox_task.done()
+        finally:
+            provider.shutdown()
+
+        assert provider._outbox_worker is None
+        assert provider._outbox_task is None
+
+    def test_route_serializes_rank_results_after_native_indexing(self, tmp_path, monkeypatch):
+        """route() should return JSON-serializable ranked results once vectors exist."""
+        monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "lancedb")
+
+        import memory_server.providers.embedding_provider as embedding_module
+
+        monkeypatch.setattr(
+            embedding_module,
+            "SentenceTransformerEmbeddingProvider",
+            MockEmbeddingProvider,
+        )
+
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="route-native",
+            config={
+                "db_url": f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}",
+                "path": str(tmp_path),
+            },
+            hermes_home=str(tmp_path),
+        )
+        try:
+            provider.handle_tool_call(
+                "remember",
+                {
+                    "subject": "HermesRouteUnique",
+                    "predicate": "uses",
+                    "object": "rank serialization",
+                    "confidence": 1.0,
+                    "source": "test",
+                },
+            )
+
+            route_result = None
+            for _ in range(6):
+                route_result = json.loads(
+                    provider.handle_tool_call(
+                        "route",
+                        {"query": "HermesRouteUnique serialization", "top_k": 5},
+                    )
+                )
+                if route_result.get("total", 0) > 0:
+                    break
+                time.sleep(1)
+
+            assert route_result is not None
+            assert route_result["total"] > 0
+            assert isinstance(route_result.get("all_results"), list)
+            assert isinstance(route_result["all_results"][0], dict)
+        finally:
+            provider.shutdown()
 
 
 class TestHermesProviderPrefetch:

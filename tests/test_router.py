@@ -5,7 +5,7 @@ import uuid
 import pytest
 
 from memory_server.router.embedding_router import EmbeddingRouter
-from memory_server.router.rules import RoutingRule, RoutingRuleSet, RuleResult
+from memory_server.router.rules import RoutingRule, RoutingRuleSet
 
 
 class TestRoutingRules:
@@ -58,10 +58,19 @@ class TestRoutingRules:
         assert rule.match("server information") is None
 
     def test_partial_word_match(self):
-        """Keywords should match within words (substring)."""
+        """Keywords should match as whole words, not substrings."""
         rule = RoutingRule(name="test", keywords=["ip"], route="sql", priority=5)
-        # "ip" is a substring of "pip" and "multiple"
+        # "ip" as a standalone word matches
         assert rule.match("What is the ip?") is not None
+        # "ip" inside "pip" or "multiple" must NOT match
+        assert rule.match("Pip is a package manager") is None
+        assert rule.match("multiple machines") is None
+
+    def test_port_keyword_does_not_match_portfolio(self):
+        """Regression: substring matching made 'port' fire on 'Portfolio'."""
+        rule = RoutingRule(name="port_query", keywords=["port"], route="sql", priority=5)
+        assert rule.match("Portfolio strategy target 20%") is None
+        assert rule.match("which port does caddy use") is not None
 
     def test_empty_query(self):
         rule = RoutingRule(name="test", keywords=["hello"], route="sql", priority=5)
@@ -126,8 +135,8 @@ class TestEmbeddingRouter:
 
     @pytest.fixture
     def router(self):
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
 
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
         embedder = MockEmbeddingProvider(vector_size=384)
@@ -154,8 +163,12 @@ class TestEmbeddingRouter:
     async def test_semantic_search_ranking(self, router):
         # Store facts where one is an exact match for the query (identical text = identical vector)
         query_text = "programming language"
-        await router._vector_provider.upsert("memories", point_id=str(uuid.uuid4()), vector=router._embedder.embed(query_text),
-                                     payload={"content": query_text, "subject": "ExactMatch"})
+        await router._vector_provider.upsert(
+            "memories",
+            point_id=str(uuid.uuid4()),
+            vector=router._embedder.embed(query_text),
+            payload={"content": query_text, "subject": "ExactMatch"},
+        )
         await router._vector_provider.upsert("memories", point_id=str(uuid.uuid4()),
                                      vector=router._embedder.embed("The weather is nice today"),
                                      payload={"content": "The weather is nice today", "subject": "Weather"})

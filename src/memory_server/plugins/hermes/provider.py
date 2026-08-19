@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import Future as ThreadFuture
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -67,6 +68,20 @@ def _run_async(coro, timeout: float = 30.0):
 # ---------------------------------------------------------------------------
 
 DEFAULT_DB_URL = "sqlite+aiosqlite:///data/memory.db"
+
+
+def _supports_background_outbox(db_url: str) -> bool:
+    """Return whether the DB URL can safely host a second polling session.
+
+    The transient in-memory SQLite URLs used by unit tests do not behave like
+    the real profile-backed file database; starting a second session against
+    them can break basic CRUD flows. Skip the outbox worker there.
+    """
+    normalized = db_url.strip().lower()
+    return normalized not in {
+        "sqlite+aiosqlite://",
+        "sqlite+aiosqlite:///:memory:",
+    }
 
 
 def _cmms_repo_root() -> Path:
@@ -125,7 +140,11 @@ async def _get_vector_provider(provider: "HermesProvider"):
         if provider._qdrant is None:
             from memory_server.providers.qdrant_provider import QdrantProvider
 
-            provider._qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+            # Persistent Qdrant only when a host URL is configured; otherwise
+            # fall back to in-memory (parity with the MCP server path, where
+            # indexes are process-local by default).
+            location = os.environ.get("MEMORY_QDRANT_URL", ":memory:")
+            provider._qdrant = QdrantProvider(location=location, prefer_grpc=False)
         return provider._qdrant
 
     if provider._lancedb is None:
@@ -134,6 +153,25 @@ async def _get_vector_provider(provider: "HermesProvider"):
         db_path = _resolve_cmms_data_path(provider, "data/lancedb")
         provider._lancedb = LanceDBProvider(db_path=str(db_path), table="memories")
     return provider._lancedb
+
+
+async def _get_embedder(provider: "HermesProvider"):
+    """Resolve the active embedding provider for Hermes tools/workers."""
+    if provider._embedder is None:
+        from memory_server.providers.embedding_provider import (
+            SentenceTransformerEmbeddingProvider,
+        )
+
+        provider._embedder = SentenceTransformerEmbeddingProvider()
+    return provider._embedder
+
+
+def _serialize_route_result(result: dict[str, Any]) -> str:
+    """Serialize route results, converting RankResult objects to plain dicts."""
+    if isinstance(result, dict) and "all_results" in result:
+        result = dict(result)
+        result["all_results"] = [r.__dict__ for r in result["all_results"]]
+    return json.dumps(result)
 
 
 async def _build_auditor(provider: "HermesProvider"):
@@ -193,13 +231,16 @@ class HermesProvider:
     def __init__(self):
         self._initialized = False
         self._shut_down = False
-        self._provider = None  # SQLiteProvider
-        self._qdrant = None
+        self._provider: Any | None = None  # SQLiteProvider
+        self._qdrant: Any | None = None
         self._lancedb: Any | None = None
-        self._embedder = None
-        self._graph = None
-        self._router = None
+        self._embedder: Any | None = None
+        self._graph: Any | None = None
+        self._router: Any | None = None
+        self._hybrid_router: Any | None = None
         self._writer: WriterQueue | None = None
+        self._outbox_worker: Any | None = None
+        self._outbox_task: ThreadFuture | None = None
         self._config: HermesPluginConfig | None = None
         self._hermes_home: str = ""
         self._session_id: str = ""
@@ -242,6 +283,8 @@ class HermesProvider:
             logger.debug("HermesProvider already initialized for session %s", session_id)
             return
 
+        # Allow re-initialization after a previous shutdown / failed init.
+        self._shut_down = False
         self._session_id = session_id
         self._hermes_home = kwargs.get("hermes_home", "")
 
@@ -273,6 +316,16 @@ class HermesProvider:
         # Start the writer's background task on the shared loop
         _run_async(self._writer.start())
 
+        # Start the outbox worker so semantic/graph indexes drain just like
+        # the MCP server path.
+        if _supports_background_outbox(db_url):
+            try:
+                _run_async(self._start_outbox_worker(), timeout=60.0)
+            except Exception:
+                logger.exception("HermesProvider: failed to start outbox worker")
+                self.shutdown()
+                raise
+
         self._initialized = True
         logger.info(
             "HermesProvider initialized (session=%s, db=%s)",
@@ -288,9 +341,70 @@ class HermesProvider:
         await provider.initialize()
         return provider
 
+    def _require_provider(self):
+        """Return the initialized SQLite provider or fail fast."""
+        if self._provider is None:
+            raise RuntimeError("HermesProvider is not initialized")
+        return self._provider
+
+    async def _start_outbox_worker(self) -> None:
+        """Start the persistent outbox worker on the shared loop."""
+        if self._outbox_worker is not None and self._outbox_task is not None:
+            return
+
+        from storage.outbox_worker import OutboxWorker
+
+        from memory_server.router.graph_router import GraphRouter
+
+        vector_provider = await _get_vector_provider(self)
+        embedder = await _get_embedder(self)
+        graph = await _get_graph(self)
+        graph_router = GraphRouter(graph=graph)
+        assert self._provider is not None
+
+        self._outbox_worker = OutboxWorker(
+            engine=self._provider.engine,
+            qdrant=vector_provider,
+            embedder=embedder,
+            graph_router=graph_router,
+        )
+        await self._outbox_worker.initialize()
+
+        loop = _get_loop()
+        self._outbox_task = asyncio.run_coroutine_threadsafe(
+            self._outbox_worker.run(),
+            loop,
+        )
+
+    async def _stop_outbox_worker(self) -> None:
+        """Stop the background outbox worker and release its resources."""
+        # Signal first so the run loop exits on its next cycle. The task was
+        # scheduled via run_coroutine_threadsafe, so its concurrent.futures
+        # Future.cancel() would NOT cancel the coroutine — only the flag does.
+        if self._outbox_worker is not None:
+            self._outbox_worker.stop()
+
+        if self._outbox_task is not None:
+            try:
+                # wrap_future keeps the loop running while we wait; a plain
+                # .result(timeout=...) here would deadlock because run() needs
+                # the same loop to observe its stop flag.
+                await asyncio.wait_for(
+                    asyncio.wrap_future(self._outbox_task), timeout=10.0
+                )
+            except BaseException:
+                pass
+            self._outbox_task = None
+
+        if self._outbox_worker is not None:
+            try:
+                await self._outbox_worker.close()
+            finally:
+                self._outbox_worker = None
+
     def shutdown(self) -> None:
         """Flush writer queue and close the database connection."""
-        if not self._initialized:
+        if self._shut_down:
             return
 
         logger.info("HermesProvider: shutting down")
@@ -298,6 +412,12 @@ class HermesProvider:
         # Flush and stop writer
         if self._writer is not None:
             _run_async(self._writer.shutdown(), timeout=30.0)
+
+        if self._outbox_worker is not None or self._outbox_task is not None:
+            try:
+                _run_async(self._stop_outbox_worker(), timeout=30.0)
+            except Exception:
+                logger.exception("HermesProvider: error stopping outbox worker")
 
         # Close the provider
         if self._provider is not None:
@@ -321,6 +441,7 @@ class HermesProvider:
         self._provider = None
         self._qdrant = None
         self._lancedb = None
+        self._hybrid_router = None
         self._writer = None
         self._initialized = False
         self._shut_down = True
@@ -962,8 +1083,9 @@ class HermesProvider:
         limit: int = 50,
     ) -> str:
         from memory_server.api.search import search as search_fn
+        provider = self._require_provider()
         result = await search_fn(
-            self._provider,
+            provider,
             query=query,
             subject=subject if subject else None,
             predicate=predicate if predicate else None,
@@ -980,8 +1102,9 @@ class HermesProvider:
         source: str = "user",
     ) -> str:
         from memory_server.api.remember import remember as remember_fn
+        provider = self._require_provider()
         result = await remember_fn(
-            self._provider,
+            provider,
             subject=subject,
             predicate=predicate,
             object=object,
@@ -1003,8 +1126,9 @@ class HermesProvider:
         max_results: int = 10,
     ) -> str:
         from memory_server.api.get_context import get_context as get_context_fn
+        provider = self._require_provider()
         result = await get_context_fn(
-            self._provider,
+            provider,
             task=task,
             subject=subject if subject else None,
             max_results=max_results,
@@ -1019,8 +1143,9 @@ class HermesProvider:
         min_belief_confidence: float = 0.6,
     ) -> str:
         from memory_server.api.learn import learn as learn_fn
+        provider = self._require_provider()
         result = await learn_fn(
-            provider=self._provider,
+            provider=provider,
             text=text,
             source=source,
             extract_beliefs=extract_beliefs,
@@ -1034,26 +1159,21 @@ class HermesProvider:
         top_k: int = 10,
         score_threshold: float = 0.0,
     ) -> str:
-        # Lazy-init Qdrant + Embedder
-        from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.router.embedding_router import EmbeddingRouter
 
-        if self._qdrant is None:
-            self._qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
-        if self._embedder is None:
-            self._embedder = SentenceTransformerEmbeddingProvider()
+        vector_provider = await _get_vector_provider(self)
+        embedder = await _get_embedder(self)
 
         router = EmbeddingRouter(
-            vector_provider=self._qdrant,
-            embedder=self._embedder,
+            vector_provider=vector_provider,
+            embedder=embedder,
         )
         results = await router.route(
             query=query,
             top_k=top_k,
             score_threshold=score_threshold,
         )
-        return json.dumps(results)
+        return _serialize_route_result(results)
 
     async def _handle_graph_search(
         self,
@@ -1122,29 +1242,23 @@ class HermesProvider:
         top_k: int = 10,
         score_threshold: float = 0.0,
     ) -> str:
-        from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
-        from memory_server.providers.graph_provider import SimpleGraph
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.router.hybrid_router import HybridRouter
 
-        if self._qdrant is None:
-            self._qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
-        if self._embedder is None:
-            self._embedder = SentenceTransformerEmbeddingProvider()
-        if self._graph is None:
-            self._graph = SimpleGraph()
+        vector_provider = await _get_vector_provider(self)
+        embedder = await _get_embedder(self)
+        graph = await _get_graph(self)
 
         router = HybridRouter(
-            vector_provider=self._qdrant,
-            embedder=self._embedder,
-            graph=self._graph,
+            vector_provider=vector_provider,
+            embedder=embedder,
+            graph=graph,
         )
         result = await router.route(
             query=query,
             top_k=top_k,
             score_threshold=score_threshold,
         )
-        return json.dumps(result)
+        return _serialize_route_result(result)
 
     async def _handle_audit(
         self,
@@ -1650,6 +1764,8 @@ class HermesProvider:
             logger.warning("HermesProvider: cannot write batch — not initialized")
             return
 
+        provider = self._require_provider()
+
         for messages, turn_id in batch:
             try:
                 # Extract text from the turn for CMMS ingestion
@@ -1658,7 +1774,7 @@ class HermesProvider:
                     from memory_server.api.learn import learn as learn_fn
 
                     await learn_fn(
-                        provider=self._provider,
+                        provider=provider,
                         text=text_content,
                         source=f"hermes_turn_{turn_id or 'unknown'}",
                         extract_beliefs=False,

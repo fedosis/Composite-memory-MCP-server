@@ -271,8 +271,16 @@ class LanceDBProvider:
                     [json.dumps(payload or {})], type=pa.utf8()
                 ),
             })
-            # Use add() which handles both insert and replace by id
-            await self._run(table.add, data)
+            # True upsert by id: merge_insert replaces matching rows and
+            # inserts new ones. Plain add(mode="append") would create
+            # duplicate rows on retry (outbox worker retries failed entries).
+            await self._run(
+                table.merge_insert("id")
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute,
+                data,
+            )
             return True
         except Exception as exc:
             logger.error("Failed to upsert point %s: %s", pid, exc)
@@ -298,6 +306,15 @@ class LanceDBProvider:
         try:
             import pyarrow as pa
 
+            # Deduplicate by id within the batch: merge_insert does not
+            # collapse duplicate keys inside a single payload, so two entries
+            # for the same id in one batch would insert both rows. Last
+            # occurrence wins (matching dict upsert semantics).
+            seen: dict[str, dict[str, Any]] = {}
+            for p in points:
+                seen[str(p.get("id", str(uuid.uuid4())))] = p
+            points = list(seen.values())
+
             ids = [str(p.get("id", str(uuid.uuid4()))) for p in points]
             vectors = [p.get("vector", []) for p in points]
             metadatas = [json.dumps(p.get("payload", {})) for p in points]
@@ -307,7 +324,15 @@ class LanceDBProvider:
                 "vector": pa.array(vectors, type=pa.list_(pa.float32())),
                 "_metadata": pa.array(metadatas, type=pa.utf8()),
             })
-            await self._run(table.add, data)
+            # True upsert by id — same reasoning as upsert(): avoid
+            # duplicate rows when an entry is reprocessed after a retry.
+            await self._run(
+                table.merge_insert("id")
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute,
+                data,
+            )
             return True
         except Exception as exc:
             logger.error("Failed to batch upsert: %s", exc)

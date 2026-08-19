@@ -6,6 +6,7 @@ the query is routed to the specified backend (e.g., SQL, not vector).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -41,6 +42,10 @@ class RoutingRule:
     def match(self, query: str) -> Optional[RuleResult]:
         """Check if the query matches this rule.
 
+        Keywords are matched as whole words (word-boundary aware) so that
+        e.g. the keyword ``port`` does not fire on ``Portfolio`` or
+        ``report``. Multi-word keywords match as contiguous phrases.
+
         Args:
             query: User query string.
 
@@ -54,7 +59,8 @@ class RoutingRule:
         matches = []
 
         for keyword in self.keywords:
-            if keyword.lower() in query_lower:
+            pattern = r"\b" + re.escape(keyword.lower()) + r"\b"
+            if re.search(pattern, query_lower):
                 matches.append(keyword)
 
         if self.match_all:
@@ -123,7 +129,7 @@ class RoutingRuleSet:
         ))
         rules.add(RoutingRule(
             name="port_query",
-            keywords=["port", "which port", "port number"],
+            keywords=["port", "ports", "which port", "port number"],
             route="sql",
             priority=90,
         ))

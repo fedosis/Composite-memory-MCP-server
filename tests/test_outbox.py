@@ -256,6 +256,41 @@ class TestOutboxRepository:
 class TestOutboxWorker:
     """Test the outbox worker processes entries correctly."""
 
+    async def test_stop_terminates_run_loop(self, outbox_worker):
+        """stop() must make run() exit instead of polling forever."""
+        import asyncio
+
+        task = asyncio.create_task(outbox_worker.run())
+        # Give the loop a chance to enter the poll cycle
+        await asyncio.sleep(0.1)
+        assert not task.done()
+
+        outbox_worker.stop()
+        await asyncio.wait_for(task, timeout=5.0)
+        assert task.done()
+
+    async def test_poll_once_returns_processed_count(self, outbox_worker):
+        """_poll_once returns the number of entries processed, 0 when empty."""
+        # Empty queue → 0
+        assert await outbox_worker._poll_once() == 0
+
+        async with outbox_worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            await repo.add_entry(
+                record_type="fact",
+                record_id=str(uuid.uuid4()),
+                operation="index_fact",
+                payload={
+                    "subject": "Count",
+                    "predicate": "returns",
+                    "object": "one",
+                    "source": "test",
+                },
+            )
+            await session.commit()
+
+        assert await outbox_worker._poll_once() == 1
+
     async def test_process_fact_index_updates_qdrant_and_graph(self, outbox_worker, qdrant_provider, embedder):
         """Add a fact outbox entry → worker processes it → Qdrant + graph updated."""
         graph = outbox_worker._graph_router.graph

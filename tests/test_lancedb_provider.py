@@ -1,7 +1,5 @@
 """Tests for LanceDB provider (Card 001 — v0.10)."""
 
-import json
-import os
 import tempfile
 import uuid
 
@@ -110,8 +108,7 @@ class TestLanceDBPointOperations:
         await provider.upsert(collection, point_id=point_id, vector=vec, payload=payload)
 
         # High threshold — should exclude (similarities are in 0.9-1.0 for same vector)
-        results_high = await provider.search(collection, vector=vec, limit=10, score_threshold=0.999)
-        ids_high = [r["id"] for r in results_high]
+        await provider.search(collection, vector=vec, limit=10, score_threshold=0.999)
         # Our cosine similarity for identical vectors should be 1.0
         # So threshold=0.999 should still include it with scores near 1.0
 
@@ -207,3 +204,39 @@ class TestLanceDBPointOperations:
         # Search with first point's vector — should find all
         results = await provider.search(collection, vector=points[0]["vector"], limit=10)
         assert len(results) >= 1
+
+    async def test_upsert_same_id_is_idempotent(self, provider):
+        """Re-upserting the same point_id must not create duplicate rows.
+
+        Regression: plain table.add(mode=append) duplicates rows on retry;
+        upsert must behave like a true merge (outbox worker replays entries).
+        """
+        collection = await self._ensure_table(provider)
+        vec = [float(i % 10) / 10.0 for i in range(384)]
+        point_id = str(uuid.uuid4())
+        payload = {"subject": "Idempotent", "predicate": "is", "object": "Unique"}
+
+        assert await provider.upsert(collection, point_id=point_id, vector=vec, payload=payload)
+        assert await provider.upsert(collection, point_id=point_id, vector=vec, payload=payload)
+        assert await provider.upsert(collection, point_id=point_id, vector=vec, payload=payload)
+
+        results = await provider.search(collection, vector=vec, limit=10)
+        matching = [r for r in results if r["id"] == point_id]
+        assert len(matching) == 1, f"expected 1 row for {point_id}, got {len(matching)}"
+
+    async def test_upsert_batch_same_ids_is_idempotent(self, provider):
+        """Batch re-upsert with duplicate ids collapses to one row per id."""
+        collection = await self._ensure_table(provider)
+        vec = [float(i % 10) / 10.0 for i in range(384)]
+        point_id = str(uuid.uuid4())
+
+        batch = [
+            {"id": point_id, "vector": vec, "payload": {"n": 1}},
+            {"id": point_id, "vector": vec, "payload": {"n": 2}},
+            {"id": str(uuid.uuid4()), "vector": vec, "payload": {"n": 3}},
+        ]
+        assert await provider.upsert_batch(batch, collection=collection)
+
+        results = await provider.search(collection, vector=vec, limit=10)
+        matching = [r for r in results if r["id"] == point_id]
+        assert len(matching) == 1, f"expected 1 row for {point_id}, got {len(matching)}"
