@@ -500,6 +500,44 @@ class LanceDBProvider:
             logger.warning("Failed to delete point %s: %s", point_id, exc)
             return False
 
+    async def optimize(
+        self,
+        collection: str | None = None,
+        cleanup_older_than: Any | None = None,
+        delete_unverified: bool = False,
+    ) -> bool:
+        """Compact the table and prune old versions (LanceDB VACUUM).
+
+        Every upsert/merge creates a new table version; without periodic
+        compaction the ``_versions`` directory accumulates full copies of the
+        data and can grow orders of magnitude larger than the live dataset.
+
+        Args:
+            collection: Table name (default: provider default).
+            cleanup_older_than: Minimum age of versions to delete
+                (default: LanceDB default, ~7 days).
+            delete_unverified: Allow deleting files newer than 7 days
+                (default False — safe for concurrent writers).
+
+        Returns:
+            True on success.
+        """
+        table = await self._get_table(collection)
+        try:
+            await self._run(
+                table.optimize,
+                cleanup_older_than=cleanup_older_than,
+                delete_unverified=delete_unverified,
+            )
+            logger.info(
+                "LanceDB table '%s' optimized (compaction + prune)",
+                table.name,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("LanceDB optimize failed for '%s': %s", table.name, exc)
+            return False
+
     async def close(self) -> None:
         """Close the underlying LanceDB database connection."""
         self._db = None

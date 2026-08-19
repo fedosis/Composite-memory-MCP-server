@@ -43,6 +43,11 @@ POLL_INTERVAL_SECONDS = 1.0
 # while keeping each cycle bounded for the event loop.
 POLL_BATCH_SIZE = 200
 
+# Minimum interval between LanceDB compaction runs. Compaction (VACUUM) is
+# only triggered when the outbox queue is empty, so it never competes with
+# active indexing, and it's throttled to avoid churning the table.
+COMPACT_INTERVAL_SECONDS = 1800
+
 
 class OutboxWorker:
     """Background worker that processes outbox entries.
@@ -73,6 +78,7 @@ class OutboxWorker:
         self._graph_router = graph_router
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
         self._stop_requested = False
+        self._last_compact_at: float = 0.0
 
     def stop(self) -> None:
         """Signal the run loop to exit after the current iteration.
@@ -121,10 +127,36 @@ class OutboxWorker:
             # the full interval when the queue is empty. With a large backlog
             # this avoids wasting ~50% of wall time in asyncio.sleep.
             if processed == 0:
+                await self._maybe_compact()
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
             else:
                 await asyncio.sleep(0)
         logger.info("Outbox worker stopped")
+
+    async def _maybe_compact(self) -> None:
+        """Run LanceDB compaction when idle, throttled.
+
+        Compaction prunes the accumulated table versions that every
+        merge_insert creates, keeping the on-disk store near the live dataset
+        size. Only triggered on an empty queue so it never blocks indexing,
+        and at most once per COMPACT_INTERVAL_SECONDS.
+        """
+        import time
+
+        if self._qdrant is None:
+            return
+        optimize = getattr(self._qdrant, "optimize", None)
+        if optimize is None:
+            return
+        if time.monotonic() - self._last_compact_at < COMPACT_INTERVAL_SECONDS:
+            return
+        self._last_compact_at = time.monotonic()
+        try:
+            ok = await optimize()
+            if ok:
+                logger.info("Outbox worker: LanceDB compaction done")
+        except Exception:
+            logger.exception("Outbox worker: LanceDB compaction failed")
 
     async def _poll_once(self) -> int:
         """Single poll cycle: fetch pending entries and process them.

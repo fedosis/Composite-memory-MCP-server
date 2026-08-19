@@ -2,6 +2,7 @@
 
 import tempfile
 import uuid
+from datetime import timedelta
 
 import pytest
 
@@ -240,3 +241,45 @@ class TestLanceDBPointOperations:
         results = await provider.search(collection, vector=vec, limit=10)
         matching = [r for r in results if r["id"] == point_id]
         assert len(matching) == 1, f"expected 1 row for {point_id}, got {len(matching)}"
+
+    async def test_optimize_prunes_old_versions(self, provider):
+        """optimize() must compact and prune accumulated table versions.
+
+        Regression: every merge_insert creates a new table version; without
+        compaction the _versions dir grows orders of magnitude beyond the
+        live dataset (observed 48 GB vs 140 MB live).
+        """
+        from pathlib import Path
+
+        collection = await self._ensure_table(provider)
+        vec = [float(i % 10) / 10.0 for i in range(384)]
+
+        # Create several versions via repeated upserts
+        for i in range(5):
+            await provider.upsert(
+                collection,
+                point_id=f"optimize-test-{i}",
+                vector=vec,
+                payload={"n": i},
+            )
+
+        # Find the table version dir
+        versions_dir = Path(provider._db_path) / f"{collection}.lance" / "_versions"
+        assert versions_dir.is_dir()
+        versions_before = len(list(versions_dir.glob("*.manifest")))
+
+        ok = await provider.optimize(
+            collection,
+            cleanup_older_than=timedelta(0),
+            delete_unverified=True,
+        )
+        assert ok is True
+
+        versions_after = len(list(versions_dir.glob("*.manifest")))
+        assert versions_after < versions_before, (
+            f"expected version prune ({versions_before} -> {versions_after})"
+        )
+
+        # Data must still be searchable after compaction
+        results = await provider.search(collection, vector=vec, limit=10)
+        assert len(results) >= 5
