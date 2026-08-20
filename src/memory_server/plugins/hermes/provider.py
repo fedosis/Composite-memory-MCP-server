@@ -23,6 +23,7 @@ from concurrent.futures import Future as ThreadFuture
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from memory_server.paths import cmms_repo_root
 from memory_server.plugins.hermes.config import HermesPluginConfig
 from memory_server.plugins.hermes.writer import WriterQueue
 
@@ -84,13 +85,6 @@ def _supports_background_outbox(db_url: str) -> bool:
     }
 
 
-def _cmms_repo_root() -> Path:
-    """Return the checked-out CMMS repository root."""
-    import memory_server
-
-    return Path(memory_server.__file__).resolve().parents[2]
-
-
 def _resolve_cmms_data_path(
     provider: "HermesProvider",
     relative_path: str,
@@ -110,7 +104,7 @@ def _resolve_cmms_data_path(
             if (candidate / "data").exists():
                 base_root = candidate
         if base_root is None:
-            base_root = _cmms_repo_root()
+            base_root = cmms_repo_root()
         path = (base_root / path).resolve()
 
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -15,6 +15,8 @@ from typing import Optional
 
 import typer
 
+from memory_server.paths import cmms_repo_root
+
 # Lazy import: server.py imports ``storage`` which may not be installed.
 # Only load it when the ``serve`` subcommand is actually invoked.
 _run_server = None
@@ -65,14 +67,6 @@ def _config_path(hermes_home: str) -> Path:
 
 def _backup_path(hermes_home: str) -> Path:
     return Path(hermes_home) / BACKUP_FILE
-
-
-def _abs_cmms_path() -> str:
-    """Return the absolute path to the CMMS package directory."""
-    # Resolve from the package location (src/memory_server/cli.py -> project root)
-    cli_file = Path(__file__).resolve()
-    # Navigate up: cli.py -> memory_server -> src -> project root
-    return str(cli_file.parent.parent.parent)
 
 
 def _current_memory_provider(yaml_data) -> str | None:
@@ -156,7 +150,7 @@ def _do_install(
     out,
 ) -> int:
     """Perform the install (or dry-run preview).  Returns 0 on success."""
-    cmms_path = _abs_cmms_path()
+    cmms_path = str(cmms_repo_root())
     cfg_path = _config_path(hermes_home)
     back_path = _backup_path(hermes_home)
 
@@ -289,6 +283,130 @@ def _do_uninstall(
     out("👉 Restart Hermes gateway to apply changes:")
     out("   hermes gateway restart")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Doctor — data-root consolidation check
+# ---------------------------------------------------------------------------
+
+
+def _collect_profile_homes(hermes_home: str) -> list[tuple[str, Path]]:
+    """Return [(label, home_dir)] for the root config and every profile.
+
+    A profile's HERMES_HOME is ``<hermes_home>/profiles/<name>``; the root
+    config lives at ``<hermes_home>/config.yaml``.
+    """
+    homes: list[tuple[str, Path]] = [("default", Path(hermes_home))]
+    profiles_dir = Path(hermes_home) / "profiles"
+    if profiles_dir.is_dir():
+        for child in sorted(profiles_dir.iterdir()):
+            if child.is_dir() and (child / "config.yaml").is_file():
+                homes.append((child.name, child))
+    return homes
+
+
+def _profile_data_dirs(home: Path) -> list[Path]:
+    """Return per-profile CMMS data dirs that exist under *home*.
+
+    These are the fragmentation symptoms: a LanceDB index or graph
+    snapshot living under a profile's own HERMES_HOME instead of the
+    shared repo-root data dir.
+    """
+    found: list[Path] = []
+    for rel in ("data/lancedb", "data/graph.json"):
+        candidate = home / rel
+        if candidate.exists():
+            found.append(candidate)
+    return found
+
+
+def _do_doctor(
+    hermes_home: str,
+    *,
+    out,
+) -> int:
+    """Scan profiles for CMMS data fragmentation. Returns problem count."""
+    from memory_server.plugins.hermes.config import HermesPluginConfig
+
+    expected = str(cmms_repo_root())
+    problems = 0
+
+    for label, home in _collect_profile_homes(hermes_home):
+        cfg_path = _config_path(str(home))
+        if not cfg_path.is_file():
+            continue
+        data = _load_config(cfg_path)
+        memory = data.get("memory") or {}
+        providers = memory.get("providers") or {}
+        entry = providers.get("memory_server") or {}
+        if not entry:
+            continue  # profile not using CMMS — nothing to check
+
+        configured_path = entry.get("path") or ""
+        data_dirs = _profile_data_dirs(home)
+        bad = []
+        warnings = []
+
+        if not configured_path:
+            bad.append("path is missing (will default to repo root — set it explicitly)")
+        else:
+            cfg = HermesPluginConfig.from_dict({"path": configured_path})
+            try:
+                cfg.validate_shared_root(expected=expected)
+            except ValueError as exc:
+                bad.append(str(exc))
+
+            env_path = os.environ.get("MEMORY_SERVER_PATH") or ""
+            if cfg.cmms_path_source == "env" and env_path != configured_path:
+                warnings.append(
+                    f"MEMORY_SERVER_PATH env overrides config path "
+                    f"({env_path!r} vs {configured_path!r}) — effective path "
+                    "validated above"
+                )
+                # Env masks a possibly-invalid config value; validate the raw
+                # config path too so unsetting env later cannot silently
+                # re-enable a per-profile data dir.
+                try:
+                    HermesPluginConfig.from_dict(
+                        {"path": configured_path}, use_env=False
+                    ).validate_shared_root(expected=expected)
+                except ValueError as exc:
+                    bad.append(str(exc))
+
+        for data_dir in data_dirs:
+            bad.append(f"per-profile data dir exists: {data_dir}")
+
+        for item in warnings:
+            out(f"ℹ️  {label}: {item}")
+        if bad:
+            problems += 1
+            out(f"⚠️  {label} ({home})")
+            for item in bad:
+                out(f"   - {item}")
+
+    if problems == 0:
+        out(f"✅ All CMMS profiles point at shared data root: {expected}")
+    return problems
+
+
+@app.command("doctor")
+def doctor(
+    hermes_home: Optional[str] = typer.Option(
+        None,
+        "--hermes-home",
+        help="Hermes config directory (default: $HERMES_HOME or ~/.hermes)",
+    ),
+) -> None:
+    """Check CMMS data-root consolidation across Hermes profiles.
+
+    Flags profiles whose config.yaml is missing
+    ``memory.providers.memory_server.path``, points it at a non-repo
+    location, or still has per-profile data dirs (LanceDB index / graph
+    snapshot). Exits 1 when any problem is found.
+    """
+    resolved = _find_hermes_home(hermes_home)
+    problems = _do_doctor(resolved, out=typer.echo)
+    sys.exit(1 if problems else 0)
 
 
 # ---------------------------------------------------------------------------

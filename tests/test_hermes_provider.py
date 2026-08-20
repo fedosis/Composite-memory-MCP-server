@@ -624,3 +624,116 @@ class TestHermesPluginConfig:
         )
         resolved = config.resolve_db_url("/tmp/hermes_home")
         assert resolved == "sqlite+aiosqlite:////absolute/path/memory.db"
+
+    # --- CMMS data consolidation: single shared data root -----------------
+
+    def _repo_root(self) -> str:
+        """Return the expected repo root the config should default to."""
+        from memory_server.paths import cmms_repo_root
+
+        return str(cmms_repo_root())
+
+    def test_from_dict_defaults_cmms_path_to_repo_root(self):
+        """Empty/missing path must default to the CMMS repo root.
+
+        Prevents future profiles from silently creating per-profile data
+        dirs (the fragmentation CMMS consolidation removes).
+        """
+        config = HermesPluginConfig.from_dict({})
+        assert config.cmms_path == self._repo_root()
+
+    def test_from_dict_none_defaults_cmms_path_to_repo_root(self):
+        """None config must also default cmms_path to the repo root."""
+        config = HermesPluginConfig.from_dict(None)
+        assert config.cmms_path == self._repo_root()
+
+    def test_from_dict_explicit_path_preserved(self):
+        """An explicit path in config is kept as-is."""
+        config = HermesPluginConfig.from_dict({"path": "/custom/cmms"})
+        assert config.cmms_path == "/custom/cmms"
+
+    def test_from_dict_empty_path_defaults_to_repo_root(self):
+        """An explicitly empty path must fall back to the repo root."""
+        config = HermesPluginConfig.from_dict({"path": ""})
+        assert config.cmms_path == self._repo_root()
+
+    def test_from_env_defaults_cmms_path_to_repo_root(self, monkeypatch):
+        """from_env without MEMORY_SERVER_PATH defaults to repo root."""
+        monkeypatch.delenv("MEMORY_SERVER_PATH", raising=False)
+        config = HermesPluginConfig.from_env()
+        assert config.cmms_path == self._repo_root()
+
+    # --- W2: empty MEMORY_SERVER_PATH must behave like unset ---------------
+
+    def test_from_dict_empty_env_defaults_to_repo_root(self, monkeypatch):
+        """Empty-string env must not bypass the repo-root default."""
+        monkeypatch.setenv("MEMORY_SERVER_PATH", "")
+        config = HermesPluginConfig.from_dict({})
+        assert config.cmms_path == self._repo_root()
+        assert config.cmms_path_source == "default"
+
+    def test_from_dict_empty_env_ignored_when_config_has_path(self, monkeypatch):
+        """Empty-string env must not shadow an explicit config path."""
+        monkeypatch.setenv("MEMORY_SERVER_PATH", "")
+        config = HermesPluginConfig.from_dict({"path": "/custom/cmms"})
+        assert config.cmms_path == "/custom/cmms"
+        assert config.cmms_path_source == "config"
+
+    def test_from_env_empty_env_defaults_to_repo_root(self, monkeypatch):
+        """from_env with empty MEMORY_SERVER_PATH defaults to repo root."""
+        monkeypatch.setenv("MEMORY_SERVER_PATH", "")
+        config = HermesPluginConfig.from_env()
+        assert config.cmms_path == self._repo_root()
+        assert config.cmms_path_source == "default"
+
+    # --- W1: env override visibility ----------------------------------------
+
+    def test_from_dict_env_overrides_config_and_tracks_source(self, monkeypatch):
+        """A set env var wins over config and is reported as source=env."""
+        monkeypatch.setenv("MEMORY_SERVER_PATH", "/env/cmms")
+        config = HermesPluginConfig.from_dict({"path": "/cfg/cmms"})
+        assert config.cmms_path == "/env/cmms"
+        assert config.cmms_path_source == "env"
+
+    def test_from_dict_config_source_tracked(self, monkeypatch):
+        """Without env, an explicit config path is source=config."""
+        monkeypatch.delenv("MEMORY_SERVER_PATH", raising=False)
+        config = HermesPluginConfig.from_dict({"path": "/cfg/cmms"})
+        assert config.cmms_path == "/cfg/cmms"
+        assert config.cmms_path_source == "config"
+
+    def test_from_dict_use_env_false_ignores_env(self, monkeypatch):
+        """use_env=False must validate the raw config value, not env."""
+        monkeypatch.setenv("MEMORY_SERVER_PATH", "/env/cmms")
+        config = HermesPluginConfig.from_dict({"path": "/cfg/cmms"}, use_env=False)
+        assert config.cmms_path == "/cfg/cmms"
+        assert config.cmms_path_source == "config"
+
+    # --- W3: single source of truth for repo-root resolution ----------------
+
+    def test_repo_root_single_source_of_truth(self):
+        """paths.cmms_repo_root is the one shared resolver; config uses it."""
+        from memory_server.paths import cmms_repo_root
+
+        root = str(cmms_repo_root())
+        assert root == self._repo_root()
+        # from_dict default and validate_shared_root expected both derive
+        # from the shared helper, so a layout change cannot diverge.
+        assert HermesPluginConfig.from_dict({}).cmms_path == root
+        HermesPluginConfig.from_dict({"path": root}).validate_shared_root(expected=root)
+
+    def test_validate_shared_root_accepts_repo_root(self):
+        """Repo-root path passes shared-root validation."""
+        config = HermesPluginConfig.from_dict({"path": self._repo_root()})
+        config.validate_shared_root()
+
+    def test_validate_shared_root_rejects_non_repo_path(self):
+        """Non-repo path must be rejected by shared-root validation."""
+        config = HermesPluginConfig.from_dict({"path": "/tmp/per-profile"})
+        with pytest.raises(ValueError, match="must point at the shared CMMS repo root"):
+            config.validate_shared_root()
+
+    def test_validate_shared_root_empty_is_noop(self):
+        """Empty cmms_path (direct construction) is allowed by validation."""
+        config = HermesPluginConfig()
+        config.validate_shared_root()  # no raise

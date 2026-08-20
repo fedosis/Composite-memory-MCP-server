@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from memory_server.paths import cmms_repo_root
+
 
 @dataclass
 class WriterConfig:
@@ -43,42 +45,67 @@ class HermesPluginConfig:
     """SQLite database URL."""
 
     cmms_path: str = ""
-    """Path to the CMMS installation directory (auto-detected if empty)."""
+    """Path to the CMMS installation directory (defaults to repo root)."""
+
+    cmms_path_source: str = "default"
+    """Where ``cmms_path`` came from: ``"env"``, ``"config"``, or ``"default"``."""
 
     writer: WriterConfig = field(default_factory=WriterConfig)
     """Async batch writer configuration."""
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> HermesPluginConfig:
+    def from_dict(
+        cls,
+        data: dict[str, Any] | None,
+        *,
+        use_env: bool = True,
+    ) -> HermesPluginConfig:
         """Create config from a dict (from Hermes config.yaml).
 
-        Falls back to env vars when config keys are missing.
+        Falls back to env vars when config keys are missing. An empty
+        ``path`` (or an empty/absent ``MEMORY_SERVER_PATH``) defaults to the
+        CMMS repo root so every profile shares the same data directory.
+        ``use_env=False`` skips environment overrides (used by doctor to
+        validate the raw config value).
         """
         data = data or {}
 
         writer_cfg = WriterConfig.from_dict(data.get("writer", {}))
+
+        env_path = os.environ.get("MEMORY_SERVER_PATH") if use_env else None
+        config_path = data.get("path")
+        if env_path:
+            cmms_path, source = env_path, "env"
+        elif config_path:
+            cmms_path, source = config_path, "config"
+        else:
+            cmms_path, source = str(cmms_repo_root()), "default"
 
         return cls(
             db_url=os.environ.get(
                 "MEMORY_SERVER_DB_URL",
                 data.get("db_url") or "sqlite+aiosqlite:///data/memory.db",
             ),
-            cmms_path=os.environ.get(
-                "MEMORY_SERVER_PATH",
-                data.get("path") or "",
-            ),
+            cmms_path=cmms_path,
+            cmms_path_source=source,
             writer=writer_cfg,
         )
 
     @classmethod
     def from_env(cls) -> HermesPluginConfig:
         """Create config from environment variables only."""
+        env_path = os.environ.get("MEMORY_SERVER_PATH")
+        if env_path:
+            cmms_path, source = env_path, "env"
+        else:
+            cmms_path, source = str(cmms_repo_root()), "default"
         return cls(
             db_url=os.environ.get(
                 "MEMORY_SERVER_DB_URL",
                 "sqlite+aiosqlite:///data/memory.db",
             ),
-            cmms_path=os.environ.get("MEMORY_SERVER_PATH", ""),
+            cmms_path=cmms_path,
+            cmms_path_source=source,
             writer=WriterConfig(
                 flush_interval=float(
                     os.environ.get("MEMORY_SERVER_WRITER_FLUSH_INTERVAL", "5.0")
@@ -88,6 +115,24 @@ class HermesPluginConfig:
                 ),
             ),
         )
+
+    def validate_shared_root(self, expected: str | None = None) -> None:
+        """Assert cmms_path points at the shared CMMS repo root.
+
+        Raises ValueError if the configured path is set to anything other
+        than the CMMS repository root — per-profile paths fragment the
+        vector index and graph snapshot. Used by doctor/install validation.
+        """
+        if not self.cmms_path:
+            return
+        expected_root = Path(expected or str(cmms_repo_root())).resolve()
+        configured = Path(self.cmms_path).resolve()
+        if configured != expected_root:
+            raise ValueError(
+                "memory.providers.memory_server.path must point at the shared "
+                f"CMMS repo root ({expected_root}), got {configured}. "
+                "Per-profile data dirs fragment the LanceDB index and graph."
+            )
 
     def resolve_db_url(self, hermes_home: str) -> str:
         """Resolve the database URL, expanding paths relative to hermes_home.
