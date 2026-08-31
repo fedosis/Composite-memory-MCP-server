@@ -752,3 +752,368 @@ class TestServerOutboxIntegration:
 
         sql_output = result.stdout
         assert "CREATE TABLE outbox_entries" in sql_output, "Migration should create outbox_entries table"
+
+
+# =============================================================================
+# Card 2: exception contract (D4), real failed count (D5), belief deferral (D6)
+# =============================================================================
+
+
+class StubEmbedder:
+    """Deterministic embedder — fixed vector, no model load."""
+
+    def embed(self, text: str) -> list[float]:
+        return [0.1] * 8
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [[0.1] * 8 for _ in texts]
+
+
+class ChunkFailingEmbedder(StubEmbedder):
+    """Embedder whose batch path always raises (per-entry path works)."""
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("injected embed_batch failure")
+
+
+class FakeVectorProvider:
+    """Records upsert/upsert_batch calls; upsert raises for matching payloads.
+
+    ``fail_predicate`` receives the payload dict; when it returns True the
+    upsert raises a plain RuntimeError (no provider exceptions module exists
+    in this card). ``upsert_batch`` raises unconditionally so the chunk path
+    can be forced into the per-entry fallback.
+    """
+
+    def __init__(self, fail_predicate=None):
+        self.fail_predicate = fail_predicate
+        self.upsert_calls = 0
+        self.upsert_batch_calls = 0
+
+    async def upsert(self, **kwargs):
+        self.upsert_calls += 1
+        payload = kwargs.get("payload", {})
+        if self.fail_predicate and self.fail_predicate(payload):
+            raise RuntimeError("injected upsert failure")
+        return True
+
+    async def upsert_batch(self, points):
+        self.upsert_batch_calls += 1
+        raise RuntimeError("injected upsert_batch failure")
+
+
+class FailingGraphRouter:
+    """Graph router whose sync methods always raise (injected graph failure)."""
+
+    def sync_fact(self, subject, predicate, object):
+        raise RuntimeError("injected graph sync failure")
+
+    def sync_facts_batch(self, triples):
+        raise RuntimeError("injected graph batch sync failure")
+
+
+@pytest.mark.asyncio
+class TestOutboxExceptionContract:
+    """Card 2, D4/D5: exception = failure; no completion; real failed count.
+
+    Every indexing step (embed, vector upsert, graph sync) may raise; the
+    exception propagates to ``_process_entry``'s handler, which never marks
+    the entry completed. ``process_all_pending`` returns the REAL exhausted
+    failure count; retryable entries stay pending and are counted nowhere.
+    """
+
+    async def _worker(self, *, qdrant, embedder, graph_router, max_retries):
+        """Fresh OutboxWorker wired with the given fakes."""
+        engine, factory, db_path = _make_engine_and_factory()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        worker = OutboxWorker(
+            db_url=f"sqlite+aiosqlite:///{db_path}",
+            qdrant=qdrant,
+            embedder=embedder,
+            graph_router=graph_router,
+            max_retries=max_retries,
+        )
+        await worker.initialize()
+        return worker, engine, db_path
+
+    async def _add_entry(self, worker, operation, record_id, payload):
+        async with worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            entry = await repo.add_entry(
+                record_type=operation.replace("index_", ""),
+                record_id=record_id,
+                operation=operation,
+                payload=payload,
+            )
+            await session.commit()
+            return entry.id
+
+    async def _statuses(self, worker):
+        from sqlalchemy import select as sa_select
+
+        async with worker._session_factory() as session:
+            rows = (await session.execute(sa_select(OutboxEntryORM))).scalars().all()
+            return {row.record_id: row.status for row in rows}
+
+    async def test_upsert_exception_no_completion_failed_after_exhaustion(self):
+        """Vector upsert raises → entry never completed → failed; graph untouched."""
+        graph = SimpleGraph()
+        qdrant = FakeVectorProvider(fail_predicate=lambda payload: True)
+        worker, engine, db_path = await self._worker(
+            qdrant=qdrant,
+            embedder=StubEmbedder(),
+            graph_router=GraphRouter(graph=graph),
+            max_retries=1,
+        )
+        try:
+            entry_id = await self._add_entry(
+                worker, "index_fact", "f-raise",
+                {"subject": "Raise", "predicate": "is", "object": "Broken", "source": "test"},
+            )
+            result = await worker.process_all_pending()
+            assert result == {"processed": 0, "failed": 1}
+
+            async with worker._session_factory() as session:
+                repo = OutboxRepository(session)
+                failed = await repo.get_failed()
+                assert len(failed) == 1
+                assert failed[0].id == entry_id
+                assert failed[0].retry_count == 1
+                assert "injected upsert failure" in (failed[0].error or "")
+
+            # Graph sync never ran because the upsert failed first.
+            assert graph.to_dict()["nodes"] == {}
+            assert graph.to_dict()["edges"] == []
+        finally:
+            await worker.close()
+            await engine.dispose()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+    async def test_upsert_exception_retryable_stays_pending(self):
+        """Same failure with headroom → stays pending, counted in neither bucket."""
+        qdrant = FakeVectorProvider(fail_predicate=lambda payload: True)
+        worker, engine, db_path = await self._worker(
+            qdrant=qdrant,
+            embedder=StubEmbedder(),
+            graph_router=GraphRouter(graph=SimpleGraph()),
+            max_retries=3,
+        )
+        try:
+            entry_id = await self._add_entry(
+                worker, "index_fact", "f-retry",
+                {"subject": "Retry", "predicate": "is", "object": "Later", "source": "test"},
+            )
+            result = await worker.process_all_pending()
+            assert result == {"processed": 0, "failed": 0}
+
+            async with worker._session_factory() as session:
+                repo = OutboxRepository(session)
+                pending = await repo.get_pending()
+                assert len(pending) == 1
+                assert pending[0].id == entry_id
+                assert pending[0].retry_count == 1
+        finally:
+            await worker.close()
+            await engine.dispose()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+    async def test_graph_sync_exception_no_completion(self):
+        """Vector upsert succeeds; graph sync raises → not completed; retried → failed."""
+        qdrant = FakeVectorProvider()
+        worker, engine, db_path = await self._worker(
+            qdrant=qdrant,
+            embedder=StubEmbedder(),
+            graph_router=FailingGraphRouter(),
+            max_retries=2,
+        )
+        try:
+            await self._add_entry(
+                worker, "index_fact", "f-graph",
+                {"subject": "Graph", "predicate": "is", "object": "Broken", "source": "test"},
+            )
+            # First attempt: retryable → pending (counted in neither bucket).
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+            assert (await self._statuses(worker)).get("f-graph") == "pending"  # noqa: SIM118
+
+            # Second attempt: exhausted → failed, and counted.
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 1}
+            assert (await self._statuses(worker)).get("f-graph") == "failed"  # noqa: SIM118
+        finally:
+            await worker.close()
+            await engine.dispose()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+    async def test_belief_upsert_exception_failed_graph_unchanged(self):
+        """Failing belief upsert → entry not completed → failed; graph unchanged."""
+        graph = SimpleGraph()
+        qdrant = FakeVectorProvider(
+            fail_predicate=lambda payload: payload.get("memory_type") == "belief"
+        )
+        worker, engine, db_path = await self._worker(
+            qdrant=qdrant,
+            embedder=StubEmbedder(),
+            graph_router=GraphRouter(graph=graph),
+            max_retries=1,
+        )
+        try:
+            entry_id = await self._add_entry(
+                worker, "index_belief", "b-raise",
+                {"proposition": "Docker is containerized", "confidence": 0.9, "tags": ["docker"]},
+            )
+            result = await worker.process_all_pending()
+            assert result == {"processed": 0, "failed": 1}
+
+            async with worker._session_factory() as session:
+                repo = OutboxRepository(session)
+                failed = await repo.get_failed()
+                assert len(failed) == 1
+                assert failed[0].id == entry_id
+
+            assert graph.to_dict()["nodes"] == {}
+            assert graph.to_dict()["edges"] == []
+        finally:
+            await worker.close()
+            await engine.dispose()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+    async def test_mixed_batch_counts_processed_and_failed(self):
+        """Success + pre-exhausted + retryable → {"processed": 1, "failed": 1}."""
+        qdrant = FakeVectorProvider(
+            fail_predicate=lambda payload: payload.get("subject") in ("Exhausted", "Retryable")
+        )
+        worker, engine, db_path = await self._worker(
+            qdrant=qdrant,
+            embedder=StubEmbedder(),
+            graph_router=GraphRouter(graph=SimpleGraph()),
+            max_retries=2,
+        )
+        try:
+            async with worker._session_factory() as session:
+                repo = OutboxRepository(session)
+                await repo.add_entry(
+                    "fact", "f-good", "index_fact",
+                    {"subject": "Good", "predicate": "is", "object": "Val", "source": "test"},
+                )
+                exhausted = await repo.add_entry(
+                    "fact", "f-ex", "index_fact",
+                    {"subject": "Exhausted", "predicate": "is", "object": "Val", "source": "test"},
+                )
+                await repo.add_entry(
+                    "fact", "f-ret", "index_fact",
+                    {"subject": "Retryable", "predicate": "is", "object": "Val", "source": "test"},
+                )
+                # Pre-seed retry_count = max_retries - 1 so the next failure exhausts.
+                await repo.increment_retry(exhausted.id, "pre-seeded failure")
+                await session.commit()
+
+            result = await worker.process_all_pending()
+            assert result == {"processed": 1, "failed": 1}
+
+            statuses = await self._statuses(worker)
+            assert statuses["f-good"] == "completed"
+            assert statuses["f-ex"] == "failed"
+            assert statuses["f-ret"] == "pending"
+        finally:
+            await worker.close()
+            await engine.dispose()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+    async def test_poll_once_returns_attempted_count_not_outcomes(self):
+        """_poll_once returns len(entries) even when entries end up failed (D5)."""
+        qdrant = FakeVectorProvider(fail_predicate=lambda payload: True)
+        worker, engine, db_path = await self._worker(
+            qdrant=qdrant,
+            embedder=StubEmbedder(),
+            graph_router=GraphRouter(graph=SimpleGraph()),
+            max_retries=1,
+        )
+        try:
+            for i in range(3):
+                await self._add_entry(
+                    worker, "index_fact", f"f-{i}",
+                    {"subject": f"Fail{i}", "predicate": "is", "object": "Val", "source": "test"},
+                )
+            # Batch path: chunk fails (upsert_batch raises) → per-entry fallback
+            # exhausts all three (max_retries=1) — _poll_once still returns 3.
+            assert await worker._poll_once() == 3
+
+            async with worker._session_factory() as session:
+                repo = OutboxRepository(session)
+                assert len(await repo.get_failed()) == 3
+        finally:
+            await worker.close()
+            await engine.dispose()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+    async def test_batch_path_chunk_failure_falls_back_per_entry(self):
+        """Chunk exception is handled locally; outcomes live in per-entry DB state (4b)."""
+        qdrant = FakeVectorProvider(
+            fail_predicate=lambda payload: payload.get("subject") == "Bad"
+        )
+        graph = SimpleGraph()
+        worker, engine, db_path = await self._worker(
+            qdrant=qdrant,
+            embedder=ChunkFailingEmbedder(),
+            graph_router=GraphRouter(graph=graph),
+            max_retries=1,
+        )
+        try:
+            for i in range(2):
+                await self._add_entry(
+                    worker, "index_fact", f"f-good-{i}",
+                    {"subject": f"Good{i}", "predicate": "is", "object": "Val", "source": "test"},
+                )
+            await self._add_entry(
+                worker, "index_fact", "f-bad",
+                {"subject": "Bad", "predicate": "is", "object": "Val", "source": "test"},
+            )
+
+            # (i) chunk exception handled locally — not converted into an aggregate.
+            assert await worker._poll_once() == 3
+
+            # (ii) per-entry DB statuses follow _process_entry semantics.
+            statuses = await self._statuses(worker)
+            assert statuses["f-good-0"] == "completed"
+            assert statuses["f-good-1"] == "completed"
+            assert statuses["f-bad"] == "failed"
+
+            # (iii) process_all_pending tallies ONLY per-entry statuses — nothing pending.
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+        finally:
+            await worker.close()
+            await engine.dispose()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+    async def test_belief_entry_upserts_vector_without_graph_mutation(self):
+        """Belief entries: vector upsert happens, graph stays empty (D6)."""
+        qdrant = FakeVectorProvider()
+        graph = SimpleGraph()
+        worker, engine, db_path = await self._worker(
+            qdrant=qdrant,
+            embedder=StubEmbedder(),
+            graph_router=GraphRouter(graph=graph),
+            max_retries=3,
+        )
+        try:
+            await self._add_entry(
+                worker, "index_belief", "b-ok",
+                {"proposition": "Docker is containerized", "confidence": 0.9, "tags": ["docker"]},
+            )
+            result = await worker.process_all_pending()
+            assert result == {"processed": 1, "failed": 0}
+            assert qdrant.upsert_calls == 1
+            assert graph.to_dict()["nodes"] == {}
+            assert graph.to_dict()["edges"] == []
+        finally:
+            await worker.close()
+            await engine.dispose()
+            if os.path.exists(db_path):
+                os.unlink(db_path)

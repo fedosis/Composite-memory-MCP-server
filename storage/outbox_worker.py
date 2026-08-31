@@ -188,6 +188,11 @@ class OutboxWorker:
         only for the status update, not for the whole embed + upsert cycle.
         Stale ``processing`` entries from a crashed run are reset first.
 
+        This method does NOT aggregate per-entry outcomes — it returns the
+        number of entries attempted, regardless of how many completed,
+        failed, or stayed pending. Outcome counts live only in
+        ``process_all_pending`` (D5 boundary).
+
         Returns:
             Number of entries processed (0 when the queue was empty).
         """
@@ -251,6 +256,12 @@ class OutboxWorker:
         (malformed payload, embedder hiccup) cannot mark 499 healthy
         entries as failed or stall the queue. Each chunk is committed in
         its own short transaction, keeping SQLite write locks minimal.
+
+        Chunk outcomes are NEVER converted into an outcome aggregate here —
+        the per-entry fallback updates DB state via ``_process_entry`` (its
+        returned statuses are ignored; DB state is authoritative), and
+        ``_poll_once`` still returns ``len(entries)`` attempted (D5
+        boundary). Only ``process_all_pending`` tallies per-entry statuses.
         """
         if not entries:
             return
@@ -341,8 +352,23 @@ class OutboxWorker:
         session: AsyncSession,
         repo: OutboxRepository,
         entry: OutboxEntry,
-    ) -> None:
-        """Process a single outbox entry."""
+    ) -> str:
+        """Process a single outbox entry.
+
+        Exception contract: any exception raised by an indexing step (embed,
+        vector upsert, graph sync) is a FAILURE — the entry is never marked
+        completed. ``mark_completed`` is reached only on a clean return; the
+        exception handler increments the retry counter and either marks the
+        entry failed (exhausted in this run) or leaves it pending for the
+        next poll. Result-checking of False returns is deliberately NOT part
+        of this contract (provider-contract card).
+
+        Returns:
+            A status string consumed only by ``process_all_pending``:
+            - ``"completed"`` — marked completed (clean return).
+            - ``"failed"`` — retries exhausted; marked failed in this run.
+            - ``"pending"`` — failed retryably; reset to pending for retry.
+        """
         # Mark as processing
         await repo.mark_processing(entry.id)
 
@@ -360,6 +386,7 @@ class OutboxWorker:
 
             await repo.mark_completed(entry.id)
             logger.debug("Outbox entry %s completed (%s)", entry.id, entry.operation)
+            return "completed"
 
         except Exception as e:
             error_msg = str(e)
@@ -373,6 +400,7 @@ class OutboxWorker:
                     new_retry,
                     error_msg,
                 )
+                return "failed"
             else:
                 logger.warning(
                     "Outbox entry %s failed (retry %d/%d): %s",
@@ -381,6 +409,7 @@ class OutboxWorker:
                     self._max_retries,
                     error_msg,
                 )
+                return "pending"
 
     async def _process_index_fact(self, entry: OutboxEntry) -> None:
         """Process an index_fact entry: embed + upsert to Qdrant + sync to graph.
@@ -461,12 +490,14 @@ class OutboxWorker:
         )
 
     async def _process_index_belief(self, entry: OutboxEntry) -> None:
-        """Process an index_belief entry: embed + upsert to Qdrant + sync to graph.
+        """Process an index_belief entry: embed + upsert to Qdrant.
 
-        Indexes the belief proposition in Qdrant for semantic search.
-        Graph sync is deferred (GraphRouter.sync_belief is optional).
+        Beliefs are vector-indexed ONLY — graph sync is intentionally
+        skipped: beliefs are not graph entities in this design, and
+        ``GraphRouter`` has no ``sync_belief`` API (only sync_fact /
+        sync_facts_batch / sync_decision / sync_skill).
 
-        Idempotent: Qdrant upsert replaces by point_id, graph sync is additive.
+        Idempotent: Qdrant upsert replaces by point_id.
         """
         import uuid
 
@@ -496,20 +527,22 @@ class OutboxWorker:
                     },
                 )
 
-        # Sync to graph (if GraphRouter supports it)
-        if self._graph_router and hasattr(self._graph_router, "sync_belief"):
-            await asyncio.to_thread(
-                self._graph_router.sync_belief,
-                proposition=proposition,
-                tags=tags,
-            )
+        # No graph sync — beliefs are vector-indexed only (see docstring).
+        # The previous ``hasattr(self._graph_router, "sync_belief")``
+        # fallback was dead code (GraphRouter has no sync_belief) and has
+        # been removed (Card 2, D6).
 
     # ── utility for server integration ──────────────────────────────
 
     async def process_all_pending(self) -> dict:
         """Process all pending entries synchronously (for testing).
 
-        Returns a summary dict with counts of processed/failed entries.
+        Returns:
+            ``{"processed": N, "failed": M}`` where N = entries COMPLETED in
+            this run and M = entries whose retries were EXHAUSTED (marked
+            failed) in this run. Entries that fail retryably stay
+            ``pending`` (reset by ``increment_retry``) and are counted in
+            NEITHER bucket — they are re-picked by the next poll/run.
         """
         processed = 0
         failed = 0
@@ -522,8 +555,13 @@ class OutboxWorker:
             entries = await repo.get_pending(limit=self._process_pending_limit)
 
             for entry in entries:
-                await self._process_entry(session, repo, entry)
+                status = await self._process_entry(session, repo, entry)
+                if status == "completed":
+                    processed += 1
+                elif status == "failed":
+                    failed += 1
+                # "pending" is counted in neither bucket.
 
             await session.commit()
 
-        return {"processed": len(entries)}
+        return {"processed": processed, "failed": failed}
