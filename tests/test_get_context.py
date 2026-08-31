@@ -77,6 +77,9 @@ class TestGetContext:
         assert result["total"] == len(result["facts"]) + len(result["decisions"])
 
     async def test_get_context_no_decisions_when_no_match(self, provider):
+        # Seed a decision, then prove the wiring both ways: a matching task must
+        # surface it (positive proof — red on the pre-change decisions stub),
+        # a non-matching task must return nothing (negative proof).
         await provider.create_decision(
             Decision(
                 id="d2",
@@ -85,6 +88,12 @@ class TestGetContext:
                 reason="Already deployed",
             )
         )
+
+        matching = await get_context(provider, task="Postgres")
+        assert any(d["id"] == "d2" for d in matching["decisions"]), (
+            "decision search is not wired: matching task returned no decisions"
+        )
+
         result = await get_context(provider, task="XYZZZDoesNotExist")
         assert result["decisions"] == []
         assert result["total"] == 0

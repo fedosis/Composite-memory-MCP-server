@@ -552,7 +552,12 @@ class TestHermesProviderPrefetch:
             provider.shutdown()
 
     def test_prefetch_filters_low_confidence_decisions(self):
-        """Decisions below min_confidence (0.8) are excluded from the block."""
+        """High-confidence decisions render; low-confidence (<0.8) are excluded.
+
+        Seeds BOTH a high-confidence and a low-confidence matching decision so
+        the test is red on the pre-change stub (no decisions wired at all) and
+        genuinely exercises the confidence filter on current code.
+        """
         provider = HermesProvider()
         provider.initialize(
             session_id="test",
@@ -561,7 +566,16 @@ class TestHermesProviderPrefetch:
         try:
             _run_async(provider._provider.create_decision(
                 Decision(
-                    id="pd2",
+                    id="pd_high",
+                    context="Hermes",
+                    choice="High confidence choice",
+                    reason="Confirmed",
+                    confidence=0.95,
+                )
+            ))
+            _run_async(provider._provider.create_decision(
+                Decision(
+                    id="pd_low",
                     context="Hermes",
                     choice="Low confidence choice",
                     reason="Uncertain",
@@ -569,7 +583,9 @@ class TestHermesProviderPrefetch:
                 )
             ))
             result = provider.prefetch(query="Hermes")
-            assert "Decisions:" not in result
+            assert "--- Memory Context ---" in result
+            assert "Decisions:" in result
+            assert "High confidence choice" in result
             assert "Low confidence choice" not in result
         finally:
             provider.shutdown()
