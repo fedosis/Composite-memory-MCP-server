@@ -95,6 +95,25 @@ memory:
         max_batch: 50
 ```
 
+### Context injection tuning
+
+The number of facts/decisions CMMS injects into the agent's system prompt
+before each turn is configurable. Default is **5**; set it via env var (takes
+precedence) or the provider config block:
+
+```bash
+# ~/.hermes/.env  — global, applies to ALL profiles (single shared CMMS)
+MEMORY_SERVER_MAX_FACTS=10
+```
+
+```yaml
+# ~/.hermes/config.yaml — per-profile fallback (env wins if both set)
+memory:
+  providers:
+    memory_server:
+      max_facts: 10
+```
+
 ### Backup
 
 The previous `memory.provider` value is saved to `~/.hermes/.memory-provider-backup`

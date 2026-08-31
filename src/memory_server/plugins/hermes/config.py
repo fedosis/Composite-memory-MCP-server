@@ -53,6 +53,10 @@ class HermesPluginConfig:
     writer: WriterConfig = field(default_factory=WriterConfig)
     """Async batch writer configuration."""
 
+    max_facts: int = 5
+    """Maximum number of facts/decisions injected into the system prompt
+    context on each prefetch. Shared across all profiles (single CMMS)."""
+
     @classmethod
     def from_dict(
         cls,
@@ -89,6 +93,9 @@ class HermesPluginConfig:
             cmms_path=cmms_path,
             cmms_path_source=source,
             writer=writer_cfg,
+            max_facts=int(
+                os.environ.get("MEMORY_SERVER_MAX_FACTS", data.get("max_facts") or 5)
+            ),
         )
 
     @classmethod
@@ -114,6 +121,7 @@ class HermesPluginConfig:
                     os.environ.get("MEMORY_SERVER_WRITER_MAX_BATCH", "50")
                 ),
             ),
+            max_facts=int(os.environ.get("MEMORY_SERVER_MAX_FACTS", "5")),
         )
 
     def validate_shared_root(self, expected: str | None = None) -> None:

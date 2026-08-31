@@ -459,6 +459,12 @@ class HermesProvider:
             "resolve_conflict, reflect.\n"
         )
 
+    def _max_facts(self) -> int:
+        """Return the configured max facts for context injection (default 5)."""
+        if self._config is not None:
+            return max(1, int(getattr(self._config, "max_facts", 5) or 5))
+        return 5
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background context load for the NEXT turn.
 
@@ -470,7 +476,7 @@ class HermesProvider:
         try:
             loop = _get_loop()
             asyncio.run_coroutine_threadsafe(
-                self._queue_prefetch_async(query, max_results=5),
+                self._queue_prefetch_async(query, max_results=self._max_facts()),
                 loop,
             )
         except Exception:
@@ -494,7 +500,7 @@ class HermesProvider:
         # Fallback: sync load (first turn, no prior queue_prefetch)
         try:
             result = _run_async(
-                self._prefetch_async(query, max_results=5),
+                self._prefetch_async(query, max_results=self._max_facts()),
                 timeout=10.0,
             )
             if result:
