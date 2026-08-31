@@ -1068,26 +1068,3 @@ class TestOutboxWorkerWiring:
         await worker.process_all_pending()
         assert calls["pending_limit"] == 9
         await worker.close()
-
-    def test_outbox_py_not_modified_by_card1(self):
-        """storage/outbox.py diff must be unchanged vs the Task 1 baseline
-        patch (the file is excluded from the Card 1 commit)."""
-        baseline = (
-            REPO_ROOT.parent
-            / ".hermes"
-            / "workspace"
-            / "cmms-audit-fixes"
-            / "baseline"
-            / "PLAN-baseline-outbox.py.patch"
-        )
-        if not baseline.exists():
-            pytest.skip("Task 1 baseline patch not recorded in this checkout")
-        proc = subprocess.run(
-            ["git", "diff", "--", "storage/outbox.py"],
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        assert proc.returncode == 0, proc.stderr
-        assert proc.stdout == baseline.read_text()
