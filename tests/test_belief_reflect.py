@@ -8,19 +8,19 @@ Tests cover:
 """
 
 import json
-import pytest
 from datetime import datetime, timedelta, timezone
 
-from memory_server.models import Belief, Evidence
-from memory_server.providers.sqlite_provider import SQLiteProvider
+import pytest
+
 from memory_server.api.reflect import (
     ReflectEngine,
-    _tokenize,
-    _has_opposite_sentiment,
     _build_histogram,
+    _has_opposite_sentiment,
+    _tokenize,
     detect_contradictions,
 )
-
+from memory_server.models import Belief, Evidence
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 # =========================================================================
 # Helper: build mock belief
@@ -335,6 +335,44 @@ class TestReflectDecay:
         result = await engine.decay_analysis()
         assert result["stale_now"] == 1
         assert result["recommendation"] != ""
+
+    # --- Card 3 remainder: Settings single-source drift tests ---
+
+    @pytest.mark.asyncio
+    async def test_decay_forecast_follows_settings_ttl(self, monkeypatch):
+        """MEMORY_SERVER_TTL_DAYS__BELIEF changes the forecast without code edits."""
+        from memory_server.settings import get_settings
+        monkeypatch.setenv("MEMORY_SERVER_TTL_DAYS__BELIEF", "30")
+        get_settings.cache_clear()
+        created = datetime.now(timezone.utc) - timedelta(days=28)  # > 0.7*30-7
+        beliefs = [_make_belief("Aging belief", lifecycle_state="active", created_at=created)]
+        engine = ReflectEngine(_MockProvider(beliefs))
+        assert (await engine.decay_analysis())["stale_7d"] == 1  # default TTL 180 → 0
+
+    @pytest.mark.asyncio
+    async def test_decay_forecast_follows_settings_window(self, monkeypatch):
+        from memory_server.settings import get_settings
+        monkeypatch.setenv("MEMORY_SERVER_DECAY_FORECAST_WINDOW_DAYS", "30")
+        get_settings.cache_clear()
+        created = datetime.now(timezone.utc) - timedelta(days=100)
+        beliefs = [_make_belief("Window belief", lifecycle_state="active", created_at=created)]
+        engine = ReflectEngine(_MockProvider(beliefs))
+        # default window 7: 100 >= 126-7=119 → False; window 30: 100 >= 96 → True
+        assert (await engine.decay_analysis())["stale_7d"] == 1
+
+    @pytest.mark.asyncio
+    async def test_decay_analysis_partial_ttl_omits_belief_no_keyerror(self, monkeypatch):
+        """Partial JSON ttl_days omitting 'belief' must not crash decay_analysis;
+        belief TTL falls back to decay_default_ttl_days (90.0)."""
+        from memory_server.settings import get_settings
+        monkeypatch.setenv("MEMORY_SERVER_TTL_DAYS", '{"fact": 30.0}')
+        get_settings.cache_clear()
+        created = datetime.now(timezone.utc) - timedelta(days=70)
+        beliefs = [_make_belief("Partial TTL belief", lifecycle_state="active",
+                                created_at=created)]
+        engine = ReflectEngine(_MockProvider(beliefs))
+        # fallback 90: 0.7*90=63 <= 77 → stale_7d=1; belief 180 would give 0
+        assert (await engine.decay_analysis())["stale_7d"] == 1
 
 
 class TestReflectTopics:
@@ -663,8 +701,8 @@ class TestReflectMToolEdgeCases:
 
     async def test_mcp_tool_contradictions(self, provider):
         """Set up contradicting beliefs and verify MCP tool detects them."""
-        from memory_server.server import reflect_tool
         from memory_server.models import Belief as BelModel
+        from memory_server.server import reflect_tool
         b1 = BelModel(proposition="Docker is better than Podman", confidence=0.8, tags=["docker"])
         b2 = BelModel(proposition="Docker is worse than Podman", confidence=0.6, tags=["podman"])
         await provider.create_belief(b1)

@@ -9,6 +9,7 @@ from memory_server.evaluation.confidence import (
     SOURCE_RELIABILITY,
     ConfidenceEngine,
 )
+from memory_server.settings import get_settings
 
 
 @pytest.fixture
@@ -280,3 +281,34 @@ class TestLifecycleStateScoring:
         assert LIFECYCLE_MULTIPLIER["stale"] == 0.6
         assert LIFECYCLE_MULTIPLIER["archived"] == 0.3
         assert LIFECYCLE_MULTIPLIER["forgotten"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Card 3 remainder: Settings single-source drift tests
+# ---------------------------------------------------------------------------
+
+
+def test_env_overrides_change_scoring(monkeypatch):
+    monkeypatch.setenv("MEMORY_SERVER_CONFIDENCE_SOURCE_RELIABILITY__VERIFIED", "0.5")
+    get_settings.cache_clear()
+    assert ConfidenceEngine().score_fact(
+        {"source_type": "verified", "created_at": None}) == pytest.approx(0.5)
+    monkeypatch.setenv("MEMORY_SERVER_CONFIDENCE_LIFECYCLE_MULTIPLIERS__ACTIVE", "0.5")
+    get_settings.cache_clear()
+    assert ConfidenceEngine()._lifecycle_multipliers["active"] == 0.5
+
+
+def test_boost_penalty_overrides():
+    engine = ConfidenceEngine(corroboration_boost=0.2, boost_threshold=1,
+                              conflict_penalty=0.3, penalty_threshold=2)
+    assert engine._corroboration_boost(2) == pytest.approx(0.2)   # >= threshold+1
+    assert engine._corroboration_boost(1) == pytest.approx(0.1)   # == threshold
+    assert engine._conflict_penalty(3) == pytest.approx(0.3)
+    assert engine._conflict_penalty(2) == pytest.approx(0.15)
+
+
+def test_aliases_match_settings():
+    from memory_server.evaluation.confidence import DEFAULT_TTL_DAYS, LIFECYCLE_MULTIPLIER, SOURCE_RELIABILITY
+    assert SOURCE_RELIABILITY == get_settings().confidence_source_reliability
+    assert LIFECYCLE_MULTIPLIER == get_settings().confidence_lifecycle_multipliers
+    assert DEFAULT_TTL_DAYS == get_settings().confidence_ttl_days
