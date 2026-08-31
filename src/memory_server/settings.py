@@ -35,6 +35,9 @@ class Settings(BaseSettings):
         env_file=".env",
         extra="ignore",
         populate_by_name=True,
+        # Enables nested dict env vars like MEMORY_SERVER_TTL_DAYS__BELIEF=30
+        # (pydantic-settings 2.14.2 requirement; without it the var is ignored).
+        env_nested_delimiter="__",
     )
 
     # --- Database ----------------------------------------------------------

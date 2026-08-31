@@ -444,6 +444,26 @@ class TestSecretsAndValidation:
         get_settings.cache_clear()
         assert get_settings().ttl_days == {"fact": 30.0}
 
+    def test_dict_fields_parse_nested_env(self, monkeypatch):
+        # nested-only env (no parent JSON) → PARTIAL dict {"belief": 30.0}
+        monkeypatch.setenv("MEMORY_SERVER_TTL_DAYS__BELIEF", "30")
+        get_settings.cache_clear()
+        assert get_settings().ttl_days == {"belief": 30.0}
+
+    def test_dict_fields_json_env_coexists_with_nested_delimiter(self, monkeypatch):
+        # JSON-only env still parses with env_nested_delimiter set
+        monkeypatch.setenv("MEMORY_SERVER_TTL_DAYS", '{"fact": 30.0}')
+        get_settings.cache_clear()
+        assert get_settings().ttl_days == {"fact": 30.0}
+
+    def test_dict_fields_json_and_nested_env_merge(self, monkeypatch):
+        # pydantic-settings 2.14.2: nested value MERGES into the parent JSON dict
+        # (nested wins on conflict) — it does NOT replace the whole dict
+        monkeypatch.setenv("MEMORY_SERVER_TTL_DAYS", '{"fact": 30.0}')
+        monkeypatch.setenv("MEMORY_SERVER_TTL_DAYS__BELIEF", "30")
+        get_settings.cache_clear()
+        assert get_settings().ttl_days == {"fact": 30.0, "belief": 30.0}
+
     def test_path_fields_accept_env_and_string(self, monkeypatch):
         monkeypatch.setenv("MEMORY_SERVER_LANCEDB_PATH", "custom/lancedb")
         get_settings.cache_clear()
