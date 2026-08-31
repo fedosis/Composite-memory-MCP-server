@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy.ext.asyncio import (
@@ -41,12 +42,24 @@ POLL_INTERVAL_SECONDS = 1.0
 
 # Maximum entries to claim per poll cycle. Sized to drain the backlog fast
 # while keeping each cycle bounded for the event loop.
-POLL_BATCH_SIZE = 200
+POLL_BATCH_SIZE = 500
+
+# Chunk size for batched embedding inside _process_fact_batch. Kept at the
+# embedder's internal batch size so a failing chunk only poisons a small
+# group, which then falls back to the per-entry path.
+FACT_BATCH_CHUNK_SIZE = 32
 
 # Minimum interval between LanceDB compaction runs. Compaction (VACUUM) is
-# only triggered when the outbox queue is empty, so it never competes with
-# active indexing, and it's throttled to avoid churning the table.
+# throttled to avoid churning the table; it runs as a background task so it
+# never blocks the drain loop. It fires even while the queue is busy (the old
+# "only when empty" gate meant a permanent backlog skipped compaction forever).
 COMPACT_INTERVAL_SECONDS = 1800
+
+# Age threshold for pruning accumulated table versions. Must be well below
+# LanceDB's default (~7 days): every upsert creates a version, so a 7-day
+# cutoff deletes nothing on a busy store. 1 hour keeps the on-disk index near
+# the live dataset size without racing in-flight writers.
+COMPACT_CLEANUP_OLDER_THAN = timedelta(hours=1)
 
 
 class OutboxWorker:
@@ -126,20 +139,29 @@ class OutboxWorker:
             # Adaptive backoff: keep draining while there is work, only sleep
             # the full interval when the queue is empty. With a large backlog
             # this avoids wasting ~50% of wall time in asyncio.sleep.
+            # Compaction is attempted every cycle (throttled internally by
+            # COMPACT_INTERVAL_SECONDS) — gating it on an empty queue meant a
+            # permanent backlog skipped it forever, letting LanceDB versions
+            # accumulate unboundedly.
+            await self._maybe_compact()
             if processed == 0:
-                await self._maybe_compact()
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
             else:
                 await asyncio.sleep(0)
         logger.info("Outbox worker stopped")
 
     async def _maybe_compact(self) -> None:
-        """Run LanceDB compaction when idle, throttled.
+        """Schedule LanceDB compaction when due, without blocking the loop.
 
         Compaction prunes the accumulated table versions that every
         merge_insert creates, keeping the on-disk store near the live dataset
-        size. Only triggered on an empty queue so it never blocks indexing,
-        and at most once per COMPACT_INTERVAL_SECONDS.
+        size. Runs as a background task so a long VACUUM never stalls the
+        drain loop. Throttled to once per COMPACT_INTERVAL_SECONDS.
+
+        The ``cleanup_older_than`` threshold is explicit: LanceDB's default
+        (~7 days) deletes nothing on a busy store where every version is
+        younger than a week, which is exactly how versions accumulated to
+        hundreds of GB before this fix.
         """
         import time
 
@@ -151,15 +173,26 @@ class OutboxWorker:
         if time.monotonic() - self._last_compact_at < COMPACT_INTERVAL_SECONDS:
             return
         self._last_compact_at = time.monotonic()
-        try:
-            ok = await optimize()
-            if ok:
-                logger.info("Outbox worker: LanceDB compaction done")
-        except Exception:
-            logger.exception("Outbox worker: LanceDB compaction failed")
+
+        async def _compact() -> None:
+            try:
+                ok = await optimize(
+                    cleanup_older_than=COMPACT_CLEANUP_OLDER_THAN,
+                )
+                if ok:
+                    logger.info("Outbox worker: LanceDB compaction done")
+            except Exception:
+                logger.exception("Outbox worker: LanceDB compaction failed")
+
+        asyncio.create_task(_compact())
 
     async def _poll_once(self) -> int:
         """Single poll cycle: fetch pending entries and process them.
+
+        Claim (mark_processing) is committed in its own short transaction
+        before the heavy embedding work, so the SQLite write lock is held
+        only for the status update, not for the whole embed + upsert cycle.
+        Stale ``processing`` entries from a crashed run are reset first.
 
         Returns:
             Number of entries processed (0 when the queue was empty).
@@ -169,6 +202,8 @@ class OutboxWorker:
 
         async with self._session_factory() as session:
             repo = OutboxRepository(session)
+            # Recover entries left in "processing" by a crashed worker.
+            await repo.reset_stale_processing()
             entries = await repo.get_pending(limit=POLL_BATCH_SIZE)
 
             if not entries:
@@ -179,11 +214,131 @@ class OutboxWorker:
                 len(entries),
             )
 
+            # Claim: mark as processing and commit immediately. This is a
+            # short write lock; the heavy embed/upsert below runs outside
+            # any SQLite transaction so other writers are not blocked.
             for entry in entries:
-                await self._process_entry(session, repo, entry)
-
+                await repo.mark_processing(entry.id)
             await session.commit()
-            return len(entries)
+
+        # Batch-friendly operations: group index_fact entries and process
+        # them in one embed + one upsert_batch call instead of one model
+        # invocation per fact. Other operation types are rare and keep the
+        # per-entry path.
+        fact_entries = [e for e in entries if e.operation == "index_fact"]
+        other_entries = [e for e in entries if e.operation != "index_fact"]
+
+        if fact_entries:
+            await self._process_fact_batch(fact_entries)
+
+        for entry in other_entries:
+            async with self._session_factory() as session:
+                repo = OutboxRepository(session)
+                await self._process_entry(session, repo, entry)
+                await session.commit()
+
+        return len(entries)
+
+    async def _process_fact_batch(
+        self,
+        entries: list[OutboxEntry],
+    ) -> None:
+        """Process a batch of index_fact entries with batched embedding.
+
+        Embeds all fact texts with one ``embed_batch`` call, upserts them
+        with one ``upsert_batch`` call, then syncs each fact to the graph.
+        This is dramatically faster than per-entry embed + upsert for large
+        backlogs.
+
+        The batch is processed in small chunks; if a chunk fails, its
+        entries fall back to the per-entry path so a single toxic entry
+        (malformed payload, embedder hiccup) cannot mark 499 healthy
+        entries as failed or stall the queue. Each chunk is committed in
+        its own short transaction, keeping SQLite write locks minimal.
+        """
+        if not entries:
+            return
+
+        assert self._session_factory is not None  # guaranteed by caller (_poll_once)
+
+        for start in range(0, len(entries), FACT_BATCH_CHUNK_SIZE):
+            chunk = entries[start : start + FACT_BATCH_CHUNK_SIZE]
+            try:
+                await self._process_fact_chunk(chunk)
+                async with self._session_factory() as session:
+                    repo = OutboxRepository(session)
+                    for entry in chunk:
+                        await repo.mark_completed(entry.id)
+                    await session.commit()
+            except Exception as exc:
+                logger.warning(
+                    "Fact chunk of %d entries failed (%s); falling back to per-entry",
+                    len(chunk),
+                    exc,
+                )
+                async with self._session_factory() as session:
+                    repo = OutboxRepository(session)
+                    for entry in chunk:
+                        await self._process_entry(session, repo, entry)
+                    await session.commit()
+
+    async def _process_fact_chunk(
+        self,
+        chunk: list[OutboxEntry],
+    ) -> None:
+        """Embed and upsert a chunk of index_fact entries in one call each.
+
+        Raises on any failure; the caller decides whether to retry the
+        chunk or fall back to per-entry processing.
+        """
+        payloads = [e.payload for e in chunk]
+        texts = [
+            f"{p.get('subject', '')} {p.get('predicate', '')} {p.get('object', '')}"
+            for p in payloads
+        ]
+        record_ids = [e.record_id for e in chunk]
+
+        # Embed all texts in one batch call (sync, run in thread)
+        if self._embedder:
+            vectors = await asyncio.to_thread(self._embedder.embed_batch, texts)
+            if len(vectors) != len(texts):
+                raise RuntimeError(
+                    f"embed_batch returned {len(vectors)} vectors for {len(texts)} texts"
+                )
+
+            if self._qdrant:
+                import uuid
+
+                points = []
+                for i, payload in enumerate(payloads):
+                    point_uuid = str(
+                        uuid.uuid5(uuid.NAMESPACE_DNS, f"fact:{record_ids[i]}")
+                    )
+                    points.append(
+                        {
+                            "id": point_uuid,
+                            "vector": vectors[i],
+                            "payload": {
+                                "subject": payload.get("subject", ""),
+                                "predicate": payload.get("predicate", ""),
+                                "object": payload.get("object", ""),
+                                "source": payload.get("source", ""),
+                                "memory_type": "fact",
+                            },
+                        }
+                    )
+                ok = await self._qdrant.upsert_batch(points)
+                if not ok:
+                    raise RuntimeError(
+                        f"upsert_batch returned False for {len(points)} points"
+                    )
+            else:
+                logger.warning("_process_fact_chunk: no vector provider — skipping upsert")
+
+        # Sync to graph in one batch (single snapshot write for the chunk
+        # instead of ~6 per fact).
+        if self._graph_router:
+            await asyncio.to_thread(self._graph_router.sync_facts_batch, payloads)
 
     async def _process_entry(
         self,

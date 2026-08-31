@@ -491,6 +491,132 @@ class TestOutboxWorker:
             assert pending[0].record_id == "crash-test"
             assert pending[0].status == "pending"
 
+    async def test_fact_batch_completes_all_entries(self, outbox_worker, qdrant_provider, embedder):
+        """Batch path: many index_fact entries are all completed and indexed."""
+        # Chunk size is 32; add more than one chunk to exercise chunking.
+        total = 70
+        async with outbox_worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            for i in range(total):
+                await repo.add_entry(
+                    record_type="fact",
+                    record_id=f"batch-{i}",
+                    operation="index_fact",
+                    payload={
+                        "subject": f"BatchSubject{i}",
+                        "predicate": "is",
+                        "object": f"BatchObject{i}",
+                        "source": "test",
+                    },
+                )
+            await session.commit()
+
+        assert await outbox_worker._poll_once() == total
+
+        async with outbox_worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            pending = await repo.get_pending()
+            assert len(pending) == 0
+
+        # Spot-check that the vectors landed in Qdrant.
+        vector = await asyncio.to_thread(embedder.embed, "BatchSubject7 is BatchObject7")
+        search_results = await qdrant_provider.search(
+            vector=vector,
+            limit=5,
+            score_threshold=0.0,
+        )
+        found = any(r["payload"].get("subject") == "BatchSubject7" for r in search_results)
+        assert found, "Batch-embedded fact should be indexed in Qdrant"
+
+    async def test_fact_batch_falls_back_per_entry_on_bad_payload(self, outbox_worker, qdrant_provider):
+        """A malformed payload must not poison the whole batch.
+
+        The chunk containing the bad entry falls back to per-entry handling:
+        the bad entry gets retried, healthy entries in the same chunk still
+        complete, and healthy entries in other chunks are untouched.
+        """
+        async with outbox_worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            for i in range(70):
+                await repo.add_entry(
+                    record_type="fact",
+                    record_id=f"mixed-{i}",
+                    operation="index_fact",
+                    payload={
+                        "subject": f"Mixed{i}",
+                        "predicate": "is",
+                        "object": f"Val{i}",
+                        "source": "test",
+                    },
+                )
+            # Corrupt one payload directly in the DB (as a rogue writer would).
+            from sqlalchemy import text as sa_text
+
+            await session.flush()  # ensure inserted rows exist before UPDATE
+            await session.execute(
+                sa_text(
+                    "UPDATE outbox_entries SET payload_json = 'not-json' "
+                    "WHERE record_id = 'mixed-31'"
+                )
+            )
+            await session.commit()
+
+        # Processing must not raise: the bad chunk falls back per-entry.
+        await outbox_worker._poll_once()
+
+        async with outbox_worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            pending = await repo.get_pending()
+            # 69 healthy entries should be completed; only the bad one remains.
+            assert len(pending) == 1
+            assert pending[0].record_id == "mixed-31"
+            assert pending[0].retry_count == 1
+
+    async def test_maybe_compact_passes_cleanup_older_than(self, tmp_path):
+        """Compaction must pass an explicit cleanup_older_than threshold.
+
+        Regression: _maybe_compact() called optimize() with no threshold, so
+        LanceDB's ~7-day default applied and deleted nothing on a busy store
+        where every version is younger than a week — versions accumulated to
+        hundreds of GB. The worker must schedule compaction with an explicit
+        sub-week cleanup_older_than and run it as a background task.
+        """
+        from datetime import timedelta
+
+        from storage.outbox_worker import (
+            COMPACT_CLEANUP_OLDER_THAN,
+            COMPACT_INTERVAL_SECONDS,
+        )
+
+        captured = {}
+
+        class FakeOptimizeProvider:
+            async def optimize(self, **kwargs):
+                captured["kwargs"] = kwargs
+                return True
+
+        worker = OutboxWorker(
+            db_url=f"sqlite+aiosqlite:///{tmp_path / 'compact-test.db'}",
+            qdrant=FakeOptimizeProvider(),
+        )
+        worker._last_compact_at = 0.0  # force first run
+
+        # Give the background task a chance to run.
+        await asyncio.sleep(0.2)
+        await worker._maybe_compact()
+        await asyncio.sleep(0.2)
+
+        assert "kwargs" in captured, "optimize() was never called"
+        kw = captured["kwargs"]
+        assert "cleanup_older_than" in kw, (
+            "optimize() must receive an explicit cleanup_older_than"
+        )
+        assert kw["cleanup_older_than"] <= timedelta(hours=1), (
+            f"cleanup_older_than must be sub-week, got {kw['cleanup_older_than']}"
+        )
+        assert COMPACT_CLEANUP_OLDER_THAN == timedelta(hours=1)
+        assert COMPACT_INTERVAL_SECONDS > 0
+
 
 # =============================================================================
 # Server Integration Tests
