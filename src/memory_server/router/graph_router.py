@@ -16,6 +16,20 @@ from memory_server.providers.graph_provider import SimpleGraph
 logger = logging.getLogger(__name__)
 
 
+def _valid_triple(t) -> bool:
+    """Return True if *t* is a valid fact triple dict.
+
+    A valid triple is a dict with all three of ``subject``, ``predicate``,
+    ``object`` present as non-empty strings. ``str.strip()`` rejects both
+    ASCII and Unicode whitespace (``"   "``, ``"\\t"``, ``"\\u00a0"``,
+    ``"\\u2003"``). Extra keys are allowed and ignored.
+    """
+    return isinstance(t, dict) and all(
+        isinstance(v, str) and v.strip()
+        for v in (t.get("subject"), t.get("predicate"), t.get("object"))
+    )
+
+
 class GraphRouter:
     """Routes queries through entity relation lookups in the knowledge graph.
 
@@ -170,6 +184,75 @@ class GraphRouter:
                 target_id=obj_id,
                 relation=predicate,
             )
+
+    def sync_facts_batch(self, triples: list[dict[str, Any]]) -> None:
+        """Sync a batch of facts into the graph with a single snapshot write.
+
+        Each triple is a dict with ``subject``, ``predicate``, ``object`` keys.
+        Creates any missing nodes exactly once, then adds edges deduplicated
+        by ``(source_id, target_id, relation)`` so two facts sharing the same
+        subject/object but different predicates both keep their edges (S7).
+
+        All mutations run with persistence suspended and the graph snapshot is
+        written exactly once at the end, replacing the ~6 full snapshot writes
+        per fact of the per-entry ``sync_fact`` path.
+
+        Args:
+            triples: List of fact dicts with subject/predicate/object keys.
+        """
+        # Input validation — atomic by construction: every triple is checked
+        # BEFORE any graph mutation (no nodes, edges, or snapshot writes), so
+        # an invalid batch is rejected as a whole with no partial writes
+        # (Card 2, AC2). None / non-list containers raise ValueError.
+        if not isinstance(triples, list):
+            raise ValueError(
+                "sync_facts_batch expects a list of triples, "
+                f"got {type(triples).__name__}"
+            )
+        if not triples:
+            return
+
+        for triple in triples:
+            if not _valid_triple(triple):
+                logger.warning("sync_facts_batch rejected invalid triple: %r", triple)
+                raise ValueError(f"invalid triple in sync_facts_batch: {triple!r}")
+
+        # Collect unique node ids/names up front.
+        pending_nodes: dict[str, str] = {}
+        for triple in triples:
+            subj = triple.get("subject", "")
+            obj = triple.get("object", "")
+            pending_nodes[self._to_node_id(subj)] = subj
+            pending_nodes[self._to_node_id(obj)] = obj
+
+        with self._graph.suspend_persistence():
+            # One pass to determine which nodes already exist, then add the rest.
+            for nid, name in pending_nodes.items():
+                if self._graph.get_node(nid) is None:
+                    self._graph.add_node(id=nid, type="entity", name=name)
+
+            # Add edges, deduped by (source_id, target_id, relation).
+            seen: set[tuple[str, str, str]] = set()
+            for triple in triples:
+                source_id = self._to_node_id(triple.get("subject", ""))
+                target_id = self._to_node_id(triple.get("object", ""))
+                relation = triple.get("predicate", "")
+                key = (source_id, target_id, relation)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if (
+                    self._graph.get_edge(source_id, target_id, relation=relation)
+                    is None
+                ):
+                    self._graph.add_edge(
+                        source_id=source_id,
+                        target_id=target_id,
+                        relation=relation,
+                    )
+
+        # Single disk write for the whole batch.
+        self._graph.save_snapshot()
 
     def sync_decision(
         self,
