@@ -20,6 +20,7 @@ from memory_server.evaluation.relation import (
 )
 from memory_server.models.belief import Belief
 from memory_server.providers.sqlite_provider import SQLiteProvider
+from memory_server.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,9 @@ OPPOSITE_SENTIMENT: dict[str, str] = {
 
 # Timeout guard for large contradiction scans
 # O(n²) pairwise comparison: 447 beliefs ≈ 100K pairs, ~1s at Python speed
-MAX_CONTRADICTION_PAIRS = 100_000
-_MAX_BELIEFS_FOR_CONTRADICTION = 447  # derived: sqrt(2 * MAX_CONTRADICTION_PAIRS)
+# Settings-derived alias (single source: settings.max_contradiction_pairs).
+MAX_CONTRADICTION_PAIRS = get_settings().max_contradiction_pairs
+_MAX_BELIEFS_FOR_CONTRADICTION = int((2 * MAX_CONTRADICTION_PAIRS) ** 0.5)  # 447, unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +153,7 @@ class ReflectEngine:
             min_confidence=min_confidence if min_confidence > 0 else None,
             lifecycle_state=None,  # all states
             include_inactive=True,
-            limit=limit if limit > 0 else 10000,  # effectively unlimited
+            limit=limit if limit > 0 else get_settings().reflect_belief_cap,  # effectively-unlimited cap from Settings
         )
 
     async def overview(
@@ -232,14 +234,17 @@ class ReflectEngine:
 
         # Decaying next 7d estimate: count beliefs nearing stale (age > 60% TTL for belief=180d)
         decaying_next_7d = 0
+        _s = get_settings()
+        belief_ttl = _s.ttl_days.get("belief", _s.decay_default_ttl_days)  # Decision 7 fallback
+        stale_ratio = _s.decay_stale_ratio
         for b in beliefs:
             created = _naive_dt(b.created_at)
             if created:
                 now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
                 age = (now_naive - created).total_seconds() / 86400.0
-                # belief TTL = 180 days: stale at 70% = 126 days
-                stale_ratio = 0.7
-                if age >= (180 * stale_ratio * 0.9) and b.lifecycle_state == "active":
+                # 0.9 = "within 10% of stale threshold" proximity heuristic, kept for
+                # compat (NOT the forecast window — see PLAN Design decision 3).
+                if age >= (belief_ttl * stale_ratio * 0.9) and b.lifecycle_state == "active":
                     # within 10% of stale threshold
                     decaying_next_7d += 1
 
@@ -393,11 +398,17 @@ class ReflectEngine:
     ) -> dict[str, Any]:
         """Analyse which beliefs are approaching lifecycle transitions.
 
-        Uses belief TTL of 180 days for decay calculations.
+        TTL / ratios / forecast window come from Settings (single source).
         """
         beliefs = await self._fetch_beliefs(topic, min_confidence, limit)
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-        belief_ttl = 180.0  # days (from decay.py PER_TYPE_TTL)
+        _s = get_settings()
+        # fallback: settings can yield a PARTIAL ttl_days (nested-only/partial JSON env);
+        # missing 'belief' → decay_default_ttl_days (90.0), never KeyError (Design decision 7)
+        belief_ttl = _s.ttl_days.get("belief", _s.decay_default_ttl_days)
+        stale_ratio = _s.decay_stale_ratio
+        forgotten_ratio = _s.decay_forgotten_ratio
+        window = _s.decay_forecast_window_days
 
         stale_now = 0
         stale_7d = 0
@@ -417,16 +428,16 @@ class ReflectEngine:
                 for tag in b.tags or []:
                     by_tag_stale[tag] = by_tag_stale.get(tag, 0) + 1
 
-            # Active → stale within 7 days (70% TTL = 126 days)
-            if b.lifecycle_state == "active" and 0.7 * belief_ttl <= age + 7:
+            # Active → stale within window (stale_ratio * TTL = 126 days default)
+            if b.lifecycle_state == "active" and stale_ratio * belief_ttl <= age + window:
                 stale_7d += 1
 
-            # Stale → archived within 7 days (100% TTL = 180 days)
-            if b.lifecycle_state == "stale" and age + 7 >= belief_ttl:
+            # Stale → archived within window (100% TTL = 180 days default)
+            if b.lifecycle_state == "stale" and age + window >= belief_ttl:
                 archived_7d += 1
 
-            # Archived → forgotten within 7 days (200% TTL = 360 days)
-            if b.lifecycle_state == "archived" and age + 7 >= 2.0 * belief_ttl:
+            # Archived → forgotten within window (forgotten_ratio * TTL = 360 days default)
+            if b.lifecycle_state == "archived" and age + window >= forgotten_ratio * belief_ttl:
                 forgotten_7d += 1
 
         recommendation = ""
