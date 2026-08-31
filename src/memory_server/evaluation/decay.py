@@ -14,24 +14,18 @@ from typing import Any
 
 from memory_server.evaluation.validator import Validator
 from memory_server.models.receipt import LifecycleState
+from memory_server.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Per-type TTLs (in days for production, hours for testing)
-PER_TYPE_TTL: dict[str, float] = {
-    "fact": 90.0,       # 90 days
-    "decision": 180.0,  # 180 days
-    "skill": 365.0,     # 365 days
-    "entity": 365.0,    # 365 days
-    "belief": 180.0,    # 180 days (Card 001)
-}
-
-DEFAULT_ARCHIVE_THRESHOLD = 0.2
-
-# Lifecycle state TTL ratios
-STALE_RATIO = 0.7       # 70% of TTL → active → stale
-ARCHIVE_RATIO = 1.0     # 100% of TTL → stale → archived
-FORGOTTEN_RATIO = 2.0   # 200% of TTL → archived → forgotten
+# Settings-derived aliases (single source: settings.py). Snapshot at import;
+# kept for backward-compatible imports. Behavior follows Settings via
+# DecayEngine.__init__ (live get_settings()).
+PER_TYPE_TTL: dict[str, float] = dict(get_settings().ttl_days)
+DEFAULT_ARCHIVE_THRESHOLD: float = get_settings().decay_archive_threshold
+STALE_RATIO: float = get_settings().decay_stale_ratio
+ARCHIVE_RATIO: float = get_settings().decay_archive_ratio
+FORGOTTEN_RATIO: float = get_settings().decay_forgotten_ratio
 
 
 class DecayEngine:
@@ -46,13 +40,26 @@ class DecayEngine:
     def __init__(
         self,
         per_type_ttl: dict[str, float] | None = None,
-        archive_threshold: float = DEFAULT_ARCHIVE_THRESHOLD,
+        archive_threshold: float | None = None,
         validator: Validator | None = None,
+        stale_ratio: float | None = None,
+        archive_ratio: float | None = None,
+        forgotten_ratio: float | None = None,
+        default_ttl_days: float | None = None,
+        decay_base: float | None = None,
+        confidence_floor: float | None = None,
     ) -> None:
-        self._per_type_ttl = dict(PER_TYPE_TTL)
+        _s = get_settings()
+        self._per_type_ttl = dict(_s.ttl_days)
         if per_type_ttl:
             self._per_type_ttl.update(per_type_ttl)
-        self._archive_threshold = archive_threshold
+        self._archive_threshold = _s.decay_archive_threshold if archive_threshold is None else archive_threshold
+        self._stale_ratio = _s.decay_stale_ratio if stale_ratio is None else stale_ratio
+        self._archive_ratio = _s.decay_archive_ratio if archive_ratio is None else archive_ratio
+        self._forgotten_ratio = _s.decay_forgotten_ratio if forgotten_ratio is None else forgotten_ratio
+        self._default_ttl_days = _s.decay_default_ttl_days if default_ttl_days is None else default_ttl_days
+        self._decay_base = _s.decay_base if decay_base is None else decay_base
+        self._confidence_floor = _s.decay_confidence_floor if confidence_floor is None else confidence_floor
         self._validator = validator or Validator()
         # Items registered for decay tracking
         self._items: dict[str, dict[str, Any]] = {}
@@ -172,7 +179,7 @@ class DecayEngine:
 
         if created_at is not None:
             age_days = self._age_in_days(created_at)
-            ttl = self._per_type_ttl.get(item_type, 90.0)
+            ttl = self._per_type_ttl.get(item_type, self._default_ttl_days)
             if age_days > ttl:
                 return True
 
@@ -189,7 +196,7 @@ class DecayEngine:
         for item_id, item in self._items.items():
             created_at = item["created_at"]
             age_days = (now - created_at).total_seconds() / 86400.0
-            ttl = self._per_type_ttl.get(item["type"], 90.0)
+            ttl = self._per_type_ttl.get(item["type"], self._default_ttl_days)
             if age_days > ttl:
                 expired.append(dict(item))
         return expired
@@ -215,7 +222,7 @@ class DecayEngine:
 
         created_at = item["created_at"]
         age_days = self._age_in_days(created_at)
-        ttl = self._per_type_ttl.get(item["type"], 90.0)
+        ttl = self._per_type_ttl.get(item["type"], self._default_ttl_days)
         if ttl <= 0:
             return None
 
@@ -231,7 +238,7 @@ class DecayEngine:
         new_state: str | None = None
 
         # Check transitions in forward order
-        if current_state in ("active",) and age_ratio >= STALE_RATIO:
+        if current_state in ("active",) and age_ratio >= self._stale_ratio:
             reason = f"Decay: {age_ratio:.1%} of TTL"
             try:
                 self._validator.mark_stale(item_id, reason=reason)
@@ -243,7 +250,7 @@ class DecayEngine:
                     item_id, current_state, reason, exc,
                 )
 
-        elif current_state in ("superseded",) and age_ratio >= STALE_RATIO:
+        elif current_state in ("superseded",) and age_ratio >= self._stale_ratio:
             reason = f"Superseded decay: {age_ratio:.1%} of TTL"
             try:
                 self._validator.mark_stale(item_id, reason=reason)
@@ -255,7 +262,7 @@ class DecayEngine:
                     item_id, current_state, reason, exc,
                 )
 
-        elif current_state in ("contradicted",) and age_ratio >= STALE_RATIO:
+        elif current_state in ("contradicted",) and age_ratio >= self._stale_ratio:
             reason = f"Contradicted decay: {age_ratio:.1%} of TTL"
             try:
                 self._validator.mark_stale(item_id, reason=reason)
@@ -267,7 +274,7 @@ class DecayEngine:
                     item_id, current_state, reason, exc,
                 )
 
-        elif current_state in ("discarded",) and age_ratio >= ARCHIVE_RATIO:
+        elif current_state in ("discarded",) and age_ratio >= self._archive_ratio:
             reason = f"Discarded TTL expired: {age_ratio:.1%} of TTL"
             try:
                 self._validator.archive(item_id, reason=reason)
@@ -279,7 +286,7 @@ class DecayEngine:
                     item_id, current_state, reason, exc,
                 )
 
-        elif current_state in ("stale",) and age_ratio >= ARCHIVE_RATIO:
+        elif current_state in ("stale",) and age_ratio >= self._archive_ratio:
             reason = f"TTL expired: {age_ratio:.1%} of TTL"
             try:
                 self._validator.archive(item_id, reason=reason)
@@ -291,7 +298,7 @@ class DecayEngine:
                     item_id, current_state, reason, exc,
                 )
 
-        elif current_state in ("archived",) and age_ratio >= FORGOTTEN_RATIO:
+        elif current_state in ("archived",) and age_ratio >= self._forgotten_ratio:
             reason = f"Extended TTL expired: {age_ratio:.1%} of TTL"
             try:
                 self._validator.forget(item_id, reason=reason)
@@ -338,11 +345,11 @@ class DecayEngine:
         if created_at is None:
             return confidence
         age_days = self._age_in_days(created_at)
-        ttl = self._per_type_ttl.get(item_type, 90.0)
+        ttl = self._per_type_ttl.get(item_type, self._default_ttl_days)
         if ttl <= 0:
             return confidence
         ratio = age_days / ttl
-        decay_factor = max(0.1, 2.0 ** (-ratio))
+        decay_factor = max(self._confidence_floor, self._decay_base ** (-ratio))
         return confidence * decay_factor
 
     @staticmethod
@@ -356,4 +363,4 @@ class DecayEngine:
 
     def get_ttl(self, item_type: str) -> float:
         """Get the TTL for a given item type."""
-        return self._per_type_ttl.get(item_type, 90.0)
+        return self._per_type_ttl.get(item_type, self._default_ttl_days)
