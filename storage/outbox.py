@@ -10,11 +10,11 @@ as failed.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Integer, String, Text, select
+from sqlalchemy import DateTime, Integer, String, Text, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -226,6 +226,7 @@ class OutboxRepository:
         if orm is None:
             return False
         orm.status = "processing"
+        orm.processed_at = utcnow()
         # Note: caller must commit
         return True
 
@@ -292,3 +293,29 @@ class OutboxRepository:
         )
         result = await self._session.execute(stmt)
         return len(result.scalars().all())
+
+    async def reset_stale_processing(self, max_age_seconds: int = 600) -> int:
+        """Reset entries stuck in ``processing`` back to ``pending``.
+
+        A worker crash between claim (mark_processing) and completion would
+        otherwise leave entries in ``processing`` forever; they would never
+        be re-picked by get_pending(). Entries whose processing started
+        longer than ``max_age_seconds`` ago are considered stale and reset.
+
+        Args:
+            max_age_seconds: Age threshold for a stale processing entry.
+
+        Returns:
+            Number of entries reset.
+        """
+        cutoff = utcnow() - timedelta(seconds=max_age_seconds)
+        stmt = (
+            update(OutboxEntryORM)
+            .where(
+                OutboxEntryORM.status == "processing",
+                OutboxEntryORM.processed_at < cutoff,
+            )
+            .values(status="pending", processed_at=None)
+        )
+        result = await self._session.execute(stmt)
+        return getattr(result, "rowcount", 0) or 0

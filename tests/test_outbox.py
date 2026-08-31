@@ -13,7 +13,7 @@ import logging
 import os
 import subprocess
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy.ext.asyncio import (
@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from storage.base import Base
+from storage.base import Base, utcnow
 from storage.outbox import OutboxEntry, OutboxEntryORM, OutboxRepository
 from storage.outbox_worker import OutboxWorker
 
@@ -247,6 +247,105 @@ class TestOutboxRepository:
             assert len(failed) == 1
             assert failed[0].retry_count == 3
             assert failed[0].status == "failed"
+
+    async def test_reset_stale_processing_resets_stale_entry(self, empty_db):
+        """A processing entry older than the cutoff is reset to pending."""
+        factory, _ = empty_db
+        async with factory() as session:
+            repo = OutboxRepository(session)
+            entry = await repo.add_entry(
+                "fact", "f-reset-stale", "index_fact", {"subject": "Stale", "object": "Reset"}
+            )
+            await repo.mark_processing(entry.id)
+            await session.commit()
+            orm = await session.get(OutboxEntryORM, entry.id)
+            orm.processed_at = utcnow() - timedelta(seconds=900)
+            await session.commit()
+
+            assert await repo.reset_stale_processing(max_age_seconds=600) == 1
+            await session.commit()
+
+            pending = await repo.get_pending()
+            assert len(pending) == 1
+            assert pending[0].id == entry.id
+            assert pending[0].status == "pending"
+            assert pending[0].processed_at is None
+
+    async def test_reset_stale_processing_keeps_fresh_entry(self, empty_db):
+        """A processing entry newer than the cutoff is NOT reset."""
+        factory, _ = empty_db
+        async with factory() as session:
+            repo = OutboxRepository(session)
+            entry = await repo.add_entry(
+                "fact", "f-fresh", "index_fact", {"subject": "Fresh", "object": "Kept"}
+            )
+            await repo.mark_processing(entry.id)
+            await session.commit()
+            orm = await session.get(OutboxEntryORM, entry.id)
+            orm.processed_at = utcnow() - timedelta(seconds=100)
+            await session.commit()
+
+            assert await repo.reset_stale_processing(max_age_seconds=600) == 0
+            await session.commit()
+
+            assert await repo.get_pending() == []
+            orm = await session.get(OutboxEntryORM, entry.id)
+            assert orm.status == "processing"
+
+    async def test_reset_stale_processing_max_age_override(self, empty_db):
+        """max_age_seconds override tightens the staleness window."""
+        factory, _ = empty_db
+        async with factory() as session:
+            repo = OutboxRepository(session)
+            entry = await repo.add_entry(
+                "fact", "f-override", "index_fact", {"subject": "Override", "object": "Window"}
+            )
+            await repo.mark_processing(entry.id)
+            await session.commit()
+            orm = await session.get(OutboxEntryORM, entry.id)
+            orm.processed_at = utcnow() - timedelta(seconds=300)
+            await session.commit()
+
+            # Default window (600s) does not consider a 300s-old entry stale.
+            assert await repo.reset_stale_processing() == 0
+            await session.commit()
+
+            # Tightened window (120s) does.
+            assert await repo.reset_stale_processing(max_age_seconds=120) == 1
+            await session.commit()
+
+            pending = await repo.get_pending()
+            assert len(pending) == 1
+            assert pending[0].id == entry.id
+            assert pending[0].status == "pending"
+
+    async def test_reset_stale_processing_rowcount(self, empty_db):
+        """Returns the exact number of entries reset; 0 when none are stale."""
+        factory, _ = empty_db
+        async with factory() as session:
+            repo = OutboxRepository(session)
+            stale_ids = []
+            for i in range(2):
+                e = await repo.add_entry("fact", f"f-stale-{i}", "index_fact", {"x": i})
+                await repo.mark_processing(e.id)
+                stale_ids.append(e.id)
+            fresh = await repo.add_entry("fact", "f-fresh", "index_fact", {"x": 9})
+            await repo.mark_processing(fresh.id)
+            await session.commit()
+
+            for eid in stale_ids:
+                orm = await session.get(OutboxEntryORM, eid)
+                orm.processed_at = utcnow() - timedelta(seconds=900)
+            orm = await session.get(OutboxEntryORM, fresh.id)
+            orm.processed_at = utcnow() - timedelta(seconds=100)
+            await session.commit()
+
+            assert await repo.reset_stale_processing(max_age_seconds=600) == 2
+            await session.commit()
+
+            # Nothing stale left: the fresh entry is still processing but young.
+            assert await repo.reset_stale_processing(max_age_seconds=600) == 0
+            await session.commit()
 
 
 # =============================================================================
@@ -883,6 +982,71 @@ class TestOutboxWorker:
             assert "sync_facts_batch returned False" in caplog.text
         finally:
             await worker.close()
+
+    async def test_poll_once_recovers_stale_processing(self, outbox_worker, qdrant_provider):
+        """_poll_once() resets a stale processing entry and re-processes it.
+
+        Recovery path (MANDATORY): reset_stale_processing is only called by
+        _poll_once() (outbox_worker.py:220), NOT by process_all_pending().
+        A crash between claim and completion leaves an entry stuck in
+        "processing"; _poll_once must reset it to pending, re-pick it, and
+        complete it — all without AttributeError.
+        """
+        await qdrant_provider.create_collection("memory_facts")
+
+        async with outbox_worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            entry = await repo.add_entry(
+                record_type="fact",
+                record_id=str(uuid.uuid4()),
+                operation="index_fact",
+                payload={
+                    "subject": "Stale",
+                    "predicate": "recovers",
+                    "object": "ViaPollOnce",
+                    "source": "test",
+                },
+            )
+            await repo.mark_processing(entry.id)
+            await session.commit()
+            orm = await session.get(OutboxEntryORM, entry.id)
+            orm.processed_at = utcnow() - timedelta(seconds=900)
+            await session.commit()
+
+        attempted = await outbox_worker._poll_once()
+        assert attempted == 1
+
+        async with outbox_worker._session_factory() as session:
+            orm = await session.get(OutboxEntryORM, entry.id)
+            assert orm is not None
+            assert orm.status == "completed"
+
+    async def test_process_all_pending_smoke_own_contract(self, outbox_worker, qdrant_provider):
+        """process_all_pending() processes a fresh pending entry (own contract).
+
+        Scoped deliberately: process_all_pending() (outbox_worker.py:571-601)
+        only calls get_pending() — it does NOT call reset_stale_processing.
+        No stale state is involved here; reset is _poll_once()'s contract.
+        """
+        await qdrant_provider.create_collection("memory_facts")
+
+        async with outbox_worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            await repo.add_entry(
+                record_type="fact",
+                record_id=str(uuid.uuid4()),
+                operation="index_fact",
+                payload={
+                    "subject": "Fresh",
+                    "predicate": "is",
+                    "object": "Processed",
+                    "source": "test",
+                },
+            )
+            await session.commit()
+
+        result = await outbox_worker.process_all_pending()
+        assert result == {"processed": 1, "failed": 0}
 
 
 # =============================================================================
