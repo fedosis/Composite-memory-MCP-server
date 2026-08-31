@@ -537,8 +537,12 @@ class HermesProvider:
             f for f in context.get("facts", [])
             if f.get("confidence", 1.0) >= min_confidence
         ]
+        filtered_decisions = [
+            d for d in context.get("decisions", [])
+            if d.get("confidence", 1.0) >= min_confidence
+        ]
 
-        if not filtered_facts and not context.get("decisions"):
+        if not filtered_facts and not filtered_decisions:
             return ""
 
         # Format as a system prompt block
@@ -550,9 +554,9 @@ class HermesProvider:
                 f"{fact.get('object', '?')}"
                 f" (confidence: {fact.get('confidence', 1.0):.2f})"
             )
-        if context.get("decisions"):
+        if filtered_decisions:
             lines.append("  Decisions:")
-            for dec in context["decisions"]:
+            for dec in filtered_decisions:
                 lines.append(f"    - {dec.get('context', '?')}: {dec.get('choice', '?')}")
         lines.append("--- End Memory Context ---")
 

@@ -48,14 +48,21 @@ async def get_context(
             if f.id not in existing_ids:
                 facts.append(f)
 
-    # Decisions: search by context text
-    decisions = []  # Full decision search will be added in later cards
+    # Decisions: search by context text (Decision model has no subject field)
+    decisions = await provider.search_decisions(
+        text=task if task else None,
+        limit=max_results,
+    )
+    if not include_inactive:
+        active_states = {"candidate", "validated", "active"}
+        decisions = [d for d in decisions if d.lifecycle_state in active_states]
+    decisions = decisions[:max_results]
 
     # Limit to max_results
     facts = facts[:max_results]
 
     return {
         "facts": [f.model_dump(mode="json") for f in facts],
-        "decisions": decisions,
-        "total": len(facts),
+        "decisions": [d.model_dump(mode="json") for d in decisions],
+        "total": len(facts) + len(decisions),
     }

@@ -15,10 +15,11 @@ import time
 
 import pytest
 
+from memory_server.models import Decision
 from memory_server.plugins.hermes.config import (
     HermesPluginConfig,
 )
-from memory_server.plugins.hermes.provider import HermesProvider
+from memory_server.plugins.hermes.provider import HermesProvider, _run_async
 from memory_server.providers.embedding_provider import MockEmbeddingProvider
 
 
@@ -526,6 +527,52 @@ class TestHermesProviderPrefetch:
         assert len(result) > 0
         assert "Hermes" in result
         provider.shutdown()
+
+    def test_prefetch_includes_decisions(self):
+        """Matching decisions appear in the Memory Context block."""
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="test",
+            config={"db_url": "sqlite+aiosqlite://"},
+        )
+        try:
+            _run_async(provider._provider.create_decision(
+                Decision(
+                    id="pd1",
+                    context="Hermes",
+                    choice="Use native CMMS provider",
+                    reason="Faster than MCP transport",
+                )
+            ))
+            result = provider.prefetch(query="Hermes")
+            assert "--- Memory Context ---" in result
+            assert "Decisions:" in result
+            assert "Use native CMMS provider" in result
+        finally:
+            provider.shutdown()
+
+    def test_prefetch_filters_low_confidence_decisions(self):
+        """Decisions below min_confidence (0.8) are excluded from the block."""
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="test",
+            config={"db_url": "sqlite+aiosqlite://"},
+        )
+        try:
+            _run_async(provider._provider.create_decision(
+                Decision(
+                    id="pd2",
+                    context="Hermes",
+                    choice="Low confidence choice",
+                    reason="Uncertain",
+                    confidence=0.5,
+                )
+            ))
+            result = provider.prefetch(query="Hermes")
+            assert "Decisions:" not in result
+            assert "Low confidence choice" not in result
+        finally:
+            provider.shutdown()
 
 
 class TestHermesProviderSessionHooks:

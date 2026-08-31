@@ -3,7 +3,7 @@
 import pytest
 
 from memory_server.api.get_context import get_context
-from memory_server.models import Fact
+from memory_server.models import Decision, Fact
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
 
@@ -60,3 +60,52 @@ class TestGetContext:
         result = await get_context(provider, task="", subject="Caddy")
         assert result["total"] >= 1
         assert any(f["subject"] == "Caddy" for f in result["facts"])
+
+    async def test_get_context_returns_decisions(self, provider):
+        await provider.create_decision(
+            Decision(
+                id="d1",
+                context="Docker",
+                choice="Use OMV8 for Docker",
+                reason="OMV8 handles Docker containers well",
+            )
+        )
+        result = await get_context(provider, task="Docker")
+        assert result["decisions"], "expected at least one decision"
+        assert result["decisions"][0]["context"] == "Docker"
+        assert result["decisions"][0]["choice"] == "Use OMV8 for Docker"
+        assert result["total"] == len(result["facts"]) + len(result["decisions"])
+
+    async def test_get_context_no_decisions_when_no_match(self, provider):
+        await provider.create_decision(
+            Decision(
+                id="d2",
+                context="Postgres",
+                choice="Keep Postgres",
+                reason="Already deployed",
+            )
+        )
+        result = await get_context(provider, task="XYZZZDoesNotExist")
+        assert result["decisions"] == []
+        assert result["total"] == 0
+
+    async def test_get_context_excludes_inactive_decisions(self, provider):
+        await provider.create_decision(
+            Decision(
+                id="d3",
+                context="Caddy",
+                choice="Use Caddy",
+                reason="Docker integration",
+                lifecycle_state="archived",
+            )
+        )
+        default_result = await get_context(provider, task="Caddy")
+        assert default_result["decisions"] == []
+
+        inclusive_result = await get_context(
+            provider, task="Caddy", include_inactive=True
+        )
+        assert any(d["id"] == "d3" for d in inclusive_result["decisions"])
+        assert inclusive_result["total"] == (
+            len(inclusive_result["facts"]) + len(inclusive_result["decisions"])
+        )
