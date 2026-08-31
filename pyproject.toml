@@ -50,6 +50,9 @@ dev = [
 [project.scripts]
 memory-server = "memory_server.cli:app"
 
+[project.entry-points."hermes_agent.memory_providers"]
+memory_server = "memory_server.plugins.hermes:HermesProvider"
+
 [project.urls]
 Homepage = "https://github.com/fedosis/Composite-memory-MCP-server"
 Repository = "https://github.com/fedosis/Composite-memory-MCP-server"
