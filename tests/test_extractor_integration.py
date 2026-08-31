@@ -5,6 +5,7 @@ is queryable via search/get_context.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
@@ -13,8 +14,18 @@ from mcp.types import TextContent
 
 
 @pytest.fixture
-def server_params():
-    return StdioServerParameters(command="memory-server", args=["serve"])
+def server_params(tmp_path: Path) -> StdioServerParameters:
+    """Return isolated server params — each test gets a unique DB file in tmp_path.
+
+    Never point the spawned server at the production DB: learn() would write
+    test junk (source=e2e-test/round-trip-test) into prod memory.
+    """
+    return StdioServerParameters(
+        command="memory-server",
+        args=["serve"],
+        cwd=str(tmp_path),
+        env={"MEMORY_SERVER_DB_URL": f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}"},
+    )
 
 
 @pytest.mark.asyncio

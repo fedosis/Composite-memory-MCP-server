@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memory_server.models import Decision
+from storage.dedup import ACTIVE_LIFECYCLE_STATES, decision_dedup_key
 from storage.models.decision import DecisionORM
 
 
@@ -26,6 +27,55 @@ class DecisionRepository:
         result = await self._session.get(DecisionORM, decision_id)
         return result.to_pydantic() if result else None
 
+    async def find_existing(
+        self, context: str, choice: str
+    ) -> Optional[Decision]:
+        """Return the best ACTIVE decision matching a normalized (context, choice) key.
+
+        Used by the ingestion write path to deduplicate decisions: the same
+        decision can arrive repeatedly (e.g. under different ``hermes_turn_*``
+        session sources, or as near-duplicate variants whose ``choice`` grew a
+        parenthetical), and should be skipped instead of creating a new row.
+
+        Matching uses the NORMALIZED dedup key (context stripped, choice
+        whitespace-collapsed to a 200-char prefix) — the same key the read
+        path (``get_context``) and the DB partial unique index use, so
+        write-path skip, read-path collapse, and DB constraint all agree.
+
+        Only ACTIVE rows (candidate/validated/active) participate (W3): a
+        rejected/archived decision must NOT permanently block re-ingestion of
+        the same key.
+
+        Among matching rows the BEST one is returned: higher confidence first
+        (W4 — a high-confidence decision must never be hidden behind a
+        low-confidence duplicate), then newest, then highest id.
+
+        Args:
+            context: The decision context (matched after stripping).
+            choice: The decision choice (matched after normalization).
+
+        Returns:
+            The best matching active Decision, or None if none exists.
+        """
+        norm_context, norm_choice = decision_dedup_key(context, choice)
+        stmt = (
+            select(DecisionORM)
+            .where(
+                DecisionORM.context == norm_context,
+                DecisionORM.dedup_key == norm_choice,
+                DecisionORM.lifecycle_state.in_(ACTIVE_LIFECYCLE_STATES),
+            )
+            .order_by(
+                DecisionORM.confidence.desc(),
+                DecisionORM.created_at.desc(),
+                DecisionORM.id.desc(),
+            )
+            .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        return row.to_pydantic() if row else None
+
     async def search(
         self,
         choice: Optional[str] = None,
@@ -42,7 +92,11 @@ class DecisionRepository:
                 | DecisionORM.choice.like(pattern)
                 | DecisionORM.reason.like(pattern)
             )
-        stmt = stmt.limit(limit).order_by(DecisionORM.created_at.desc())
+        # Deterministic ordering: newest first, id DESC as final tie-break so
+        # rows sharing a created_at (same ingestion batch) have a stable order.
+        stmt = stmt.limit(limit).order_by(
+            DecisionORM.created_at.desc(), DecisionORM.id.desc()
+        )
         result = await self._session.execute(stmt)
         return [row.to_pydantic() for row in result.scalars().all()]
 

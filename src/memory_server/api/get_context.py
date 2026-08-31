@@ -6,7 +6,14 @@ or subject and returns structured context to the agent.
 
 from typing import Optional
 
+from storage.dedup import ACTIVE_LIFECYCLE_STATES, decision_dedup_key
+
+from memory_server.models import Decision
 from memory_server.providers.sqlite_provider import SQLiteProvider
+
+# Over-fetch factor for the decisions search: duplicates are dropped after
+# retrieval, so we fetch more than the final budget to still fill it.
+DEDUP_OVERFETCH_FACTOR = 4
 
 
 async def get_context(
@@ -48,15 +55,38 @@ async def get_context(
             if f.id not in existing_ids:
                 facts.append(f)
 
-    # Decisions: search by context text (Decision model has no subject field)
+    # Decisions: search by context text (Decision model has no subject field).
+    # Over-fetch so dedup below can still fill the budget: duplicate decisions
+    # (same context/choice ingested across turns) are collapsed to the most
+    # recent row instead of flooding the injected context block.
     decisions = await provider.search_decisions(
         text=task if task else None,
-        limit=max_results,
+        limit=max_results * DEDUP_OVERFETCH_FACTOR,
     )
     if not include_inactive:
-        active_states = {"candidate", "validated", "active"}
-        decisions = [d for d in decisions if d.lifecycle_state in active_states]
-    decisions = decisions[:max_results]
+        decisions = [d for d in decisions if d.lifecycle_state in ACTIVE_LIFECYCLE_STATES]
+    # Dedup by the NORMALIZED (context, choice) key — (context.strip(),
+    # whitespace-collapsed 200-char prefix of choice) — the same key the write
+    # path (find_existing) and the DB partial unique index use, so
+    # near-duplicate variants of the same decision collapse (W1).
+    # The winner per key is chosen best-first: ACTIVE rows beat inactive ones
+    # (W3 — archived/rejected rows can't evict active ones even with
+    # include_inactive=True), then HIGHER confidence wins (W4 — a
+    # high-confidence decision must never be hidden behind a low-confidence
+    # duplicate), then newest, then highest id (deterministic tie-break).
+    decisions.sort(
+        key=lambda d: (
+            d.lifecycle_state in ACTIVE_LIFECYCLE_STATES,
+            d.confidence,
+            d.created_at,
+            d.id,
+        ),
+        reverse=True,
+    )
+    seen: dict[tuple[str, str], Decision] = {}
+    for d in decisions:
+        seen.setdefault(decision_dedup_key(d.context, d.choice), d)
+    decisions = list(seen.values())[:max_results]
 
     # Limit to max_results
     facts = facts[:max_results]

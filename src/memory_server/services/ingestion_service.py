@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from storage.outbox import OutboxRepository
 from storage.repositories import (
@@ -278,17 +279,68 @@ class MemoryIngestionService:
                     receipts.append(stored_receipt.model_dump(mode="json"))
 
                 for ed in extracted_decisions:
+                    # N3: LLM extractors may emit an explicit None instead of a
+                    # missing key — coerce so the dedup key never crashes and
+                    # Decision(choice=None) can't abort the transaction.
+                    context = (ed.get("context") or "").strip()
+                    choice = ed.get("choice") or ""
+
+                    # Dedup: skip when an ACTIVE decision with the same
+                    # NORMALIZED (context, choice) key already exists. The key
+                    # is (context.strip(), whitespace-collapsed 200-char prefix
+                    # of choice) — identical to the read-path collapse in
+                    # get_context.py and the DB partial unique index, so
+                    # near-duplicate variants of the same decision (e.g. a
+                    # growing parenthetical in `choice`) collapse too (W1).
+                    # Matching is deliberately cross-source — the same real
+                    # decision is re-ingested under different hermes_turn_*
+                    # session prefixes. Only ACTIVE rows participate (W3): a
+                    # rejected/archived row must not permanently block
+                    # re-ingestion of the same decision.
+                    existing = await decision_repo.find_existing(
+                        context=context, choice=choice
+                    )
+                    if existing is not None:
+                        logger.debug(
+                            "Skipping duplicate decision (context=%r, choice=%r): "
+                            "existing id=%s source=%s confidence=%s",
+                            context,
+                            choice,
+                            existing.id,
+                            existing.source,
+                            existing.confidence,
+                        )
+                        continue
+
                     decision_id = str(uuid4())
                     decision = Decision(
                         id=decision_id,
-                        context=ed.get("context", ""),
-                        choice=ed.get("choice", ""),
+                        context=context,
+                        choice=choice,
                         rejected_alternatives=ed.get("alternatives", []),
                         reason=ed.get("reason", ""),
                         source=source,
                         created_at=now,
                     )
-                    stored_decision = await decision_repo.create(decision)
+                    try:
+                        # B1: two concurrent learn() calls can both pass
+                        # find_existing() before either commits. The partial
+                        # unique index on (context, dedup_key) makes the second
+                        # insert fail; the savepoint lets us roll back just the
+                        # losing insert (not the whole transaction) and treat
+                        # it as a duplicate — no new row, receipt, or outbox
+                        # entry.
+                        async with session.begin_nested():
+                            stored_decision = await decision_repo.create(decision)
+                    except IntegrityError:
+                        logger.debug(
+                            "Concurrent duplicate decision insert for "
+                            "(context=%r, choice=%r) — unique index fired, "
+                            "treating as duplicate (race loser)",
+                            context,
+                            choice,
+                        )
+                        continue
 
                     receipt = MemoryReceipt(
                         id=decision_id,
