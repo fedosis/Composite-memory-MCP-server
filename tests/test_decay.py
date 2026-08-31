@@ -3,13 +3,13 @@
 Note: Tests use small hour-based TTLs for quick verification.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from memory_server.evaluation.decay import PER_TYPE_TTL, DecayEngine
 from memory_server.evaluation.validator import Validator as EvValidator
-from memory_server.models.receipt import LifecycleState
 
 # TTLs in hours for testing — passed as days to DecayEngine
 # (decay engine works in days, so 1/24 day = 1 hour)
@@ -336,3 +336,87 @@ class TestDecayEngine:
     def test_tick_unregistered(self, engine):
         """tick on unregistered item returns None."""
         assert engine.tick("nonexistent") is None
+
+
+class TestDecayTransitionFailures:
+    """Card 2, D8: cumulative transition_failures counter + logged skips."""
+
+    def test_counter_starts_zero_and_is_readonly(self, engine):
+        assert engine.transition_failures == 0
+        with pytest.raises(AttributeError):
+            engine.transition_failures = 5
+
+    def test_active_to_stale_failure_then_success_then_failure(
+        self, validator_engine, monkeypatch, caplog
+    ):
+        """Branch 1: fail → 1, successful tick keeps 1, second failure → 2."""
+        caplog.set_level(logging.WARNING, logger="memory_server.evaluation.decay")
+        past = datetime.now(timezone.utc) - timedelta(hours=0.75)
+        validator_engine.register("f1", "fact", past, lifecycle_state="active")
+
+        original = validator_engine._validator.mark_stale
+        state = {"fail": True}
+
+        def flaky_mark_stale(*args, **kwargs):
+            if state["fail"]:
+                raise ValueError("validator refused (injected)")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(validator_engine._validator, "mark_stale", flaky_mark_stale)
+
+        # 1st failure: tick returns None, counter 1, log has id/state/reason.
+        assert validator_engine.tick("f1") is None
+        assert validator_engine.transition_failures == 1
+        assert "decay transition skipped" in caplog.text
+        assert "f1" in caplog.text
+        assert "active" in caplog.text
+        assert "Decay:" in caplog.text  # reason is the pre-try local
+
+        # Successful tick: transitions, counter stays 1 (no reset on success).
+        state["fail"] = False
+        assert validator_engine.tick("f1") == "stale"
+        assert validator_engine.transition_failures == 1
+
+        # 2nd failure (new active item): counter → 2.
+        validator_engine.register("f2", "fact", past, lifecycle_state="active")
+        state["fail"] = True
+        assert validator_engine.tick("f2") is None
+        assert validator_engine.transition_failures == 2
+
+    def test_stale_to_archived_failure_then_success_then_failure(
+        self, validator_engine, monkeypatch, caplog
+    ):
+        """Branch 5: hoisted reason local, KeyError path, cumulative counter."""
+        caplog.set_level(logging.WARNING, logger="memory_server.evaluation.decay")
+        past = datetime.now(timezone.utc) - timedelta(hours=1.5)
+        validator_engine.register("f1", "fact", past, lifecycle_state="stale")
+
+        original = validator_engine._validator.archive
+        state = {"fail": True}
+
+        def flaky_archive(*args, **kwargs):
+            if state["fail"]:
+                raise KeyError("validator refused (injected)")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(validator_engine._validator, "archive", flaky_archive)
+
+        # 1st failure: counter 1, reason from the hoisted pre-try local
+        # (no UnboundLocalError), id + state in the log.
+        assert validator_engine.tick("f1") is None
+        assert validator_engine.transition_failures == 1
+        assert "decay transition skipped" in caplog.text
+        assert "f1" in caplog.text
+        assert "stale" in caplog.text
+        assert "TTL expired:" in caplog.text
+
+        # Successful tick: counter stays 1.
+        state["fail"] = False
+        assert validator_engine.tick("f1") == "archived"
+        assert validator_engine.transition_failures == 1
+
+        # 2nd failure (new stale item): counter → 2.
+        validator_engine.register("f2", "fact", past, lifecycle_state="stale")
+        state["fail"] = True
+        assert validator_engine.tick("f2") is None
+        assert validator_engine.transition_failures == 2

@@ -8,11 +8,14 @@ they transition through the lifecycle:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from memory_server.evaluation.validator import Validator
 from memory_server.models.receipt import LifecycleState
+
+logger = logging.getLogger(__name__)
 
 # Per-type TTLs (in days for production, hours for testing)
 PER_TYPE_TTL: dict[str, float] = {
@@ -53,6 +56,19 @@ class DecayEngine:
         self._validator = validator or Validator()
         # Items registered for decay tracking
         self._items: dict[str, dict[str, Any]] = {}
+        # Cumulative count of lifecycle transitions the validator refused
+        # (ValueError/KeyError) over this engine's lifetime.
+        self._transition_failures: int = 0
+
+    @property
+    def transition_failures(self) -> int:
+        """Cumulative number of failed lifecycle transitions (read-only).
+
+        Increments exactly once per transition the validator refused
+        (``ValueError``/``KeyError``) and never resets — neither per tick
+        nor on success. (fail → success → fail yields 1 → 1 → 2.)
+        """
+        return self._transition_failures
 
     # ------------------------------------------------------------------
     # Registration
@@ -216,50 +232,76 @@ class DecayEngine:
 
         # Check transitions in forward order
         if current_state in ("active",) and age_ratio >= STALE_RATIO:
+            reason = f"Decay: {age_ratio:.1%} of TTL"
             try:
-                self._validator.mark_stale(item_id, reason=f"Decay: {age_ratio:.1%} of TTL")
+                self._validator.mark_stale(item_id, reason=reason)
                 new_state = "stale"
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                self._transition_failures += 1
+                logger.warning(
+                    "decay transition skipped: id=%s state=%s reason=%s err=%s",
+                    item_id, current_state, reason, exc,
+                )
 
         elif current_state in ("superseded",) and age_ratio >= STALE_RATIO:
+            reason = f"Superseded decay: {age_ratio:.1%} of TTL"
             try:
-                reason = f"Superseded decay: {age_ratio:.1%} of TTL"
                 self._validator.mark_stale(item_id, reason=reason)
                 new_state = "stale"
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                self._transition_failures += 1
+                logger.warning(
+                    "decay transition skipped: id=%s state=%s reason=%s err=%s",
+                    item_id, current_state, reason, exc,
+                )
 
         elif current_state in ("contradicted",) and age_ratio >= STALE_RATIO:
+            reason = f"Contradicted decay: {age_ratio:.1%} of TTL"
             try:
-                reason = f"Contradicted decay: {age_ratio:.1%} of TTL"
                 self._validator.mark_stale(item_id, reason=reason)
                 new_state = "stale"
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                self._transition_failures += 1
+                logger.warning(
+                    "decay transition skipped: id=%s state=%s reason=%s err=%s",
+                    item_id, current_state, reason, exc,
+                )
 
         elif current_state in ("discarded",) and age_ratio >= ARCHIVE_RATIO:
+            reason = f"Discarded TTL expired: {age_ratio:.1%} of TTL"
             try:
-                reason = f"Discarded TTL expired: {age_ratio:.1%} of TTL"
                 self._validator.archive(item_id, reason=reason)
                 new_state = "archived"
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                self._transition_failures += 1
+                logger.warning(
+                    "decay transition skipped: id=%s state=%s reason=%s err=%s",
+                    item_id, current_state, reason, exc,
+                )
 
         elif current_state in ("stale",) and age_ratio >= ARCHIVE_RATIO:
+            reason = f"TTL expired: {age_ratio:.1%} of TTL"
             try:
-                self._validator.archive(item_id, reason=f"TTL expired: {age_ratio:.1%} of TTL")
+                self._validator.archive(item_id, reason=reason)
                 new_state = "archived"
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                self._transition_failures += 1
+                logger.warning(
+                    "decay transition skipped: id=%s state=%s reason=%s err=%s",
+                    item_id, current_state, reason, exc,
+                )
 
         elif current_state in ("archived",) and age_ratio >= FORGOTTEN_RATIO:
+            reason = f"Extended TTL expired: {age_ratio:.1%} of TTL"
             try:
-                reason = f"Extended TTL expired: {age_ratio:.1%} of TTL"
                 self._validator.forget(item_id, reason=reason)
                 new_state = "forgotten"
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                self._transition_failures += 1
+                logger.warning(
+                    "decay transition skipped: id=%s state=%s reason=%s err=%s",
+                    item_id, current_state, reason, exc,
+                )
 
         if new_state:
             self._items[item_id]["lifecycle_state"] = new_state
