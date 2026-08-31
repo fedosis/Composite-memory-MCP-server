@@ -2,16 +2,35 @@
 
 v0.6 Phase 6: Uses SQLite FTS5 full-text search when available,
 with backward-compatible LIKE fallback.
+
+FTS-fallback classification (Card 2, D7): the fallback catches ONLY the
+expected SQLite "FTS unavailable / malformed query" situations — catching
+``(SQLAlchemyOperationalError, sqlite3.OperationalError)`` whose message
+matches an FTS marker (``no such table: facts_fts``, ``malformed MATCH
+expression``, ``unable to use function MATCH in the requested context``,
+``no such module: fts5``) means the FTS path is not usable and falling back
+to LIKE/WHERE is correct. ANY other exception type (IntegrityError,
+ProgrammingError, ...) or an OperationalError whose message does NOT match
+(e.g. ``database is locked``, ``database disk image is malformed``,
+``disk I/O error``, ``unable to open database file``) is a REAL DB
+operational failure and must propagate — it is NOT evidence that FTS is
+unavailable, and must never silently fall back or permanently cache
+``_fts5_available = False``.
 """
 
+import logging
+import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select, text
+from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memory_server.models import Fact
 from storage.models.fact import FactORM
+
+logger = logging.getLogger(__name__)
 
 # FTS5 MATCH query wrapper — turns a user text query into an FTS5 query.
 # Supports stemmed search (FTS5's default porter stemmer) and prefix matching.
@@ -28,6 +47,30 @@ FTS5_SEARCH_SQL = text("""
     ORDER BY rank
     LIMIT :limit
 """)
+
+# Narrow catch tuple for the FTS fallback (see module docstring).
+_FTS_FALLBACK_ERRORS = (SQLAlchemyOperationalError, sqlite3.OperationalError)
+
+# Messages that prove the failure is FTS-related, not a real DB problem.
+_FTS_FALLBACK_MARKERS = (
+    "no such table: facts_fts",
+    "malformed MATCH expression",
+    "unable to use function MATCH in the requested context",
+    "no such module: fts5",
+)
+
+
+def _is_expected_fts_failure(exc: BaseException) -> bool:
+    """Return True if *exc* indicates FTS is unavailable or the query malformed.
+
+    Checks ``str(exc)`` and, for SQLAlchemy-wrapped DBAPI errors, the original
+    driver exception (``.orig``).
+    """
+    messages = [str(exc)]
+    orig = getattr(exc, "orig", None)
+    if orig is not None and orig is not exc:
+        messages.append(str(orig))
+    return any(marker in msg for marker in _FTS_FALLBACK_MARKERS for msg in messages)
 
 
 class FactRepository:
@@ -46,8 +89,18 @@ class FactRepository:
                 text("SELECT name FROM sqlite_master WHERE type='table' AND name='facts_fts'")
             )
             self._fts5_available = result.scalar() is not None
-        except Exception:
-            self._fts5_available = False
+        except _FTS_FALLBACK_ERRORS as exc:
+            if _is_expected_fts_failure(exc):
+                logger.debug(
+                    "FTS5 probe failed (%s); FTS unavailable — using fallback", exc
+                )
+                self._fts5_available = False
+            else:
+                # Real DB operational failure (e.g. "database is locked") is
+                # NOT evidence that FTS is unavailable — propagate it and do
+                # NOT cache _fts5_available=False (a transient failure must
+                # not permanently disable FTS for this repo instance).
+                raise
         return self._fts5_available
 
     @staticmethod
@@ -114,8 +167,16 @@ class FactRepository:
                         for row in rows:
                             facts.append(Fact(**row))
                         return facts
-                except Exception:
-                    pass  # Fall through to LIKE
+                except _FTS_FALLBACK_ERRORS as exc:
+                    if _is_expected_fts_failure(exc):
+                        logger.debug(
+                            "FTS5 search failed (%s); falling back to LIKE", exc
+                        )
+                    else:
+                        # Real DB failure — do not hide it behind the LIKE
+                        # fallback (see module docstring).
+                        raise
+                # Fall through to LIKE
 
         # Fallback: standard LIKE query (original behavior)
         stmt = select(FactORM)

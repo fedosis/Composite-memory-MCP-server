@@ -1,11 +1,15 @@
 """Integration tests for BeliefRepository (Card 001)."""
 
-import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+import logging
+import sqlite3
 
-from memory_server.models import Belief
+import pytest
+from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from storage.base import Base
 from storage.repositories.belief_repo import BeliefRepository
+
+from memory_server.models import Belief
 
 
 @pytest.fixture
@@ -241,7 +245,6 @@ class TestBeliefRepoUpdate:
         assert result is None
 
     async def test_update_reinforced_at(self, repo):
-        from datetime import datetime, timezone
         b = await repo.create(Belief(proposition="Test"))
         original_reinforced = b.last_reinforced_at
         updated = await repo.update_reinforced_at(b.id)
@@ -253,3 +256,128 @@ class TestBeliefRepoUpdate:
         updated = await repo.increment_version(b.id)
         assert updated is not None
         assert updated.version == 2
+
+
+def _patch_execute(session, monkeypatch, *, fail_when, exc):
+    """Raise *exc* from session.execute when the SQL text contains *fail_when*."""
+
+    original = session.execute
+
+    async def execute(stmt, *args, **kwargs):
+        if fail_when in str(stmt):
+            raise exc
+        return await original(stmt, *args, **kwargs)
+
+    monkeypatch.setattr(session, "execute", execute)
+
+
+@pytest.mark.asyncio
+class TestBeliefRepoFTSFallback:
+    """Narrow-except matrix for the FTS fallback (Card 2, Test plan 6).
+
+    Split by failure SITE: (P) probe failures inside ``_check_fts5`` vs
+    (M) MATCH-query failures inside the search FTS block. Expected FTS
+    failures fall back / disable FTS; real DB failures propagate.
+    """
+
+    async def _seed(self, repo):
+        await repo.create(Belief(proposition="Docker runs on OMV"))
+        await repo.create(Belief(proposition="Nginx proxies web"))
+
+    async def test_fts_normal_path_used(self, repo):
+        """Probe passes + MATCH succeeds → FTS used (results found)."""
+        await self._seed(repo)
+        results = await repo.search(proposition="Docker")
+        assert len(results) == 1
+        assert results[0].proposition == "Docker runs on OMV"
+
+    async def test_probe_expected_failure_disables_fts_and_falls_back(
+        self, repo, monkeypatch, caplog
+    ):
+        """(P1) probe: 'no such table: beliefs_fts' → FTS off, LIKE used."""
+        caplog.set_level(logging.DEBUG, logger="storage.repositories.belief_repo")
+        await self._seed(repo)
+        _patch_execute(
+            repo._session,
+            monkeypatch,
+            fail_when="sqlite_master",
+            exc=sqlite3.OperationalError("no such table: beliefs_fts"),
+        )
+        assert await repo._check_fts5() is False
+        assert repo._fts5_available is False
+        assert "FTS unavailable" in caplog.text
+        results = await repo.search(proposition="Docker")
+        assert len(results) == 1  # LIKE fallback returned results
+
+    async def test_match_expected_failure_falls_through_to_like(
+        self, repo, monkeypatch, caplog
+    ):
+        """(M1) MATCH: 'malformed MATCH expression' → LIKE fallback."""
+        caplog.set_level(logging.DEBUG, logger="storage.repositories.belief_repo")
+        await self._seed(repo)
+        _patch_execute(
+            repo._session,
+            monkeypatch,
+            fail_when="beliefs_fts MATCH",
+            exc=sqlite3.OperationalError("malformed MATCH expression"),
+        )
+        assert await repo._check_fts5() is True  # probe passed
+        results = await repo.search(proposition="Docker")
+        assert len(results) == 1  # LIKE fallback
+        assert "falling back to LIKE" in caplog.text
+
+    async def test_match_unable_to_use_function_falls_through_to_like(
+        self, repo, monkeypatch, caplog
+    ):
+        """(M1b) MATCH: 'unable to use function MATCH ...' → LIKE fallback."""
+        caplog.set_level(logging.DEBUG, logger="storage.repositories.belief_repo")
+        await self._seed(repo)
+        _patch_execute(
+            repo._session,
+            monkeypatch,
+            fail_when="beliefs_fts MATCH",
+            exc=sqlite3.OperationalError(
+                "unable to use function MATCH in the requested context"
+            ),
+        )
+        results = await repo.search(proposition="Docker")
+        assert len(results) == 1
+
+    async def test_probe_real_db_failure_propagates_not_cached(self, repo, monkeypatch):
+        """(P2) probe: 'database is locked' → propagates, FTS NOT cached False."""
+        await self._seed(repo)
+        _patch_execute(
+            repo._session,
+            monkeypatch,
+            fail_when="sqlite_master",
+            exc=sqlite3.OperationalError("database is locked"),
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            await repo.search(proposition="Docker")
+        assert repo._fts5_available is None  # transient failure must not disable FTS
+
+    async def test_match_real_db_failure_propagates(self, repo, monkeypatch):
+        """(M2) MATCH: 'database is locked' → propagates (no LIKE fallback)."""
+        await self._seed(repo)
+        _patch_execute(
+            repo._session,
+            monkeypatch,
+            fail_when="beliefs_fts MATCH",
+            exc=sqlite3.OperationalError("database is locked"),
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            await repo.search(proposition="Docker")
+
+    async def test_integrity_error_propagates(self, repo, monkeypatch):
+        """Non-OperationalError (IntegrityError) propagates from the FTS site."""
+        await self._seed(repo)
+        _patch_execute(
+            repo._session,
+            monkeypatch,
+            fail_when="beliefs_fts MATCH",
+            exc=SQLAlchemyIntegrityError(
+                "SELECT ...", {}, sqlite3.IntegrityError("UNIQUE constraint failed")
+            ),
+        )
+        with pytest.raises(SQLAlchemyIntegrityError):
+            await repo.search(proposition="Docker")
