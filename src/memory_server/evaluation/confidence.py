@@ -12,35 +12,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-# Source reliability weights
-SOURCE_RELIABILITY: dict[str, float] = {
-    "verified": 0.9,
-    "admin": 0.85,
-    "inferred": 0.7,
-    "extracted": 0.6,
-    "unknown": 0.3,
-}
+from memory_server.settings import get_settings
 
-DEFAULT_SOURCE_TYPE = "unknown"
-DEFAULT_TTL_DAYS = 90.0
-
-# Lifecycle state multipliers for confidence scoring
-# active > stale > archived for final score weighting
-LIFECYCLE_MULTIPLIER: dict[str, float] = {
-    "active": 1.0,
-    "validated": 0.95,
-    "candidate": 0.85,
-    "stale": 0.6,
-    "archived": 0.3,
-    "forgotten": 0.0,
-    # Belief-specific multipliers
-    "superseded": 0.3,
-    "contradicted": 0.3,
-    "discarded": 0.0,
-    # Backward compat
-    "trusted": 1.0,
-    "deprecated": 0.6,
-}
+# Settings-derived aliases (single source: settings.py). Snapshot at import;
+# kept for backward-compatible imports. Behavior follows Settings via
+# ConfidenceEngine.__init__ (live get_settings()).
+SOURCE_RELIABILITY: dict[str, float] = dict(get_settings().confidence_source_reliability)
+DEFAULT_SOURCE_TYPE = "unknown"  # heuristic default; no Settings field
+DEFAULT_TTL_DAYS: float = get_settings().confidence_ttl_days
+LIFECYCLE_MULTIPLIER: dict[str, float] = dict(get_settings().confidence_lifecycle_multipliers)
 
 _OLD_LIFECYCLE_MAP: dict[str, str] = {
     "trusted": "active",
@@ -60,10 +40,34 @@ class ConfidenceEngine:
     def __init__(
         self,
         source_reliability: dict[str, float] | None = None,
-        ttl_days: float = DEFAULT_TTL_DAYS,
+        ttl_days: float | None = None,
+        lifecycle_multipliers: dict[str, float] | None = None,
+        corroboration_boost: float | None = None,
+        boost_threshold: int | None = None,
+        conflict_penalty: float | None = None,
+        penalty_threshold: int | None = None,
     ) -> None:
-        self._source_reliability = source_reliability or dict(SOURCE_RELIABILITY)
-        self._ttl_days = ttl_days
+        _s = get_settings()
+        self._source_reliability = source_reliability or dict(_s.confidence_source_reliability)
+        self._ttl_days = _s.confidence_ttl_days if ttl_days is None else ttl_days
+        self._lifecycle_multipliers = lifecycle_multipliers or dict(_s.confidence_lifecycle_multipliers)
+        # NOTE: float values live under *_value names because the scoring
+        # methods below are also named _corroboration_boost/_conflict_penalty;
+        # an instance attribute with the same name would shadow the method.
+        self._corroboration_boost_value = (
+            _s.confidence_corroboration_boost
+            if corroboration_boost is None else corroboration_boost
+        )
+        self._boost_threshold = (
+            _s.confidence_boost_threshold if boost_threshold is None else boost_threshold
+        )
+        self._conflict_penalty_value = (
+            _s.confidence_conflict_penalty
+            if conflict_penalty is None else conflict_penalty
+        )
+        self._penalty_threshold = (
+            _s.confidence_penalty_threshold if penalty_threshold is None else penalty_threshold
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -88,7 +92,7 @@ class ConfidenceEngine:
         source_type = fact_data.get("source_type", DEFAULT_SOURCE_TYPE)
         base = self._source_reliability.get(
             source_type,
-            SOURCE_RELIABILITY[DEFAULT_SOURCE_TYPE],
+            self._source_reliability.get(DEFAULT_SOURCE_TYPE, 0.3),
         )
 
         # 2. Age decay
@@ -108,7 +112,7 @@ class ConfidenceEngine:
         lifecycle_state = fact_data.get("lifecycle_state", "active")
         # Normalize old values
         lifecycle_state = _OLD_LIFECYCLE_MAP.get(lifecycle_state, lifecycle_state)
-        lifecycle_mult = LIFECYCLE_MULTIPLIER.get(lifecycle_state, 1.0)
+        lifecycle_mult = self._lifecycle_multipliers.get(lifecycle_state, 1.0)
 
         score = (base * age_factor + corr_boost - conflict_penalty) * lifecycle_mult
         return max(0.0, min(1.0, score))
@@ -208,10 +212,10 @@ class ConfidenceEngine:
         2 sources → 0.05
         3+ sources → 0.10
         """
-        if count >= 3:
-            return 0.10
-        if count == 2:
-            return 0.05
+        if count >= self._boost_threshold + 1:
+            return self._corroboration_boost_value
+        if count == self._boost_threshold:
+            return self._corroboration_boost_value / 2.0
         return 0.0
 
     def _conflict_penalty(self, count: int) -> float:
@@ -221,8 +225,8 @@ class ConfidenceEngine:
         1 conflict → 0.10
         2+ conflicts → 0.20
         """
-        if count >= 2:
-            return 0.20
-        if count == 1:
-            return 0.10
+        if count >= self._penalty_threshold + 1:
+            return self._conflict_penalty_value
+        if count == self._penalty_threshold:
+            return self._conflict_penalty_value / 2.0
         return 0.0
