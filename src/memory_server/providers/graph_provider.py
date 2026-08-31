@@ -6,11 +6,13 @@ Designed for fast testing and simple persistence via JSON dump/load.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,31 @@ class SimpleGraph:
         self._edges: dict[str, dict[str, list[GraphEdge]]] = {}  # source -> target -> [edges]
         self._snapshot_path = Path(snapshot_path) if snapshot_path else None
         self._suspend_persistence = False
+
+    @contextmanager
+    def suspend_persistence(self) -> Iterator[None]:
+        """Temporarily suspend snapshot writes (batch mutation support).
+
+        Transactional: on ANY exception inside the with-block the in-memory
+        ``_nodes``/``_edges`` are restored to the state captured on entry and
+        the exception is re-raised, so a failed batch never leaves partial
+        mutations behind (Card 3b, SPEC scope 2). A deep copy is required —
+        ``add_edge`` appends into nested lists, so a shallow dict copy would
+        not restore them. Pair with ``save_snapshot()``.
+        """
+        snapshot_nodes = copy.deepcopy(self._nodes)
+        snapshot_edges = copy.deepcopy(self._edges)
+        self._suspend_persistence = True
+        try:
+            yield
+        except Exception:
+            self._nodes.clear()
+            self._nodes.update(snapshot_nodes)
+            self._edges.clear()
+            self._edges.update(snapshot_edges)
+            raise
+        finally:
+            self._suspend_persistence = False
 
     # --- Node operations ---
 
@@ -161,20 +188,27 @@ class SimpleGraph:
 
         return edge
 
-    def get_edge(self, source_id: str, target_id: str) -> Optional[GraphEdge]:
-        """Get the first edge between two nodes.
+    def get_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        relation: str | None = None,
+    ) -> Optional[GraphEdge]:
+        """Get the first edge between two nodes, optionally filtered by relation.
 
         Args:
             source_id: Source node id.
             target_id: Target node id.
+            relation: Optional relation filter. When provided, only edges with
+                this relation are considered.
 
         Returns:
-            First GraphEdge if any edges exist, None otherwise.
+            First matching GraphEdge if any exist, None otherwise.
         """
         if source_id in self._edges and target_id in self._edges[source_id]:
-            edges = self._edges[source_id][target_id]
-            if edges:
-                return edges[0]
+            for edge in self._edges[source_id][target_id]:
+                if relation is None or edge.relation == relation:
+                    return edge
         return None
 
     def delete_edge(self, source_id: str, target_id: str) -> None:

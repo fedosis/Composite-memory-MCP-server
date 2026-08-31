@@ -194,8 +194,14 @@ class GraphRouter:
         subject/object but different predicates both keep their edges (S7).
 
         All mutations run with persistence suspended and the graph snapshot is
-        written exactly once at the end, replacing the ~6 full snapshot writes
-        per fact of the per-entry ``sync_fact`` path.
+        written exactly once inside the transaction scope, replacing the ~6
+        full snapshot writes per fact of the per-entry ``sync_fact`` path.
+        The single write stays inside the with-block on purpose (Card 3b): if
+        ``save_snapshot`` raises, ``suspend_persistence`` rolls the in-memory
+        batch back so the graph is never left half-mutated with a stale
+        snapshot. Real disk-write errors are still swallowed by
+        ``SimpleGraph._write_snapshot`` (pre-existing); the rollback path is
+        exercised when ``save_snapshot`` itself raises.
 
         Args:
             triples: List of fact dicts with subject/predicate/object keys.
@@ -251,8 +257,12 @@ class GraphRouter:
                         relation=relation,
                     )
 
-        # Single disk write for the whole batch.
-        self._graph.save_snapshot()
+            # Single disk write for the whole batch. Inside the with-block on
+            # purpose: if save_snapshot raises, suspend_persistence rolls the
+            # in-memory batch back (Card 3b). Real disk-write errors are still
+            # swallowed by SimpleGraph._write_snapshot (pre-existing); the
+            # rollback path is exercised when save_snapshot itself raises.
+            self._graph.save_snapshot()
 
     def sync_decision(
         self,

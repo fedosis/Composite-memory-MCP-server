@@ -9,6 +9,8 @@ Covers:
 - S7: get_edge(..., relation=...) filter.
 """
 
+import types
+
 import pytest  # noqa: F401  (kept for symmetry with sibling test modules)
 
 from memory_server.providers.graph_provider import SimpleGraph
@@ -233,3 +235,93 @@ class TestSyncFactsBatchValidation:
         router.sync_facts_batch([])
         assert graph.get_all_nodes() == []
         assert graph.write_count == 0
+
+
+class TestSuspendPersistenceRollback:
+    """Card 3b: suspend_persistence is transactional.
+
+    Any exception inside the with-block restores the in-memory
+    ``_nodes``/``_edges`` captured on entry (deep copy — ``add_edge`` appends
+    into nested lists), and ``sync_facts_batch`` keeps its ``save_snapshot()``
+    inside the transaction scope so a failing snapshot write also rolls the
+    batch back.
+    """
+
+    def test_exception_inside_suspend_restores_nodes_and_edges(self):
+        """Nested-list regression: r2 append to the SAME inner list is undone."""
+        g = SimpleGraph()
+        g.add_node(id="a", type="entity", name="A")
+        g.add_node(id="b", type="entity", name="B")
+        g.add_edge(source_id="a", target_id="b", relation="r1")
+        before = g.to_dict()
+
+        with pytest.raises(RuntimeError):
+            with g.suspend_persistence():
+                g.add_node(id="x", type="entity", name="X")
+                g.add_edge(source_id="a", target_id="b", relation="r2")
+                raise RuntimeError("boom")
+
+        assert g.to_dict() == before
+        assert g._suspend_persistence is False
+
+    def test_sync_facts_batch_mid_loop_exception_restores_state(
+        self, monkeypatch
+    ):
+        """Exception on the 2nd add_edge → whole batch rolled back."""
+        g = SimpleGraph()
+        router = GraphRouter(graph=g)
+        triples = [
+            {"subject": "A", "predicate": "is", "object": "B"},
+            {"subject": "C", "predicate": "is", "object": "D"},
+            {"subject": "E", "predicate": "is", "object": "F"},
+        ]
+        before = g.to_dict()
+
+        calls = {"n": 0}
+        original_add_edge = g.add_edge
+
+        def boom_add_edge(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("boom")
+            return original_add_edge(*args, **kwargs)
+
+        monkeypatch.setattr(g, "add_edge", boom_add_edge)
+
+        with pytest.raises(RuntimeError):
+            router.sync_facts_batch(triples)
+
+        assert calls["n"] == 2
+        assert g.to_dict() == before
+
+    def test_sync_facts_batch_save_snapshot_failure_restores_state(
+        self, tmp_path, monkeypatch
+    ):
+        """A raising save_snapshot (inside the txn scope) rolls the batch back."""
+        g = SimpleGraph(snapshot_path=tmp_path / "graph.json")
+        router = GraphRouter(graph=g)
+        before = g.to_dict()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("disk full")
+
+        g.save_snapshot = types.MethodType(boom, g)
+
+        with pytest.raises(RuntimeError):
+            router.sync_facts_batch(
+                [{"subject": "A", "predicate": "is", "object": "B"}]
+            )
+
+        assert g.to_dict() == before
+
+    def test_suspend_persistence_happy_path_keeps_mutations(self):
+        """Exception-free body keeps mutations and clears the flag."""
+        g = SimpleGraph()
+        with g.suspend_persistence():
+            g.add_node(id="a", type="entity", name="A")
+            g.add_node(id="b", type="entity", name="B")
+            g.add_edge(source_id="a", target_id="b", relation="r1")
+        assert g.get_node("a") is not None
+        assert g.get_node("b") is not None
+        assert g.get_edge("a", "b", relation="r1") is not None
+        assert g._suspend_persistence is False
