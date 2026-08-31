@@ -64,6 +64,7 @@ class OutboxWorker:
         compact_cleanup_hours: int = 1,
         stale_processing_seconds: int = 600,
         process_pending_limit: int = 500,
+        busy_timeout_ms: int = 5000,
     ):
         self._db_url = db_url
         self._engine = engine
@@ -78,6 +79,7 @@ class OutboxWorker:
         self._compact_cleanup_hours = compact_cleanup_hours
         self._stale_processing_seconds = stale_processing_seconds
         self._process_pending_limit = process_pending_limit
+        self._busy_timeout_ms = busy_timeout_ms
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
         self._stop_requested = False
         self._last_compact_at: float = 0.0
@@ -100,7 +102,7 @@ class OutboxWorker:
             async with self._engine.connect() as conn:
                 await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
                 await conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
-                await conn.exec_driver_sql("PRAGMA busy_timeout=5000")
+                await conn.exec_driver_sql(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
 
             async with self._engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)

@@ -374,19 +374,18 @@ class TestPrecedenceContextB:
         )
 
     def test_public_shape_unchanged(self):
-        """HermesPluginConfig public attribute set is unchanged."""
+        """HermesPluginConfig public attribute set is exactly unchanged."""
         from memory_server.plugins.hermes.config import HermesPluginConfig
 
         config = HermesPluginConfig.from_dict({})
-        assert set(
-            (
-                "db_url",
-                "cmms_path",
-                "cmms_path_source",
-                "writer",
-                "max_facts",
-            )
-        ) <= set(config.__dataclass_fields__)
+        expected = {
+            "db_url",
+            "cmms_path",
+            "cmms_path_source",
+            "writer",
+            "max_facts",
+        }
+        assert set(config.__dataclass_fields__) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +466,39 @@ class TestConstructorCompat:
 
         provider = SQLiteProvider()
         assert provider._url == "sqlite+aiosqlite:///memory.db"
+
+    def test_sqlite_busy_timeout_default_preserved(self):
+        """SQLiteProvider() keeps the 5000 ms busy-timeout default."""
+        from memory_server.providers.sqlite_provider import SQLiteProvider
+
+        assert SQLiteProvider()._busy_timeout_ms == 5000
+
+    def test_sqlite_busy_timeout_explicit_arg_wins(self):
+        """Explicit busy_timeout_ms is honored without Settings involvement."""
+        from memory_server.providers.sqlite_provider import SQLiteProvider
+
+        assert SQLiteProvider(busy_timeout_ms=1234)._busy_timeout_ms == 1234
+
+    @pytest.mark.asyncio
+    async def test_sqlite_initialize_applies_busy_timeout_pragma(self):
+        """The effective PRAGMA busy_timeout on the initialized engine matches
+        the configured value (review finding #2)."""
+        from memory_server.providers.sqlite_provider import SQLiteProvider
+
+        provider = SQLiteProvider(
+            url="sqlite+aiosqlite:///:memory:",
+            busy_timeout_ms=9000,
+        )
+        await provider.initialize()
+        try:
+            engine = provider.engine
+            assert engine is not None
+            async with engine.connect() as conn:
+                row = (await conn.exec_driver_sql("PRAGMA busy_timeout")).first()
+                assert row is not None
+                assert row[0] == 9000
+        finally:
+            await provider.close()
 
     def test_openai_no_arg_vector_size_preserved(self):
         from memory_server.providers.embedding_provider import OpenAIEmbeddingProvider
@@ -652,6 +684,7 @@ class TestServerWiring:
         monkeypatch.setenv("MEMORY_SERVER_OUTBOX_COMPACT_CLEANUP_HOURS", "2")
         monkeypatch.setenv("MEMORY_SERVER_OUTBOX_STALE_PROCESSING_SECONDS", "900")
         monkeypatch.setenv("MEMORY_SERVER_OUTBOX_PROCESS_PENDING_LIMIT", "99")
+        monkeypatch.setenv("MEMORY_SERVER_SQLITE_BUSY_TIMEOUT_MS", "9000")
         get_settings.cache_clear()
 
         await server_module._get_outbox_worker()
@@ -663,6 +696,7 @@ class TestServerWiring:
         assert captured["compact_cleanup_hours"] == 2
         assert captured["stale_processing_seconds"] == 900
         assert captured["process_pending_limit"] == 99
+        assert captured["busy_timeout_ms"] == 9000
 
     @pytest.mark.asyncio
     async def test_graph_router_depth_follows_settings(self, monkeypatch):
@@ -673,6 +707,68 @@ class TestServerWiring:
 
         router = await server_module._get_graph_router()
         assert router._max_path_depth == 9
+
+    @pytest.mark.asyncio
+    async def test_graph_search_fn_path_depth_follows_env_override(self, monkeypatch):
+        """Behavior-level regression for review finding #1: the server
+        ``graph_search`` tool must pathfind with the env-overridden depth, not a
+        hardcoded literal 4. A 6-node chain (5 edges) is unreachable at the
+        default depth 4 but reachable with MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH=9.
+        """
+        import memory_server.server as server_module
+        from memory_server.providers.graph_provider import SimpleGraph
+
+        graph = SimpleGraph()
+        for i in range(6):
+            graph.add_node(id=f"n{i}", type="node", name=f"N{i}")
+        for i in range(5):
+            graph.add_edge(source_id=f"n{i}", target_id=f"n{i + 1}", relation="next")
+
+        async def _fake_get_graph():
+            return graph
+
+        monkeypatch.setattr(server_module, "_get_graph", _fake_get_graph)
+        monkeypatch.setattr(server_module, "_graph", None)
+        monkeypatch.setattr(server_module, "_graph_router", None)
+
+        # Default depth (4) cannot reach the 5-edge target.
+        get_settings.cache_clear()
+        result = json.loads(
+            await server_module.graph_search_fn(source_id="n0", target_id="n5")
+        )
+        assert result["paths"] == []
+
+        # Env override (9) reaches it through the same production function.
+        monkeypatch.setenv("MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH", "9")
+        get_settings.cache_clear()
+        monkeypatch.setattr(server_module, "_graph_router", None)
+        result = json.loads(
+            await server_module.graph_search_fn(source_id="n0", target_id="n5")
+        )
+        assert result["paths"], "graph_search must find the 5-edge path under the env override"
+        assert result["paths"][0][-1]["id"] == "n5"
+
+    @pytest.mark.asyncio
+    async def test_sqlite_provider_constructor_follows_settings(self, monkeypatch):
+        """The server SQLiteProvider singleton receives the Settings-configured
+        busy timeout (review finding #2)."""
+        import memory_server.server as server_module
+
+        captured: dict[str, object] = {}
+
+        class FakeProvider:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def initialize(self):
+                pass
+
+        monkeypatch.setattr(server_module, "SQLiteProvider", FakeProvider)
+        monkeypatch.setenv("MEMORY_SERVER_SQLITE_BUSY_TIMEOUT_MS", "9000")
+        get_settings.cache_clear()
+
+        await server_module._get_provider()
+        assert captured["busy_timeout_ms"] == 9000
 
     def test_hybrid_internal_graph_router_keeps_default_depth(self, tmp_path, monkeypatch):
         """Documented Card 1 exception (SPEC acceptance 7): HybridRouter's
@@ -860,6 +956,7 @@ class TestOutboxWorkerWiring:
             compact_cleanup_hours=2,
             stale_processing_seconds=123,
             process_pending_limit=9,
+            busy_timeout_ms=1234,
         )
         assert worker._max_retries == 4
         assert worker._poll_interval_seconds == 0.5
@@ -869,6 +966,33 @@ class TestOutboxWorkerWiring:
         assert worker._compact_cleanup_hours == 2
         assert worker._stale_processing_seconds == 123
         assert worker._process_pending_limit == 9
+        assert worker._busy_timeout_ms == 1234
+
+    async def test_busy_timeout_default_preserved(self):
+        """OutboxWorker keeps the 5000 ms default when not configured."""
+        from storage.outbox_worker import OutboxWorker
+
+        assert OutboxWorker(db_url="sqlite+aiosqlite:///:memory:")._busy_timeout_ms == 5000
+
+    async def test_initialize_applies_configured_busy_timeout(self):
+        """The effective PRAGMA busy_timeout on the worker-owned engine matches
+        the configured value (review finding #2)."""
+        from storage.outbox_worker import OutboxWorker
+
+        worker = OutboxWorker(
+            db_url="sqlite+aiosqlite:///:memory:",
+            busy_timeout_ms=9000,
+        )
+        await worker.initialize()
+        try:
+            engine = worker._engine
+            assert engine is not None
+            async with engine.connect() as conn:
+                row = (await conn.exec_driver_sql("PRAGMA busy_timeout")).first()
+                assert row is not None
+                assert row[0] == 9000
+        finally:
+            await worker.close()
 
     async def test_poll_once_uses_stale_threshold_and_batch_size(self, monkeypatch):
         """reset_stale_processing receives max_age_seconds explicitly and

@@ -52,8 +52,14 @@ class SQLiteProvider:
     WAL mode is enabled on initialization for concurrent read performance.
     """
 
-    def __init__(self, url: str = "sqlite+aiosqlite:///memory.db"):
+    def __init__(
+        self,
+        url: str = "sqlite+aiosqlite:///memory.db",
+        *,
+        busy_timeout_ms: int = 5000,
+    ):
         self._url = url
+        self._busy_timeout_ms = busy_timeout_ms
         self._engine = None
         self._session_factory = None
 
@@ -95,7 +101,7 @@ class SQLiteProvider:
         async with self._engine.connect() as conn:
             await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
             await conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
-            await conn.exec_driver_sql("PRAGMA busy_timeout=5000")
+            await conn.exec_driver_sql(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
 
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

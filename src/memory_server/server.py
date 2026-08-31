@@ -110,7 +110,10 @@ async def _get_provider() -> SQLiteProvider:
     """Get or create the SQLiteProvider singleton."""
     global _provider
     if _provider is None:
-        _provider = SQLiteProvider(url=_get_sqlite_db_url())
+        _provider = SQLiteProvider(
+            url=_get_sqlite_db_url(),
+            busy_timeout_ms=get_settings().sqlite_busy_timeout_ms,
+        )
         await _provider.initialize()
     return _provider
 
@@ -285,6 +288,7 @@ async def _get_outbox_worker() -> OutboxWorker:
             compact_cleanup_hours=settings.outbox_compact_cleanup_hours,
             stale_processing_seconds=settings.outbox_stale_processing_seconds,
             process_pending_limit=settings.outbox_process_pending_limit,
+            busy_timeout_ms=settings.sqlite_busy_timeout_ms,
         )
         await _outbox_worker.initialize()
     return _outbox_worker
@@ -596,7 +600,11 @@ async def graph_search_fn(
                         "attributes": edge.attributes,
                     })
         elif source_id and target_id:
-            found_paths = graph.find_path(source_id, target_id, max_depth=4)
+            found_paths = graph.find_path(
+                source_id,
+                target_id,
+                max_depth=get_settings().graph_max_path_depth,
+            )
             for p in found_paths:
                 paths.append([
                     {"id": n.id, "name": n.name, "type": n.type}
