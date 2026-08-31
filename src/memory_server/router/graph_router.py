@@ -163,7 +163,7 @@ class GraphRouter:
             )
 
         # Add edge if it doesn't exist
-        existing = self._graph.get_edge(subj_id, obj_id)
+        existing = self._graph.get_edge(subj_id, obj_id, relation=predicate)
         if existing is None:
             self._graph.add_edge(
                 source_id=subj_id,

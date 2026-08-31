@@ -106,6 +106,19 @@ class TestGraphRouter:
         omv8_edges = [e for n, e in neighbors if n.id == "omv8"]
         assert len(omv8_edges) >= 1
 
+    def test_sync_fact_same_subj_obj_different_predicates_keeps_both_edges(self, graph, router):
+        """Regression: legacy sync_fact path must dedup by (subj, obj, relation).
+
+        Two facts sharing the same subject/object but different predicates
+        must both keep their edges (Card 2, AC1). The legacy path must pass
+        ``relation=predicate`` to ``get_edge`` exactly like the batch path.
+        """
+        router.sync_fact(subject="Docker", predicate="is", object="container")
+        router.sync_fact(subject="Docker", predicate="uses", object="container")
+
+        assert graph.get_edge("docker", "container", relation="is") is not None
+        assert graph.get_edge("docker", "container", relation="uses") is not None
+
     def test_sync_decision_adds_decision_node(self, graph, router):
         router.sync_decision(
             choice="use Caddy",
