@@ -47,14 +47,31 @@ class QdrantProvider:
 
     def __init__(
         self,
-        location: str = ":memory:",
-        port: int = 6333,
-        prefer_grpc: bool = False,
-        collection: str = DEFAULT_COLLECTION,
-        vector_size: int = DEFAULT_VECTOR_SIZE,
-        distance: str = "cosine",
+        location: str | None = None,
+        port: int | None = None,
+        prefer_grpc: bool | None = None,
+        collection: str | None = None,
+        vector_size: int | None = None,
+        distance: str | None = None,
         api_key: str | None = None,
     ) -> None:
+        # None → resolve from Settings (defaults equal the previous module
+        # constants; explicit args still win). api_key stays env-only.
+        from memory_server.settings import get_settings
+
+        settings = get_settings()
+        location = location if location is not None else settings.qdrant_location
+        port = port if port is not None else settings.qdrant_port
+        prefer_grpc = (
+            prefer_grpc if prefer_grpc is not None else settings.qdrant_prefer_grpc
+        )
+        collection = (
+            collection if collection is not None else settings.vector_collection
+        )
+        vector_size = (
+            vector_size if vector_size is not None else settings.vector_size
+        )
+        distance = distance if distance is not None else settings.vector_metric
         self._collection = collection
         self._vector_size = vector_size
         self._distance = _normalize_distance(distance)

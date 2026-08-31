@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import memory_server.api.get_context as get_context_module
 from memory_server.api.get_context import get_context
 from memory_server.models import Decision, Fact
 from memory_server.providers.sqlite_provider import SQLiteProvider
@@ -297,15 +296,20 @@ class TestGetContext:
                 )
 
         # Without over-fetch (factor 1): the 10 newest rows are 3 distinct
-        # pairs, so dedup cannot fill the budget.
-        monkeypatch.setattr(get_context_module, "DEDUP_OVERFETCH_FACTOR", 1)
+        # pairs, so dedup cannot fill the budget. The factor is Settings-fed,
+        # so we override the env var and clear the settings cache.
+        from memory_server.settings import get_settings
+
+        monkeypatch.setenv("MEMORY_SERVER_CONTEXT_DEDUP_OVERFETCH_FACTOR", "1")
+        get_settings.cache_clear()
         under = await get_context(provider, task="", max_results=10)
         assert len(under["decisions"]) < 10, (
             "over-fetch factor must be needed to fill the budget (N1)"
         )
 
         # With the real ×4 factor, the budget fills with 10 distinct decisions.
-        monkeypatch.setattr(get_context_module, "DEDUP_OVERFETCH_FACTOR", 4)
+        monkeypatch.setenv("MEMORY_SERVER_CONTEXT_DEDUP_OVERFETCH_FACTOR", "4")
+        get_settings.cache_clear()
         full = await get_context(provider, task="", max_results=10)
         assert len(full["decisions"]) == 10
         assert {d["choice"] for d in full["decisions"]} == {

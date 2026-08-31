@@ -42,9 +42,6 @@ from memory_server.models import (
 
 logger = logging.getLogger(__name__)
 
-# Soft limit: maximum active beliefs before extraction is skipped
-MAX_ACTIVE_BELIEFS = 500
-
 
 class MemoryIngestionService:
     """Transactional service for memory ingestion (remember + learn).
@@ -453,17 +450,20 @@ class MemoryIngestionService:
             belief_repo = BeliefRepository(session)
             ev_repo = EvidenceRepository(session)
 
-            # 1. Check soft limit
+            # 1. Check soft limit (Settings-fed; env MEMORY_SERVER_MAX_ACTIVE_BELIEFS)
+            from memory_server.settings import get_settings
+
+            max_active_beliefs = get_settings().max_active_beliefs
             active_beliefs = await belief_repo.search(
                 lifecycle_state="active",
                 limit=0,
             )
             active_count = len(active_beliefs) if active_beliefs else 0
-            if active_count >= MAX_ACTIVE_BELIEFS:
+            if active_count >= max_active_beliefs:
                 logger.warning(
                     "Active beliefs (%s) at limit (%s): skipping belief extraction",
                     active_count,
-                    MAX_ACTIVE_BELIEFS,
+                    max_active_beliefs,
                 )
                 return beliefs_result
 

@@ -104,15 +104,23 @@ class LanceDBProvider:
 
     def __init__(
         self,
-        db_path: str = "data/lancedb",
-        table: str = DEFAULT_TABLE,
-        metric: str = "cosine",
-        vector_size: int = DEFAULT_VECTOR_SIZE,
+        db_path: str | None = None,
+        table: str | None = None,
+        metric: str | None = None,
+        vector_size: int | None = None,
     ) -> None:
-        self._db_path = db_path
-        self._table_name = table
-        self._metric = _normalize_metric(metric)
-        self._vector_size = vector_size
+        # None → resolve from Settings (defaults equal the previous module
+        # constants; explicit args still win).
+        from memory_server.settings import get_settings
+
+        settings = get_settings()
+        self._db_path = db_path if db_path is not None else str(settings.lancedb_path)
+        self._table_name = table if table is not None else settings.vector_collection
+        metric_value = metric if metric is not None else settings.vector_metric
+        self._metric = _normalize_metric(metric_value)
+        self._vector_size = (
+            vector_size if vector_size is not None else settings.vector_size
+        )
         self._db: Any = None  # lazy-init
 
     async def _get_db(self):

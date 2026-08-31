@@ -34,33 +34,6 @@ from storage.outbox import OutboxEntry, OutboxRepository
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of retries before marking an entry as failed
-MAX_RETRIES = 3
-
-# Polling interval in seconds
-POLL_INTERVAL_SECONDS = 1.0
-
-# Maximum entries to claim per poll cycle. Sized to drain the backlog fast
-# while keeping each cycle bounded for the event loop.
-POLL_BATCH_SIZE = 500
-
-# Chunk size for batched embedding inside _process_fact_batch. Kept at the
-# embedder's internal batch size so a failing chunk only poisons a small
-# group, which then falls back to the per-entry path.
-FACT_BATCH_CHUNK_SIZE = 32
-
-# Minimum interval between LanceDB compaction runs. Compaction (VACUUM) is
-# throttled to avoid churning the table; it runs as a background task so it
-# never blocks the drain loop. It fires even while the queue is busy (the old
-# "only when empty" gate meant a permanent backlog skipped compaction forever).
-COMPACT_INTERVAL_SECONDS = 1800
-
-# Age threshold for pruning accumulated table versions. Must be well below
-# LanceDB's default (~7 days): every upsert creates a version, so a 7-day
-# cutoff deletes nothing on a busy store. 1 hour keeps the on-disk index near
-# the live dataset size without racing in-flight writers.
-COMPACT_CLEANUP_OLDER_THAN = timedelta(hours=1)
-
 
 class OutboxWorker:
     """Background worker that processes outbox entries.
@@ -83,12 +56,28 @@ class OutboxWorker:
         qdrant: QdrantProvider | LanceDBProvider | None = None,
         embedder: SentenceTransformerEmbeddingProvider | None = None,
         graph_router: GraphRouter | None = None,
+        max_retries: int = 3,
+        poll_interval_seconds: float = 1.0,
+        poll_batch_size: int = 500,
+        fact_batch_chunk_size: int = 32,
+        compact_interval_seconds: int = 1800,
+        compact_cleanup_hours: int = 1,
+        stale_processing_seconds: int = 600,
+        process_pending_limit: int = 500,
     ):
         self._db_url = db_url
         self._engine = engine
         self._qdrant = qdrant
         self._embedder = embedder
         self._graph_router = graph_router
+        self._max_retries = max_retries
+        self._poll_interval_seconds = poll_interval_seconds
+        self._poll_batch_size = poll_batch_size
+        self._fact_batch_chunk_size = fact_batch_chunk_size
+        self._compact_interval_seconds = compact_interval_seconds
+        self._compact_cleanup_hours = compact_cleanup_hours
+        self._stale_processing_seconds = stale_processing_seconds
+        self._process_pending_limit = process_pending_limit
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
         self._stop_requested = False
         self._last_compact_at: float = 0.0
@@ -129,7 +118,10 @@ class OutboxWorker:
 
     async def run(self) -> None:
         """Main loop — poll outbox until ``stop()`` is requested."""
-        logger.info("Outbox worker started, polling every %ss", POLL_INTERVAL_SECONDS)
+        logger.info(
+            "Outbox worker started, polling every %ss",
+            self._poll_interval_seconds,
+        )
         while not self._stop_requested:
             try:
                 processed = await self._poll_once()
@@ -140,12 +132,12 @@ class OutboxWorker:
             # the full interval when the queue is empty. With a large backlog
             # this avoids wasting ~50% of wall time in asyncio.sleep.
             # Compaction is attempted every cycle (throttled internally by
-            # COMPACT_INTERVAL_SECONDS) — gating it on an empty queue meant a
+            # the compact interval) — gating it on an empty queue meant a
             # permanent backlog skipped it forever, letting LanceDB versions
             # accumulate unboundedly.
             await self._maybe_compact()
             if processed == 0:
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                await asyncio.sleep(self._poll_interval_seconds)
             else:
                 await asyncio.sleep(0)
         logger.info("Outbox worker stopped")
@@ -156,7 +148,7 @@ class OutboxWorker:
         Compaction prunes the accumulated table versions that every
         merge_insert creates, keeping the on-disk store near the live dataset
         size. Runs as a background task so a long VACUUM never stalls the
-        drain loop. Throttled to once per COMPACT_INTERVAL_SECONDS.
+        drain loop. Throttled to once per ``self._compact_interval_seconds``.
 
         The ``cleanup_older_than`` threshold is explicit: LanceDB's default
         (~7 days) deletes nothing on a busy store where every version is
@@ -170,14 +162,14 @@ class OutboxWorker:
         optimize = getattr(self._qdrant, "optimize", None)
         if optimize is None:
             return
-        if time.monotonic() - self._last_compact_at < COMPACT_INTERVAL_SECONDS:
+        if time.monotonic() - self._last_compact_at < self._compact_interval_seconds:
             return
         self._last_compact_at = time.monotonic()
 
         async def _compact() -> None:
             try:
                 ok = await optimize(
-                    cleanup_older_than=COMPACT_CLEANUP_OLDER_THAN,
+                    cleanup_older_than=timedelta(hours=self._compact_cleanup_hours),
                 )
                 if ok:
                     logger.info("Outbox worker: LanceDB compaction done")
@@ -203,8 +195,10 @@ class OutboxWorker:
         async with self._session_factory() as session:
             repo = OutboxRepository(session)
             # Recover entries left in "processing" by a crashed worker.
-            await repo.reset_stale_processing()
-            entries = await repo.get_pending(limit=POLL_BATCH_SIZE)
+            await repo.reset_stale_processing(
+                max_age_seconds=self._stale_processing_seconds
+            )
+            entries = await repo.get_pending(limit=self._poll_batch_size)
 
             if not entries:
                 return 0
@@ -261,8 +255,8 @@ class OutboxWorker:
 
         assert self._session_factory is not None  # guaranteed by caller (_poll_once)
 
-        for start in range(0, len(entries), FACT_BATCH_CHUNK_SIZE):
-            chunk = entries[start : start + FACT_BATCH_CHUNK_SIZE]
+        for start in range(0, len(entries), self._fact_batch_chunk_size):
+            chunk = entries[start : start + self._fact_batch_chunk_size]
             try:
                 await self._process_fact_chunk(chunk)
                 async with self._session_factory() as session:
@@ -369,7 +363,7 @@ class OutboxWorker:
             error_msg = str(e)
             new_retry = await repo.increment_retry(entry.id, error_msg)
 
-            if new_retry >= MAX_RETRIES:
+            if new_retry >= self._max_retries:
                 await repo.mark_failed(entry.id, error_msg)
                 logger.error(
                     "Outbox entry %s failed after %d retries: %s",
@@ -382,7 +376,7 @@ class OutboxWorker:
                     "Outbox entry %s failed (retry %d/%d): %s",
                     entry.id,
                     new_retry,
-                    MAX_RETRIES,
+                    self._max_retries,
                     error_msg,
                 )
 
@@ -523,7 +517,7 @@ class OutboxWorker:
 
         async with self._session_factory() as session:
             repo = OutboxRepository(session)
-            entries = await repo.get_pending(limit=500)
+            entries = await repo.get_pending(limit=self._process_pending_limit)
 
             for entry in entries:
                 await self._process_entry(session, repo, entry)

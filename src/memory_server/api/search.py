@@ -15,7 +15,7 @@ async def search(
     query: str = "",
     subject: Optional[str] = None,
     predicate: Optional[str] = None,
-    limit: int = 50,
+    limit: int | None = None,
     include_inactive: bool = False,
 ) -> dict:
     """Search facts by keyword text with optional filters.
@@ -25,11 +25,16 @@ async def search(
         query: Free-text keyword to search across subject, predicate, object.
         subject: Optional subject filter (exact match).
         predicate: Optional predicate filter (exact match).
-        limit: Maximum number of results to return (default 50).
+        limit: Maximum number of results to return. When None (default),
+            resolves from ``MEMORY_SERVER_SEARCH_DEFAULT_LIMIT`` via Settings.
 
     Returns:
         Dict with 'results' (list of fact dicts) and 'total' (int).
     """
+    from memory_server.settings import get_settings
+
+    if limit is None:
+        limit = get_settings().search_default_limit
     facts: list[Fact] = await provider.search_facts(
         text=query if query else None,
         subject=subject,

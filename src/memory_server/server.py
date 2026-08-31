@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -39,9 +38,10 @@ from memory_server.services.lifecycle_service import (
     LifecycleService,
     LifecycleTransitionRequest,
 )
+from memory_server.settings import get_openai_api_key, get_settings
 
 if TYPE_CHECKING:
-    from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+    from memory_server.providers.embedding_provider import EmbeddingProvider
     from memory_server.providers.lancedb_provider import LanceDBProvider
     from memory_server.providers.qdrant_provider import QdrantProvider
     from memory_server.router.embedding_router import EmbeddingRouter
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 _provider: SQLiteProvider | None = None
 _qdrant: QdrantProvider | None = None
 _lancedb: LanceDBProvider | None = None
-_embedder: SentenceTransformerEmbeddingProvider | None = None
+_embedder: EmbeddingProvider | None = None
 _router: EmbeddingRouter | None = None
 _graph: SimpleGraph | None = None
 _graph_router: GraphRouter | None = None
@@ -117,7 +117,7 @@ async def _get_provider() -> SQLiteProvider:
 
 def _get_sqlite_db_url() -> str:
     """Return the server SQLite URL and ensure file-backed parent dirs exist."""
-    db_url = os.environ.get("MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///data/memory.db")
+    db_url = get_settings().db_url
     prefix = "sqlite+aiosqlite:///"
     if db_url.startswith(prefix):
         db_path = db_url.removeprefix(prefix)
@@ -128,9 +128,7 @@ def _get_sqlite_db_url() -> str:
 
 def _get_graph_snapshot_path() -> Path:
     """Return the snapshot file path for the graph store."""
-    snapshot_path = Path(
-        os.environ.get("MEMORY_GRAPH_SNAPSHOT_PATH", "data/graph.json")
-    )
+    snapshot_path = get_settings().graph_snapshot_path
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     return snapshot_path
 
@@ -141,7 +139,13 @@ async def _get_lancedb_provider() -> LanceDBProvider:
     if _lancedb is None:
         from memory_server.providers.lancedb_provider import LanceDBProvider
 
-        _lancedb = LanceDBProvider(db_path="data/lancedb", table="memories")
+        settings = get_settings()
+        _lancedb = LanceDBProvider(
+            db_path=str(settings.lancedb_path),
+            table=settings.vector_collection,
+            metric=settings.vector_metric,
+            vector_size=settings.vector_size,
+        )
     return _lancedb
 
 
@@ -151,20 +155,57 @@ async def _get_qdrant_provider() -> QdrantProvider:
     if _qdrant is None:
         from memory_server.providers.qdrant_provider import QdrantProvider
 
-        _qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+        settings = get_settings()
+        _qdrant = QdrantProvider(
+            location=settings.qdrant_location,
+            port=settings.qdrant_port,
+            prefer_grpc=settings.qdrant_prefer_grpc,
+            collection=settings.vector_collection,
+            vector_size=settings.vector_size,
+            distance=settings.vector_metric,
+        )
     return _qdrant
 
 
 def _get_vector_provider():
     """Get the active vector provider — LanceDB by default, Qdrant if configured.
 
-    Controlled by MEMORY_VECTOR_BACKEND env var: 'lancedb' (default) or 'qdrant'.
+    Controlled by the Settings ``vector_backend`` (env MEMORY_VECTOR_BACKEND
+    legacy alias / MEMORY_SERVER_VECTOR_BACKEND canonical): 'lancedb' (default)
+    or 'qdrant'.
     """
-    import os
-    backend = os.environ.get("MEMORY_VECTOR_BACKEND", "lancedb").lower()
+    backend = get_settings().vector_backend
     if backend == "qdrant":
         return _get_qdrant_provider()
     return _get_lancedb_provider()
+
+
+def _build_embedder():
+    """Build the embedder selected by Settings.
+
+    sentence-transformers (default) → local SentenceTransformerEmbeddingProvider;
+    openai → OpenAIEmbeddingProvider with the Settings model/base_url/vector size
+    and the API key read from ``OPENAI_API_KEY`` at construction time (no
+    Settings field; the key is never part of the settings model).
+    """
+    from memory_server.providers.embedding_provider import (
+        OpenAIEmbeddingProvider,
+        SentenceTransformerEmbeddingProvider,
+    )
+
+    settings = get_settings()
+    if settings.embedding_provider == "openai":
+        return OpenAIEmbeddingProvider(
+            model=settings.openai_embedding_model,
+            base_url=settings.embedding_base_url,
+            vector_size=settings.openai_embedding_vector_size,
+            api_key=get_openai_api_key(),
+        )
+    return SentenceTransformerEmbeddingProvider(
+        model_name=settings.embedding_model,
+        device=settings.embedding_device,
+        batch_size=settings.embedding_batch_size,
+    )
 
 
 async def _build_auditor() -> MemoryAuditor:
@@ -204,9 +245,7 @@ async def _get_router() -> EmbeddingRouter:
 
         vector_provider = await _get_vector_provider()
         if _embedder is None:
-            from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
-
-            _embedder = SentenceTransformerEmbeddingProvider()
+            _embedder = _build_embedder()
         _router = EmbeddingRouter(
             vector_provider=vector_provider,
             embedder=_embedder,
@@ -230,16 +269,22 @@ async def _get_outbox_worker() -> OutboxWorker:
         # of silently no-oping because both were module-level None.
         vector_provider = await _get_vector_provider()
         if _embedder is None:
-            from memory_server.providers.embedding_provider import (
-                SentenceTransformerEmbeddingProvider,
-            )
-            _embedder = SentenceTransformerEmbeddingProvider()
+            _embedder = _build_embedder()
 
+        settings = get_settings()
         _outbox_worker = OutboxWorker(
             engine=provider.engine,
             qdrant=vector_provider,
             embedder=_embedder,
             graph_router=_chart_router,
+            max_retries=settings.outbox_max_retries,
+            poll_interval_seconds=settings.outbox_poll_interval_seconds,
+            poll_batch_size=settings.outbox_poll_batch_size,
+            fact_batch_chunk_size=settings.outbox_fact_batch_chunk_size,
+            compact_interval_seconds=settings.outbox_compact_interval_seconds,
+            compact_cleanup_hours=settings.outbox_compact_cleanup_hours,
+            stale_processing_seconds=settings.outbox_stale_processing_seconds,
+            process_pending_limit=settings.outbox_process_pending_limit,
         )
         await _outbox_worker.initialize()
     return _outbox_worker
@@ -266,7 +311,7 @@ async def search_tool(
     query: str = "",
     subject: str = "",
     predicate: str = "",
-    limit: int = 50,
+    limit: int = get_settings().search_default_limit,
 ) -> str:
     """Search stored facts by keyword text with optional filters.
 
@@ -290,7 +335,11 @@ async def search_tool(
 
 
 @mcp.tool(name="get_context")
-async def get_context_tool(task: str, subject: str = "", max_results: int = 10) -> str:
+async def get_context_tool(
+    task: str,
+    subject: str = "",
+    max_results: int = get_settings().context_default_limit,
+) -> str:
     """Retrieve structured context about a task.
 
     Args:
@@ -360,7 +409,7 @@ async def learn_tool(
     text: str,
     source: str = "user",
     extract_beliefs: bool = False,
-    min_belief_confidence: float = 0.6,
+    min_belief_confidence: float = get_settings().min_belief_confidence,
 ) -> str:
     """Extract and store facts, decisions, skills, and optionally beliefs from text.
 
@@ -409,8 +458,8 @@ def _serialize_route_result(result: dict) -> str:
 @mcp.tool(name="semantic_search")
 async def semantic_search_tool(
     query: str = "",
-    top_k: int = 10,
-    score_threshold: float = 0.0,
+    top_k: int = get_settings().semantic_top_k,
+    score_threshold: float = get_settings().semantic_score_threshold,
 ) -> str:
     """Semantic search — embed a query and find similar facts via vector similarity.
 
@@ -439,7 +488,10 @@ async def _get_graph_router() -> GraphRouter:
     global _graph, _graph_router
     if _graph_router is None:
         _graph = await _get_graph()
-        _graph_router = GraphRouter(graph=_graph)
+        _graph_router = GraphRouter(
+            graph=_graph,
+            max_path_depth=get_settings().graph_max_path_depth,
+        )
     return _graph_router
 
 
@@ -622,9 +674,7 @@ async def _get_hybrid_router() -> HybridRouter:
 
         vector_provider = await _get_vector_provider()
         if _embedder is None:
-            from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
-
-            _embedder = SentenceTransformerEmbeddingProvider()
+            _embedder = _build_embedder()
         if _graph is None:
             _graph = await _get_graph()
         _hybrid_router = HybridRouter(
@@ -638,8 +688,8 @@ async def _get_hybrid_router() -> HybridRouter:
 @mcp.tool(name="route")
 async def route_tool(
     query: str = "",
-    top_k: int = 10,
-    score_threshold: float = 0.0,
+    top_k: int = get_settings().semantic_top_k,
+    score_threshold: float = get_settings().semantic_score_threshold,
 ) -> str:
     """Route a query through the 4-stage hybrid router (rules -> embeddings -> graph -> LLM).
 
@@ -852,7 +902,7 @@ async def get_belief_tool(
     source: str = "",
     creator: str = "",
     source_id: str = "",
-    limit: int = 10,
+    limit: int = get_settings().belief_search_limit,
 ) -> str:
     """Search beliefs with optional filters.
 
@@ -1235,8 +1285,8 @@ async def resolve_conflict_tool(
 async def reflect_tool(
     mode: str = "overview",
     topic: str = "",
-    min_confidence: float = 0.0,
-    limit: int = 50,
+    min_confidence: float = get_settings().reflect_min_confidence,
+    limit: int = get_settings().reflect_limit,
 ) -> str:
     """Analyse the belief store and produce structured insights.
 

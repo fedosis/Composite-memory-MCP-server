@@ -583,10 +583,7 @@ class TestOutboxWorker:
         """
         from datetime import timedelta
 
-        from storage.outbox_worker import (
-            COMPACT_CLEANUP_OLDER_THAN,
-            COMPACT_INTERVAL_SECONDS,
-        )
+        from storage.outbox_worker import OutboxWorker
 
         captured = {}
 
@@ -614,8 +611,10 @@ class TestOutboxWorker:
         assert kw["cleanup_older_than"] <= timedelta(hours=1), (
             f"cleanup_older_than must be sub-week, got {kw['cleanup_older_than']}"
         )
-        assert COMPACT_CLEANUP_OLDER_THAN == timedelta(hours=1)
-        assert COMPACT_INTERVAL_SECONDS > 0
+        # Tuning values are instance attributes now (constructor kwargs with
+        # the previous module-constant defaults).
+        assert worker._compact_cleanup_hours == 1
+        assert worker._compact_interval_seconds > 0
 
 
 # =============================================================================

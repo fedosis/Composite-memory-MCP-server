@@ -11,16 +11,12 @@ from storage.dedup import ACTIVE_LIFECYCLE_STATES, decision_dedup_key
 from memory_server.models import Decision
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
-# Over-fetch factor for the decisions search: duplicates are dropped after
-# retrieval, so we fetch more than the final budget to still fill it.
-DEDUP_OVERFETCH_FACTOR = 4
-
 
 async def get_context(
     provider: SQLiteProvider,
     task: str,
     subject: Optional[str] = None,
-    max_results: int = 10,
+    max_results: int | None = None,
     include_inactive: bool = False,
 ) -> dict:
     """Retrieve structured context for a task.
@@ -29,11 +25,18 @@ async def get_context(
         provider: Initialized SQLiteProvider instance.
         task: The task description or search query.
         subject: Optional subject filter.
-        max_results: Maximum number of results to return.
+        max_results: Maximum number of results to return. When None
+            (default), resolves from Settings.
 
     Returns:
         Dict with 'facts', 'decisions', and 'total' keys.
     """
+    from memory_server.settings import get_settings
+
+    settings = get_settings()
+    if max_results is None:
+        max_results = settings.context_default_limit
+    overfetch_factor = settings.context_dedup_overfetch_factor
     # Search facts by text (task) and optionally by subject
     facts = await provider.search_facts(
         text=task if task else None,
@@ -61,7 +64,7 @@ async def get_context(
     # recent row instead of flooding the injected context block.
     decisions = await provider.search_decisions(
         text=task if task else None,
-        limit=max_results * DEDUP_OVERFETCH_FACTOR,
+        limit=max_results * overfetch_factor,
     )
     if not include_inactive:
         decisions = [d for d in decisions if d.lifecycle_state in ACTIVE_LIFECYCLE_STATES]

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from memory_server.paths import cmms_repo_root
+from memory_server.settings import get_settings
 
 
 @dataclass
@@ -88,7 +89,7 @@ class HermesPluginConfig:
         return cls(
             db_url=os.environ.get(
                 "MEMORY_SERVER_DB_URL",
-                data.get("db_url") or "sqlite+aiosqlite:///data/memory.db",
+                data.get("db_url") or get_settings().db_url,
             ),
             cmms_path=cmms_path,
             cmms_path_source=source,
@@ -109,7 +110,7 @@ class HermesPluginConfig:
         return cls(
             db_url=os.environ.get(
                 "MEMORY_SERVER_DB_URL",
-                "sqlite+aiosqlite:///data/memory.db",
+                get_settings().db_url,
             ),
             cmms_path=cmms_path,
             cmms_path_source=source,

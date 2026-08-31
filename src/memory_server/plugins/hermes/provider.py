@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from memory_server.paths import cmms_repo_root
 from memory_server.plugins.hermes.config import HermesPluginConfig
 from memory_server.plugins.hermes.writer import WriterQueue
+from memory_server.settings import get_openai_api_key, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,9 @@ def _run_async(coro, timeout: float = 30.0):
 # Default config
 # ---------------------------------------------------------------------------
 
-DEFAULT_DB_URL = "sqlite+aiosqlite:///data/memory.db"
+# Single source: the Settings default. Kept under the original name for
+# any external import compatibility.
+DEFAULT_DB_URL = get_settings().db_url
 
 
 def _supports_background_outbox(db_url: str) -> bool:
@@ -118,8 +121,7 @@ async def _get_graph(provider: "HermesProvider"):
     if provider._graph is None:
         snapshot_path = _resolve_cmms_data_path(
             provider,
-            "data/graph.json",
-            env_var="MEMORY_GRAPH_SNAPSHOT_PATH",
+            str(get_settings().graph_snapshot_path),
         )
         provider._graph = SimpleGraph(snapshot_path=snapshot_path)
         provider._graph.load_snapshot()
@@ -128,7 +130,7 @@ async def _get_graph(provider: "HermesProvider"):
 
 async def _get_vector_provider(provider: "HermesProvider"):
     """Resolve the active vector backend for Hermes audit/tools."""
-    backend = os.environ.get("MEMORY_VECTOR_BACKEND", "lancedb").lower()
+    backend = get_settings().vector_backend
 
     if backend == "qdrant":
         if provider._qdrant is None:
@@ -137,15 +139,28 @@ async def _get_vector_provider(provider: "HermesProvider"):
             # Persistent Qdrant only when a host URL is configured; otherwise
             # fall back to in-memory (parity with the MCP server path, where
             # indexes are process-local by default).
-            location = os.environ.get("MEMORY_QDRANT_URL", ":memory:")
-            provider._qdrant = QdrantProvider(location=location, prefer_grpc=False)
+            settings = get_settings()
+            provider._qdrant = QdrantProvider(
+                location=settings.qdrant_location,
+                port=settings.qdrant_port,
+                prefer_grpc=settings.qdrant_prefer_grpc,
+                collection=settings.vector_collection,
+                vector_size=settings.vector_size,
+                distance=settings.vector_metric,
+            )
         return provider._qdrant
 
     if provider._lancedb is None:
         from memory_server.providers.lancedb_provider import LanceDBProvider
 
-        db_path = _resolve_cmms_data_path(provider, "data/lancedb")
-        provider._lancedb = LanceDBProvider(db_path=str(db_path), table="memories")
+        settings = get_settings()
+        db_path = _resolve_cmms_data_path(provider, str(settings.lancedb_path))
+        provider._lancedb = LanceDBProvider(
+            db_path=str(db_path),
+            table=settings.vector_collection,
+            metric=settings.vector_metric,
+            vector_size=settings.vector_size,
+        )
     return provider._lancedb
 
 
@@ -153,10 +168,24 @@ async def _get_embedder(provider: "HermesProvider"):
     """Resolve the active embedding provider for Hermes tools/workers."""
     if provider._embedder is None:
         from memory_server.providers.embedding_provider import (
+            OpenAIEmbeddingProvider,
             SentenceTransformerEmbeddingProvider,
         )
 
-        provider._embedder = SentenceTransformerEmbeddingProvider()
+        settings = get_settings()
+        if settings.embedding_provider == "openai":
+            provider._embedder = OpenAIEmbeddingProvider(
+                model=settings.openai_embedding_model,
+                base_url=settings.embedding_base_url,
+                vector_size=settings.openai_embedding_vector_size,
+                api_key=get_openai_api_key(),
+            )
+        else:
+            provider._embedder = SentenceTransformerEmbeddingProvider(
+                model_name=settings.embedding_model,
+                device=settings.embedding_device,
+                batch_size=settings.embedding_batch_size,
+            )
     return provider._embedder
 
 
@@ -353,7 +382,11 @@ class HermesProvider:
         vector_provider = await _get_vector_provider(self)
         embedder = await _get_embedder(self)
         graph = await _get_graph(self)
-        graph_router = GraphRouter(graph=graph)
+        settings = get_settings()
+        graph_router = GraphRouter(
+            graph=graph,
+            max_path_depth=settings.graph_max_path_depth,
+        )
         assert self._provider is not None
 
         self._outbox_worker = OutboxWorker(
@@ -361,6 +394,14 @@ class HermesProvider:
             qdrant=vector_provider,
             embedder=embedder,
             graph_router=graph_router,
+            max_retries=settings.outbox_max_retries,
+            poll_interval_seconds=settings.outbox_poll_interval_seconds,
+            poll_batch_size=settings.outbox_poll_batch_size,
+            fact_batch_chunk_size=settings.outbox_fact_batch_chunk_size,
+            compact_interval_seconds=settings.outbox_compact_interval_seconds,
+            compact_cleanup_hours=settings.outbox_compact_cleanup_hours,
+            stale_processing_seconds=settings.outbox_stale_processing_seconds,
+            process_pending_limit=settings.outbox_process_pending_limit,
         )
         await self._outbox_worker.initialize()
 
@@ -1084,7 +1125,7 @@ class HermesProvider:
         query: str = "",
         subject: str = "",
         predicate: str = "",
-        limit: int = 50,
+        limit: int = get_settings().search_default_limit,
     ) -> str:
         from memory_server.api.search import search as search_fn
         provider = self._require_provider()
@@ -1127,7 +1168,7 @@ class HermesProvider:
         self,
         task: str,
         subject: str = "",
-        max_results: int = 10,
+        max_results: int = get_settings().context_default_limit,
     ) -> str:
         from memory_server.api.get_context import get_context as get_context_fn
         provider = self._require_provider()
@@ -1144,7 +1185,7 @@ class HermesProvider:
         text: str,
         source: str = "user",
         extract_beliefs: bool = False,
-        min_belief_confidence: float = 0.6,
+        min_belief_confidence: float = get_settings().min_belief_confidence,
     ) -> str:
         from memory_server.api.learn import learn as learn_fn
         provider = self._require_provider()
@@ -1160,8 +1201,8 @@ class HermesProvider:
     async def _handle_semantic_search(
         self,
         query: str = "",
-        top_k: int = 10,
-        score_threshold: float = 0.0,
+        top_k: int = get_settings().semantic_top_k,
+        score_threshold: float = get_settings().semantic_score_threshold,
     ) -> str:
         from memory_server.router.embedding_router import EmbeddingRouter
 
@@ -1191,7 +1232,10 @@ class HermesProvider:
 
         if self._graph is None:
             self._graph = SimpleGraph()
-        graph_router = GraphRouter(graph=self._graph)
+        graph_router = GraphRouter(
+            graph=self._graph,
+            max_path_depth=get_settings().graph_max_path_depth,
+        )
         graph = graph_router.graph
 
         nodes: list[dict] = []
@@ -1222,7 +1266,11 @@ class HermesProvider:
                         "attributes": edge.attributes,
                     })
         elif source_id and target_id:
-            found_paths = graph.find_path(source_id, target_id, max_depth=4)
+            found_paths = graph.find_path(
+                source_id,
+                target_id,
+                max_depth=get_settings().graph_max_path_depth,
+            )
             for p in found_paths:
                 paths.append([
                     {"id": n.id, "name": n.name, "type": n.type}
@@ -1243,8 +1291,8 @@ class HermesProvider:
     async def _handle_route(
         self,
         query: str = "",
-        top_k: int = 10,
-        score_threshold: float = 0.0,
+        top_k: int = get_settings().semantic_top_k,
+        score_threshold: float = get_settings().semantic_score_threshold,
     ) -> str:
         from memory_server.router.hybrid_router import HybridRouter
 
@@ -1403,7 +1451,7 @@ class HermesProvider:
         source: str = "",
         creator: str = "",
         source_id: str = "",
-        limit: int = 10,
+        limit: int = get_settings().belief_search_limit,
     ) -> str:
         import json as _json
 
@@ -1720,8 +1768,8 @@ class HermesProvider:
         self,
         mode: str = "overview",
         topic: str = "",
-        min_confidence: float = 0.0,
-        limit: int = 50,
+        min_confidence: float = get_settings().reflect_min_confidence,
+        limit: int = get_settings().reflect_limit,
     ) -> str:
         from memory_server.api.reflect import ReflectEngine
 

@@ -21,10 +21,17 @@ class GraphRouter:
 
     Args:
         graph: Optional SimpleGraph instance. Creates a new one if not provided.
+        max_path_depth: Maximum pathfinding depth used by ``query()``
+            (default 4, Settings-driven at production call sites).
     """
 
-    def __init__(self, graph: SimpleGraph | None = None) -> None:
+    def __init__(
+        self,
+        graph: SimpleGraph | None = None,
+        max_path_depth: int = 4,
+    ) -> None:
         self._graph = graph or SimpleGraph()
+        self._max_path_depth = max_path_depth
 
     # --- Entity extraction ---
 
@@ -106,7 +113,7 @@ class GraphRouter:
                     found_paths = self._graph.find_path(
                         entities[i]["id"],
                         entities[j]["id"],
-                        max_depth=4,
+                        max_depth=self._max_path_depth,
                     )
                     for p in found_paths:
                         paths.append([

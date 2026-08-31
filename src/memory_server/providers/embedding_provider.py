@@ -58,7 +58,15 @@ class MockEmbeddingProvider(EmbeddingProvider):
         seed: Random seed for reproducibility (default 42).
     """
 
-    def __init__(self, vector_size: int = 384, seed: int = 42) -> None:
+    def __init__(
+        self,
+        vector_size: int = 384,
+        seed: int = 42,
+        **kwargs: Any,
+    ) -> None:
+        # ``**kwargs`` lets tests substitute this mock for the real
+        # SentenceTransformer/OpenAI providers, which are constructed with
+        # Settings-fed keyword arguments; the mock ignores them.
         self._vector_size = vector_size
         self._seed = seed
         self._cache: dict[str, list[float]] = {}
@@ -102,13 +110,22 @@ class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
 
     def __init__(
         self,
-        model_name: str = "all-MiniLM-L6-v2",
+        model_name: str | None = None,
         device: str | None = None,
-        batch_size: int = 32,
+        batch_size: int | None = None,
     ) -> None:
-        self._model_name = model_name
-        self._device = device
-        self._batch_size = batch_size
+        # None → resolve from Settings (defaults equal the previous literals;
+        # explicit args still win).
+        from memory_server.settings import get_settings
+
+        settings = get_settings()
+        self._model_name = (
+            model_name if model_name is not None else settings.embedding_model
+        )
+        self._device = device if device is not None else settings.embedding_device
+        self._batch_size = (
+            batch_size if batch_size is not None else settings.embedding_batch_size
+        )
         self._model: Any = None
 
     @staticmethod
@@ -177,15 +194,29 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
 
     def __init__(
         self,
-        model: str = "text-embedding-3-small",
+        model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
-        vector_size: int = 1536,
+        vector_size: int | None = None,
     ) -> None:
-        self._model = model
+        # None → resolve from Settings (defaults equal the previous literals;
+        # explicit args still win). api_key stays env-only — the openai
+        # client reads OPENAI_API_KEY from the environment when None.
+        from memory_server.settings import get_settings
+
+        settings = get_settings()
+        self._model = (
+            model if model is not None else settings.openai_embedding_model
+        )
         self._api_key = api_key
-        self._base_url = base_url
-        self._vector_size = vector_size
+        self._base_url = (
+            base_url if base_url is not None else settings.embedding_base_url
+        )
+        self._vector_size = (
+            vector_size
+            if vector_size is not None
+            else settings.openai_embedding_vector_size
+        )
         self._client: Any = None
 
     @staticmethod

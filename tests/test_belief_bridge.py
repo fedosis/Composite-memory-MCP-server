@@ -9,7 +9,6 @@ Covers:
 - TestExistingNoRegression — all existing learn tests still pass
 """
 
-import json
 import logging
 
 import pytest
@@ -249,38 +248,47 @@ class TestEvidenceLinking:
 class TestSoftLimit:
     """Test MAX_ACTIVE_BELIEFS soft limit."""
 
-    async def test_soft_limit_skip_warns(self, provider, caplog):
-        """Active beliefs >= 500 triggers warning and skips belief extraction."""
-        # Seed 500 active beliefs
-        for i in range(500):
-            b = Belief(
-                proposition=f"Test belief {i}",
-                confidence=0.5,
-                source="test",
-                tags=["test"],
-                creator="test",
-            )
-            await provider.create_belief(b)
+    async def test_soft_limit_skip_warns(self, provider, caplog, monkeypatch):
+        """Active beliefs >= soft limit triggers warning and skips belief extraction.
 
-        # Verify 500 active beliefs
-        active = await provider.search_beliefs(lifecycle_state="active", limit=0)
-        assert len(active) >= 500
+        The soft limit is Settings-fed: overriding MEMORY_SERVER_MAX_ACTIVE_BELIEFS
+        changes the admission threshold without code edits.
+        """
+        from memory_server.settings import get_settings
 
-        # Now call learn() with extract_beliefs=True
-        with caplog.at_level(logging.WARNING, logger="memory_server.services.ingestion_service"):
-            # Re-create the module-level logger reference
-            from memory_server.services import ingestion_service
-            result = await learn(
-                provider,
-                text="Docker is container. I prefer Docker over Podman",
-                extract_beliefs=True,
-                min_belief_confidence=0.3,
-            )
+        monkeypatch.setenv("MEMORY_SERVER_MAX_ACTIVE_BELIEFS", "42")
+        get_settings.cache_clear()
+        try:
+            # Seed 42 active beliefs (>= limit 42)
+            for i in range(42):
+                b = Belief(
+                    proposition=f"Test belief {i}",
+                    confidence=0.5,
+                    source="test",
+                    tags=["test"],
+                    creator="test",
+                )
+                await provider.create_belief(b)
 
-        # Should skip belief extraction due to soft limit
-        assert result["beliefs"] == []
-        # Facts etc still work
-        assert len(result["facts"]) >= 1
+            # Verify 42 active beliefs
+            active = await provider.search_beliefs(lifecycle_state="active", limit=0)
+            assert len(active) >= 42
+
+            # Now call learn() with extract_beliefs=True
+            with caplog.at_level(logging.WARNING, logger="memory_server.services.ingestion_service"):
+                result = await learn(
+                    provider,
+                    text="Docker is container. I prefer Docker over Podman",
+                    extract_beliefs=True,
+                    min_belief_confidence=0.3,
+                )
+
+            # Should skip belief extraction due to soft limit
+            assert result["beliefs"] == []
+            # Facts etc still work
+            assert len(result["facts"]) >= 1
+        finally:
+            get_settings.cache_clear()
 
 
 # =============================================================================
