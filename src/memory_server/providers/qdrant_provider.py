@@ -13,12 +13,32 @@ from uuid import uuid4
 
 from qdrant_client import QdrantClient as _QdrantClient
 from qdrant_client.http import models as qmodels
+from qdrant_client.http.exceptions import ApiException
+
+from memory_server.providers.exceptions import (
+    ProviderSearchError,
+    ProviderWriteError,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_COLLECTION = "memories"
 DEFAULT_VECTOR_SIZE = 384
 DEFAULT_DISTANCE = qmodels.Distance.COSINE
+
+
+def _is_not_found(exc: Exception) -> bool:
+    """True for a missing-collection/point backend error (404 / ValueError)."""
+    if isinstance(exc, ApiException):  # UnexpectedResponse subclasses it
+        return exc.status_code == 404
+    return isinstance(exc, ValueError) and "not found" in str(exc).lower()
+
+
+def _is_conflict(exc: Exception) -> bool:
+    """True for an already-exists backend error (409 / ValueError)."""
+    if isinstance(exc, ApiException):
+        return exc.status_code == 409
+    return isinstance(exc, ValueError) and "already exists" in str(exc).lower()
 
 
 def _normalize_distance(distance: str) -> qmodels.Distance:
@@ -91,7 +111,13 @@ class QdrantProvider:
         self._ensure_collection(collection)
 
     def _ensure_collection(self, name: str) -> bool:
-        """Create collection if it doesn't exist (sync helper)."""
+        """Create collection if it doesn't exist (sync helper).
+
+        Deliberately degrades to warning+False: this feeds only __init__
+        (construction-time auto-create), not a public operation — a down
+        backend at boot must not crash server startup (server.py constructs
+        without try).
+        """
         try:
             collections = self._client.get_collections()
             existing = {c.name for c in collections.collections}
@@ -154,8 +180,13 @@ class QdrantProvider:
             )
             return True
         except Exception as exc:
+            if _is_conflict(exc):
+                logger.info("Collection '%s' already exists", name)
+                return False
             logger.error("Failed to create collection '%s': %s", name, exc)
-            return False
+            raise ProviderWriteError(
+                f"qdrant create_collection failed: {exc}"
+            ) from exc
 
     async def delete_collection(self, name: str) -> bool:
         """Delete a collection.
@@ -167,8 +198,13 @@ class QdrantProvider:
             await self._run(self._client.delete_collection, collection_name=name)
             return True
         except Exception as exc:
+            if _is_not_found(exc):
+                logger.info("Collection '%s' not found — nothing to delete", name)
+                return True
             logger.warning("Failed to delete collection '%s': %s", name, exc)
-            return False
+            raise ProviderWriteError(
+                f"qdrant delete_collection failed: {exc}"
+            ) from exc
 
     async def list_collections(self) -> list[str]:
         """List all collection names."""
@@ -177,16 +213,24 @@ class QdrantProvider:
             return [c.name for c in collections.collections]
         except Exception as exc:
             logger.error("Failed to list collections: %s", exc)
-            return []
+            raise ProviderSearchError(
+                f"qdrant list_collections failed: {exc}"
+            ) from exc
 
     async def count_points(self, collection: str | None = None) -> int:
         """Return the number of indexed vector points in a collection."""
-        result = await self._run(
-            self._client.count,
-            collection_name=collection or self._collection,
-            exact=True,
-        )
-        return int(result.count)
+        try:
+            result = await self._run(
+                self._client.count,
+                collection_name=collection or self._collection,
+                exact=True,
+            )
+            return int(result.count)
+        except Exception as exc:
+            logger.error("Failed to count points: %s", exc)
+            raise ProviderSearchError(
+                f"qdrant count_points failed: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Point operations
@@ -224,7 +268,7 @@ class QdrantProvider:
             return True
         except Exception as exc:
             logger.error("Failed to upsert point %s in '%s': %s", pid, col, exc)
-            return False
+            raise ProviderWriteError(f"qdrant upsert failed: {exc}") from exc
 
     async def upsert_batch(
         self,
@@ -258,7 +302,7 @@ class QdrantProvider:
             return True
         except Exception as exc:
             logger.error("Failed to batch upsert in '%s': %s", col, exc)
-            return False
+            raise ProviderWriteError(f"qdrant upsert_batch failed: {exc}") from exc
 
     async def search(
         self,
@@ -305,8 +349,10 @@ class QdrantProvider:
                 for h in resp.points
             ]
         except Exception as exc:
+            if _is_not_found(exc):
+                return []  # missing collection → empty result (kept degradation)
             logger.error("Search failed in '%s': %s", col, exc)
-            return []
+            raise ProviderSearchError(f"qdrant search failed: {exc}") from exc
 
     async def scroll(
         self,
@@ -342,8 +388,10 @@ class QdrantProvider:
                 for r in records
             ]
         except Exception as exc:
+            if _is_not_found(exc):
+                return []  # missing collection → empty result (kept degradation)
             logger.error("Scroll failed in '%s': %s", col, exc)
-            return []
+            raise ProviderSearchError(f"qdrant scroll failed: {exc}") from exc
 
     async def delete(
         self,
@@ -370,8 +418,11 @@ class QdrantProvider:
             )
             return True
         except Exception as exc:
+            if _is_not_found(exc):
+                logger.info("Point %s not found in '%s' — nothing to delete", point_id, col)
+                return True
             logger.warning("Failed to delete point %s in '%s': %s", point_id, col, exc)
-            return False
+            raise ProviderWriteError(f"qdrant delete failed: {exc}") from exc
 
     async def close(self) -> None:
         """Close the underlying Qdrant client."""

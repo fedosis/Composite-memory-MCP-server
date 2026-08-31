@@ -14,6 +14,7 @@ from memory_server.providers.embedding_provider import (
     EmbeddingProvider,
     MockEmbeddingProvider,
 )
+from memory_server.providers.exceptions import ProviderSearchError
 from memory_server.router.rules import RoutingRuleSet
 
 if TYPE_CHECKING:
@@ -130,13 +131,27 @@ class EmbeddingRouter:
         vector = self._embedder.embed(query)
         logger.debug("Embedded query '%s' to %d-dim vector", query[:50], len(vector))
 
-        # Search vector store
-        results = await self._vector_provider.search(
-            collection=self._collection,
-            vector=vector,
-            limit=top_k,
-            score_threshold=score_threshold,
-        )
+        # Search vector store — a search failure degrades to a logged []
+        # instead of escaping to server/hermes. Embed failures above stay
+        # outside the try and keep propagating.
+        try:
+            results = await self._vector_provider.search(
+                collection=self._collection,
+                vector=vector,
+                limit=top_k,
+                score_threshold=score_threshold,
+            )
+        except ProviderSearchError as exc:
+            logger.warning(
+                "embedding search failed (%s): %s", type(exc).__name__, exc
+            )
+            return []
+        except Exception as exc:
+            logger.warning(
+                "embedding search failed (unexpected %s): %s",
+                type(exc).__name__, exc,
+            )
+            return []
         logger.debug(
             "semantic_search: query=%r top_k=%d found=%d provider=%s",
             query, top_k, len(results),

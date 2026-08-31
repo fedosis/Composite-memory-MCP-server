@@ -1,5 +1,6 @@
 """Tests for semantic router and routing rules (Card 010)."""
 
+import logging
 import uuid
 
 import pytest
@@ -234,9 +235,87 @@ class TestEmbeddingRouter:
     async def test_no_rule_match_falls_through_to_semantic(self, router):
         """When no rule matches, semantic search should run."""
         vec = router._embedder.embed("General knowledge about Python")
-        await router._vector_provider.upsert("memories", point_id="general", vector=vec,
+        # Valid UUID id: Qdrant rejects non-UUID point ids (provider contract
+        # surfaces the failure as ProviderWriteError instead of silent False).
+        await router._vector_provider.upsert("memories", point_id=str(uuid.uuid4()), vector=vec,
                                      payload={"content": "General knowledge about Python"})
 
         result = await router.route("What is Python?")
         assert result is not None
         assert "semantic_results" in result or "rule_match" not in result
+
+
+class TestEmbeddingRouterSearchFailure:
+    """Search failure must degrade to a logged [] instead of escaping (Card 3a).
+
+    The router is built with an EMPTY RoutingRuleSet so no rule can
+    short-circuit the semantic-search path: results must come from
+    EmbeddingRouter.search catching the provider failure.
+    """
+
+    @pytest.fixture
+    def router(self):
+        from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
+
+        qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
+        embedder = MockEmbeddingProvider(vector_size=384)
+        return EmbeddingRouter(
+            vector_provider=qdrant,
+            embedder=embedder,
+            rules=RoutingRuleSet(),
+        )
+
+    async def test_typed_search_failure_returns_empty_and_logs_type(
+        self, router, monkeypatch, caplog
+    ):
+        from memory_server.providers.exceptions import ProviderSearchError
+
+        async def _boom(*a, **k):
+            raise ProviderSearchError("down")
+
+        monkeypatch.setattr(router._vector_provider, "search", _boom)
+        with caplog.at_level(
+            logging.WARNING, logger="memory_server.router.embedding_router"
+        ):
+            results = await router.search("hello")
+        assert results == []
+        assert "ProviderSearchError" in caplog.text
+
+    async def test_unexpected_search_failure_returns_empty_and_logs_type(
+        self, router, monkeypatch, caplog
+    ):
+        async def _boom(*a, **k):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(router._vector_provider, "search", _boom)
+        with caplog.at_level(
+            logging.WARNING, logger="memory_server.router.embedding_router"
+        ):
+            results = await router.search("hello")
+        assert results == []
+        assert "RuntimeError" in caplog.text
+
+    async def test_route_fallthrough_catches_search_failure(self, router, monkeypatch):
+        """route() with empty rules must fall through to search; the failure
+        is caught inside EmbeddingRouter.search, not rule-short-circuited."""
+        calls = []
+
+        async def _spy_search(*a, **k):
+            calls.append(1)
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(router._vector_provider, "search", _spy_search)
+        result = await router.route("hello")
+        assert result == {"semantic_results": [], "total": 0}
+        assert calls == [1]
+
+    async def test_embed_failure_propagates(self, router, monkeypatch):
+        """Embed failures must NOT be swallowed by the search degradation."""
+
+        def _bad_embed(*a, **k):
+            raise RuntimeError("embed boom")
+
+        monkeypatch.setattr(router._embedder, "embed", _bad_embed)
+        with pytest.raises(RuntimeError):
+            await router.search("hello")

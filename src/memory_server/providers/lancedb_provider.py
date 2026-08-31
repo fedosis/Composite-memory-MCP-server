@@ -15,6 +15,11 @@ import logging
 import uuid
 from typing import Any
 
+from memory_server.providers.exceptions import (
+    ProviderSearchError,
+    ProviderWriteError,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TABLE = "memories"
@@ -130,12 +135,17 @@ class LanceDBProvider:
 
             self._db = await asyncio.to_thread(lancedb.connect, self._db_path)
             # Ensure default table exists
-            await self._ensure_table(self._table_name)
+            await self._ensure_table(self._table_name, db=self._db)
         return self._db
 
-    async def _ensure_table(self, name: str) -> bool:
-        """Create the table if it doesn't exist."""
-        db = await self._get_db()
+    async def _ensure_table(self, name: str, db=None) -> bool:
+        """Create the table if it doesn't exist.
+
+        Raises ProviderWriteError on failure: a down backend must surface as
+        a typed error on the first public operation, not a silent False.
+        """
+        if db is None:
+            db = await self._get_db()
         try:
             table_names = await asyncio.to_thread(db.table_names)
             if name in table_names:
@@ -161,7 +171,9 @@ class LanceDBProvider:
             return True
         except Exception as exc:
             logger.warning("Failed to ensure table '%s': %s", name, exc)
-            return False
+            raise ProviderWriteError(
+                f"failed to ensure lancedb table '{name}': {exc}"
+            ) from exc
 
     async def _run(self, func, *args, **kwargs):
         """Run a blocking LanceDB call in a thread."""
@@ -195,8 +207,8 @@ class LanceDBProvider:
         Returns:
             True if created, False if already exists or error.
         """
-        db = await self._get_db()
         try:
+            db = await self._get_db()
             table_names = await asyncio.to_thread(db.table_names)
             if name in table_names:
                 return False
@@ -213,9 +225,13 @@ class LanceDBProvider:
                 db.create_table, name, schema=schema, exist_ok=True,
             )
             return True
+        except ProviderWriteError:
+            raise
         except Exception as exc:
             logger.error("Failed to create table '%s': %s", name, exc)
-            return False
+            raise ProviderWriteError(
+                f"lancedb create_collection failed: {exc}"
+            ) from exc
 
     async def delete_collection(self, name: str) -> bool:
         """Delete a table (collection).
@@ -223,27 +239,39 @@ class LanceDBProvider:
         Returns:
             True if deleted, False if not found or error.
         """
-        db = await self._get_db()
         try:
+            db = await self._get_db()
             await asyncio.to_thread(db.drop_table, name, ignore_missing=True)
             return True
+        except ProviderWriteError:
+            raise
         except Exception as exc:
             logger.warning("Failed to delete table '%s': %s", name, exc)
-            return False
+            raise ProviderWriteError(
+                f"lancedb delete_collection failed: {exc}"
+            ) from exc
 
     async def list_collections(self) -> list[str]:
         """List all table names."""
-        db = await self._get_db()
         try:
+            db = await self._get_db()
             return await asyncio.to_thread(db.table_names)
         except Exception as exc:
             logger.error("Failed to list tables: %s", exc)
-            return []
+            raise ProviderSearchError(
+                f"lancedb list_collections failed: {exc}"
+            ) from exc
 
     async def count_points(self, collection: str | None = None) -> int:
         """Return the number of vector rows in the collection/table."""
-        table = await self._get_table(collection)
-        return int(await asyncio.to_thread(table.count_rows))
+        try:
+            table = await self._get_table(collection)
+            return int(await asyncio.to_thread(table.count_rows))
+        except Exception as exc:
+            logger.error("Failed to count points: %s", exc)
+            raise ProviderSearchError(
+                f"lancedb count_points failed: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Point operations
@@ -267,9 +295,9 @@ class LanceDBProvider:
         Returns:
             True on success.
         """
-        table = await self._get_table(collection)
         pid = str(point_id) if point_id else str(uuid.uuid4())
         try:
+            table = await self._get_table(collection)
             import pyarrow as pa
 
             data = pa.table({
@@ -290,9 +318,11 @@ class LanceDBProvider:
                 data,
             )
             return True
+        except ProviderWriteError:
+            raise
         except Exception as exc:
             logger.error("Failed to upsert point %s: %s", pid, exc)
-            return False
+            raise ProviderWriteError(f"lancedb upsert failed: {exc}") from exc
 
     async def upsert_batch(
         self,
@@ -310,8 +340,8 @@ class LanceDBProvider:
         Returns:
             True on success.
         """
-        table = await self._get_table(collection)
         try:
+            table = await self._get_table(collection)
             import pyarrow as pa
 
             # Deduplicate by id within the batch: merge_insert does not
@@ -342,9 +372,11 @@ class LanceDBProvider:
                 data,
             )
             return True
+        except ProviderWriteError:
+            raise
         except Exception as exc:
             logger.error("Failed to batch upsert: %s", exc)
-            return False
+            raise ProviderWriteError(f"lancedb upsert_batch failed: {exc}") from exc
 
     async def search(
         self,
@@ -369,8 +401,8 @@ class LanceDBProvider:
         if not vector:
             return []
 
-        table = await self._get_table(collection)
         try:
+            table = await self._get_table(collection)
             import numpy as np  # lazy: optional dep, only needed for search
             lance_filter = _dict_to_filter(filter_) if isinstance(filter_, dict) else filter_
             query = table.search(np.array(vector, dtype=np.float32))
@@ -431,7 +463,7 @@ class LanceDBProvider:
             return parsed
         except Exception as exc:
             logger.error("Search failed: %s", exc)
-            return []
+            raise ProviderSearchError(f"lancedb search failed: {exc}") from exc
 
     async def scroll(
         self,
@@ -449,8 +481,8 @@ class LanceDBProvider:
         Returns:
             List of point dicts with keys: id, payload.
         """
-        table = await self._get_table(collection)
         try:
+            table = await self._get_table(collection)
             lance_filter = _dict_to_filter(filter_) if isinstance(filter_, dict) else filter_
             results = await self._run(
                 table.search().limit(limit).to_list
@@ -483,7 +515,7 @@ class LanceDBProvider:
             return parsed
         except Exception as exc:
             logger.error("Scroll failed: %s", exc)
-            return []
+            raise ProviderSearchError(f"lancedb scroll failed: {exc}") from exc
 
     async def delete(
         self,
@@ -499,14 +531,16 @@ class LanceDBProvider:
         Returns:
             True if deleted, False if not found or error.
         """
-        table = await self._get_table(collection)
         try:
+            table = await self._get_table(collection)
             pid = str(point_id)
             await self._run(table.delete, f'id = "{pid}"')
             return True
+        except ProviderWriteError:
+            raise
         except Exception as exc:
             logger.warning("Failed to delete point %s: %s", point_id, exc)
-            return False
+            raise ProviderWriteError(f"lancedb delete failed: {exc}") from exc
 
     async def optimize(
         self,
@@ -530,8 +564,8 @@ class LanceDBProvider:
         Returns:
             True on success.
         """
-        table = await self._get_table(collection)
         try:
+            table = await self._get_table(collection)
             await self._run(
                 table.optimize,
                 cleanup_older_than=cleanup_older_than,
@@ -542,9 +576,11 @@ class LanceDBProvider:
                 table.name,
             )
             return True
+        except ProviderWriteError:
+            raise
         except Exception as exc:
-            logger.warning("LanceDB optimize failed for '%s': %s", table.name, exc)
-            return False
+            logger.warning("LanceDB optimize failed: %s", exc)
+            raise ProviderWriteError(f"lancedb optimize failed: {exc}") from exc
 
     async def close(self) -> None:
         """Close the underlying LanceDB database connection."""
