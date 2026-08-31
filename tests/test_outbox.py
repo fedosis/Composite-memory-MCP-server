@@ -9,6 +9,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import uuid
@@ -26,6 +27,7 @@ from storage.outbox_worker import OutboxWorker
 
 from memory_server.models import Fact, MemoryReceipt, VerificationStatus
 from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+from memory_server.providers.exceptions import ProviderSearchError, ProviderWriteError
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.providers.sqlite_provider import SQLiteProvider
@@ -250,6 +252,94 @@ class TestOutboxRepository:
 # =============================================================================
 # OutboxWorker Integration Tests
 # =============================================================================
+
+
+class _FakeEmbedder:
+    def embed(self, text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+
+class _FakeQdrantFalse:
+    """Write methods always return False (defensive failure signal)."""
+
+    def __init__(self) -> None:
+        self.upsert_batch_calls = 0
+        self.upsert_calls = 0
+
+    async def upsert(self, **kwargs) -> bool:
+        self.upsert_calls += 1
+        return False
+
+    # Worker calls upsert_batch(points) POSITIONALLY (outbox_worker.py:337);
+    # a **kwargs-only fake raises TypeError before returning False and never
+    # exercises the False branch.
+    async def upsert_batch(self, *args, **kwargs) -> bool:
+        self.upsert_batch_calls += 1
+        return False
+
+
+class _FakeQdrantTrue:
+    """Write methods always succeed — the vector chunk step passes; whether
+    the chunk fails is decided by the graph step."""
+
+    def __init__(self) -> None:
+        self.upsert_batch_calls = 0
+        self.upsert_calls = 0
+
+    async def upsert(self, **kwargs) -> bool:
+        self.upsert_calls += 1
+        return True
+
+    async def upsert_batch(self, *args, **kwargs) -> bool:
+        self.upsert_batch_calls += 1
+        return True
+
+
+class _FakeQdrantRaises:
+    """Raises the 3a typed error on writes."""
+
+    def __init__(self, exc: type[Exception]) -> None:
+        self._exc = exc
+
+    async def upsert(self, **kwargs) -> bool:
+        raise self._exc("backend boom")
+
+
+class _FakeRouterFalse:
+    """Graph sync methods always return False."""
+
+    def __init__(self) -> None:
+        self.sync_facts_batch_calls = 0
+        self.sync_fact_calls = 0
+
+    def sync_fact(self, *args, **kwargs) -> bool:
+        self.sync_fact_calls += 1
+        return False
+
+    def sync_facts_batch(self, *args, **kwargs) -> bool:
+        self.sync_facts_batch_calls += 1
+        return False
+
+
+async def _make_worker(**kw) -> OutboxWorker:
+    engine, factory, db_path = _make_engine_and_factory()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    # The bootstrap engine is only needed for create_all; the worker builds
+    # its own engine from db_url in initialize(). Dispose it so no aiosqlite
+    # worker thread outlives the test's event loop (avoids
+    # PytestUnhandledThreadExceptionWarning "Event loop is closed").
+    await engine.dispose()
+    worker = OutboxWorker(
+        db_url=f"sqlite+aiosqlite:///{db_path}",
+        max_retries=3,
+        **kw,
+    )
+    await worker.initialize()
+    return worker
 
 
 @pytest.mark.asyncio
@@ -615,6 +705,184 @@ class TestOutboxWorker:
         # the previous module-constant defaults).
         assert worker._compact_cleanup_hours == 1
         assert worker._compact_interval_seconds > 0
+
+    # ── Card 3b: provider False / typed-error results are failures ──────
+
+    async def _insert_entry(self, worker, operation, record_id, payload):
+        async with worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            await repo.add_entry(
+                record_type=operation.replace("index_", ""),
+                record_id=record_id,
+                operation=operation,
+                payload=payload,
+            )
+            await session.commit()
+
+    async def _entry_row(self, worker, record_id):
+        from sqlalchemy import select as sa_select
+
+        async with worker._session_factory() as session:
+            row = (
+                await session.execute(
+                    sa_select(OutboxEntryORM).where(OutboxEntryORM.record_id == record_id)
+                )
+            ).scalars().first()
+            return row
+
+    async def test_index_fact_false_upsert_not_completed_retried_then_failed(self):
+        """qdrant.upsert returning False → never completed; retried then failed."""
+        worker = await _make_worker(
+            qdrant=_FakeQdrantFalse(),
+            embedder=_FakeEmbedder(),
+            graph_router=None,
+        )
+        try:
+            await self._insert_entry(
+                worker, "index_fact", "f-false-upsert",
+                {"subject": "S", "predicate": "p", "object": "O", "source": "test"},
+            )
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+            assert (await self._entry_row(worker, "f-false-upsert")).status == "pending"
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+            assert (await self._entry_row(worker, "f-false-upsert")).status == "pending"
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 1}
+            row = await self._entry_row(worker, "f-false-upsert")
+            assert row.status == "failed"
+            assert row.retry_count == 3
+            assert "returned False" in (row.error or "")
+        finally:
+            await worker.close()
+
+    async def test_index_belief_false_upsert_not_completed_retried_then_failed(self):
+        """Belief upsert returning False → never completed; retried then failed."""
+        worker = await _make_worker(
+            qdrant=_FakeQdrantFalse(),
+            embedder=_FakeEmbedder(),
+            graph_router=None,
+        )
+        try:
+            await self._insert_entry(
+                worker, "index_belief", "b-false-upsert",
+                {"proposition": "P", "confidence": 0.5, "tags": []},
+            )
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+            assert (await self._entry_row(worker, "b-false-upsert")).status == "pending"
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+            assert (await self._entry_row(worker, "b-false-upsert")).status == "pending"
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 1}
+            row = await self._entry_row(worker, "b-false-upsert")
+            assert row.status == "failed"
+            assert row.retry_count == 3
+            assert "returned False" in (row.error or "")
+        finally:
+            await worker.close()
+
+    async def test_index_fact_false_sync_fact_not_completed_retried_then_failed(self):
+        """graph sync_fact returning False → never completed; retried then failed."""
+        worker = await _make_worker(
+            qdrant=None,
+            embedder=_FakeEmbedder(),
+            graph_router=_FakeRouterFalse(),
+        )
+        try:
+            await self._insert_entry(
+                worker, "index_fact", "f-false-sync",
+                {"subject": "S", "predicate": "p", "object": "O", "source": "test"},
+            )
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+            assert (await self._entry_row(worker, "f-false-sync")).status == "pending"
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+            assert (await self._entry_row(worker, "f-false-sync")).status == "pending"
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 1}
+            row = await self._entry_row(worker, "f-false-sync")
+            assert row.status == "failed"
+            assert row.retry_count == 3
+            assert "sync_fact returned False" in (row.error or "")
+        finally:
+            await worker.close()
+
+    @pytest.mark.parametrize("exc", [ProviderWriteError, ProviderSearchError])
+    async def test_provider_typed_error_not_completed_retried_then_failed(self, exc):
+        """Typed provider error → never completed; retried then failed (green-guard)."""
+        worker = await _make_worker(
+            qdrant=_FakeQdrantRaises(exc),
+            embedder=_FakeEmbedder(),
+            graph_router=None,
+        )
+        try:
+            await self._insert_entry(
+                worker, "index_fact", f"f-typed-{exc.__name__}",
+                {"subject": "S", "predicate": "p", "object": "O", "source": "test"},
+            )
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 0}
+            assert await worker.process_all_pending() == {"processed": 0, "failed": 1}
+            row = await self._entry_row(worker, f"f-typed-{exc.__name__}")
+            assert row.status == "failed"
+            assert row.retry_count == 3
+            assert "backend boom" in (row.error or "")
+        finally:
+            await worker.close()
+
+    async def test_fact_batch_false_provider_falls_back_to_per_entry_failure(self, caplog):
+        """Vector chunk upsert_batch False → per-entry fallback → all retried."""
+        qdrant = _FakeQdrantFalse()
+        router = _FakeRouterFalse()
+        worker = await _make_worker(
+            qdrant=qdrant,
+            embedder=_FakeEmbedder(),
+            graph_router=router,
+            fact_batch_chunk_size=32,
+        )
+        try:
+            for i in range(3):
+                await self._insert_entry(
+                    worker, "index_fact", f"f-batch-{i}",
+                    {"subject": f"S{i}", "predicate": "p", "object": "O", "source": "test"},
+                )
+            with caplog.at_level(logging.WARNING, logger="storage.outbox_worker"):
+                assert await worker._poll_once() == 3
+            for i in range(3):
+                row = await self._entry_row(worker, f"f-batch-{i}")
+                assert row.status == "pending"
+                assert row.retry_count == 1
+                assert "qdrant upsert returned False" in (row.error or "")
+            assert qdrant.upsert_batch_calls == 1
+            assert qdrant.upsert_calls == 3
+            assert "upsert_batch returned False" in caplog.text
+        finally:
+            await worker.close()
+
+    async def test_fact_batch_false_graph_sync_falls_back_to_per_entry_failure(self, caplog):
+        """Graph chunk sync_facts_batch False → per-entry fallback → all retried."""
+        qdrant = _FakeQdrantTrue()
+        router = _FakeRouterFalse()
+        worker = await _make_worker(
+            qdrant=qdrant,
+            embedder=_FakeEmbedder(),
+            graph_router=router,
+            fact_batch_chunk_size=32,
+        )
+        try:
+            for i in range(3):
+                await self._insert_entry(
+                    worker, "index_fact", f"f-gbatch-{i}",
+                    {"subject": f"S{i}", "predicate": "p", "object": "O", "source": "test"},
+                )
+            with caplog.at_level(logging.WARNING, logger="storage.outbox_worker"):
+                assert await worker._poll_once() == 3
+            for i in range(3):
+                row = await self._entry_row(worker, f"f-gbatch-{i}")
+                assert row.status == "pending"
+                assert row.retry_count == 1
+                assert "sync_fact returned False" in (row.error or "")
+            assert qdrant.upsert_batch_calls == 1
+            assert router.sync_facts_batch_calls == 1
+            assert router.sync_fact_calls == 3
+            assert "sync_facts_batch returned False" in caplog.text
+        finally:
+            await worker.close()
 
 
 # =============================================================================

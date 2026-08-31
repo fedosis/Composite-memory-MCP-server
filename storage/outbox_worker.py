@@ -35,6 +35,21 @@ from storage.outbox import OutboxEntry, OutboxRepository
 logger = logging.getLogger(__name__)
 
 
+def _provider_write_error(message: str) -> Exception:
+    """Build a ``ProviderWriteError`` without importing it at module load.
+
+    The pre-commit smoke hook (``.githooks/pre-commit``) imports
+    ``storage.outbox_worker`` from an environment where ``memory_server``
+    resolves to an installed copy that predates ``providers/exceptions.py``
+    (Card 3a). A module-level import would break that gate; deferring the
+    import to call time keeps the same typed error at every provider
+    boundary while staying importable everywhere.
+    """
+    from memory_server.providers.exceptions import ProviderWriteError
+
+    return ProviderWriteError(message)
+
+
 class OutboxWorker:
     """Background worker that processes outbox entries.
 
@@ -335,8 +350,8 @@ class OutboxWorker:
                         }
                     )
                 ok = await self._qdrant.upsert_batch(points)
-                if not ok:
-                    raise RuntimeError(
+                if ok is False:
+                    raise _provider_write_error(
                         f"upsert_batch returned False for {len(points)} points"
                     )
             else:
@@ -345,7 +360,13 @@ class OutboxWorker:
         # Sync to graph in one batch (single snapshot write for the chunk
         # instead of ~6 per fact).
         if self._graph_router:
-            await asyncio.to_thread(self._graph_router.sync_facts_batch, payloads)
+            result = await asyncio.to_thread(
+                self._graph_router.sync_facts_batch, payloads
+            )
+            if result is False:
+                raise _provider_write_error(
+                    f"sync_facts_batch returned False for {len(chunk)} facts"
+                )
 
     async def _process_entry(
         self,
@@ -360,8 +381,9 @@ class OutboxWorker:
         completed. ``mark_completed`` is reached only on a clean return; the
         exception handler increments the retry counter and either marks the
         entry failed (exhausted in this run) or leaves it pending for the
-        next poll. Result-checking of False returns is deliberately NOT part
-        of this contract (provider-contract card).
+        next poll. Result-checking IS part of the contract: provider False
+        returns are converted to ProviderWriteError in the indexing paths,
+        so they land in this handler (never in mark_completed).
 
         Returns:
             A status string consumed only by ``process_all_pending``:
@@ -434,7 +456,7 @@ class OutboxWorker:
             if self._qdrant:
                 import uuid
                 point_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"fact:{fact_id}"))
-                await self._qdrant.upsert(
+                ok = await self._qdrant.upsert(
                     point_id=point_uuid,
                     vector=vector,
                     payload={
@@ -445,14 +467,22 @@ class OutboxWorker:
                         "memory_type": "fact",
                     },
                 )
+                if ok is False:
+                    raise _provider_write_error(
+                        f"qdrant upsert returned False for fact:{fact_id}"
+                    )
             else:
                 logger.warning("_process_index_fact: no vector provider — skipping upsert")
 
         # Sync to graph (idempotent — additive)
         if self._graph_router:
-            await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self._graph_router.sync_fact, subject, predicate, obj
             )
+            if result is False:
+                raise _provider_write_error(
+                    f"graph sync_fact returned False for fact:{fact_id}"
+                )
 
     async def _process_index_decision(self, entry: OutboxEntry) -> None:
         """Process an index_decision entry: sync to graph.
@@ -515,7 +545,7 @@ class OutboxWorker:
 
             if self._qdrant:
                 point_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"belief:{belief_id}"))
-                await self._qdrant.upsert(
+                ok = await self._qdrant.upsert(
                     point_id=point_uuid,
                     vector=vector,
                     payload={
@@ -526,6 +556,10 @@ class OutboxWorker:
                         "memory_type": "belief",
                     },
                 )
+                if ok is False:
+                    raise _provider_write_error(
+                        f"qdrant upsert returned False for belief:{belief_id}"
+                    )
 
         # No graph sync — beliefs are vector-indexed only (see docstring).
         # The previous ``hasattr(self._graph_router, "sync_belief")``
