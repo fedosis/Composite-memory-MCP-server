@@ -94,6 +94,11 @@ EXPECTED_FIELDS = frozenset({
     "admission_ephemeral_ttl_days",
     "admission_ephemeral_score",
     "admission_important_score",
+    "extraction_mode",
+    "llm_model",
+    "llm_timeout_seconds",
+    "llm_max_input_chars",
+    "llm_confidence_gate",
 })
 
 # Byte-for-byte defaults == today's hardcoded values (verified against source).
@@ -182,6 +187,11 @@ DEFAULTS: dict[str, object] = {
     "admission_ephemeral_ttl_days": 1,
     "admission_ephemeral_score": 0.05,
     "admission_important_score": 0.95,
+    "extraction_mode": "regex",
+    "llm_model": None,
+    "llm_timeout_seconds": 15.0,
+    "llm_max_input_chars": 8000,
+    "llm_confidence_gate": 0.7,
 }
 
 
@@ -384,8 +394,65 @@ class TestPrecedenceContextB:
             "cmms_path_source",
             "writer",
             "max_facts",
+            "extraction_mode",
+            "llm_model",
+            "llm_timeout_seconds",
+            "llm_max_input_chars",
+            "llm_confidence_gate",
         }
         assert set(config.__dataclass_fields__) == expected
+
+
+@pytest.mark.parametrize(
+    "name,value,expected",
+    [
+        ("MEMORY_SERVER_EXTRACTION_MODE", "llm", "llm"),
+        ("MEMORY_SERVER_LLM_MODEL", "  model-x  ", "model-x"),
+        ("MEMORY_SERVER_LLM_TIMEOUT_SECONDS", "2.5", 2.5),
+        ("MEMORY_SERVER_LLM_MAX_INPUT_CHARS", "-4", -4),
+        ("MEMORY_SERVER_LLM_CONFIDENCE_GATE", "0.25", 0.25),
+    ],
+)
+def test_extraction_env_values_are_lenient_raw_strings(monkeypatch, name, value, expected):
+    monkeypatch.setenv(name, value)
+    got = Settings()
+    assert getattr(got, name.removeprefix("MEMORY_SERVER_").lower()) == expected
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("MEMORY_SERVER_LLM_TIMEOUT_SECONDS", "not-a-number"),
+        ("MEMORY_SERVER_LLM_TIMEOUT_SECONDS", "nan"),
+        ("MEMORY_SERVER_LLM_TIMEOUT_SECONDS", "+inf"),
+        ("MEMORY_SERVER_LLM_TIMEOUT_SECONDS", "-inf"),
+        ("MEMORY_SERVER_LLM_CONFIDENCE_GATE", "nan"),
+        ("MEMORY_SERVER_LLM_CONFIDENCE_GATE", "+inf"),
+        ("MEMORY_SERVER_LLM_CONFIDENCE_GATE", "-inf"),
+        ("MEMORY_SERVER_LLM_MAX_INPUT_CHARS", "3.5"),
+    ],
+)
+def test_malformed_extraction_env_falls_back_to_field_default(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    got = Settings()
+    expected = {
+        "MEMORY_SERVER_LLM_TIMEOUT_SECONDS": 15.0,
+        "MEMORY_SERVER_LLM_CONFIDENCE_GATE": 0.7,
+        "MEMORY_SERVER_LLM_MAX_INPUT_CHARS": 8000,
+    }[name]
+    assert getattr(got, name.removeprefix("MEMORY_SERVER_").lower()) == expected
+
+
+@pytest.mark.parametrize(
+    "field,expected",
+    [
+        ("llm_timeout_seconds", 15.0),
+        ("llm_confidence_gate", 0.7),
+    ],
+)
+def test_huge_integer_numeric_values_fall_back_to_field_default(field, expected):
+    got = Settings(**{field: 10**1000})
+    assert getattr(got, field) == expected
 
 
 # ---------------------------------------------------------------------------

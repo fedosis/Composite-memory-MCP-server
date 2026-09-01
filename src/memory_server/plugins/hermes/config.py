@@ -58,6 +58,12 @@ class HermesPluginConfig:
     """Maximum number of facts/decisions injected into the system prompt
     context on each prefetch. Shared across all profiles (single CMMS)."""
 
+    extraction_mode: str | None = None
+    llm_model: str | None = None
+    llm_timeout_seconds: float | None = None
+    llm_max_input_chars: int | None = None
+    llm_confidence_gate: float | None = None
+
     @classmethod
     def from_dict(
         cls,
@@ -97,6 +103,11 @@ class HermesPluginConfig:
             max_facts=int(
                 os.environ.get("MEMORY_SERVER_MAX_FACTS", data.get("max_facts") or 5)
             ),
+            extraction_mode=data.get("extraction_mode"),
+            llm_model=data.get("llm_model"),
+            llm_timeout_seconds=data.get("llm_timeout_seconds"),
+            llm_max_input_chars=data.get("llm_max_input_chars"),
+            llm_confidence_gate=data.get("llm_confidence_gate"),
         )
 
     @classmethod

@@ -18,6 +18,8 @@ can never appear in ``model_dump()`` / JSON serialization.
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -25,6 +27,69 @@ from typing import Literal
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+ExtractionMode = Literal["regex", "llm", "auto"]
+
+
+def _coerce_extraction_mode(value: object) -> ExtractionMode | None:
+    if isinstance(value, str) and value in {"regex", "llm", "auto"}:
+        return value
+    return None
+
+
+def _coerce_timeout_seconds(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) and result > 0.0 else None
+
+
+def _coerce_max_input_chars(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not isinstance(value, int):
+        return None
+    return value
+
+
+def _coerce_confidence_gate(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) and 0.0 <= result <= 1.0 else None
 
 
 class Settings(BaseSettings):
@@ -180,7 +245,64 @@ class Settings(BaseSettings):
     admission_ephemeral_score: float = 0.05
     admission_important_score: float = 0.95
 
+    # --- Extraction ---------------------------------------------------------
+
+    extraction_mode: str = "regex"
+    llm_model: str | None = None
+    llm_timeout_seconds: float = 15.0
+    llm_max_input_chars: int = 8000
+    llm_confidence_gate: float = 0.7
+
     # --- Validators ----------------------------------------------------------
+
+    @field_validator("extraction_mode", mode="before")
+    @classmethod
+    def _raw_extraction_mode(cls, value: object) -> str:
+        parsed = _coerce_extraction_mode(value)
+        if parsed is None:
+            logger.warning("Invalid extraction_mode %r; using default 'regex'", value)
+            return "regex"
+        return parsed
+
+    @field_validator("llm_model", mode="before")
+    @classmethod
+    def _raw_llm_model(cls, value: object) -> str | None:
+        if not isinstance(value, str):
+            if value is not None:
+                logger.warning("Invalid llm_model %r; using default None", value)
+            return None
+        result = value.strip()
+        if not result:
+            logger.warning("Blank llm_model; using default None")
+            return None
+        return result
+
+    @field_validator("llm_timeout_seconds", mode="before")
+    @classmethod
+    def _raw_llm_timeout_seconds(cls, value: object) -> float:
+        parsed = _coerce_timeout_seconds(value)
+        if parsed is None:
+            logger.warning("Invalid llm_timeout_seconds %r; using default 15.0", value)
+            return 15.0
+        return parsed
+
+    @field_validator("llm_max_input_chars", mode="before")
+    @classmethod
+    def _raw_llm_max_input_chars(cls, value: object) -> int:
+        parsed = _coerce_max_input_chars(value)
+        if parsed is None:
+            logger.warning("Invalid llm_max_input_chars %r; using default 8000", value)
+            return 8000
+        return parsed
+
+    @field_validator("llm_confidence_gate", mode="before")
+    @classmethod
+    def _raw_llm_confidence_gate(cls, value: object) -> float:
+        parsed = _coerce_confidence_gate(value)
+        if parsed is None:
+            logger.warning("Invalid llm_confidence_gate %r; using default 0.7", value)
+            return 0.7
+        return parsed
 
     @field_validator(
         "vector_size",
