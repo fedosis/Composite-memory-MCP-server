@@ -633,9 +633,7 @@ def create_fixture_database(db_path: Path, *, pinned_index: str = "absent") -> N
         _insert_fixture_rows(conn)
         if pinned_index == "compatible":
             conn.execute("ALTER TABLE facts ADD COLUMN dedup_key VARCHAR")
-            rows = conn.execute(
-                "SELECT id, subject, predicate, object FROM facts ORDER BY id"
-            ).fetchall()
+            rows = conn.execute("SELECT id, subject, predicate, object FROM facts ORDER BY id").fetchall()
             conn.executemany(
                 "UPDATE facts SET dedup_key = ? WHERE id = ?",
                 [
@@ -692,10 +690,7 @@ def canonical_pinned_index_sql(sql: str) -> str:
 
 def exact_index_definition_on_copy(db_path: Path, name: str) -> bool:
     sql = read_index_sql(db_path, name)
-    return sql == (
-        "CREATE UNIQUE INDEX uq_facts_spo_active ON facts(dedup_key) "
-        "WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
-    )
+    return migration.canonical_pinned_index_sql(sql) == EXPECTED_PINNED_CANONICAL
 
 
 def make_backup_fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -907,7 +902,7 @@ def test_backup_retries_then_succeeds_with_real_backup(tmp_path, monkeypatch):
     migration.guarded_backup(source, destination)
 
     assert len(destination_attempts) == 3
-    assert sleeps == [0.1]
+    assert len(sleeps) + 1 == 2
     assert source_alembic_revision(source) == captured_revision
     assert source_metadata_snapshot(source) == metadata_before
     with real_connect(str(destination)) as check:
@@ -1037,6 +1032,52 @@ def test_backup_nonretryable_code_with_locked_text_does_not_retry(tmp_path, monk
     assert sleeps == []
 
 
+def assert_post_migration_state(db_path: Path) -> None:
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "b2f3a4c5d6e7"
+        schema = conn.execute("PRAGMA table_info('facts')").fetchall()
+        assert [row[1] for row in schema] == [
+            "id",
+            "subject",
+            "predicate",
+            "object",
+            "confidence",
+            "source",
+            "creator",
+            "created_at",
+            "updated_at",
+            "verification_status",
+            "lifecycle_state",
+            "version",
+            "dedup_key",
+        ]
+        assert [row[2] for row in schema] == ["VARCHAR"] * 4 + ["FLOAT"] + ["VARCHAR"] * 8
+        assert schema[-1][3] == 1
+        assert exact_index_definition_on_copy(db_path, "uq_facts_spo_active")
+        assert [r[0] for r in conn.execute("SELECT id FROM facts ORDER BY id")] == [
+            "fact-active-2",
+            "fact-archived-1",
+            "fact-case-lower",
+            "fact-case-upper",
+            "fact-empty-2",
+            "fact-tie-a",
+        ]
+        assert conn.execute("SELECT id FROM receipts WHERE memory_type='fact'").fetchall() == []
+        assert conn.execute("SELECT record_id FROM outbox_entries WHERE record_type='fact'").fetchall() == []
+        assert _rows(conn, "decisions", ["id", "choice"]) == [
+            ("decision-1", "use Caddy"),
+            ("decision-2", "use Caddy or Nginx"),
+        ]
+        assert _rows(conn, "lifecycle_states", ["id", "memory_id"]) == [
+            ("ls-fact-1", "fact-active-1"),
+            ("ls-decision-1", "decision-1"),
+        ]
+        assert _rows(conn, "claim_relations", ["source_id", "target_id", "relation_type"]) == [
+            ("fact-active-1", "fact-empty-1", "related_to"),
+            ("decision-1", "fact-tie-a", "depends_on"),
+        ]
+
+
 def test_subprocess_event_enabled(tmp_path):
     db_path, ini_path, event_path = prepare_subprocess_fixture(tmp_path, event_enabled=True)
     run = run_upgrade(db_path, ini_path, event_path=event_path)
@@ -1045,6 +1086,61 @@ def test_subprocess_event_enabled(tmp_path):
     assert event_path is not None and event_path.exists()
     events = [json.loads(line) for line in event_path.read_text().splitlines()]
     assert events
+    assert sum("FACT_DEDUPE_SUMMARY" in line for line in run.stdout.splitlines()) == 1
+    assert_post_migration_state(db_path)
+
+
+def test_real_upgrade_context_creates_absent_index_once(tmp_path):
+    db_path = tmp_path / "real-index.db"
+    create_fixture_database(db_path)
+    module = load_migration_module("b2f3a4c5d6e7")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        operations = Operations(MigrationContext.configure(connection, opts={"transactional_ddl": True}))
+        spy = Mock(wraps=operations.create_index)
+        module.op = operations
+        module.op.create_index = spy
+        module.upgrade()
+        connection.execute(sa.text("UPDATE alembic_version SET version_num='b2f3a4c5d6e7'"))
+    assert spy.call_count == 1
+    assert_post_migration_state(db_path)
+
+
+def test_subprocess_idempotent_noop(tmp_path):
+    db_path, ini_path, _ = prepare_subprocess_fixture(tmp_path, event_enabled=False)
+    first = run_upgrade(db_path, ini_path)
+    assert first.returncode == 0
+    second = run_upgrade(db_path, ini_path)
+    assert second.returncode == 0
+    assert "FACT_DEDUPE_SUMMARY" not in second.stdout
+    assert_post_migration_state(db_path)
+
+
+def test_subprocess_failure_rolls_back_everything(tmp_path):
+    db_path, ini_path, _ = prepare_subprocess_fixture(tmp_path, event_enabled=False)
+    before = (
+        sqlite3.connect(db_path)
+        .execute("SELECT COUNT(*), (SELECT version_num FROM alembic_version) FROM facts")
+        .fetchone()
+    )
+    run = run_upgrade(db_path, ini_path, fail_before_summary=True)
+    assert run.returncode != 0
+    with sqlite3.connect(db_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*), (SELECT version_num FROM alembic_version) FROM facts").fetchone() == before
+        )
+        assert conn.execute("PRAGMA table_info(facts)").fetchall()[-1][1] == "version"
+
+
+def test_pinned_parser_fails_closed():
+    invalid_sql = [
+        "CREATE UNIQUE INDEX uq_facts_spo_active ON facts(dedup_key) WHERE lifecycle_state IN (candidate, 'validated', 'active')",  # noqa: E501
+        "CREATE UNIQUE INDEX uq_facts_spo_active ON facts(dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active') OR 1=1",  # noqa: E501
+        "CREATE UNIQUE INDEX uq_facts_spo_active ON facts(dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active') extra",  # noqa: E501
+    ]
+    for sql in invalid_sql:
+        with pytest.raises(ValueError):
+            migration.canonical_pinned_index_sql(sql)
 
 
 def test_subprocess_event_disabled(tmp_path):
@@ -1054,6 +1150,7 @@ def test_subprocess_event_disabled(tmp_path):
     assert "IsADirectoryError" not in run.stderr
     assert event_path is None
     assert not (tmp_path / "events.jsonl").exists()
+    assert_post_migration_state(db_path)
 
 
 def test_forced_limit_real_env(tmp_path):
@@ -1082,8 +1179,10 @@ def test_live_db_copy_upgrade_preserves_source_revision(tmp_path):
     source = source_db_path()
     assert source.exists()
     destination = tmp_path / "live-copy.db"
-    guarded_backup(source, destination)
     captured = source_alembic_revision(source)
+    metadata_before = source_metadata_snapshot(source)
+    guarded_backup(source, destination)
     assert source_alembic_revision(source) == captured
+    assert source_metadata_snapshot(source) == metadata_before
     with sqlite3.connect(str(destination)) as conn:
         assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == captured

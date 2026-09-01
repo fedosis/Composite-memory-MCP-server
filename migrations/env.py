@@ -1,12 +1,9 @@
 import os
 import sys
-
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, text
-from sqlalchemy import pool
-
 from alembic import context
+from sqlalchemy import engine_from_config, pool, text
 
 # Add project root to sys.path so storage.models is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -73,9 +70,12 @@ def run_migrations_online() -> None:
         # Enable WAL mode for SQLite
         connection.execute(text("PRAGMA journal_mode=WAL"))
         connection.execute(text("PRAGMA synchronous=NORMAL"))
+        connection.commit()
 
         context.configure(
-            connection=connection, target_metadata=target_metadata
+            connection=connection,
+            target_metadata=target_metadata,
+            transactional_ddl=True,
         )
 
         with context.begin_transaction():

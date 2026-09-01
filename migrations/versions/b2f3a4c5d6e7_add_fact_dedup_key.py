@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime
@@ -248,59 +249,21 @@ def _normalize_sql_whitespace(text: str) -> str:
 
 
 def canonical_pinned_index_sql(sql: str) -> str:
-    raw = sql.strip().rstrip(";").strip()
-    if "/*" in raw or "--" in raw:
-        raise ValueError("comments are not accepted")
-    lowered = raw.lower()
-    marker = " where "
-    if not lowered.startswith("create ") or " index " not in lowered or marker not in lowered:
-        raise ValueError("malformed index SQL")
-    before_where, where = raw.rsplit("WHERE", 1) if " WHERE " in raw.upper() else raw.rsplit("where", 1)
-    head = _normalize_sql_whitespace(before_where)
-    if " on " not in head.lower():
-        raise ValueError("missing ON clause")
-    if not head.lower().startswith("create"):
-        raise ValueError("malformed index SQL")
-    tokens = head.split()
-    unique = 0
-    idx = 1
-    if len(tokens) > 1 and tokens[1].lower() == "unique":
-        unique = 1
-        idx += 1
-    if tokens[idx].lower() != "index":
-        raise ValueError("malformed index SQL")
-    idx += 1
-    if idx + 2 >= len(tokens) or tokens[idx + 1].lower() != "on":
-        raise ValueError("malformed index SQL")
-    table = tokens[idx + 2]
-    cols_start = head.find("(")
-    cols_end = head.rfind(")")
-    if cols_start < 0 or cols_end < cols_start:
-        raise ValueError("malformed index SQL")
-    columns = [piece.strip() for piece in head[cols_start + 1 : cols_end].split(",")]
-    if table.strip('"[]') != "facts":
-        raise ValueError("unexpected table")
-    if len(columns) != 1 or columns[0].strip('"[]') != "dedup_key":
-        raise ValueError("unexpected columns")
-    predicate = _normalize_sql_whitespace(where)
-    predicate = predicate.replace('"', "")
-    predicate = predicate.replace("[", "").replace("]", "")
-    predicate = predicate.replace("IN", "in").replace("AND", "and").replace("OR", "or").replace("NOT", "not")
-    predicate = _normalize_sql_whitespace(predicate)
-    if predicate.startswith("(") and predicate.endswith(")"):
-        depth = 0
-        balanced = True
-        for i, ch in enumerate(predicate):
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0 and i != len(predicate) - 1:
-                    balanced = False
-                    break
-        if balanced and depth == 0:
-            predicate = predicate[1:-1].strip()
-    return f"unique={unique};columns=dedup_key;where={predicate}"
+    """Parse only SQLite's pinned index grammar; reject everything else."""
+    raw = sql.strip()
+    if raw.endswith(";"):
+        raw = raw[:-1].rstrip()
+    identifier = r'(?:facts|"facts"|\[facts\])'
+    column = r'(?:dedup_key|"dedup_key"|\[dedup_key\])'
+    literal = r"'candidate'\s*,\s*'validated'\s*,\s*'active'"
+    pattern = (
+        rf"CREATE\s+UNIQUE\s+INDEX\s+{re.escape(_INDEX_NAME)}\s+ON\s+"
+        rf"{identifier}\s*\(\s*{column}\s*\)\s+WHERE\s+"
+        rf"lifecycle_state\s+IN\s*\(\s*{literal}\s*\)"
+    )
+    if re.fullmatch(pattern, raw, flags=re.IGNORECASE) is None:
+        raise ValueError("malformed pinned index SQL")
+    return EXPECTED_PINNED_CANONICAL
 
 
 EXPECTED_PINNED_CANONICAL = "unique=1;columns=dedup_key;where=lifecycle_state in ('candidate', 'validated', 'active')"
@@ -347,8 +310,7 @@ def _ensure_preflight(bind: sa.engine.Connection) -> str:
     return inspect_pinned_index(bind)
 
 
-def _fact_rows(bind: sa.engine.Connection) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def _fact_rows(bind: sa.engine.Connection):
     last_id = ""
     while True:
         page = list(
@@ -365,31 +327,28 @@ def _fact_rows(bind: sa.engine.Connection) -> list[dict[str, Any]]:
         )
         if not page:
             break
-        rows.extend(page)
+        yield from page
         last_id = str(page[-1]["id"])
-    return rows
 
 
-def _update_dedup_keys(bind: sa.engine.Connection) -> dict[str, str]:
-    rows = _fact_rows(bind)
-    saved: dict[str, str] = {}
+def _update_dedup_keys(bind: sa.engine.Connection) -> None:
     batch_size = _effective_batch(bind, params_per_row=2, fixed_params=1)
-    for start in range(0, len(rows), batch_size):
-        chunk = rows[start : start + batch_size]
+    chunk = []
+    for row in _fact_rows(bind):
+        chunk.append(row)
+        if len(chunk) < batch_size:
+            continue
         params: dict[str, Any] = {"guard": 1}
         value_rows = []
         for index, row in enumerate(chunk):
             id_key = f"id_{index}"
             key_key = f"key_{index}"
             key = fact_dedup_key(row["subject"], row["predicate"], row["object"])
-            saved[str(row["id"])] = key
             params[id_key] = row["id"]
             params[key_key] = key
             value_rows.append(f"(:{id_key}, :{key_key})")
         statement = (
-            "WITH data(id, dedup_key) AS (VALUES "
-            + ", ".join(value_rows)
-            + ") UPDATE facts SET dedup_key = "
+            "WITH data(id, dedup_key) AS (VALUES " + ", ".join(value_rows) + ") UPDATE facts SET dedup_key = "
             "(SELECT data.dedup_key FROM data WHERE data.id = facts.id) "
             "WHERE :guard = 1 AND dedup_key IS NULL "
             "AND id IN (SELECT id FROM data)"
@@ -402,11 +361,28 @@ def _update_dedup_keys(bind: sa.engine.Connection) -> dict[str, str]:
             params_per_row=2,
             fixed_params=1,
         )
-    return saved
+        chunk = []
+    if chunk:
+        params = {"guard": 1}
+        value_rows = []
+        for index, row in enumerate(chunk):
+            id_key, key_key = f"id_{index}", f"key_{index}"
+            key = fact_dedup_key(row["subject"], row["predicate"], row["object"])
+            params[id_key], params[key_key] = row["id"], key
+            value_rows.append(f"(:{id_key}, :{key_key})")
+        _execute(
+            bind,
+            "WITH data(id, dedup_key) AS (VALUES " + ", ".join(value_rows) + ") "
+            "UPDATE facts SET dedup_key=(SELECT data.dedup_key FROM data WHERE data.id=facts.id) "
+            "WHERE :guard=1 AND dedup_key IS NULL AND id IN (SELECT id FROM data)",
+            params,
+            kind="case_update",
+            params_per_row=2,
+            fixed_params=1,
+        )
 
 
-def _group_fact_rows(bind: sa.engine.Connection) -> list[dict[str, Any]]:
-    rows = []
+def _group_fact_rows(bind: sa.engine.Connection):
     last_key = ""
     last_id = ""
     while True:
@@ -426,10 +402,9 @@ def _group_fact_rows(bind: sa.engine.Connection) -> list[dict[str, Any]]:
         )
         if not page:
             break
-        rows.extend(page)
+        yield from page
         last_key = str(page[-1]["dedup_key"])
         last_id = str(page[-1]["id"])
-    return rows
 
 
 def _parse_created_at(value: Any) -> tuple[Any, str]:
@@ -454,7 +429,7 @@ def _keeper_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _select_keepers_and_deletes(rows: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+def _select_keepers_and_deletes(rows) -> tuple[list[str], list[str]]:
     keepers: list[str] = []
     deletes: list[str] = []
     current_key: str | None = None
@@ -537,7 +512,7 @@ def _recreate_saved_indexes(
     pinned_state: str,
 ) -> None:
     for index in saved:
-        if index["name"] == "sqlite_autoindex_facts_1":
+        if index["name"].startswith("sqlite_autoindex_") and index["origin"] == "pk":
             continue
         if index["name"] == _INDEX_NAME and pinned_state == "compatible" and index_exists(bind, _INDEX_NAME):
             continue
@@ -552,7 +527,7 @@ def _recreate_saved_indexes(
                 )
             continue
         if index["sql"] is None:
-            continue
+            raise RuntimeError(f"cannot restore saved index {index['name']}")
         if not index_exists(bind, index["name"]):
             bind.execute(sa.text(index["sql"]))
 
@@ -575,12 +550,15 @@ def upgrade() -> None:
     _record_event("observed_limit", observed_limit=observed_limit)
 
     pinned_state = _ensure_preflight(bind)
+    if os.environ.get("B2_FAIL_BEFORE_SUMMARY"):
+        raise RuntimeError("B2 fail-before-summary requested")
     saved_indexes = _save_index_state(bind)
-    pre_rebuild_count = int(_scalar(bind, "SELECT COUNT(*) FROM facts"))
+    pre_rebuild_ids = {str(row[0]) for row in bind.execute(sa.text("SELECT id FROM facts"))}
+    pre_rebuild_count = len(pre_rebuild_ids)
 
     op.add_column("facts", sa.Column("dedup_key", sa.String(), nullable=True))
 
-    saved_keys = _update_dedup_keys(bind)
+    _update_dedup_keys(bind)
     assert int(_scalar(bind, "SELECT COUNT(*) FROM facts")) == int(_scalar(bind, "SELECT COUNT(dedup_key) FROM facts"))
 
     facts_copy = sa.Table(
@@ -593,8 +571,8 @@ def upgrade() -> None:
         sa.Column("confidence", sa.Float(), nullable=False),
         sa.Column("source", sa.String(), nullable=True),
         sa.Column("creator", sa.String(), nullable=False),
-        sa.Column("created_at", sa.DateTime(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.Column("created_at", sa.String(), nullable=False),
+        sa.Column("updated_at", sa.String(), nullable=False),
         sa.Column("verification_status", sa.String(), nullable=False),
         sa.Column("lifecycle_state", sa.String(), nullable=False),
         sa.Column("version", sa.String(), nullable=False),
@@ -610,40 +588,30 @@ def upgrade() -> None:
     ) as batch_op:
         batch_op.alter_column("dedup_key", existing_type=sa.String(), nullable=False)
 
-    rows = _group_fact_rows(bind)
-    keeper_ids, deleted_fact_ids = _select_keepers_and_deletes(rows)
+    keeper_ids, deleted_fact_ids = _select_keepers_and_deletes(_group_fact_rows(bind))
     deleted_fact_ids = sorted(set(deleted_fact_ids))
+    pre_delete_ids = {str(row[0]) for row in bind.execute(sa.text("SELECT id FROM facts"))}
 
-    deleted_receipt_ids = (
-        [
-            str(row[0])
-            for row in bind.execute(
-                sa.text(
-                    "SELECT id FROM receipts WHERE memory_type='fact' AND id IN ("
-                    + ", ".join(f":id_{i}" for i, _ in enumerate(deleted_fact_ids))
-                    + ")"
-                ),
-                {f"id_{i}": value for i, value in enumerate(deleted_fact_ids)},
-            ).fetchall()
-        ]
-        if deleted_fact_ids
-        else []
-    )
-    deleted_outbox_ids = (
-        [
-            str(row[0])
-            for row in bind.execute(
-                sa.text(
-                    "SELECT record_id FROM outbox_entries WHERE record_type='fact' AND record_id IN ("
-                    + ", ".join(f":id_{i}" for i, _ in enumerate(deleted_fact_ids))
-                    + ")"
-                ),
-                {f"id_{i}": value for i, value in enumerate(deleted_fact_ids)},
-            ).fetchall()
-        ]
-        if deleted_fact_ids
-        else []
-    )
+    def child_ids(table: str, column: str, kind: str) -> list[str]:
+        found: list[str] = []
+        batch_size = _effective_batch(bind, params_per_row=1, fixed_params=0)
+        for start in range(0, len(deleted_fact_ids), batch_size):
+            chunk = deleted_fact_ids[start : start + batch_size]
+            params = {f"id_{i}": value for i, value in enumerate(chunk)}
+            placeholders = ", ".join(f":id_{i}" for i in range(len(chunk)))
+            owner = "memory_type='fact' AND id" if table == "receipts" else "record_type='fact' AND record_id"
+            result = _execute(
+                bind,
+                f"SELECT {column} FROM {table} WHERE {owner} IN ({placeholders})",
+                params,
+                kind=kind,
+                params_per_row=1,
+            )
+            found.extend(str(row[0]) for row in result.fetchall())
+        return found
+
+    deleted_receipt_ids = child_ids("receipts", "id", "child_select") if deleted_fact_ids else []
+    deleted_outbox_ids = child_ids("outbox_entries", "record_id", "child_select") if deleted_fact_ids else []
 
     receipt_deleted = _delete_ids(bind, "receipts", "id", deleted_receipt_ids)
     outbox_deleted = _delete_ids(bind, "outbox_entries", "record_id", deleted_outbox_ids)
@@ -652,7 +620,7 @@ def upgrade() -> None:
     assert fact_deleted == len(deleted_fact_ids)
     assert receipt_deleted == len(deleted_receipt_ids)
     assert outbox_deleted == len(deleted_outbox_ids)
-    pre_rebuild_count = int(_scalar(bind, "SELECT COUNT(*) FROM facts"))
+    assert pre_delete_ids == pre_rebuild_ids
 
     _recreate_saved_indexes(bind, saved_indexes, pinned_state)
 
@@ -675,11 +643,11 @@ def upgrade() -> None:
         "dedup_key",
     ]
     assert int(columns[-1]["notnull"]) == 1
-    assert int(_scalar(bind, "SELECT COUNT(*) FROM facts")) == pre_rebuild_count
-    assert all(
-        str(row["dedup_key"]) == saved_keys[str(row["id"])]
-        for row in bind.execute(sa.text("SELECT id, dedup_key FROM facts")).mappings().all()
-    )
+    post_ids = {str(row[0]) for row in bind.execute(sa.text("SELECT id FROM facts"))}
+    assert post_ids == pre_rebuild_ids - set(deleted_fact_ids)
+    assert len(post_ids) == pre_rebuild_count - len(deleted_fact_ids)
+    for row in bind.execute(sa.text("SELECT subject, predicate, object, dedup_key FROM facts")):
+        assert str(row[3]) == fact_dedup_key(row[0], row[1], row[2])
 
     if not index_exists(bind, _INDEX_NAME):
         if pinned_state == "absent":
@@ -700,9 +668,7 @@ def upgrade() -> None:
     )
     current_sql = read_index_sql(bind, _INDEX_NAME) or ""
     if saved_pinned_sql is not None:
-        assert canonical_pinned_index_sql(current_sql) == canonical_pinned_index_sql(
-            saved_pinned_sql
-        )
+        assert canonical_pinned_index_sql(current_sql) == canonical_pinned_index_sql(saved_pinned_sql)
     else:
         assert canonical_pinned_index_sql(current_sql) == EXPECTED_PINNED_CANONICAL
 
