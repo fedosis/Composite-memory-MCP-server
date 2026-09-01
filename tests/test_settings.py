@@ -384,7 +384,7 @@ class TestPrecedenceContextB:
         )
 
     def test_public_shape_unchanged(self):
-        """HermesPluginConfig public attribute set is exactly unchanged."""
+        """HermesPluginConfig keeps old fields plus five extraction fields."""
         from memory_server.plugins.hermes.config import HermesPluginConfig
 
         config = HermesPluginConfig.from_dict({})

@@ -119,8 +119,14 @@ def test_invalid_env_falls_through_to_yaml(
         pytest.param("llm_model", "  ", " settings-model ", "settings-model", id="model-blank-yaml-settings"),
         pytest.param("llm_timeout_seconds", False, 4.0, 4.0, id="timeout-bool-yaml-settings"),
         pytest.param("llm_timeout_seconds", "not-a-number", 4.0, 4.0, id="timeout-malformed-yaml-settings"),
+        pytest.param("llm_timeout_seconds", float("nan"), 4.0, 4.0, id="timeout-yaml-nan-settings-wins"),
+        pytest.param("llm_timeout_seconds", float("inf"), 4.0, 4.0, id="timeout-yaml-plus-inf-settings-wins"),
+        pytest.param("llm_timeout_seconds", float("-inf"), 4.0, 4.0, id="timeout-yaml-minus-inf-settings-wins"),
         pytest.param("llm_confidence_gate", True, 0.4, 0.4, id="confidence-bool-yaml-settings"),
         pytest.param("llm_confidence_gate", "not-a-number", 0.4, 0.4, id="confidence-malformed-yaml-settings"),
+        pytest.param("llm_confidence_gate", float("nan"), 0.4, 0.4, id="confidence-yaml-nan-settings-wins"),
+        pytest.param("llm_confidence_gate", float("inf"), 0.4, 0.4, id="confidence-yaml-plus-inf-settings-wins"),
+        pytest.param("llm_confidence_gate", float("-inf"), 0.4, 0.4, id="confidence-yaml-minus-inf-settings-wins"),
         pytest.param("llm_max_input_chars", True, 5, 5, id="max-bool-yaml-settings"),
         pytest.param("llm_max_input_chars", 3.5, 5, 5, id="max-float-yaml-settings"),
     ],
@@ -139,8 +145,10 @@ def test_invalid_yaml_falls_through_to_settings(
         pytest.param("llm_timeout_seconds", False, 15.0, id="timeout-bool-settings-default"),
         pytest.param("llm_timeout_seconds", float("nan"), 15.0, id="timeout-nan-settings-default"),
         pytest.param("llm_timeout_seconds", float("inf"), 15.0, id="timeout-inf-settings-default"),
+        pytest.param("llm_timeout_seconds", float("-inf"), 15.0, id="timeout-settings-minus-inf-default-wins"),
         pytest.param("llm_confidence_gate", True, 0.7, id="confidence-bool-settings-default"),
         pytest.param("llm_confidence_gate", float("nan"), 0.7, id="confidence-nan-settings-default"),
+        pytest.param("llm_confidence_gate", float("inf"), 0.7, id="confidence-settings-plus-inf-default-wins"),
         pytest.param("llm_confidence_gate", float("-inf"), 0.7, id="confidence-minus-inf-settings-default"),
         pytest.param("llm_max_input_chars", True, 8000, id="max-bool-settings-default"),
         pytest.param("llm_max_input_chars", 3.5, 8000, id="max-float-settings-default"),
@@ -199,6 +207,31 @@ def test_huge_integer_yaml_falls_through_to_settings(clear_extraction_env, field
 ])
 def test_huge_integer_settings_falls_through_to_default(clear_extraction_env, field, settings_value, expected):
     assert getattr(make(settings={field: settings_value}), field) == expected
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        pytest.param("extraction_mode", "LLM", id="mode-raw-invalid-case"),
+        pytest.param("llm_model", "  ", id="model-raw-blank"),
+        pytest.param("llm_timeout_seconds", "abc", id="timeout-raw-invalid-string"),
+        pytest.param("llm_max_input_chars", True, id="max-raw-bool"),
+        pytest.param("llm_max_input_chars", 3.5, id="max-raw-float"),
+        pytest.param("llm_confidence_gate", "abc", id="confidence-raw-invalid-string"),
+    ],
+)
+def test_from_dict_preserves_raw_extraction_values(field, value):
+    config = HermesPluginConfig.from_dict({field: value})
+    assert getattr(config, field) is value if isinstance(value, (bool, float)) else getattr(config, field) == value
+
+
+def test_from_env_does_not_overlay_extraction_environment(monkeypatch):
+    for field, env_name in ENV.items():
+        monkeypatch.setenv(env_name, f"env-{field}")
+
+    config = HermesPluginConfig.from_env()
+
+    assert {field: getattr(config, field) for field in ENV} == {field: None for field in ENV}
 
 
 def test_dto_is_exact_and_frozen(clear_extraction_env):
