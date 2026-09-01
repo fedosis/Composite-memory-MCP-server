@@ -7,8 +7,8 @@ from _common import get_db_url
 
 sys.path.insert(0, "/home/shtorm/memory-server/src")
 
-from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.api.remember import remember
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 DB_URL = get_db_url()
 SOURCE = "curiosity-worker/research"

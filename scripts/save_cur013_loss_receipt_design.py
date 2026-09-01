@@ -1,4 +1,5 @@
-"""Curiosity worker: save CUR-013 (design of a typed merge/consolidation loss-receipt primitive for CMMS) findings to CMMS via remember()."""
+"""Curiosity worker: save CUR-013 (design of a typed merge/consolidation
+loss-receipt primitive for CMMS) findings to CMMS via remember()."""
 import asyncio
 import sys
 from datetime import datetime, timezone
@@ -9,8 +10,8 @@ sys.path.insert(0, "/home/shtorm/memory-server/src")
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.api.remember import remember
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 DB_URL = get_db_url()
 SOURCE = "curiosity-worker"
@@ -52,11 +53,15 @@ FACTS = [
         "evidence": {
             "method": "code_inspection + design",
             "sources": [
-                "storage/models/lifecycle.py (LifecycleEventORM: id, memory_id, memory_type, from_state, to_state, reason, triggered_by, timestamp — NO payload column)",
+                "storage/models/lifecycle.py (LifecycleEventORM: id, memory_id, memory_type, from_state, to_state, "
+                "reason, triggered_by, timestamp — NO payload column)",
                 "storage/repositories/lifecycle_repo.py:51-71 (record_event — single write choke point)",
-                "src/memory_server/services/lifecycle_service.py:240-321 (_propagate_dependents same-state event precedent)",
-                "src/memory_server/server.py:1057-1173 (resolve_conflict merge branch), 1147-1164 (dead transition_requests rebuild)",
-                "CUR-011 (conservation-law Req1: loss receipts {collapsed_ids, frontier, invalidated revisions, rationale})",
+                "src/memory_server/services/lifecycle_service.py:240-321 (_propagate_dependents same-state event "
+                "precedent)",
+                "src/memory_server/server.py:1057-1173 (resolve_conflict merge branch), 1147-1164 (dead "
+                "transition_requests rebuild)",
+                "CUR-011 (conservation-law Req1: loss receipts {collapsed_ids, frontier, invalidated revisions, "
+                "rationale})",
                 "CUR-012 (lifecycle_events = only append-only log; 0 rows live)",
             ],
             "session_id": SESSION,
@@ -134,8 +139,10 @@ FACTS = [
             "sources": [
                 "src/memory_server/server.py:1057-1173 (_merge_callback, create_in_transaction call)",
                 "src/memory_server/server.py:698-843 (set_belief replace path)",
-                "src/memory_server/providers/sqlite_provider.py:660-718 (create_in_transaction: relation_entries before callback)",
-                "storage/repositories/relation_repo.py (create idempotent per (source,target,type); get_by_source; get_dependents)",
+                "src/memory_server/providers/sqlite_provider.py:660-718 (create_in_transaction: relation_entries "
+                "before callback)",
+                "storage/repositories/relation_repo.py (create idempotent per (source,target,type); get_by_source; "
+                "get_dependents)",
                 "storage/repositories/receipt_repo.py (write-once create)",
                 "CUR-012 gap list items (1)+(2)+(c)",
             ],

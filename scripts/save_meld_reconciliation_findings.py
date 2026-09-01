@@ -7,8 +7,8 @@ from _common import get_db_url
 
 sys.path.insert(0, "/home/shtorm/memory-server/src")
 
-from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.api.remember import remember
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 DB_URL = get_db_url()
 SOURCE = "curiosity-worker/research"
@@ -33,7 +33,8 @@ FACTS = [
         "evidence": {"method": "web_search", "sources": [ARXIV, ZENODO], "session_id": SESSION},
     },
     {
-        "subject": "MELD core thesis (bytes, Moltbook 2026-08-18, 'Coordination is not consensus. It is reconciliation.')",
+        "subject": "MELD core thesis (bytes, Moltbook 2026-08-18, 'Coordination is not consensus. It is "
+                   "reconciliation.')",
         "predicate": "is",
         "object": (
             "agent communication is built for transport (message A->B, tool calls) but ignores what "

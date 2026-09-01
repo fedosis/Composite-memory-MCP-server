@@ -7,8 +7,8 @@ from _common import get_db_url
 
 sys.path.insert(0, "/home/shtorm/memory-server/src")
 
-from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.api.remember import remember
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 DB_URL = get_db_url()
 SOURCE = "curiosity-worker/research"
@@ -74,11 +74,15 @@ FACTS = [
         "subject": "The 7-way natural-logic relation set has no off-the-shelf production model",
         "predicate": "establishes",
         "object": (
-            "MacCartney & Manning's 7 basic entailment relations (equivalence x=y -> merge; forward entailment x subset y "
+            "MacCartney & Manning's 7 basic entailment relations (equivalence x=y -> merge; forward entailment x "
+            "subset y "
             "-> refine; reverse entailment x superset y -> refine; negation x^y=empty AND x+y=U -> full conflict R3; "
-            "alternation x^y=empty AND x+y!=U -> exclusive alternatives supersede; cover x^y!=empty AND x+y=U -> partial "
-            "overrule; independence else -> coexist) have exactly one full implementation: NatLog (Stanford 2007-2009), "
-            "a Java research system. Its 7-way comes from word-level lexical relations + monotonicity projection over a "
+            "alternation x^y=empty AND x+y!=U -> exclusive alternatives supersede; cover x^y!=empty AND x+y=U -> "
+            "partial "
+            "overrule; independence else -> coexist) have exactly one full implementation: NatLog (Stanford "
+            "2007-2009), "
+            "a Java research system. Its 7-way comes from word-level lexical relations + monotonicity projection over "
+            "a "
             "syntactic parse -- i.e. the typed-comparator idea, NOT a semantic LLM. There is no maintained Python/PyPI "
             "7-way classifier. The 7-way on unstructured prose must be reconstructed, not downloaded."
         ),
@@ -90,12 +94,16 @@ FACTS = [
         "predicate": "concludes",
         "object": (
             "LLM-as-judge work shows (a) self-inconsistency across runs (Rating Roulette arXiv 2510.27106) and (b) low "
-            "class-wise consistency on fine-grained entailment labels -- contradiction consistency 0.62-0.79 and neutral "
-            "the LOWEST (~0.45-0.48) across Aya/Qwen/LLaMA/Claude/GPT (LoResLM 2026). Distinguishing forward vs reverse "
+            "class-wise consistency on fine-grained entailment labels -- contradiction consistency 0.62-0.79 and "
+            "neutral "
+            "the LOWEST (~0.45-0.48) across Aya/Qwen/LLaMA/Claude/GPT (LoResLM 2026). Distinguishing forward vs "
+            "reverse "
             "entailment vs negation vs alternation vs cover requires set-theoretic reasoning LLMs are weak at; "
-            "gpt-3.5-turbo was only shown comparable-or-better than SOTA on the binary/3-way entailment subset (SummaC), "
+            "gpt-3.5-turbo was only shown comparable-or-better than SOTA on the binary/3-way entailment subset "
+            "(SummaC), "
             "not 7-way. Therefore 7-way should be derived from set-theoretic checks in code for structured predicates, "
-            "and unstructured prose should stay at 3-way NLI + overlap heuristics, escalating to prompt-based 7-way only "
+            "and unstructured prose should stay at 3-way NLI + overlap heuristics, escalating to prompt-based 7-way "
+            "only "
             "for rare high-stakes boundary pairs."
         ),
         "confidence": 0.88,
@@ -121,8 +129,10 @@ FACTS = [
         "predicate": "recommends",
         "object": (
             "(1) sigma gate first in code: sigma = cos(emb(a), emb(b)) reusing CMMS embedder; if sigma < sigma_lo the "
-            "claims are unrelated -> coexist/relate without invoking any classifier, screening out the majority of pairs. "
-            "(2) chi = 3-way cross-encoder NLI (nli-deberta-v3-base default, -large for authority/normative class), using "
+            "claims are unrelated -> coexist/relate without invoking any classifier, screening out the majority of "
+            "pairs. "
+            "(2) chi = 3-way cross-encoder NLI (nli-deberta-v3-base default, -large for authority/normative class), "
+            "using "
             "the CALIBRATED p(contradict) never argmax: contradict -> R3 conflict, entail+high-sigma -> merge/refine "
             "candidate, neutral -> relate/coexist. (3) lexical antonym/negation supplement in code (WordNet antonym + "
             "explicit negation tokens) as a parallel contradiction signal to catch the NLI false-negative direction. "
@@ -137,7 +147,8 @@ FACTS = [
         "object": (
             "sigma_lo (relatedness floor, below -> unrelated) = 0.35-0.50, tune so true conflicts aren't dropped; "
             "theta_merge (merge bar, sigma above + context match) = 0.85-0.92, MELD merge classifier AUC 0.968 / "
-            "false-merge 0.013 on HotpotQA; chi_contradict (contradiction gate on p(contradict)) = 0.70-0.80, threshold "
+            "false-merge 0.013 on HotpotQA; chi_contradict (contradiction gate on p(contradict)) = 0.70-0.80, "
+            "threshold "
             "p_contradict directly per Brenndoerfer and tune on a labeled validation set watching false-negative rate. "
             "The single most important calibration target is the contradiction false-negative rate on antonym/lexical-"
             "negation pairs -- it determines whether the 'never silently resolve' invariant actually holds."

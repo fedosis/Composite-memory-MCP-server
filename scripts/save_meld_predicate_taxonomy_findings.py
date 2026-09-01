@@ -7,8 +7,8 @@ from _common import get_db_url
 
 sys.path.insert(0, "/home/shtorm/memory-server/src")
 
-from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.api.remember import remember
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 DB_URL = get_db_url()
 SOURCE = "curiosity-worker/research"
@@ -92,7 +92,8 @@ FACTS = [
         "object": (
             "production dedup systems (Dedupe, Splink, Zingg, Meltwater's KG record-linking pipeline) assign each "
             "attribute a comparator by its type: string -> edit-distance/fuzzy (WRatio, Jaro-Winkler, phonetic), "
-            "numeric -> tolerance, date -> interval math, categorical -> exact + taxonomy. Amperity's 'Fusion' resolves "
+            "numeric -> tolerance, date -> interval math, categorical -> exact + taxonomy. Amperity's 'Fusion' "
+            "resolves "
             "conflicts within matched clusters at MULTIPLE confidence levels rather than assuming a canonical value is "
             "reachable. This is the direct model for 'typed comparator': predicate class -> comparator -> outcome."
         ),
@@ -100,11 +101,13 @@ FACTS = [
         "evidence": {"method": "web_search", "sources": [MELTWATER], "session_id": SESSION},
     },
     {
-        "subject": "Truth-maintenance systems (Doyle 1979, de Kleer 1986) give the retraction semantics of partial overrule",
+        "subject": "Truth-maintenance systems (Doyle 1979, de Kleer 1986) give the retraction semantics of partial "
+                   "overrule",
         "predicate": "provide",
         "object": (
             "a TMS/ATMS tracks beliefs WITH their justifications (dependencies); on contradiction it performs "
-            "dependency-directed backtracking: find the assumption(s) behind the defeated belief, retract exactly them, "
+            "dependency-directed backtracking: find the assumption(s) behind the defeated belief, retract exactly "
+            "them, "
             "and propagate retraction to every belief derived from them. Maps directly onto CMMS: justification = "
             "provenance + derived_from edges (CMMS already stores both); partial overrule = retract the defeated "
             "sub-claim and transitively re-evaluate its derived_from descendants, NOT delete the world. Retraction is "
@@ -117,7 +120,8 @@ FACTS = [
         "subject": "Defeasible logic / argumentation (Dung 1995, Vreeswijk 1997) formalize priority-ordered overrule",
         "predicate": "formalizes",
         "object": (
-            "defeasible reasoning handles the case where one claim DEFEATS another without either being false: arguments "
+            "defeasible reasoning handles the case where one claim DEFEATS another without either being false: "
+            "arguments "
             "attack each other and PREFERENCE relations among arguments (authority, specificity, reliability, recency) "
             "decide which survives. Dung's admissibility captures 'the one who laughs last, laughs best' -- defeat "
             "resolved by the highest-priority undefeated argument. This is the formal basis for supersede and "
@@ -128,11 +132,13 @@ FACTS = [
         "evidence": {"method": "web_search", "sources": [SEP_DEFEASIBLE], "session_id": SESSION},
     },
     {
-        "subject": "Legal antinomy canons (lex specialis / lex posterior / lex superior) are the authority hierarchy for partial overrule",
+        "subject": "Legal antinomy canons (lex specialis / lex posterior / lex superior) are the authority hierarchy "
+                   "for partial overrule",
         "predicate": "are",
         "object": (
             "three conflict-resolution maxims that give the operational precedence order for the authority/normative "
-            "predicate class: lex specialis (specialia generalibus non derogant -- the specific overrides the general) = "
+            "predicate class: lex specialis (specialia generalibus non derogant -- the specific overrides the "
+            "general) = "
             "PARTIAL OVERRULE (narrow, don't revoke -- a specific rule derogates a general rule only to the extent of "
             "the specific's scope); lex posterior (the later overrides the earlier) = supersession by recency; "
             "lex superior (the higher authority overrides the lower) = supersession by authority. Lex specialis is "
@@ -147,9 +153,12 @@ FACTS = [
         "object": (
             "(1) identity/rigid (is_a, named, born_on, has_pid): single-value, rigid, exact+ID, merge->conflict, "
             "authority-overrule only; (2) attribution/role (works_at, member_of, is_married_to): single, sticky, exact "
-            "entity, merge->supersede-on-change; (3) preference (prefers, likes, dislikes): MULTI, sticky, set-membership "
-            "+ VALENCE (like/neutral/dislike), merge->coexist->conflict(same object opposite valence); (4) current state "
-            "transient fluent (located_at, in_meeting_with, feels): single, transient, exact+temporal, merge->supersede->"
+            "entity, merge->supersede-on-change; (3) preference (prefers, likes, dislikes): MULTI, sticky, "
+            "set-membership "
+            "+ VALENCE (like/neutral/dislike), merge->coexist->conflict(same object opposite valence); (4) current "
+            "state "
+            "transient fluent (located_at, in_meeting_with, feels): single, transient, exact+temporal, "
+            "merge->supersede->"
             "conflict(overlap+diff), TTL; (5) habitual state sticky fluent (resides_in, speaks, uses): single, sticky, "
             "exact+temporal, merge->coexist(move)->refine(containment)->conflict; (6) numeric (age, price, count): "
             "single, transient, NUMERIC TOLERANCE |v1-v2|<=eps + unit normalize, merge->supersede(recency)->conflict; "
@@ -204,15 +213,22 @@ FACTS = [
         "object": (
             "EXISTS and reusable: source (explicit/observed/inferred) + confidence = the authority axis (lex superior "
             "= source-type + confidence ordering); lifecycle_state (active/deprecated/overruled/revoked) = the outcome "
-            "states (currently dormant, 0 lifecycle_events); claim_type (fact/authority/state) in remember.py = a coarse "
-            "3-class seed of the taxonomy; derived_from edges = the TMS retraction substrate; scope = the lex specialis "
-            "specificity field. MISSING: (1) no predicate registry mapping free-form predicate strings -> (class, arity, "
+            "states (currently dormant, 0 lifecycle_events); claim_type (fact/authority/state) in remember.py = a "
+            "coarse "
+            "3-class seed of the taxonomy; derived_from edges = the TMS retraction substrate; scope = the lex "
+            "specialis "
+            "specificity field. MISSING: (1) no predicate registry mapping free-form predicate strings -> (class, "
+            "arity, "
             "rigidity, comparator) -- current save-scripts use arbitrary predicates (defines/recommends/is/requires/"
             "enables/shows/guarantees/implements/provides/are); (2) no comparator implementation (remember() does no "
-            "value-level comparison, silent append = MELD's reconciliation-by-chance); (3) claim_type 3-valued and never "
-            "consulted by any merge path; (4) no ordered-replacement outcome (supersede/partial-overrule unrepresented). "
-            "Order: (a) register predicate vocabulary defaulting unknown -> # coexist (conservative); (b) implement cheap "
-            "comparators in code (exact/set/numeric-tolerance/Allen-interval/geospatial, zero LLM); (c) wire supersede + "
+            "value-level comparison, silent append = MELD's reconciliation-by-chance); (3) claim_type 3-valued and "
+            "never "
+            "consulted by any merge path; (4) no ordered-replacement outcome (supersede/partial-overrule "
+            "unrepresented). "
+            "Order: (a) register predicate vocabulary defaulting unknown -> # coexist (conservative); (b) implement "
+            "cheap "
+            "comparators in code (exact/set/numeric-tolerance/Allen-interval/geospatial, zero LLM); (c) wire "
+            "supersede + "
             "partial-overrule outcomes; (d) gate the 7-way LLM classifier behind structured comparators."
         ),
         "confidence": 0.85,

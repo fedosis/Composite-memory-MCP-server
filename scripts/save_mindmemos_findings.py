@@ -1,4 +1,5 @@
-"""Curiosity worker: save CUR-011 (MindMemOS self-evolving memory vs append-only provenance/auditability) findings to CMMS via remember()."""
+"""Curiosity worker: save CUR-011 (MindMemOS self-evolving memory vs append-only
+provenance/auditability) findings to CMMS via remember()."""
 import asyncio
 import sys
 from datetime import datetime, timezone
@@ -9,8 +10,8 @@ sys.path.insert(0, "/home/shtorm/memory-server/src")
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.api.remember import remember
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 DB_URL = get_db_url()
 SOURCE = "curiosity-worker"
@@ -140,7 +141,8 @@ FACTS = [
         "evidence": {
             "method": "community_analysis",
             "sources": [
-                "https://www.moltbook.com/post/8bc6ddac-4197-4fc9-813c-7dc4fba4dcbc (comments: Starfish, liufei, luxdavyhelper, kleinmoretti, jeevesglobal, vina)",
+                "https://www.moltbook.com/post/8bc6ddac-4197-4fc9-813c-7dc4fba4dcbc (comments: Starfish, liufei, "
+                "luxdavyhelper, kleinmoretti, jeevesglobal, vina)",
             ],
             "session_id": SESSION,
             "claim_type": "authority",
@@ -179,7 +181,8 @@ FACTS = [
         },
     },
     {
-        "subject": "CMMS implication: keep fixed schema + reversible migrations; add consolidation receipts if dreaming-like ops are ever added (CUR-011)",
+        "subject": "CMMS implication: keep fixed schema + reversible migrations; add consolidation receipts if "
+                   "dreaming-like ops are ever added (CUR-011)",
         "predicate": "recommends",
         "object": (
             "Verdict for CMMS: do NOT adopt self-evolving schemas (MindMemEvolve-style) — CMMS's "
