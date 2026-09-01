@@ -108,6 +108,17 @@ def test_build_failures_are_closed(monkeypatch, caplog, cfg, env, home, category
     assert f"category={category}" in caplog.text
 
 
+@pytest.mark.parametrize("mode", [[], {}, ["llm"]])
+def test_unhashable_modes_fail_closed(monkeypatch, caplog, mode):
+    cfg = make_cfg(mode=mode)
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+    with caplog.at_level(logging.WARNING):
+        assert build_llm_extractor_from_cfg(cfg) is None
+    assert not FakeClient.instances
+    assert len(caplog.records) == 1
+    assert "category=invalid_mode mode=unknown" in caplog.text
+
+
 @pytest.mark.parametrize(
     "failure",
     [httpx.ConnectError("x"), httpx.ReadError("x"), httpx.WriteError("x"), httpx.PoolTimeout("x")],
@@ -118,6 +129,7 @@ def test_retryable_transport_retries_three_times(monkeypatch, caplog, failure):
     with caplog.at_level(logging.WARNING):
         assert build_valid(monkeypatch)("input") is None
     assert len(FakeClient.instances[-1].calls) == 3
+    assert FakeClient.instances[-1].closed
     assert len(caplog.records) == 1
     assert "category=retryable_transport_exhausted mode=llm" in caplog.text
 
@@ -128,6 +140,7 @@ def test_retryable_status_retries_three_times(monkeypatch, caplog, status):
     with caplog.at_level(logging.WARNING):
         assert build_valid(monkeypatch)("input") is None
     assert len(FakeClient.instances[-1].calls) == 3
+    assert FakeClient.instances[-1].closed
     assert len(caplog.records) == 1
     assert "retryable_http_exhausted" in caplog.text
 
@@ -157,9 +170,11 @@ def test_pooltimeout_precedes_timeout(monkeypatch):
     FakeClient.plan = [httpx.PoolTimeout("x")] * 3
     assert build_valid(monkeypatch)("x") is None
     assert len(FakeClient.instances[-1].calls) == 3
+    assert FakeClient.instances[-1].closed
     FakeClient.plan = [httpx.ReadTimeout("x")]
     assert build_valid(monkeypatch)("x") is None
     assert len(FakeClient.instances[-1].calls) == 1
+    assert FakeClient.instances[-1].closed
 
 
 def test_validator_once_first_and_after_retry(monkeypatch):
@@ -193,6 +208,8 @@ def test_validator_none_and_exception_close_client(monkeypatch, caplog):
         with caplog.at_level(logging.WARNING):
             assert build_valid(monkeypatch)("x") is None
         assert FakeClient.instances[-1].closed
+        if validator.side_effect:
+            assert "validation_failure" in caplog.text
     assert len(caplog.records) == 2
 
 
@@ -235,6 +252,22 @@ def test_warning_does_not_leak_secrets_or_body(monkeypatch, caplog):
     assert "Bearer" not in caplog.text
     assert body not in caplog.text
     assert url not in caplog.text
+
+
+def test_invocation_failure_does_not_leak_request_or_response(monkeypatch, caplog):
+    secret = "fake-key-like-secret-456"
+    sentinel = "request-sentinel-789"
+    response_body = "response-body-fake-key-012"
+    exception_text = "transport-exception-sensitive-345"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    FakeClient.plan = [RuntimeError(f"{exception_text}: {sentinel} {response_body}")]
+    extractor = build_llm_extractor_from_cfg(make_cfg())
+    assert extractor is not None
+    with caplog.at_level(logging.WARNING):
+        assert extractor(sentinel) is None
+    for value in [secret, sentinel, response_body, "Bearer", exception_text]:
+        assert value not in caplog.text
 
 
 def test_client_construction_and_context_fail_closed(monkeypatch, caplog):

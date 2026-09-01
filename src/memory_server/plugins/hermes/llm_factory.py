@@ -23,7 +23,7 @@ _RETRYABLE_EXCEPTIONS = (httpx.ConnectError, httpx.ReadError,
 
 
 def _warn(category: str, *, mode: object = None) -> None:
-    safe_mode = mode if mode in {"llm", "auto"} else "unknown"
+    safe_mode = mode if isinstance(mode, str) and mode in {"llm", "auto"} else "unknown"
     logger.warning("LLM extractor failure category=%s mode=%s", category, safe_mode)
 
 
@@ -110,10 +110,6 @@ def _invoke(*, base_url: str, model: str, key: str, text: str,
                 try:
                     raw = _request_once(client, base_url=base_url, model=model,
                                         key=key, text=text, timeout=timeout)
-                    result = validate_llm_result(raw)  # exactly once
-                    if result is None:
-                        _warn("validation_failure", mode=mode)
-                    return result
                 except _RetryableHTTP:
                     if attempt == _MAX_ATTEMPTS:
                         _warn("retryable_http_exhausted", mode=mode)  # noqa: E702
@@ -131,11 +127,20 @@ def _invoke(*, base_url: str, model: str, key: str, text: str,
                     _warn("non_retryable_http", mode=mode)  # noqa: E702
                     return None
                 except (json.JSONDecodeError, ValueError, TypeError):
-                    _warn("response_parse_failure", mode=mode)  # noqa: E702
+                    _warn("response_parse_failure", mode=mode)
                     return None
                 except Exception:
                     _warn("unexpected_failure", mode=mode)  # noqa: E702
                     return None
+                else:
+                    try:
+                        result = validate_llm_result(raw)  # exactly once
+                    except (ValueError, TypeError):
+                        _warn("validation_failure", mode=mode)
+                        return None
+                    if result is None:
+                        _warn("validation_failure", mode=mode)
+                    return result
     except Exception:
         # Includes Client construction, __enter__, and __exit__. A constructed
         # client is owned by `with` and is closed on every ordinary return path.
@@ -150,7 +155,7 @@ def build_llm_extractor_from_cfg(
     mode = getattr(cfg, "extraction_mode", None)
     if mode == "regex":                         # zero-touch fast path
         return None
-    if mode not in {"llm", "auto"}:
+    if not isinstance(mode, str) or mode not in {"llm", "auto"}:
         _warn("invalid_mode", mode=mode)  # noqa: E702
         return None
     captured = _capture(cfg, hermes_home, mode)
