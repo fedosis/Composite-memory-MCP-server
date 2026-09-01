@@ -25,6 +25,14 @@ REPO = Path("/home/shtorm/memory-server")
 LIVE_DB = Path("/home/shtorm/.hermes/data/memory.db")
 HISTORICAL_SOURCE = REPO / "migrations/versions/70e6afc8d15d_initial_schema.py"
 EXPECTED_PINNED_CANONICAL = "unique=1;columns=dedup_key;where=lifecycle_state in ('candidate', 'validated', 'active')"
+EXPECTED_FACT_MAPPING = (
+    ("fact-active-2", "Docker\x1fis\x1fcontainer", "validated"),
+    ("fact-archived-1", "Apple\x1fis\x1ffruit", "archived"),
+    ("fact-case-lower", "docker\x1frelates-to\x1fcontainer", "active"),
+    ("fact-case-upper", "Docker\x1frelates-to\x1fContainer", "active"),
+    ("fact-empty-2", "\x1f\x1f", "archived"),
+    ("fact-tie-a", "Tie\x1fsame\x1fkeeper", "active"),
+)
 
 FIXTURE_SCHEMA_SQL = """
 CREATE TABLE facts (
@@ -725,6 +733,30 @@ FULL_STATE_TABLES = (
 
 def full_table_snapshot(conn: sqlite3.Connection, table: str) -> tuple[tuple, ...]:
     return tuple(tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+
+
+def fact_mapping_snapshot(conn: sqlite3.Connection) -> tuple[tuple[str, str, str], ...]:
+    """Return the audit's canonical per-fact deduplication mapping."""
+    rows = [
+        (str(fact_id), str(dedup_key), str(lifecycle_state))
+        for fact_id, dedup_key, lifecycle_state in conn.execute(
+            "SELECT id, dedup_key, lifecycle_state FROM facts"
+        ).fetchall()
+    ]
+    return tuple(sorted(rows))
+
+
+def child_intersection_diagnostics(
+    receipts: tuple[tuple, ...], outbox_entries: tuple[tuple, ...], deleted_fact_ids: set[str]
+) -> dict[str, object]:
+    receipt_ids = sorted(str(row[0]) for row in receipts if row[1] == "fact" and row[0] in deleted_fact_ids)
+    outbox_ids = sorted(str(row[0]) for row in outbox_entries if row[1] == "fact" and row[2] in deleted_fact_ids)
+    return {
+        "receipt_ids": receipt_ids,
+        "receipt_count": len(receipt_ids),
+        "outbox_ids": outbox_ids,
+        "outbox_count": len(outbox_ids),
+    }
 
 
 def _canonical_rows(conn: sqlite3.Connection, table: str) -> list[list[Any]]:
@@ -1496,21 +1528,54 @@ def test_normal_and_forced_limit_have_identical_post_state(tmp_path):
     assert regular.returncode == constrained.returncode == 0
     regular_summary = parse_summary(regular.stdout)
     forced_summary = parse_summary(constrained.stdout)
-    assert regular_summary == forced_summary
-    expected_deleted = set(regular_summary["deleted_fact_ids"])
     pre_fact_ids = {row[0] for row in pre_facts}
-    assert expected_deleted == pre_fact_ids - {
-        *regular_summary["kept"]["fact_ids"],
-    }
-    expected_receipts = {row for row in pre_receipts if row[1] == "fact" and row[0] in expected_deleted}
-    expected_outbox = {row for row in pre_outbox if row[1] == "fact" and row[2] in expected_deleted}
-    assert regular_summary["deleted_receipt_count"] == len(expected_receipts)
-    assert regular_summary["deleted_outbox_count"] == len(expected_outbox)
-    assert regular_summary["deleted_receipt_count"] == forced_summary["deleted_receipt_count"]
-    assert regular_summary["deleted_outbox_count"] == forced_summary["deleted_outbox_count"]
     with sqlite3.connect(normal) as left, sqlite3.connect(forced) as right:
+        regular_mapping = fact_mapping_snapshot(left)
+        forced_mapping = fact_mapping_snapshot(right)
         left_state = full_state_snapshot(left)
         right_state = full_state_snapshot(right)
+
+    # Compare the canonical duplicate mapping directly, and against the fixture contract.
+    assert regular_mapping == forced_mapping
+    assert regular_mapping == EXPECTED_FACT_MAPPING
+
+    # Keep the named audit diagnostics independent from whole-summary equality.
+    regular_keeper_ids = regular_summary["kept"]["fact_ids"]
+    forced_keeper_ids = forced_summary["kept"]["fact_ids"]
+    assert regular_keeper_ids == forced_keeper_ids
+    assert regular_keeper_ids == [row[0] for row in EXPECTED_FACT_MAPPING]
+    regular_deleted_ids = regular_summary["deleted_fact_ids"]
+    forced_deleted_ids = forced_summary["deleted_fact_ids"]
+    assert regular_deleted_ids == forced_deleted_ids
+    expected_deleted = pre_fact_ids - set(regular_keeper_ids)
+    assert set(regular_deleted_ids) == expected_deleted
+    expected_child_diagnostics = child_intersection_diagnostics(pre_receipts, pre_outbox, expected_deleted)
+    regular_child_diagnostics = {
+        "receipt_ids": sorted(
+            str(row[0]) for row in pre_receipts if row[1] == "fact" and row[0] in set(regular_deleted_ids)
+        ),
+        "receipt_count": regular_summary["deleted_receipt_count"],
+        "outbox_ids": sorted(
+            str(row[0]) for row in pre_outbox if row[1] == "fact" and row[2] in set(regular_deleted_ids)
+        ),
+        "outbox_count": regular_summary["deleted_outbox_count"],
+    }
+    forced_child_diagnostics = {
+        "receipt_ids": sorted(
+            str(row[0]) for row in pre_receipts if row[1] == "fact" and row[0] in set(forced_deleted_ids)
+        ),
+        "receipt_count": forced_summary["deleted_receipt_count"],
+        "outbox_ids": sorted(
+            str(row[0]) for row in pre_outbox if row[1] == "fact" and row[2] in set(forced_deleted_ids)
+        ),
+        "outbox_count": forced_summary["deleted_outbox_count"],
+    }
+    assert regular_child_diagnostics == forced_child_diagnostics
+    assert regular_child_diagnostics == expected_child_diagnostics
+    assert regular_summary["deleted_fact_count"] == len(regular_deleted_ids)
+    assert forced_summary["deleted_fact_count"] == len(forced_deleted_ids)
+    assert regular_summary["kept"]["fact_count"] == len(regular_keeper_ids)
+    assert forced_summary["kept"]["fact_count"] == len(forced_keeper_ids)
     assert_full_state_equal(left_state, right_state)
 
 
