@@ -8,9 +8,11 @@ Card 003: Learn-to-Belief Bridge — optional belief extraction after the
 main transaction, using a separate session for belief CRUD.
 """
 
+import asyncio
 import logging
+import math
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
@@ -29,6 +31,8 @@ from storage.repositories import (
 from memory_server.extractors.belief_extractor import BeliefExtractor
 from memory_server.extractors.decision_extractor import DecisionExtractor
 from memory_server.extractors.fact_extractor import FactExtractor
+from memory_server.extractors.llm_response import ExtractedResult, validate_llm_result
+from memory_server.extractors.noise_filter import filter_facts
 from memory_server.extractors.skill_extractor import SkillExtractor
 from memory_server.models import (
     Belief,
@@ -41,6 +45,10 @@ from memory_server.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# LLM-mode confidence gate (D2). Card B replaces this default with resolved
+# config; the value is also the default of the llm_confidence_gate kwarg.
+LLM_CONFIDENCE_GATE = 0.7
 
 
 class MemoryIngestionService:
@@ -174,6 +182,10 @@ class MemoryIngestionService:
         source: str = "user",
         extract_beliefs: bool = False,
         min_belief_confidence: float = 0.6,
+        llm_extractor: Optional[Callable[[str], object]] = None,
+        llm_timeout_seconds: float = 15.0,
+        llm_max_input_chars: int = 8000,
+        llm_confidence_gate: float = LLM_CONFIDENCE_GATE,
     ) -> dict:
         """Extract and store facts, decisions, skills in one transaction.
 
@@ -190,6 +202,35 @@ class MemoryIngestionService:
             source: Source identifier (default "user").
             extract_beliefs: If True, also extract and store beliefs (default False).
             min_belief_confidence: Minimum confidence to create a belief (default 0.6).
+            llm_extractor: Optional callable(text) performing ONE combined
+                LLM extraction per call. When provided and its result
+                validates (A1 validate_llm_result), the SAME validated
+                combined result feeds both FactExtractor and DecisionExtractor
+                through their DI closures — one callable invocation per
+                learn(); neither extractor re-invokes the callable. Any
+                failure (callable exception, timeout, validator exception,
+                malformed kwargs, or a None/invalid result) falls back to
+                regex extraction for the batch and NEVER crashes the write
+                path. The callable runs in a worker thread bounded by
+                llm_timeout_seconds; the worker thread is NOT cancellable and
+                may finish AFTER learn() returns (thread-may-finish-later) —
+                its late result is discarded.
+            llm_timeout_seconds: Outer timeout for the LLM call (default 15.0).
+                Values <= 0 or non-finite (NaN/Inf) disable the LLM path for
+                the batch (callable NOT invoked) with a warning + regex
+                fallback; malformed types (str/None/bool) also degrade to
+                regex fallback. Callers SHOULD pass a valid finite positive
+                number.
+            llm_max_input_chars: Tail truncation of the text passed to the
+                callable (default 8000 — keeps the most recent content).
+                A non-positive value disables truncation (full text passed).
+                The extractors always run on the FULL text; only the callable
+                input is truncated. Non-int types (str/float/None/bool)
+                degrade to regex fallback; callers SHOULD pass a valid int.
+            llm_confidence_gate: LLM-mode confidence gate (default 0.7).
+                In LLM mode every extracted item below the gate is dropped
+                (regex 0.5 items included); in pure regex mode no gate
+                applies (regex confidence stays 0.5).
 
         Returns:
             Dict with keys: facts, decisions, skills, beliefs, receipts.
@@ -209,17 +250,96 @@ class MemoryIngestionService:
                 "receipts": receipts,
             }
 
+        # --- LLM extraction boundary (D1) ---
+        # ONE combined call per learn() when an LLM extractor is configured.
+        # Bounded-input computation and parameter validation live INSIDE this
+        # boundary: malformed kwargs can never crash learn() — they degrade
+        # to warning + regex fallback exactly like a callable exception. The
+        # catch is STRICTLY scoped to the call+validation block; DB writes,
+        # receipts, outbox, and belief loops below are never covered by it.
+        llm_result: Optional[ExtractedResult] = None
+        if llm_extractor is not None:
+            try:
+                if isinstance(llm_max_input_chars, bool) or not isinstance(
+                    llm_max_input_chars, int
+                ):
+                    raise TypeError(
+                        f"llm_max_input_chars must be int, got {type(llm_max_input_chars).__name__}"
+                    )
+                call_text = (
+                    text[-llm_max_input_chars:] if llm_max_input_chars > 0 else text
+                )
+                if isinstance(llm_timeout_seconds, bool) or not isinstance(
+                    llm_timeout_seconds, (int, float)
+                ):
+                    raise TypeError(
+                        f"llm_timeout_seconds must be int or float, got {type(llm_timeout_seconds).__name__}"
+                    )
+                timeout = float(llm_timeout_seconds)
+                if not math.isfinite(timeout) or timeout <= 0:
+                    raise ValueError(
+                        f"llm_timeout_seconds must be finite and > 0, got {llm_timeout_seconds!r}"
+                    )
+                raw = await asyncio.wait_for(
+                    asyncio.to_thread(llm_extractor, call_text),
+                    timeout=timeout,
+                )
+                # Validation sits INSIDE the guarded path: a validator
+                # exception falls back to regex exactly like a callable
+                # exception (review #1).
+                llm_result = validate_llm_result(raw)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning(
+                    "LLM extraction timed out after %.1fs — regex fallback for this batch",
+                    timeout,
+                )
+            except Exception:
+                logger.exception("LLM extraction failed — regex fallback for this batch")
+            else:
+                if llm_result is None:
+                    logger.warning(
+                        "LLM extraction returned an invalid response — regex fallback for this batch"
+                    )
+
+        # llm_mode = the callable produced a VALID combined result. Both DI
+        # closures close over the SAME validated llm_result (cell capture —
+        # pinned structurally by tests); list(...) adapts the frozen tuple to
+        # the extractors' list[dict] DI contract. Neither closure re-invokes
+        # the callable.
+        llm_mode = llm_result is not None
         now = datetime.now(timezone.utc)
 
         # Run all extractors first (no DB writes yet)
-        fact_extractor = FactExtractor()
+        fact_extractor = FactExtractor(
+            llm_extractor=(lambda _t: list(llm_result.facts)) if llm_mode else None
+        )
         extracted_facts = fact_extractor.extract(text)
 
-        decision_extractor = DecisionExtractor()
+        decision_extractor = DecisionExtractor(
+            llm_extractor=(lambda _t: list(llm_result.decisions)) if llm_mode else None
+        )
         extracted_decisions = decision_extractor.extract(text)
 
         skill_extractor = SkillExtractor()
         extracted_skills = skill_extractor.extract(text)
+
+        # A1 noise filter runs in BOTH modes (A1 contract; facts side — the
+        # only A1-provided filter). Then the LLM-mode confidence gate: in LLM
+        # mode every item below the gate is dropped (regex 0.5 items
+        # included); pure regex mode is unchanged (0.5).
+        extracted_facts = filter_facts(extracted_facts)
+
+        if llm_mode:
+            extracted_facts = [
+                f
+                for f in extracted_facts
+                if f.get("confidence", 0.0) >= llm_confidence_gate
+            ]
+            extracted_decisions = [
+                d
+                for d in extracted_decisions
+                if d.get("confidence", 0.0) >= llm_confidence_gate
+            ]
 
         # Write everything in one transaction
         async with self._session_factory() as session:
