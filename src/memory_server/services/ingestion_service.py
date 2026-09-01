@@ -345,7 +345,10 @@ class MemoryIngestionService:
                 # Validation sits INSIDE the guarded path: a validator
                 # exception falls back to regex exactly like a callable
                 # exception (review #1).
-                llm_result = validate_llm_result(raw)
+                if isinstance(raw, ExtractedResult):
+                    llm_result = raw
+                else:
+                    llm_result = validate_llm_result(raw)
             except (asyncio.TimeoutError, TimeoutError):
                 logger.warning(
                     "LLM extraction timed out after %.1fs — regex fallback for this batch",

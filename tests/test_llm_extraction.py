@@ -148,6 +148,121 @@ async def test_same_validated_result_structural(monkeypatch, provider):
 
 
 @pytest.mark.asyncio
+async def test_factory_validated_result_skips_second_validation(monkeypatch, provider):
+    """A factory-provided ExtractedResult is consumed without revalidation."""
+    validated = ExtractedResult(
+        facts=(
+            {
+                "subject": "Helios",
+                "predicate": "powers",
+                "object": "Aurora",
+                "confidence": 0.93,
+            },
+        ),
+        decisions=(
+            {
+                "context": "deployment review",
+                "choice": "choose Helios",
+                "reason": "lower operational risk",
+                "alternatives": ["choose Atlas"],
+                "confidence": 0.88,
+            },
+        ),
+    )
+    validator_calls: list = []
+    real_validate = svc.validate_llm_result
+
+    def spy_validate(raw):
+        validator_calls.append(raw)
+        return real_validate(raw)
+
+    monkeypatch.setattr(svc, "validate_llm_result", spy_validate)
+    spy = Mock(return_value=validated)
+    service = MemoryIngestionService(provider._session_factory)
+
+    result = await service.learn(REGEX_TEXT, llm_extractor=spy)
+
+    assert spy.call_count == 1
+    assert validator_calls == []
+    assert result["facts"][0]["item"] == {
+        "id": result["facts"][0]["item"]["id"],
+        "subject": "Helios",
+        "predicate": "powers",
+        "object": "Aurora",
+        "confidence": 0.93,
+        "source": "user",
+        "creator": "system",
+        "created_at": result["facts"][0]["item"]["created_at"],
+        "updated_at": result["facts"][0]["item"]["updated_at"],
+        "verification_status": "candidate",
+        "lifecycle_state": "active",
+        "version": 1,
+    }
+    assert result["decisions"][0]["item"] == {
+        "id": result["decisions"][0]["item"]["id"],
+        "context": "deployment review",
+        "choice": "choose Helios",
+        "rejected_alternatives": ["choose Atlas"],
+        "reason": "lower operational risk",
+        "source": "user",
+        "creator": "system",
+        "created_at": result["decisions"][0]["item"]["created_at"],
+        "updated_at": result["decisions"][0]["item"]["updated_at"],
+        "confidence": 1.0,
+        "verification_status": "candidate",
+        "lifecycle_state": "active",
+        "version": "0.1.0",
+    }
+    assert result["decisions"][0]["receipt"]["confidence"] == 0.88
+
+
+@pytest.mark.asyncio
+async def test_raw_dict_result_still_validates(monkeypatch, provider):
+    """A raw dict from the callable still goes through the validator."""
+    validator_calls: list = []
+    real_validate = svc.validate_llm_result
+
+    def spy_validate(raw):
+        result = real_validate(raw)
+        validator_calls.append(raw)
+        return result
+
+    monkeypatch.setattr(svc, "validate_llm_result", spy_validate)
+    spy = Mock(return_value={
+        "facts": [{
+            "subject": "DictSubject",
+            "predicate": "is",
+            "object": "DictObject",
+            "confidence": 0.91,
+        }],
+        "decisions": [{
+            "context": "dict context",
+            "choice": "choose DictChoice",
+            "reason": "dict reason",
+            "alternatives": ["dict alternative"],
+            "confidence": 0.89,
+        }],
+    })
+    service = MemoryIngestionService(provider._session_factory)
+
+    result = await service.learn(REGEX_TEXT, llm_extractor=spy)
+
+    assert spy.call_count == 1
+    assert len(validator_calls) == 1
+    assert result["facts"][0]["item"]["subject"] == "DictSubject"
+    assert result["facts"][0]["item"]["predicate"] == "is"
+    assert result["facts"][0]["item"]["object"] == "DictObject"
+    assert result["facts"][0]["item"]["confidence"] == 0.91
+    assert result["decisions"][0]["item"]["context"] == "dict context"
+    assert result["decisions"][0]["item"]["choice"] == "choose DictChoice"
+    assert result["decisions"][0]["item"]["rejected_alternatives"] == [
+        "dict alternative"
+    ]
+    assert result["decisions"][0]["item"]["reason"] == "dict reason"
+    assert result["decisions"][0]["receipt"]["confidence"] == 0.89
+
+
+@pytest.mark.asyncio
 async def test_one_combined_call_stores_both(monkeypatch, provider):
     """Real committed A2a extractors: one combined call stores facts AND
     decisions from the SAME validated result; the LLM-mode gate drops the
