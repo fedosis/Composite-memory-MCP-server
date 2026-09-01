@@ -149,3 +149,19 @@ class TestDecisionExtractor:
         extractor = DecisionExtractor(llm_extractor=mock_llm)
         decisions = extractor.extract("Use PostgreSQL")
         assert decisions[0]["confidence"] == 1.0
+
+    def test_include_regex_false_llm_only(self):
+        """include_regex=False (pipeline-v3 LLM mode at the service
+        boundary): the regex pass contributes NO items — the result is
+        exactly the llm_extractor closure output."""
+
+        def mock_llm(text: str) -> list[dict]:
+            return [{"context": "Web server selection", "choice": "Caddy",
+                     "alternatives": ["Nginx"], "reason": "Docker integration"}]
+
+        extractor = DecisionExtractor(llm_extractor=mock_llm)
+        decisions = extractor.extract(
+            "We decided to use Caddy because simple. Use PostgreSQL instead",
+            include_regex=False)
+        assert len(decisions) == 1
+        assert decisions[0]["choice"] == "Caddy"

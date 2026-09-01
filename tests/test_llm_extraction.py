@@ -96,7 +96,7 @@ class _RecordingExtractor:
         self.llm_extractor = kwargs.get("llm_extractor")
         _RecordingExtractor.instances.append(self)
 
-    def extract(self, text: str) -> list[dict]:
+    def extract(self, text: str, include_regex: bool = True) -> list[dict]:
         return self.llm_extractor(text) if self.llm_extractor else []
 
 
@@ -332,6 +332,85 @@ async def test_empty_valid_result_stores_nothing(provider):
     assert result["decisions"] == []
     assert result["skills"] == []
     assert result["receipts"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", [0.0, 0.5])
+async def test_empty_valid_result_stores_nothing_at_low_gate(provider, gate):
+    """BLOCKER regression (code-review round 1): a valid EMPTY LLM result
+    stores NOTHING even at the lowest accepted/custom llm_confidence_gate
+    values — 0.0 (lowest) and 0.5 (exactly the regex confidence, the value
+    the old gate-based approach leaked). In LLM mode the regex pass is
+    skipped (include_regex=False), so no regex item can enter the list
+    regardless of the gate."""
+    spy = Mock(return_value=EMPTY_VALID_PAYLOAD)
+    service = MemoryIngestionService(provider._session_factory)
+    result = await service.learn(REGEX_TEXT, llm_extractor=spy,
+                                 llm_confidence_gate=gate)
+    assert result["facts"] == []
+    assert result["decisions"] == []
+    assert result["skills"] == []
+    assert result["receipts"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate,exp_facts,exp_decisions", [
+    (0.0, 2, 2),   # low custom gate: every validated LLM item passes
+    (0.7, 1, 1),   # required default threshold: 0.9 kept, 0.4 dropped
+    (0.9, 1, 1),   # >= boundary: the item exactly AT the gate passes
+    (0.91, 0, 0),  # just above: the 0.9 items drop too
+])
+async def test_llm_confidence_gate_boundary(provider, gate, exp_facts, exp_decisions):
+    """llm_confidence_gate boundary semantics: >= comparison; low custom
+    values keep validated LLM items (regex items are never in the list in
+    LLM mode — only LLM items are gated). The payload decisions are
+    DISTINCT (different choices) so the write-loop dedup cannot collapse
+    them — the counts reflect the gate alone."""
+    payload = {
+        "facts": [
+            {"subject": "Docker", "predicate": "is", "object": "container",
+             "confidence": 0.4},
+            {"subject": "Python", "predicate": "is", "object": "great",
+             "confidence": 0.9},
+        ],
+        "decisions": [
+            {"context": "web server", "choice": "use Caddy", "reason": "simple",
+             "alternatives": [], "confidence": 0.4},
+            {"context": "database", "choice": "use PostgreSQL", "reason": "ACID",
+             "alternatives": [], "confidence": 0.9},
+        ],
+    }
+    spy = Mock(return_value=payload)
+    service = MemoryIngestionService(provider._session_factory)
+    result = await service.learn(REGEX_TEXT, llm_extractor=spy,
+                                 llm_confidence_gate=gate)
+    assert len(result["facts"]) == exp_facts
+    assert len(result["decisions"]) == exp_decisions
+    if exp_facts == 0:
+        assert result["receipts"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", [float("nan"), float("inf")])
+async def test_llm_confidence_gate_non_finite_stores_nothing(provider, gate):
+    """A non-finite llm_confidence_gate (NaN/Inf) drops EVERY validated LLM
+    item (no item >= an undefined threshold) — learn() never crashes and no
+    regex item leaks. Pure regex mode is unaffected (the gate is not
+    applied there)."""
+    spy = Mock(return_value=GATE_PAYLOAD)
+    service = MemoryIngestionService(provider._session_factory)
+    result = await service.learn(REGEX_TEXT, llm_extractor=spy,
+                                 llm_confidence_gate=gate)
+    assert result["facts"] == []
+    assert result["decisions"] == []
+    assert result["receipts"] == []
+
+    # regex mode: gate ignored
+    service2 = MemoryIngestionService(provider._session_factory)
+    result2 = await service2.learn("Docker is container",
+                                   llm_confidence_gate=gate)
+    assert len(result2["facts"]) == 1
+    assert result2["facts"][0]["item"]["confidence"] == 0.5
 
 
 @pytest.mark.asyncio

@@ -228,9 +228,13 @@ class MemoryIngestionService:
                 input is truncated. Non-int types (str/float/None/bool)
                 degrade to regex fallback; callers SHOULD pass a valid int.
             llm_confidence_gate: LLM-mode confidence gate (default 0.7).
-                In LLM mode every extracted item below the gate is dropped
-                (regex 0.5 items included); in pure regex mode no gate
-                applies (regex confidence stays 0.5).
+                In LLM mode the extractors consume ONLY the validated LLM
+                lists (the regex pass is skipped via include_regex=False,
+                so regex items never enter the list) and every item below
+                the gate is dropped. A non-finite gate (NaN/Inf) drops
+                every item (nothing passes an undefined threshold) without
+                crashing; pure regex mode is unaffected (no gate applies —
+                regex confidence stays 0.5).
 
         Returns:
             Dict with keys: facts, decisions, skills, beliefs, receipts.
@@ -305,7 +309,10 @@ class MemoryIngestionService:
         # closures close over the SAME validated llm_result (cell capture —
         # pinned structurally by tests); list(...) adapts the frozen tuple to
         # the extractors' list[dict] DI contract. Neither closure re-invokes
-        # the callable.
+        # the callable. In LLM mode extract() is driven with
+        # include_regex=False: ONLY the validated LLM lists (possibly empty)
+        # are consumed, so the regex pass contributes no items regardless of
+        # llm_confidence_gate (SPEC AC3).
         llm_mode = llm_result is not None
         now = datetime.now(timezone.utc)
 
@@ -313,20 +320,21 @@ class MemoryIngestionService:
         fact_extractor = FactExtractor(
             llm_extractor=(lambda _t: list(llm_result.facts)) if llm_mode else None
         )
-        extracted_facts = fact_extractor.extract(text)
+        extracted_facts = fact_extractor.extract(text, include_regex=not llm_mode)
 
         decision_extractor = DecisionExtractor(
             llm_extractor=(lambda _t: list(llm_result.decisions)) if llm_mode else None
         )
-        extracted_decisions = decision_extractor.extract(text)
+        extracted_decisions = decision_extractor.extract(text, include_regex=not llm_mode)
 
         skill_extractor = SkillExtractor()
         extracted_skills = skill_extractor.extract(text)
 
         # A1 noise filter runs in BOTH modes (A1 contract; facts side — the
-        # only A1-provided filter). Then the LLM-mode confidence gate: in LLM
-        # mode every item below the gate is dropped (regex 0.5 items
-        # included); pure regex mode is unchanged (0.5).
+        # only A1-provided filter). Then the LLM-mode confidence gate: in
+        # LLM mode the extracted lists already contain ONLY validated LLM
+        # items (regex skipped via include_regex=False), so the gate filters
+        # LLM items only; pure regex mode is unchanged (0.5, no gate).
         extracted_facts = filter_facts(extracted_facts)
 
         if llm_mode:

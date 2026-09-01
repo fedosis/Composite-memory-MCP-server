@@ -159,3 +159,19 @@ class TestFactExtractor:
         extractor = FactExtractor(llm_extractor=mock_llm)
         facts = extractor.extract("A relates to B")
         assert facts[0]["confidence"] == 1.0
+
+    def test_include_regex_false_llm_only(self):
+        """include_regex=False (pipeline-v3 LLM mode at the service
+        boundary): the regex pass contributes NO items — the result is
+        exactly the llm_extractor closure output."""
+
+        def mock_llm(text: str) -> list[dict]:
+            return [{"subject": "Python", "predicate": "created_by",
+                     "object": "Guido"}]
+
+        extractor = FactExtractor(llm_extractor=mock_llm)
+        facts = extractor.extract("Docker is container. Python created_by Guido",
+                                  include_regex=False)
+        assert len(facts) == 1
+        assert facts[0]["subject"] == "Python"
+        assert facts[0]["predicate"] == "created_by"
