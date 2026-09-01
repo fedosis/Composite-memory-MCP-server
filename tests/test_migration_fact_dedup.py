@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import json
 import os
@@ -710,8 +711,108 @@ def facts_indexes_snapshot(conn: sqlite3.Connection) -> tuple[tuple, ...]:
     return tuple(sorted(result))
 
 
+FULL_STATE_TABLES = (
+    "facts",
+    "receipts",
+    "outbox_entries",
+    "decisions",
+    "lifecycle_states",
+    "lifecycle_events",
+    "claim_relations",
+    "__b2_read_only_probe",
+)
+
+
 def full_table_snapshot(conn: sqlite3.Connection, table: str) -> tuple[tuple, ...]:
     return tuple(tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+
+
+def _canonical_rows(conn: sqlite3.Connection, table: str) -> list[list[Any]]:
+    columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table!r})")]
+    quoted = ", ".join('"' + column.replace('"', '""') + '"' for column in columns)
+    rows = [list(row) for row in conn.execute(f"SELECT {quoted} FROM {table}")]
+    return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
+
+
+def _facts_index_metadata(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    indexes = []
+    for row in conn.execute("PRAGMA index_list('facts')"):
+        name = str(row[1])
+        quoted_name = '"' + name.replace('"', '""') + '"'
+        indexes.append(
+            {
+                "name": name,
+                "unique": int(row[2]),
+                "origin": row[3],
+                "partial": int(row[4]),
+                "index_info": [list(item) for item in conn.execute(f"PRAGMA index_info({quoted_name})")],
+                "sql": conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
+                ).fetchone()[0],
+            }
+        )
+    return sorted(indexes, key=lambda item: item["name"])
+
+
+def _sqlite_master_snapshot(conn: sqlite3.Connection) -> list[list[Any]]:
+    return [
+        list(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name, tbl_name, sql"
+        )
+    ]
+
+
+def _integrity_check(conn: sqlite3.Connection) -> list[list[Any]]:
+    try:
+        return [list(row) for row in conn.execute("PRAGMA integrity_check")]
+    except sqlite3.DatabaseError as error:
+        return [[f"ERROR: {error}"]]
+
+
+def full_state_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Capture every logical B3 state dimension in a canonical form."""
+    conn.execute("PRAGMA writable_schema=ON")
+    try:
+        snapshot: dict[str, Any] = {
+            "tables": {table: _canonical_rows(conn, table) for table in FULL_STATE_TABLES},
+            "sqlite_master": _sqlite_master_snapshot(conn),
+            "facts_table_info": [list(row) for row in conn.execute("PRAGMA table_info('facts')")],
+            "facts_indexes": _facts_index_metadata(conn),
+            "alembic_version": conn.execute(
+                "SELECT version_num FROM alembic_version ORDER BY version_num"
+            ).fetchall(),
+        }
+    finally:
+        conn.execute("PRAGMA writable_schema=OFF")
+    snapshot["integrity_check"] = _integrity_check(conn)
+    return snapshot
+
+
+def full_state_digest(snapshot: dict[str, Any]) -> str:
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def assert_full_state_equal(left: dict[str, Any], right: dict[str, Any]) -> None:
+    left_digest = full_state_digest(left)
+    right_digest = full_state_digest(right)
+    if left_digest != right_digest:
+        differing = [
+            key
+            for key in left
+            if left.get(key) != right.get(key)
+        ]
+        if left.get("tables") != right.get("tables"):
+            differing.extend(
+                f"tables.{table}"
+                for table in FULL_STATE_TABLES
+                if left["tables"].get(table) != right["tables"].get(table)
+            )
+        raise AssertionError(
+            f"full-state mismatch: sha256 {left_digest} != {right_digest}; dimensions={differing}"
+        )
+    assert left == right
 
 
 def parse_summary(stdout: str) -> dict[str, Any]:
@@ -1326,14 +1427,18 @@ def test_subprocess_bad_pinned_index_is_atomic_and_has_no_create_event(tmp_path,
     ini_path = tmp_path / f"{pinned_index}.ini"
     write_copy_ini(ini_path, db_path.resolve(strict=True))
     event_path = tmp_path / "bad-index-events.jsonl"
+    with sqlite3.connect(str(db_path)) as conn:
+        before = full_state_snapshot(conn)
+        before_version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
     run = run_upgrade(db_path, ini_path, event_path=event_path)
     assert run.returncode != 0
+    assert "FACT_DEDUPE_SUMMARY" not in run.stdout
     with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("PRAGMA writable_schema=ON")
-        version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
+        after = full_state_snapshot(conn)
+        assert_full_state_equal(before, after)
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == before_version
+        assert after["integrity_check"] == before["integrity_check"]
         sql = conn.execute("SELECT sql FROM sqlite_master WHERE name='uq_facts_spo_active'").fetchone()[0]
-        conn.execute("PRAGMA writable_schema=OFF")
-        assert version == "6a7b8c9d0e1f"
         assert sql is not None
     events = [json.loads(line) for line in event_path.read_text().splitlines()] if event_path.exists() else []
     assert not any(
@@ -1382,21 +1487,47 @@ def test_normal_and_forced_limit_have_identical_post_state(tmp_path):
     create_fixture_database(forced)
     write_copy_ini(normal_ini, normal.resolve(strict=True))
     write_copy_ini(forced_ini, forced.resolve(strict=True))
+    with sqlite3.connect(normal) as conn:
+        pre_facts = full_table_snapshot(conn, "facts")
+        pre_receipts = full_table_snapshot(conn, "receipts")
+        pre_outbox = full_table_snapshot(conn, "outbox_entries")
     regular = run_upgrade(normal, normal_ini)
     constrained = run_forced_limit(forced, forced_ini, tmp_path)
     assert regular.returncode == constrained.returncode == 0
     regular_summary = parse_summary(regular.stdout)
-    forced_events = [json.loads(line) for line in (tmp_path / "b2-events.jsonl").read_text().splitlines()]
-    assert forced_events
-    with sqlite3.connect(normal) as left, sqlite3.connect(forced) as right:
-        assert [row[0] for row in left.execute("SELECT id FROM facts ORDER BY id")] == [
-            row[0] for row in right.execute("SELECT id FROM facts ORDER BY id")
-        ]
-        assert facts_schema_snapshot(left) == facts_schema_snapshot(right)
-        assert full_table_snapshot(left, "receipts") == full_table_snapshot(right, "receipts")
-        assert full_table_snapshot(left, "outbox_entries") == full_table_snapshot(right, "outbox_entries")
     forced_summary = parse_summary(constrained.stdout)
     assert regular_summary == forced_summary
+    expected_deleted = set(regular_summary["deleted_fact_ids"])
+    pre_fact_ids = {row[0] for row in pre_facts}
+    assert expected_deleted == pre_fact_ids - {
+        *regular_summary["kept"]["fact_ids"],
+    }
+    expected_receipts = {row for row in pre_receipts if row[1] == "fact" and row[0] in expected_deleted}
+    expected_outbox = {row for row in pre_outbox if row[1] == "fact" and row[2] in expected_deleted}
+    assert regular_summary["deleted_receipt_count"] == len(expected_receipts)
+    assert regular_summary["deleted_outbox_count"] == len(expected_outbox)
+    assert regular_summary["deleted_receipt_count"] == forced_summary["deleted_receipt_count"]
+    assert regular_summary["deleted_outbox_count"] == forced_summary["deleted_outbox_count"]
+    with sqlite3.connect(normal) as left, sqlite3.connect(forced) as right:
+        left_state = full_state_snapshot(left)
+        right_state = full_state_snapshot(right)
+    assert_full_state_equal(left_state, right_state)
+
+
+def test_full_state_equality_regression_detects_non_fact_mutation(tmp_path):
+    """The equality proof must not ignore lifecycle/decision-side state."""
+    left = tmp_path / "left.db"
+    right = tmp_path / "right.db"
+    create_fixture_database(left)
+    create_fixture_database(right)
+    with sqlite3.connect(left) as conn:
+        left_state = full_state_snapshot(conn)
+    with sqlite3.connect(right) as conn:
+        conn.execute("UPDATE lifecycle_events SET reason='mutated' WHERE id='le-fact-1'")
+        conn.commit()
+        right_state = full_state_snapshot(conn)
+    with pytest.raises(AssertionError, match="lifecycle_events"):
+        assert_full_state_equal(left_state, right_state)
 
 
 def test_read_only_source_probe_and_sidecar_contract(tmp_path):
