@@ -12,6 +12,7 @@ import sys
 import textwrap
 from pathlib import Path
 from subprocess import CompletedProcess
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -655,6 +656,8 @@ def create_fixture_database(db_path: Path, *, pinned_index: str = "absent") -> N
         elif pinned_index == "collision":
             conn.execute("CREATE INDEX uq_facts_spo_active ON facts(subject)")
         elif pinned_index == "malformed":
+            conn.execute("ALTER TABLE facts ADD COLUMN dedup_key VARCHAR")
+            conn.execute("CREATE UNIQUE INDEX uq_facts_spo_active ON facts(dedup_key)")
             conn.execute("PRAGMA writable_schema=ON")
             conn.execute(
                 (
@@ -691,6 +694,52 @@ def canonical_pinned_index_sql(sql: str) -> str:
 def exact_index_definition_on_copy(db_path: Path, name: str) -> bool:
     sql = read_index_sql(db_path, name)
     return migration.canonical_pinned_index_sql(sql) == EXPECTED_PINNED_CANONICAL
+
+
+def facts_schema_snapshot(conn: sqlite3.Connection) -> tuple[tuple, ...]:
+    return tuple(tuple(row) for row in conn.execute("PRAGMA table_info('facts')"))
+
+
+def facts_indexes_snapshot(conn: sqlite3.Connection) -> tuple[tuple, ...]:
+    result = []
+    for row in conn.execute("PRAGMA index_list('facts')").fetchall():
+        name = row[1]
+        info = tuple(tuple(item) for item in conn.execute(f"PRAGMA index_info({name!r})"))
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()[0]
+        result.append((name, int(row[2]), row[3], int(row[4]), info, sql))
+    return tuple(sorted(result))
+
+
+def full_table_snapshot(conn: sqlite3.Connection, table: str) -> tuple[tuple, ...]:
+    return tuple(tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+
+
+def parse_summary(stdout: str) -> dict[str, Any]:
+    lines = [line for line in stdout.splitlines() if line.startswith("FACT_DEDUPE_SUMMARY ")]
+    assert len(lines) == 1
+    summary = json.loads(lines[0].split(" ", 1)[1])
+    assert set(summary) == {
+        "schema",
+        "kept",
+        "deleted_fact_ids",
+        "deleted_fact_count",
+        "deleted_receipt_count",
+        "deleted_outbox_count",
+        "remaining_dupe_keys",
+        "remaining_dupe_count",
+    }
+    assert summary["schema"] == "B2-A3"
+    kept = summary["kept"]
+    assert set(kept) == {"fact_ids", "fact_count"}
+    assert kept["fact_ids"] == sorted(kept["fact_ids"])
+    assert summary["deleted_fact_ids"] == sorted(summary["deleted_fact_ids"])
+    assert set(kept["fact_ids"]).isdisjoint(summary["deleted_fact_ids"])
+    assert kept["fact_count"] == len(kept["fact_ids"])
+    assert summary["deleted_fact_count"] == len(summary["deleted_fact_ids"])
+    assert summary["remaining_dupe_count"] == len(summary["remaining_dupe_keys"])
+    assert summary["remaining_dupe_keys"] == sorted(summary["remaining_dupe_keys"])
+    assert all(isinstance(key, str) and key for key in summary["remaining_dupe_keys"])
+    return summary
 
 
 def make_backup_fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -790,6 +839,17 @@ def run_upgrade(
         [sys.executable, "-m", "alembic", "-c", str(ini_path), "upgrade", "head"],
         cwd=str(REPO),
         env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def run_downgrade(db_path: Path, ini_path: Path) -> CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "alembic", "-c", str(ini_path), "downgrade", "6a7b8c9d0e1f"],
+        cwd=str(REPO),
+        env=os.environ.copy(),
         capture_output=True,
         text=True,
         check=False,
@@ -1032,7 +1092,7 @@ def test_backup_nonretryable_code_with_locked_text_does_not_retry(tmp_path, monk
     assert sleeps == []
 
 
-def assert_post_migration_state(db_path: Path) -> None:
+def assert_post_migration_state(db_path: Path, before: dict[str, Any] | None = None) -> None:
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "b2f3a4c5d6e7"
         schema = conn.execute("PRAGMA table_info('facts')").fetchall()
@@ -1053,6 +1113,15 @@ def assert_post_migration_state(db_path: Path) -> None:
         ]
         assert [row[2] for row in schema] == ["VARCHAR"] * 4 + ["FLOAT"] + ["VARCHAR"] * 8
         assert schema[-1][3] == 1
+        assert [row[5] for row in schema] == [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        assert [(row[1], row[5]) for row in schema if row[5]] == [("id", 1)]
+        assert before is None or set(before["facts_indexes"]) <= set(facts_indexes_snapshot(conn))
+        if before is not None:
+            expected_pre = [list(row) for row in before["facts_schema"]]
+            for row in expected_pre:
+                if row[1] in {"created_at", "updated_at"}:
+                    row[2] = "VARCHAR"
+            assert tuple(tuple(row) for row in expected_pre) == tuple(schema[:-1])
         assert exact_index_definition_on_copy(db_path, "uq_facts_spo_active")
         assert [r[0] for r in conn.execute("SELECT id FROM facts ORDER BY id")] == [
             "fact-active-2",
@@ -1080,14 +1149,29 @@ def assert_post_migration_state(db_path: Path) -> None:
 
 def test_subprocess_event_enabled(tmp_path):
     db_path, ini_path, event_path = prepare_subprocess_fixture(tmp_path, event_enabled=True)
+    with sqlite3.connect(str(db_path)) as conn:
+        before: dict[str, Any] = {
+            "facts_schema": facts_schema_snapshot(conn),
+            "facts_indexes": facts_indexes_snapshot(conn),
+            "decisions": full_table_snapshot(conn, "decisions"),
+            "lifecycle_states": full_table_snapshot(conn, "lifecycle_states"),
+            "lifecycle_events": full_table_snapshot(conn, "lifecycle_events"),
+            "claim_relations": full_table_snapshot(conn, "claim_relations"),
+        }
     run = run_upgrade(db_path, ini_path, event_path=event_path)
     assert run.returncode == 0, run.stderr
     assert "IsADirectoryError" not in run.stderr
     assert event_path is not None and event_path.exists()
     events = [json.loads(line) for line in event_path.read_text().splitlines()]
     assert events
-    assert sum("FACT_DEDUPE_SUMMARY" in line for line in run.stdout.splitlines()) == 1
-    assert_post_migration_state(db_path)
+    summary = parse_summary(run.stdout)
+    assert summary["deleted_fact_count"] > 0
+    assert_post_migration_state(db_path, before)
+    with sqlite3.connect(str(db_path)) as conn:
+        assert full_table_snapshot(conn, "decisions") == before["decisions"]
+        assert full_table_snapshot(conn, "lifecycle_states") == before["lifecycle_states"]
+        assert full_table_snapshot(conn, "lifecycle_events") == before["lifecycle_events"]
+        assert full_table_snapshot(conn, "claim_relations") == before["claim_relations"]
 
 
 def test_real_upgrade_context_creates_absent_index_once(tmp_path):
@@ -1116,20 +1200,54 @@ def test_subprocess_idempotent_noop(tmp_path):
     assert_post_migration_state(db_path)
 
 
+def test_downgrade_upgraded_copy_resets_version_without_restoring_deleted_rows(tmp_path):
+    db_path, ini_path, _ = prepare_subprocess_fixture(tmp_path, event_enabled=False)
+    with sqlite3.connect(db_path) as conn:
+        before_ids = {row[0] for row in conn.execute("SELECT id FROM facts")}
+    upgrade = run_upgrade(db_path, ini_path)
+    assert upgrade.returncode == 0, upgrade.stderr
+    deleted = set(parse_summary(upgrade.stdout)["deleted_fact_ids"])
+    downgrade = run_downgrade(db_path, ini_path)
+    assert downgrade.returncode == 0, downgrade.stderr
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "6a7b8c9d0e1f"
+        assert conn.execute("PRAGMA table_info(facts)").fetchall()[-1][1] == "version"
+        assert {row[0] for row in conn.execute("SELECT id FROM facts")} == before_ids - deleted
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name=?", ("uq_facts_spo_active",)).fetchone() is None
+
+
 def test_subprocess_failure_rolls_back_everything(tmp_path):
     db_path, ini_path, _ = prepare_subprocess_fixture(tmp_path, event_enabled=False)
-    before = (
-        sqlite3.connect(db_path)
-        .execute("SELECT COUNT(*), (SELECT version_num FROM alembic_version) FROM facts")
-        .fetchone()
-    )
+    with sqlite3.connect(db_path) as conn:
+        before = {
+            table: full_table_snapshot(conn, table)
+            for table in (
+                "facts",
+                "receipts",
+                "outbox_entries",
+                "decisions",
+                "lifecycle_states",
+                "lifecycle_events",
+                "claim_relations",
+            )
+        }
+        before_schema = tuple(
+            tuple(row) for row in conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
+        )
     run = run_upgrade(db_path, ini_path, fail_before_summary=True)
     assert run.returncode != 0
+    assert "FACT_DEDUPE_SUMMARY" not in run.stdout
     with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "6a7b8c9d0e1f"
         assert (
-            conn.execute("SELECT COUNT(*), (SELECT version_num FROM alembic_version) FROM facts").fetchone() == before
+            tuple(
+                tuple(row)
+                for row in conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
+            )
+            == before_schema
         )
-        assert conn.execute("PRAGMA table_info(facts)").fetchall()[-1][1] == "version"
+        for table, rows in before.items():
+            assert full_table_snapshot(conn, table) == rows
 
 
 def test_pinned_parser_fails_closed():
@@ -1141,6 +1259,49 @@ def test_pinned_parser_fails_closed():
     for sql in invalid_sql:
         with pytest.raises(ValueError):
             migration.canonical_pinned_index_sql(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        (
+            "CREATE UNIQUE INDEX uq_facts_spo_active ON facts(dedup_key) "
+            "WHERE lifecycle_state IN ('candidate', 'validated', 'active');"
+        ),
+        (
+            'create unique index uq_facts_spo_active on "facts" ("dedup_key") '
+            "where lifecycle_state in ('candidate','validated','active')"
+        ),
+        (
+            "CREATE UNIQUE INDEX uq_facts_spo_active ON [facts]([dedup_key]) "
+            "WHERE lifecycle_state IN ( 'candidate' , 'validated' , 'active' )"
+        ),
+    ],
+)
+def test_pinned_parser_accepted_compatibility_matrix(sql):
+    assert migration.canonical_pinned_index_sql(sql) == EXPECTED_PINNED_CANONICAL
+
+
+@pytest.mark.parametrize("pinned_index", ["collision", "malformed"])
+def test_subprocess_bad_pinned_index_is_atomic_and_has_no_create_event(tmp_path, pinned_index):
+    db_path = tmp_path / f"{pinned_index}.db"
+    create_fixture_database(db_path, pinned_index=pinned_index)
+    ini_path = tmp_path / f"{pinned_index}.ini"
+    write_copy_ini(ini_path, db_path.resolve(strict=True))
+    event_path = tmp_path / "bad-index-events.jsonl"
+    run = run_upgrade(db_path, ini_path, event_path=event_path)
+    assert run.returncode != 0
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA writable_schema=ON")
+        version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE name='uq_facts_spo_active'").fetchone()[0]
+        conn.execute("PRAGMA writable_schema=OFF")
+        assert version == "6a7b8c9d0e1f"
+        assert sql is not None
+    events = [json.loads(line) for line in event_path.read_text().splitlines()] if event_path.exists() else []
+    assert not any(
+        event.get("kind") == "index_restore" and "CREATE UNIQUE INDEX" in event.get("statement", "") for event in events
+    )
 
 
 def test_subprocess_event_disabled(tmp_path):
@@ -1173,6 +1334,45 @@ def test_forced_limit_real_env(tmp_path):
     assert all(event["page_size"] <= 1000 for event in statement_events if event["page_size"] is not None)
     assert all(not event["row_wise"] for event in statement_events)
     assert any(event["kind"] == "case_update" for event in statement_events)
+
+
+def test_normal_and_forced_limit_have_identical_post_state(tmp_path):
+    normal = tmp_path / "normal.db"
+    forced = tmp_path / "forced.db"
+    normal_ini = tmp_path / "normal.ini"
+    forced_ini = tmp_path / "forced.ini"
+    create_fixture_database(normal)
+    create_fixture_database(forced)
+    write_copy_ini(normal_ini, normal.resolve(strict=True))
+    write_copy_ini(forced_ini, forced.resolve(strict=True))
+    regular = run_upgrade(normal, normal_ini)
+    constrained = run_forced_limit(forced, forced_ini, tmp_path)
+    assert regular.returncode == constrained.returncode == 0
+    regular_summary = parse_summary(regular.stdout)
+    forced_events = [json.loads(line) for line in (tmp_path / "b2-events.jsonl").read_text().splitlines()]
+    assert forced_events
+    with sqlite3.connect(normal) as left, sqlite3.connect(forced) as right:
+        assert [row[0] for row in left.execute("SELECT id FROM facts ORDER BY id")] == [
+            row[0] for row in right.execute("SELECT id FROM facts ORDER BY id")
+        ]
+        assert facts_schema_snapshot(left) == facts_schema_snapshot(right)
+        assert full_table_snapshot(left, "receipts") == full_table_snapshot(right, "receipts")
+        assert full_table_snapshot(left, "outbox_entries") == full_table_snapshot(right, "outbox_entries")
+    forced_summary = parse_summary(constrained.stdout)
+    assert regular_summary == forced_summary
+
+
+def test_read_only_source_probe_and_sidecar_contract(tmp_path):
+    source, destination = make_backup_fixture(tmp_path)
+    with sqlite3.connect(f"file:{source.resolve()}?mode=ro", uri=True) as conn:
+        with pytest.raises(sqlite3.OperationalError, match="readonly|read-only"):
+            conn.execute("INSERT INTO __b2_read_only_probe(x) VALUES (0)")
+    guarded_backup(source, destination)
+    assert source_alembic_revision(source) == "6a7b8c9d0e1f"
+    assert not Path(str(source) + "-wal").exists() or Path(str(source) + "-wal").is_file()
+    assert not Path(str(source) + "-shm").exists() or Path(str(source) + "-shm").is_file()
+    assert not Path(str(destination) + "-wal").exists()
+    assert not Path(str(destination) + "-shm").exists()
 
 
 def test_live_db_copy_upgrade_preserves_source_revision(tmp_path):

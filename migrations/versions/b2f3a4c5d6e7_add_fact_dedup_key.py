@@ -193,12 +193,12 @@ def _execute(
 
 
 def _scalar(bind: sa.engine.Connection, statement: str, params: dict[str, Any] | None = None) -> Any:
-    result = bind.execute(sa.text(statement), params or {})
+    result = _execute(bind, statement, params or {}, kind="scalar_select")
     return result.scalar_one()
 
 
 def _scalar_one_or_none(bind: sa.engine.Connection, statement: str, params: dict[str, Any] | None = None) -> Any:
-    result = bind.execute(sa.text(statement), params or {})
+    result = _execute(bind, statement, params or {}, kind="scalar_select")
     return result.scalar_one_or_none()
 
 
@@ -217,30 +217,28 @@ def table_exists(bind: sa.engine.Connection, name: str) -> bool:
 
 
 def table_info(bind: sa.engine.Connection, name: str) -> list[sa.RowMapping]:
-    return list(bind.execute(sa.text(f"PRAGMA table_info({name!r})")).mappings().all())
+    return list(_execute(bind, f"PRAGMA table_info({name!r})", {}, kind="schema_select").mappings().all())
 
 
 def primary_key_info(bind: sa.engine.Connection, table: str) -> list[str]:
-    rows = bind.execute(sa.text(f"PRAGMA table_info({table!r})")).mappings().all()
+    rows = _execute(bind, f"PRAGMA table_info({table!r})", {}, kind="schema_select").mappings().all()
     return [row["name"] for row in rows if int(row["pk"]) > 0]
 
 
 def index_list(bind: sa.engine.Connection, table: str) -> list[dict[str, Any]]:
-    return [dict(row) for row in bind.execute(sa.text(f"PRAGMA index_list({table!r})")).mappings()]
+    return [dict(row) for row in _execute(bind, f"PRAGMA index_list({table!r})", {}, kind="index_select").mappings()]
 
 
 def index_exists(bind: sa.engine.Connection, name: str) -> bool:
-    row = bind.execute(
-        sa.text("SELECT 1 FROM sqlite_master WHERE type='index' AND name=:name"),
-        {"name": name},
+    row = _execute(
+        bind, "SELECT 1 FROM sqlite_master WHERE type='index' AND name=:name", {"name": name}, kind="index_select"
     ).scalar_one_or_none()
     return row is not None
 
 
 def read_index_sql(bind: sa.engine.Connection, name: str) -> str | None:
-    return bind.execute(
-        sa.text("SELECT sql FROM sqlite_master WHERE type='index' AND name=:name"),
-        {"name": name},
+    return _execute(
+        bind, "SELECT sql FROM sqlite_master WHERE type='index' AND name=:name", {"name": name}, kind="index_select"
     ).scalar_one_or_none()
 
 
@@ -249,7 +247,13 @@ def _normalize_sql_whitespace(text: str) -> str:
 
 
 def canonical_pinned_index_sql(sql: str) -> str:
-    """Parse only SQLite's pinned index grammar; reject everything else."""
+    """Parse the deliberately constrained pinned-index compatibility matrix.
+
+    Accepted forms are CREATE UNIQUE INDEX with the pinned name, the facts
+    table and dedup_key column (bare, double-quoted, or bracket-quoted), and
+    the three single-quoted ACTIVE literals in order. Everything else fails
+    closed rather than being normalized heuristically.
+    """
     raw = sql.strip()
     if raw.endswith(";"):
         raw = raw[:-1].rstrip()
@@ -270,7 +274,7 @@ EXPECTED_PINNED_CANONICAL = "unique=1;columns=dedup_key;where=lifecycle_state in
 
 
 def inspect_pinned_index(bind: sa.engine.Connection) -> str:
-    rows = bind.execute(sa.text("PRAGMA index_list('facts')")).mappings().all()
+    rows = _execute(bind, "PRAGMA index_list('facts')", {}, kind="index_select").mappings().all()
     for row in rows:
         if row["name"] != _INDEX_NAME:
             continue
@@ -278,23 +282,32 @@ def inspect_pinned_index(bind: sa.engine.Connection) -> str:
         if sql is None:
             raise ValueError("malformed pinned index")
         canonical = canonical_pinned_index_sql(sql)
-        if canonical == EXPECTED_PINNED_CANONICAL and int(row["unique"]) == 1:
+        columns = [
+            item["name"]
+            for item in _execute(bind, "PRAGMA index_info('uq_facts_spo_active')", {}, kind="index_select")
+            .mappings()
+            .all()
+        ]
+        if canonical == EXPECTED_PINNED_CANONICAL and int(row["unique"]) == 1 and columns == ["dedup_key"]:
             return "compatible"
         raise ValueError("pinned index collision")
     return "absent"
 
 
 def _tables_with_orphans(bind: sa.engine.Connection) -> None:
-    orphan_receipt = bind.execute(
-        sa.text("SELECT id FROM receipts WHERE memory_type = 'fact' AND id NOT IN (SELECT id FROM facts)")
+    orphan_receipt = _execute(
+        bind,
+        "SELECT id FROM receipts WHERE memory_type = 'fact' AND id NOT IN (SELECT id FROM facts)",
+        {},
+        kind="orphan_check",
     ).fetchone()
     if orphan_receipt is not None:
         raise RuntimeError("orphan fact receipt present before migration")
-    orphan_outbox = bind.execute(
-        sa.text(
-            "SELECT record_id FROM outbox_entries "
-            "WHERE record_type = 'fact' AND record_id NOT IN (SELECT id FROM facts)"
-        )
+    orphan_outbox = _execute(
+        bind,
+        "SELECT record_id FROM outbox_entries WHERE record_type = 'fact' AND record_id NOT IN (SELECT id FROM facts)",
+        {},
+        kind="orphan_check",
     ).fetchone()
     if orphan_outbox is not None:
         raise RuntimeError("orphan fact outbox present before migration")
@@ -429,30 +442,29 @@ def _keeper_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _select_keepers_and_deletes(rows) -> tuple[list[str], list[str]]:
-    keepers: list[str] = []
-    deletes: list[str] = []
+def _stream_keeper_decisions(rows):
     current_key: str | None = None
     group: list[dict[str, Any]] = []
 
-    def flush() -> None:
+    def flush():
         if not group:
-            return
+            return None
         ordered = sorted(group, key=_keeper_sort_key)
-        keeper = ordered[0]
-        keepers.append(str(keeper["id"]))
-        deletes.extend(str(row["id"]) for row in ordered[1:])
+        return str(ordered[0]["id"]), tuple(str(row["id"]) for row in ordered[1:])
 
     for row in rows:
         key = str(row["dedup_key"])
         if current_key is None or key != current_key:
-            flush()
+            decision = flush()
+            if decision is not None:
+                yield decision
             group = [row]
             current_key = key
         else:
             group.append(row)
-    flush()
-    return sorted(keepers), sorted(deletes)
+    decision = flush()
+    if decision is not None:
+        yield decision
 
 
 def _delete_ids(bind: sa.engine.Connection, table: str, column: str, ids: list[str]) -> int:
@@ -483,10 +495,13 @@ def _delete_ids(bind: sa.engine.Connection, table: str, column: str, ids: list[s
 
 def _save_index_state(bind: sa.engine.Connection) -> list[dict[str, Any]]:
     saved: list[dict[str, Any]] = []
-    for row in bind.execute(sa.text("PRAGMA index_list('facts')")).mappings().all():
+    for row in _execute(bind, "PRAGMA index_list('facts')", {}, kind="index_snapshot").mappings().all():
         name = str(row["name"])
         sql = read_index_sql(bind, name)
-        columns = [str(item["name"]) for item in bind.execute(sa.text(f"PRAGMA index_info({name!r})")).mappings().all()]
+        columns = [
+            str(item["name"])
+            for item in _execute(bind, f"PRAGMA index_info({name!r})", {}, kind="index_snapshot").mappings().all()
+        ]
         saved.append(
             {
                 "name": name,
@@ -504,6 +519,35 @@ def _save_index_state(bind: sa.engine.Connection) -> list[dict[str, Any]]:
             except ValueError:
                 saved[-1]["canonical"] = None
     return saved
+
+
+def _full_row_snapshot(bind: sa.engine.Connection, table: str) -> tuple[tuple[Any, ...], ...]:
+    """Capture every declared column, not a hand-picked identity projection."""
+    return tuple(
+        tuple(row) for row in _execute(bind, f"SELECT * FROM {table} ORDER BY rowid", {}, kind="full_row_snapshot")
+    )
+
+
+def _full_state_snapshot(bind: sa.engine.Connection) -> dict[str, Any]:
+    tables = (
+        "facts",
+        "receipts",
+        "outbox_entries",
+        "decisions",
+        "lifecycle_states",
+        "lifecycle_events",
+        "claim_relations",
+    )
+    return {
+        "rows": {table: _full_row_snapshot(bind, table) for table in tables},
+        "facts_schema": tuple(tuple(row) for row in table_info(bind, "facts")),
+        "facts_indexes": tuple(tuple(sorted(index.items())) for index in _save_index_state(bind)),
+    }
+
+
+def _assert_untouched_rows(before: dict[str, Any], after: dict[str, Any], tables: Sequence[str]) -> None:
+    for table in tables:
+        assert after["rows"][table] == before["rows"][table], f"mutated untouched {table} rows"
 
 
 def _recreate_saved_indexes(
@@ -529,7 +573,7 @@ def _recreate_saved_indexes(
         if index["sql"] is None:
             raise RuntimeError(f"cannot restore saved index {index['name']}")
         if not index_exists(bind, index["name"]):
-            bind.execute(sa.text(index["sql"]))
+            _execute(bind, index["sql"], {}, kind="index_restore")
 
 
 def _expected_pinned_sql() -> str:
@@ -553,7 +597,8 @@ def upgrade() -> None:
     if os.environ.get("B2_FAIL_BEFORE_SUMMARY"):
         raise RuntimeError("B2 fail-before-summary requested")
     saved_indexes = _save_index_state(bind)
-    pre_rebuild_ids = {str(row[0]) for row in bind.execute(sa.text("SELECT id FROM facts"))}
+    pre_state = _full_state_snapshot(bind)
+    pre_rebuild_ids = {str(row[0]) for row in _execute(bind, "SELECT id FROM facts", {}, kind="identity_snapshot")}
     pre_rebuild_count = len(pre_rebuild_ids)
 
     op.add_column("facts", sa.Column("dedup_key", sa.String(), nullable=True))
@@ -588,15 +633,47 @@ def upgrade() -> None:
     ) as batch_op:
         batch_op.alter_column("dedup_key", existing_type=sa.String(), nullable=False)
 
-    keeper_ids, deleted_fact_ids = _select_keepers_and_deletes(_group_fact_rows(bind))
+    keeper_ids: list[str] = []
+    deleted_fact_ids: list[str] = []
+    for keeper_id, group_deletes in _stream_keeper_decisions(_group_fact_rows(bind)):
+        keeper_ids.append(keeper_id)
+        deleted_fact_ids.extend(group_deletes)
+    keeper_ids = sorted(keeper_ids)
     deleted_fact_ids = sorted(set(deleted_fact_ids))
-    pre_delete_ids = {str(row[0]) for row in bind.execute(sa.text("SELECT id FROM facts"))}
+    pre_delete_ids = {str(row[0]) for row in _execute(bind, "SELECT id FROM facts", {}, kind="identity_snapshot")}
 
-    def child_ids(table: str, column: str, kind: str) -> list[str]:
-        found: list[str] = []
-        batch_size = _effective_batch(bind, params_per_row=1, fixed_params=0)
-        for start in range(0, len(deleted_fact_ids), batch_size):
-            chunk = deleted_fact_ids[start : start + batch_size]
+    _execute(bind, "CREATE TEMP TABLE b2_deleted_fact_ids (fact_id VARCHAR PRIMARY KEY)", {}, kind="stream_state")
+    insert_batch = _effective_batch(bind, params_per_row=1, fixed_params=0)
+    for start in range(0, len(deleted_fact_ids), insert_batch):
+        chunk = deleted_fact_ids[start : start + insert_batch]
+        params = {f"id_{index}": value for index, value in enumerate(chunk)}
+        values = ", ".join(f"(:id_{index})" for index in range(len(chunk)))
+        _execute(
+            bind,
+            f"INSERT INTO b2_deleted_fact_ids(fact_id) VALUES {values}",
+            params,
+            kind="stream_state",
+            params_per_row=1,
+        )
+
+    def deleted_id_chunks():
+        last_id = ""
+        while True:
+            rows = _execute(
+                bind,
+                "SELECT fact_id FROM b2_deleted_fact_ids WHERE fact_id > :last_id ORDER BY fact_id LIMIT :limit",
+                {"last_id": last_id, "limit": _PAGE_SIZE},
+                kind="stream_select",
+                page_size=_PAGE_SIZE,
+            ).fetchall()
+            if not rows:
+                return
+            yield [str(row[0]) for row in rows]
+            last_id = str(rows[-1][0])
+
+    def delete_owned_children(table: str, column: str, kind: str) -> int:
+        deleted = 0
+        for chunk in deleted_id_chunks():
             params = {f"id_{i}": value for i, value in enumerate(chunk)}
             placeholders = ", ".join(f":id_{i}" for i in range(len(chunk)))
             owner = "memory_type='fact' AND id" if table == "receipts" else "record_type='fact' AND record_id"
@@ -607,19 +684,17 @@ def upgrade() -> None:
                 kind=kind,
                 params_per_row=1,
             )
-            found.extend(str(row[0]) for row in result.fetchall())
-        return found
+            child_batch = [str(row[0]) for row in result.fetchall()]
+            deleted += _delete_ids(bind, table, column, child_batch)
+        return deleted
 
-    deleted_receipt_ids = child_ids("receipts", "id", "child_select") if deleted_fact_ids else []
-    deleted_outbox_ids = child_ids("outbox_entries", "record_id", "child_select") if deleted_fact_ids else []
-
-    receipt_deleted = _delete_ids(bind, "receipts", "id", deleted_receipt_ids)
-    outbox_deleted = _delete_ids(bind, "outbox_entries", "record_id", deleted_outbox_ids)
-    fact_deleted = _delete_ids(bind, "facts", "id", deleted_fact_ids)
+    receipt_deleted = delete_owned_children("receipts", "id", "child_select") if deleted_fact_ids else 0
+    outbox_deleted = delete_owned_children("outbox_entries", "record_id", "child_select") if deleted_fact_ids else 0
+    fact_deleted = sum(_delete_ids(bind, "facts", "id", chunk) for chunk in deleted_id_chunks())
 
     assert fact_deleted == len(deleted_fact_ids)
-    assert receipt_deleted == len(deleted_receipt_ids)
-    assert outbox_deleted == len(deleted_outbox_ids)
+    deleted_receipt_count = receipt_deleted
+    deleted_outbox_count = outbox_deleted
     assert pre_delete_ids == pre_rebuild_ids
 
     _recreate_saved_indexes(bind, saved_indexes, pinned_state)
@@ -643,10 +718,10 @@ def upgrade() -> None:
         "dedup_key",
     ]
     assert int(columns[-1]["notnull"]) == 1
-    post_ids = {str(row[0]) for row in bind.execute(sa.text("SELECT id FROM facts"))}
+    post_ids = {str(row[0]) for row in _execute(bind, "SELECT id FROM facts", {}, kind="identity_scan")}
     assert post_ids == pre_rebuild_ids - set(deleted_fact_ids)
     assert len(post_ids) == pre_rebuild_count - len(deleted_fact_ids)
-    for row in bind.execute(sa.text("SELECT subject, predicate, object, dedup_key FROM facts")):
+    for row in _execute(bind, "SELECT subject, predicate, object, dedup_key FROM facts", {}, kind="dedup_verify"):
         assert str(row[3]) == fact_dedup_key(row[0], row[1], row[2])
 
     if not index_exists(bind, _INDEX_NAME):
@@ -659,7 +734,7 @@ def upgrade() -> None:
                 sqlite_where=sa.text("lifecycle_state IN ('candidate', 'validated', 'active')"),
             )
         else:
-            bind.execute(sa.text(_expected_pinned_sql()))
+            _execute(bind, _expected_pinned_sql(), {}, kind="index_restore")
 
     assert index_exists(bind, _INDEX_NAME)
     saved_pinned_sql = next(
@@ -672,14 +747,37 @@ def upgrade() -> None:
     else:
         assert canonical_pinned_index_sql(current_sql) == EXPECTED_PINNED_CANONICAL
 
+    post_state = _full_state_snapshot(bind)
+    _assert_untouched_rows(
+        pre_state, post_state, ("decisions", "lifecycle_states", "lifecycle_events", "claim_relations")
+    )
+    pre_facts = {str(row[0]): row for row in pre_state["rows"]["facts"]}
+    post_facts = {str(row[0]): row for row in post_state["rows"]["facts"]}
+    expected_survivors = set(pre_facts) - set(deleted_fact_ids)
+    assert set(post_facts) == expected_survivors
+    for fact_id in expected_survivors:
+        assert post_facts[fact_id][:-1] == pre_facts[fact_id], f"mutated fact row {fact_id}"
+    pre_receipts = {str(row[0]): row for row in pre_state["rows"]["receipts"]}
+    post_receipts = {str(row[0]): row for row in post_state["rows"]["receipts"]}
+    assert {key for key in post_receipts if key not in deleted_fact_ids} == {
+        key for key in pre_receipts if key not in deleted_fact_ids
+    }
+    for fact_id in set(pre_receipts) - set(deleted_fact_ids):
+        assert post_receipts[fact_id] == pre_receipts[fact_id], f"mutated receipt row {fact_id}"
+    pre_outbox = {str(row[0]): row for row in pre_state["rows"]["outbox_entries"]}
+    post_outbox = {str(row[0]): row for row in post_state["rows"]["outbox_entries"]}
+    for outbox_id, row in pre_outbox.items():
+        if str(row[2]) not in deleted_fact_ids:
+            assert post_outbox[outbox_id] == row, f"mutated outbox row {outbox_id}"
+
     remaining_dupe_keys = [
         str(row[0])
-        for row in bind.execute(
-            sa.text(
-                "SELECT dedup_key, COUNT(*) AS surviving_row_count "
-                "FROM facts WHERE dedup_key IS NOT NULL GROUP BY dedup_key "
-                "HAVING COUNT(*) > 1 ORDER BY dedup_key ASC"
-            )
+        for row in _execute(
+            bind,
+            "SELECT dedup_key, COUNT(*) AS surviving_row_count FROM facts WHERE dedup_key IS NOT NULL "
+            "GROUP BY dedup_key HAVING COUNT(*) > 1 ORDER BY dedup_key ASC",
+            {},
+            kind="remaining_dupe_verify",
         ).fetchall()
     ]
     summary = {
@@ -687,8 +785,8 @@ def upgrade() -> None:
         "kept": {"fact_ids": keeper_ids, "fact_count": len(keeper_ids)},
         "deleted_fact_ids": sorted(deleted_fact_ids),
         "deleted_fact_count": len(deleted_fact_ids),
-        "deleted_receipt_count": len(deleted_receipt_ids),
-        "deleted_outbox_count": len(deleted_outbox_ids),
+        "deleted_receipt_count": deleted_receipt_count,
+        "deleted_outbox_count": deleted_outbox_count,
         "remaining_dupe_keys": remaining_dupe_keys,
         "remaining_dupe_count": len(remaining_dupe_keys),
     }
