@@ -27,6 +27,17 @@ class DecisionRepository:
         result = await self._session.get(DecisionORM, decision_id)
         return result.to_pydantic() if result else None
 
+    async def update(self, decision_id: str, **kwargs) -> Optional[Decision]:
+        orm = await self._session.get(DecisionORM, decision_id)
+        if orm is None:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(orm, key):
+                setattr(orm, key, value)
+        await self._session.flush()
+        await self._session.refresh(orm)
+        return orm.to_pydantic()
+
     async def find_existing(
         self, context: str, choice: str
     ) -> Optional[Decision]:

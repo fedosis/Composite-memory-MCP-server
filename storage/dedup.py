@@ -44,6 +44,20 @@ DECISION_DEDUP_PREFIX_LEN = 200
 ACTIVE_LIFECYCLE_STATES = ("candidate", "validated", "active")
 
 
+def normalize_spo_component(value: object) -> str:
+    """Strip outer and collapse internal whitespace; preserve case."""
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
+def fact_dedup_key(subject: object, predicate: object, object: object) -> str:
+    """Canonical fact key; unit separator avoids component ambiguity."""
+    return "\x1f".join(
+        normalize_spo_component(part) for part in (subject, predicate, object)
+    )
+
+
 def normalize_choice(choice: object, prefix_len: int = DECISION_DEDUP_PREFIX_LEN) -> str:
     """Collapse whitespace and truncate ``choice`` to a stable prefix.
 
@@ -52,8 +66,7 @@ def normalize_choice(choice: object, prefix_len: int = DECISION_DEDUP_PREFIX_LEN
     """
     if choice is None:
         return ""
-    collapsed = " ".join(str(choice).split())
-    return collapsed[:prefix_len]
+    return normalize_spo_component(choice)[:prefix_len]
 
 
 def decision_dedup_key(context: object, choice: object) -> tuple[str, str]:

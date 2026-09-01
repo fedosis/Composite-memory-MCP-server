@@ -28,6 +28,7 @@ from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memory_server.models import Fact
+from storage.dedup import ACTIVE_LIFECYCLE_STATES, fact_dedup_key, normalize_spo_component
 from storage.models.fact import FactORM
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,30 @@ class FactRepository:
     async def get(self, fact_id: str) -> Optional[Fact]:
         result = await self._session.get(FactORM, fact_id)
         return result.to_pydantic() if result else None
+
+    async def find_existing(
+        self, subject: str, predicate: str, object: str
+    ) -> Optional[Fact]:
+        target = fact_dedup_key(subject, predicate, object)
+        components = (
+            (FactORM.subject, normalize_spo_component(subject)),
+            (FactORM.predicate, normalize_spo_component(predicate)),
+            (FactORM.object, normalize_spo_component(object)),
+        )
+        predicates = [FactORM.lifecycle_state.in_(ACTIVE_LIFECYCLE_STATES)]
+        for column, component in components:
+            for token in component.split():
+                predicates.append(column.contains(token, autoescape=True))
+        stmt = select(FactORM).where(*predicates).order_by(
+            FactORM.confidence.desc(),
+            FactORM.created_at.desc(),
+            FactORM.id.desc(),
+        )
+        result = await self._session.execute(stmt)
+        for row in result.scalars().all():
+            if fact_dedup_key(row.subject, row.predicate, row.object) == target:
+                return row.to_pydantic()
+        return None
 
     async def search(
         self,

@@ -1,5 +1,6 @@
 """Receipt repository — CRUD operations for memory receipts."""
 
+import json
 from typing import Optional
 
 from sqlalchemy import select
@@ -25,6 +26,21 @@ class ReceiptRepository:
     async def get(self, receipt_id: str) -> Optional[MemoryReceipt]:
         result = await self._session.get(MemoryReceiptORM, receipt_id)
         return result.to_pydantic() if result else None
+
+    async def update(self, receipt_id: str, **kwargs) -> Optional[MemoryReceipt]:
+        orm = await self._session.get(MemoryReceiptORM, receipt_id)
+        if orm is None:
+            return None
+        for key, value in kwargs.items():
+            if key == "history":
+                value = json.dumps(value)
+            elif key == "verification_status" and hasattr(value, "value"):
+                value = value.value
+            if hasattr(orm, key):
+                setattr(orm, key, value)
+        await self._session.flush()
+        await self._session.refresh(orm)
+        return orm.to_pydantic()
 
     async def search(
         self,

@@ -51,6 +51,60 @@ logger = logging.getLogger(__name__)
 LLM_CONFIDENCE_GATE = 0.7
 
 
+async def reinforce_memory_item(
+    session: AsyncSession, *, memory_type: str, item_id: str,
+    new_confidence: float, source: str,
+    previous_confidence: float | None = None,
+) -> tuple[Fact | Decision, MemoryReceipt]:
+    if memory_type == "fact":
+        item_repo = FactRepository(session)
+    elif memory_type == "decision":
+        item_repo = DecisionRepository(session)
+    else:
+        raise ValueError(f"unsupported memory_type: {memory_type!r}")
+    persisted = await item_repo.get(item_id)
+    if persisted is None:
+        raise LookupError(f"memory item not found: {memory_type}/{item_id}")
+    old = persisted.confidence
+    if previous_confidence is not None and previous_confidence != old:
+        raise ValueError("stale reinforcement caller value")
+    top = max(old, new_confidence)
+    now = datetime.now(timezone.utc)
+    if memory_type == "fact":
+        version = int(persisted.version) + 1
+    else:
+        major, middle, patch = (int(x) for x in persisted.version.split("."))
+        version = f"{major}.{middle + 1}.{patch}"
+    stored_item = await item_repo.update(
+        item_id, confidence=top, updated_at=now, version=version
+    )
+    if stored_item is None:
+        raise RuntimeError(f"memory item disappeared during update: {item_id}")
+    receipt_repo = ReceiptRepository(session)
+    receipt = await receipt_repo.get(item_id)
+    if receipt is None:
+        receipt = await receipt_repo.create(MemoryReceipt(
+            id=item_id, memory_type=memory_type, source=source,
+            created_by="learn", timestamp=now, confidence=top,
+            verification_status=VerificationStatus.CANDIDATE, history=[],
+        ))
+    entry = {"confidence": top, "kind": "reinforce", "source": source,
+             "previous_confidence": old, "timestamp": now.isoformat()}
+    history = [*receipt.history, entry]
+    stored_receipt = await receipt_repo.update(
+        item_id, confidence=top, source=source, updated_at=now, history=history,
+    )
+    if stored_receipt is None:
+        raise RuntimeError(f"receipt disappeared during update: {item_id}")
+    fresh_item = await item_repo.get(item_id)
+    fresh_receipt = await receipt_repo.get(item_id)
+    if fresh_item is None or fresh_receipt is None:
+        raise RuntimeError(f"reinforcement reload failed: {item_id}")
+    if fresh_receipt.history[-1] != entry:
+        raise RuntimeError(f"reinforcement receipt mismatch: {item_id}")
+    return fresh_item, fresh_receipt
+
+
 class MemoryIngestionService:
     """Transactional service for memory ingestion (remember + learn).
 
@@ -361,12 +415,31 @@ class MemoryIngestionService:
                 created_facts: list[Fact] = []
 
                 for ef in extracted_facts:
+                    subject, predicate, object = (
+                        ef.get(k, "") for k in ("subject", "predicate", "object")
+                    )
+                    existing = await fact_repo.find_existing(subject, predicate, object)
+                    if existing is not None:
+                        stored_fact, stored_receipt = await reinforce_memory_item(
+                            session,
+                            memory_type="fact",
+                            item_id=existing.id,
+                            new_confidence=ef.get("confidence", 0.5),
+                            source=source,
+                            previous_confidence=existing.confidence,
+                        )
+                        facts_result.append({
+                            "receipt": stored_receipt.model_dump(mode="json"),
+                            "item": stored_fact.model_dump(mode="json"),
+                        })
+                        receipts.append(stored_receipt.model_dump(mode="json"))
+                        continue
                     fact_id = str(uuid4())
                     fact = Fact(
                         id=fact_id,
-                        subject=ef.get("subject", ""),
-                        predicate=ef.get("predicate", ""),
-                        object=ef.get("object", ""),
+                        subject=subject,
+                        predicate=predicate,
+                        object=object,
                         confidence=ef.get("confidence", 0.5),
                         source=source,
                         created_at=now,
