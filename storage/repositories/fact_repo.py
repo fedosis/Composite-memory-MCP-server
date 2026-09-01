@@ -110,20 +110,18 @@ class FactRepository:
 
         - Splits on whitespace
         - Appends * for prefix matching on each term
-        - Escapes FTS5 special characters
+        - Quotes each term; FTS5 string literals make operator chars
+          (^ + - * ( ) ~ < > { } [ ]) literal, so the ONLY character that
+          needs escaping inside a term is the double quote itself, and FTS5
+          escapes it by DOUBLING (""), not by backslash (FTS5 has no
+          backslash escape — \" terminates the string early).
         - Joins with AND (all terms must match)
         """
         if not text_query or not text_query.strip():
             return ""
-        # Characters that need escaping in FTS5
-        special_chars = set('^+-*()~<>"{}')
         terms = []
         for term in text_query.strip().split():
-            # Escape any special characters
-            sanitized = "".join(
-                f'\\{ch}' if ch in special_chars else ch
-                for ch in term
-            )
+            sanitized = term.replace('"', '""')
             if sanitized:
                 # Add prefix wildcard so "run" matches "running", "runner", etc.
                 terms.append(f'"{sanitized}"*')
