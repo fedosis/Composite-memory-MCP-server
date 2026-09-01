@@ -751,24 +751,54 @@ def upgrade() -> None:
     _assert_untouched_rows(
         pre_state, post_state, ("decisions", "lifecycle_states", "lifecycle_events", "claim_relations")
     )
+    deleted_ids = set(deleted_fact_ids)
+    pre_fact_ids = {str(row[0]) for row in pre_state["rows"]["facts"]}
     pre_facts = {str(row[0]): row for row in pre_state["rows"]["facts"]}
     post_facts = {str(row[0]): row for row in post_state["rows"]["facts"]}
-    expected_survivors = set(pre_facts) - set(deleted_fact_ids)
+    expected_survivors = pre_fact_ids - deleted_ids
     assert set(post_facts) == expected_survivors
     for fact_id in expected_survivors:
         assert post_facts[fact_id][:-1] == pre_facts[fact_id], f"mutated fact row {fact_id}"
-    pre_receipts = {str(row[0]): row for row in pre_state["rows"]["receipts"]}
-    post_receipts = {str(row[0]): row for row in post_state["rows"]["receipts"]}
-    assert {key for key in post_receipts if key not in deleted_fact_ids} == {
-        key for key in pre_receipts if key not in deleted_fact_ids
-    }
-    for fact_id in set(pre_receipts) - set(deleted_fact_ids):
-        assert post_receipts[fact_id] == pre_receipts[fact_id], f"mutated receipt row {fact_id}"
-    pre_outbox = {str(row[0]): row for row in pre_state["rows"]["outbox_entries"]}
-    post_outbox = {str(row[0]): row for row in post_state["rows"]["outbox_entries"]}
-    for outbox_id, row in pre_outbox.items():
-        if str(row[2]) not in deleted_fact_ids:
-            assert post_outbox[outbox_id] == row, f"mutated outbox row {outbox_id}"
+
+    pre_receipts = pre_state["rows"]["receipts"]
+    post_receipts = post_state["rows"]["receipts"]
+    pre_owned_receipts = tuple(
+        row for row in pre_receipts if str(row[1]) == "fact" and str(row[0]) in pre_fact_ids
+    )
+    deleted_receipts = tuple(row for row in pre_owned_receipts if str(row[0]) in deleted_ids)
+    surviving_receipts = tuple(row for row in pre_owned_receipts if str(row[0]) not in deleted_ids)
+    post_owned_receipts = tuple(
+        row for row in post_receipts if str(row[1]) == "fact" and str(row[0]) in pre_fact_ids
+    )
+    assert sorted(post_owned_receipts) == sorted(surviving_receipts)
+    assert not tuple(row for row in post_owned_receipts if str(row[0]) in deleted_ids)
+    assert receipt_deleted == len(deleted_receipts)
+    assert tuple(row for row in post_receipts if str(row[1]) != "fact") == tuple(
+        row for row in pre_receipts if str(row[1]) != "fact"
+    ), "mutated or unexpected non-fact receipt row"
+
+    pre_outbox = pre_state["rows"]["outbox_entries"]
+    post_outbox = post_state["rows"]["outbox_entries"]
+    pre_owned_outbox = tuple(
+        row for row in pre_outbox if str(row[1]) == "fact" and str(row[2]) in pre_fact_ids
+    )
+    deleted_outbox = tuple(row for row in pre_owned_outbox if str(row[2]) in deleted_ids)
+    surviving_outbox = tuple(row for row in pre_owned_outbox if str(row[2]) not in deleted_ids)
+    post_owned_outbox = tuple(
+        row for row in post_outbox if str(row[1]) == "fact" and str(row[2]) in pre_fact_ids
+    )
+    assert sorted(post_owned_outbox) == sorted(surviving_outbox)
+    assert not tuple(row for row in post_owned_outbox if str(row[2]) in deleted_ids)
+    assert outbox_deleted == len(deleted_outbox)
+    assert tuple(row for row in post_outbox if str(row[1]) != "fact") == tuple(
+        row for row in pre_outbox if str(row[1]) != "fact"
+    ), "mutated or unexpected non-fact outbox row"
+    assert tuple(row for row in post_outbox if str(row[1]) == "decision") == tuple(
+        row for row in pre_outbox if str(row[1]) == "decision"
+    ), "mutated decision-owned outbox row"
+    assert tuple(row for row in post_receipts if str(row[1]) == "decision") == tuple(
+        row for row in pre_receipts if str(row[1]) == "decision"
+    ), "mutated decision-owned receipt row"
 
     remaining_dupe_keys = [
         str(row[0])

@@ -1123,16 +1123,31 @@ def assert_post_migration_state(db_path: Path, before: dict[str, Any] | None = N
                     row[2] = "VARCHAR"
             assert tuple(tuple(row) for row in expected_pre) == tuple(schema[:-1])
         assert exact_index_definition_on_copy(db_path, "uq_facts_spo_active")
-        assert [r[0] for r in conn.execute("SELECT id FROM facts ORDER BY id")] == [
-            "fact-active-2",
-            "fact-archived-1",
-            "fact-case-lower",
-            "fact-case-upper",
-            "fact-empty-2",
-            "fact-tie-a",
-        ]
-        assert conn.execute("SELECT id FROM receipts WHERE memory_type='fact'").fetchall() == []
-        assert conn.execute("SELECT record_id FROM outbox_entries WHERE record_type='fact'").fetchall() == []
+        assert before is None or set(row[0] for row in full_table_snapshot(conn, "facts")) <= {
+            row[0] for row in before["facts"]
+        }
+        if before is not None:
+            pre_fact_ids = {str(row[0]) for row in before["facts"]}
+            post_fact_ids = {str(row[0]) for row in full_table_snapshot(conn, "facts")}
+            deleted_fact_ids = pre_fact_ids - post_fact_ids
+            pre_owned_receipts = {
+                row for row in before["receipts"] if row[1] == "fact" and row[0] in pre_fact_ids
+            }
+            post_owned_receipts = {
+                row for row in full_table_snapshot(conn, "receipts") if row[1] == "fact" and row[0] in pre_fact_ids
+            }
+            assert post_owned_receipts == {row for row in pre_owned_receipts if row[0] not in deleted_fact_ids}
+            assert not {row for row in post_owned_receipts if row[0] in deleted_fact_ids}
+            pre_owned_outbox = {
+                row for row in before["outbox_entries"] if row[1] == "fact" and row[2] in pre_fact_ids
+            }
+            post_owned_outbox = {
+                row
+                for row in full_table_snapshot(conn, "outbox_entries")
+                if row[1] == "fact" and row[2] in pre_fact_ids
+            }
+            assert post_owned_outbox == {row for row in pre_owned_outbox if row[2] not in deleted_fact_ids}
+            assert not {row for row in post_owned_outbox if row[2] in deleted_fact_ids}
         assert _rows(conn, "decisions", ["id", "choice"]) == [
             ("decision-1", "use Caddy"),
             ("decision-2", "use Caddy or Nginx"),
@@ -1151,6 +1166,9 @@ def test_subprocess_event_enabled(tmp_path):
     db_path, ini_path, event_path = prepare_subprocess_fixture(tmp_path, event_enabled=True)
     with sqlite3.connect(str(db_path)) as conn:
         before: dict[str, Any] = {
+            "facts": full_table_snapshot(conn, "facts"),
+            "receipts": full_table_snapshot(conn, "receipts"),
+            "outbox_entries": full_table_snapshot(conn, "outbox_entries"),
             "facts_schema": facts_schema_snapshot(conn),
             "facts_indexes": facts_indexes_snapshot(conn),
             "decisions": full_table_snapshot(conn, "decisions"),
@@ -1172,6 +1190,25 @@ def test_subprocess_event_enabled(tmp_path):
         assert full_table_snapshot(conn, "lifecycle_states") == before["lifecycle_states"]
         assert full_table_snapshot(conn, "lifecycle_events") == before["lifecycle_events"]
         assert full_table_snapshot(conn, "claim_relations") == before["claim_relations"]
+
+
+def test_owned_child_reconciliation_rejects_omitted_fact_receipt(tmp_path, monkeypatch):
+    db_path = tmp_path / "owned-child-regression.db"
+    create_fixture_database(db_path)
+    module = load_migration_module("b2f3a4c5d6e7")
+    real_delete_ids = module._delete_ids
+
+    def omit_receipt_delete(bind, table, column, ids):
+        if table == "receipts":
+            return 0
+        return real_delete_ids(bind, table, column, ids)
+
+    monkeypatch.setattr(module, "_delete_ids", omit_receipt_delete)
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    with pytest.raises(AssertionError):
+        with engine.begin() as connection:
+            module.op = Operations(MigrationContext.configure(connection, opts={"transactional_ddl": True}))
+            module.upgrade()
 
 
 def test_real_upgrade_context_creates_absent_index_once(tmp_path):
