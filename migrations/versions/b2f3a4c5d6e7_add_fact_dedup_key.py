@@ -633,6 +633,9 @@ def upgrade() -> None:
     ) as batch_op:
         batch_op.alter_column("dedup_key", existing_type=sa.String(), nullable=False)
 
+    # W5 waiver (B9 §1.7 vs §1.8, contract audit §4.4 option (a)): retain
+    # complete sorted summary ID arrays; bounded memory still applies to
+    # scanning, child-ID processing, SQL parameter batches, and other working sets.
     keeper_ids: list[str] = []
     deleted_fact_ids: list[str] = []
     for keeper_id, group_deletes in _stream_keeper_decisions(_group_fact_rows(bind)):

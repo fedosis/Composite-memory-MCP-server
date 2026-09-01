@@ -1047,6 +1047,23 @@ def test_migration_module_syntax_and_import_smoke():
     assert migration.time.sleep is not None
 
 
+def test_w5_waiver_limits_unbounded_state_to_summary_id_arrays():
+    source = (REPO / "migrations/versions/b2f3a4c5d6e7_add_fact_dedup_key.py").read_text(encoding="utf-8")
+    assert "W5 waiver (B9 §1.7 vs §1.8, contract audit §4.4 option (a))" in source
+
+    upgrade = ast.parse(source).body
+    upgrade_function = next(node for node in upgrade if isinstance(node, ast.FunctionDef) and node.name == "upgrade")
+    empty_list_names = {
+        node.target.id
+        for node in ast.walk(upgrade_function)
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and isinstance(node.value, ast.List)
+        and not node.value.elts
+    }
+    assert empty_list_names == {"keeper_ids", "deleted_fact_ids"}
+
+
 def test_fact_dedup_helper_handles_none_and_empty_components():
     assert migration.fact_dedup_key(None, "", " ") == "\x1f\x1f"
 
