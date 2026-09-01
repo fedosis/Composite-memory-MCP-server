@@ -12,8 +12,12 @@ Confidence scoring:
 import re
 from typing import Callable, Optional
 
-# Type for an LLM extraction callable: takes raw text, returns list of SPO dicts
-LLMExtractorFn = Callable[[str], list[dict]]
+from memory_server.extractors.llm_response import ExtractedResult
+
+# Shared protocol (pipeline R3): text -> validated combined result or None.
+# At the A2 service boundary the DI closures adapt the validated
+# ExtractedResult into the per-kind list[dict] shape the extractors consume.
+LLMExtractorFn = Callable[[str], ExtractedResult | None]
 
 
 class FactExtractor:
@@ -70,12 +74,21 @@ class FactExtractor:
             llm_facts = self._llm_extractor(text)
             if llm_facts:
                 for fact in llm_facts:
+                    # D5: honor a per-item confidence key; absent -> the
+                    # constructor default (0.85). The defensive clamp applies
+                    # only to DIRECT extract() unit inputs — the service path
+                    # A1-validates first, so malformed values never reach it.
+                    conf = fact.get("confidence")
+                    confidence = (
+                        float(conf) if conf is not None else self._llm_confidence
+                    )
+                    confidence = max(0.0, min(1.0, confidence))
                     facts.append(
                         {
                             "subject": fact.get("subject", ""),
                             "predicate": fact.get("predicate", ""),
                             "object": fact.get("object", ""),
-                            "confidence": self._llm_confidence,
+                            "confidence": confidence,
                         }
                     )
 

@@ -1,7 +1,5 @@
 """Tests for FactExtractor (Card 012)."""
 
-import pytest
-
 from memory_server.extractors.fact_extractor import FactExtractor
 
 
@@ -116,3 +114,48 @@ class TestFactExtractor:
                 assert f["confidence"] == 0.5
             else:
                 assert f["confidence"] == 0.85
+
+    def test_llm_per_item_confidence(self):
+        """LLM branch honors a per-item confidence key (D5)."""
+
+        def mock_llm(text: str) -> list[dict]:
+            return [
+                {
+                    "subject": "Python",
+                    "predicate": "created_by",
+                    "object": "Guido",
+                    "confidence": 0.3,
+                }
+            ]
+
+        extractor = FactExtractor(llm_extractor=mock_llm)
+        facts = extractor.extract("Python created_by Guido")
+        assert len(facts) == 1
+        assert facts[0]["confidence"] == 0.3
+
+    def test_llm_confidence_missing_key_uses_default(self):
+        """Missing per-item confidence falls back to the constructor default."""
+
+        def mock_llm(text: str) -> list[dict]:
+            return [{"subject": "A", "predicate": "relates_to", "object": "B"}]
+
+        extractor = FactExtractor(llm_extractor=mock_llm)
+        facts = extractor.extract("A relates to B")
+        assert facts[0]["confidence"] == 0.85
+
+    def test_llm_confidence_out_of_range_clamped(self):
+        """Out-of-range per-item confidence is clamped to [0, 1]."""
+
+        def mock_llm(text: str) -> list[dict]:
+            return [
+                {
+                    "subject": "A",
+                    "predicate": "relates_to",
+                    "object": "B",
+                    "confidence": 1.5,
+                }
+            ]
+
+        extractor = FactExtractor(llm_extractor=mock_llm)
+        facts = extractor.extract("A relates to B")
+        assert facts[0]["confidence"] == 1.0

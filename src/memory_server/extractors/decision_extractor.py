@@ -14,7 +14,12 @@ Confidence scoring:
 import re
 from typing import Callable, Optional
 
-LLMExtractorFn = Callable[[str], list[dict]]
+from memory_server.extractors.llm_response import ExtractedResult
+
+# Shared protocol (pipeline R3): text -> validated combined result or None.
+# At the A2 service boundary the DI closures adapt the validated
+# ExtractedResult into the per-kind list[dict] shape the extractors consume.
+LLMExtractorFn = Callable[[str], ExtractedResult | None]
 
 
 class DecisionExtractor:
@@ -76,13 +81,22 @@ class DecisionExtractor:
             llm_decisions = self._llm_extractor(text)
             if llm_decisions:
                 for d in llm_decisions:
+                    # D5: honor a per-item confidence key; absent -> the
+                    # constructor default (0.85). The defensive clamp applies
+                    # only to DIRECT extract() unit inputs — the service path
+                    # A1-validates first, so malformed values never reach it.
+                    conf = d.get("confidence")
+                    confidence = (
+                        float(conf) if conf is not None else self._llm_confidence
+                    )
+                    confidence = max(0.0, min(1.0, confidence))
                     decisions.append(
                         {
                             "context": d.get("context", ""),
                             "choice": d.get("choice", ""),
                             "alternatives": d.get("alternatives", []),
                             "reason": d.get("reason", ""),
-                            "confidence": self._llm_confidence,
+                            "confidence": confidence,
                         }
                     )
 

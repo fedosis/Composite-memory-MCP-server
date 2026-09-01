@@ -1,7 +1,5 @@
 """Tests for DecisionExtractor (Card 013)."""
 
-import pytest
-
 from memory_server.extractors.decision_extractor import DecisionExtractor
 
 
@@ -97,3 +95,57 @@ class TestDecisionExtractor:
         decisions = extractor.extract("  decided   to   upgrade   because   needed   speed  ")
         assert len(decisions) == 1
         assert decisions[0]["choice"] == "upgrade"
+
+    def test_llm_per_item_confidence(self):
+        """LLM branch honors a per-item confidence key (D5)."""
+
+        def mock_llm(text: str) -> list[dict]:
+            return [
+                {
+                    "context": "Web server selection",
+                    "choice": "Caddy",
+                    "alternatives": ["Nginx"],
+                    "reason": "Docker integration",
+                    "confidence": 0.3,
+                }
+            ]
+
+        extractor = DecisionExtractor(llm_extractor=mock_llm)
+        decisions = extractor.extract("We should use Caddy")
+        assert len(decisions) == 1
+        assert decisions[0]["confidence"] == 0.3
+
+    def test_llm_confidence_missing_key_uses_default(self):
+        """Missing per-item confidence falls back to the constructor default."""
+
+        def mock_llm(text: str) -> list[dict]:
+            return [
+                {
+                    "context": "Database selection",
+                    "choice": "PostgreSQL",
+                    "alternatives": ["MySQL"],
+                    "reason": "ACID compliance",
+                }
+            ]
+
+        extractor = DecisionExtractor(llm_extractor=mock_llm)
+        decisions = extractor.extract("Use PostgreSQL")
+        assert decisions[0]["confidence"] == 0.85
+
+    def test_llm_confidence_out_of_range_clamped(self):
+        """Out-of-range per-item confidence is clamped to [0, 1]."""
+
+        def mock_llm(text: str) -> list[dict]:
+            return [
+                {
+                    "context": "Database selection",
+                    "choice": "PostgreSQL",
+                    "alternatives": ["MySQL"],
+                    "reason": "ACID compliance",
+                    "confidence": 2.5,
+                }
+            ]
+
+        extractor = DecisionExtractor(llm_extractor=mock_llm)
+        decisions = extractor.extract("Use PostgreSQL")
+        assert decisions[0]["confidence"] == 1.0
