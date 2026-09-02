@@ -11,7 +11,7 @@ as failed.
 
 import json
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
 
 from sqlalchemy import DateTime, Integer, String, Text, select, update
@@ -133,6 +133,9 @@ class OutboxRepository:
     """
 
     MAX_RETRIES = 3
+    # Test/instrumentation seam: called after candidate selection and before
+    # the conditional UPDATE. Production leaves it unset.
+    claim_between_select_and_update: Callable[[list[str]], Awaitable[None]] | None = None
 
     def __init__(self, session: AsyncSession):
         self._session = session
@@ -208,10 +211,17 @@ class OutboxRepository:
             .limit(limit)
             .cte("pending_ids")
         )
+        candidate_result = await self._session.execute(pending_ids.select())
+        candidate_ids = [str(row[0]) for row in candidate_result.fetchall()]
+        if not candidate_ids:
+            return []
+        hook = type(self).claim_between_select_and_update
+        if hook is not None:
+            await hook(candidate_ids)
         stmt = (
             update(OutboxEntryORM)
             .where(
-                OutboxEntryORM.id.in_(select(pending_ids.c.id)),
+                OutboxEntryORM.id.in_(candidate_ids),
                 OutboxEntryORM.status == "pending",
             )
             .values(status="processing", processed_at=utcnow())

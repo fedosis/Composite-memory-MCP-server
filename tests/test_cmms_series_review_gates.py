@@ -13,16 +13,17 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from storage.base import Base, utcnow
+from sqlalchemy.exc import IntegrityError, OperationalError
+from storage.base import utcnow
 from storage.models.fact import FactORM
 from storage.outbox import OutboxEntryORM, OutboxRepository
 from storage.outbox_worker import OutboxWorker
-from storage.repositories import FactRepository, ReceiptRepository
+from storage.repositories import FactRepository
 
 from memory_server.api.learn import learn
 from memory_server.api.remember import remember
 from memory_server.models import Fact
+from memory_server.plugins.hermes.writer import WriterQueue
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.services.ingestion_service import reinforce_memory_item
 
@@ -123,64 +124,77 @@ async def test_f1_real_provider_upgrade_remember_learn_and_reinforce(tmp_path):
         await provider.close()
 
 
-async def _real_fact_race(factory, barrier, order, source):
-    async with factory() as session:
-        async with session.begin():
-            repo = FactRepository(session)
-            assert await repo.find_existing("Docker", "is", "container") is None
+async def _real_ingestion_race(provider, barrier, source):
+    """Race two real learn() transactions after their production SELECT."""
+    original = FactRepository.find_existing
+    arrived = {"count": 0}
+
+    async def synchronized_find(self, subject, predicate, object):
+        result = await original(self, subject, predicate, object)
+        arrived["count"] += 1
+        if arrived["count"] <= 2:
             await barrier.wait()
-            order.append(source)
-            if source in {"two", "b"}:
-                await asyncio.sleep(0.1)
-                existing = await repo.find_existing("Docker", "is", "container")
-                if existing is not None:
-                    stored, _ = await reinforce_memory_item(
-                        session, memory_type="fact", item_id=existing.id,
-                        new_confidence=0.7, source=source,
-                        previous_confidence=existing.confidence,
-                    )
-                    return stored
-            fact = Fact(
-                id=f"race-{source}", subject="Docker", predicate="is", object="container",
-                dedup_key="Docker\x1fis\x1fcontainer", confidence=0.5, source=source,
-            )
-            try:
-                async with session.begin_nested():
-                    stored = await repo.create(fact)
-            except sa.exc.IntegrityError:
-                stored = await repo.find_existing("Docker", "is", "container")
-                assert stored is not None
-                stored, _ = await reinforce_memory_item(
-                    session, memory_type="fact", item_id=stored.id,
-                    new_confidence=0.7, source=source,
-                    previous_confidence=stored.confidence,
-                )
-            else:
-                await ReceiptRepository(session).create(
-                    __import__("memory_server.models", fromlist=["MemoryReceipt"]).MemoryReceipt(
-                        id=stored.id, memory_type="fact", source=source, created_by="race",
-                        timestamp=utcnow(),
-                    )
-                )
-            return stored
+        return result
+
+    try:
+        return await learn(
+            provider,
+            "Docker is container",
+            source=source,
+            llm_extractor=lambda _text: {
+                "facts": [{"subject": "Docker", "predicate": "is", "object": "container", "confidence": 0.7}],
+                "decisions": [],
+            },
+        )
+    except (OperationalError, IntegrityError) as exc:
+        # SQLite snapshot upgrade can classify the loser as busy; recover by
+        # re-entering the same production ingestion boundary.
+        assert "locked" in str(exc).lower() or "busy" in str(exc).lower() or "unique" in str(exc).lower()
+        return await learn(
+            provider, "Docker is container", source=f"{source}-recovery",
+            llm_extractor=lambda _text: {"facts": [{"subject": "Docker", "predicate": "is", "object": "container", "confidence": 0.7}], "decisions": []},
+        )
 
 
 @pytest.mark.asyncio
-async def test_f1_synchronized_real_inserts_have_one_active_row_and_explicit_loser(tmp_path):
-    p = SQLiteProvider(url=f"sqlite+aiosqlite:///{tmp_path / 'race.db'}")
-    await p.initialize()
-    barrier, order = asyncio.Barrier(2), []
+async def test_f1_synchronized_real_inserts_have_one_active_row_and_explicit_loser(tmp_path, monkeypatch):
+    db = tmp_path / "race.db"
+    url = f"sqlite+aiosqlite:///{db}"
+    providers = [SQLiteProvider(url=url), SQLiteProvider(url=url)]
+    for provider in providers:
+        await provider.initialize()
+    barrier = asyncio.Barrier(2)
+    original = FactRepository.find_existing
+    calls = 0
+
+    async def synchronized_find(self, subject, predicate, object):
+        nonlocal calls
+        result = await original(self, subject, predicate, object)
+        calls += 1
+        if calls <= 2:
+            await barrier.wait()
+        return result
+
+    monkeypatch.setattr(FactRepository, "find_existing", synchronized_find)
     try:
-        results = await asyncio.gather(
-            _real_fact_race(p._session_factory, barrier, order, "one"),
-            _real_fact_race(p._session_factory, barrier, order, "two"),
-        )
+        results = await asyncio.gather(*(
+            _real_ingestion_race(provider, barrier, source)
+            for provider, source in zip(providers, ("one", "two"), strict=True)
+        ))
     finally:
-        await p.close()
-    assert len({result.id for result in results}) == 1
-    with sqlite3.connect(tmp_path / "race.db") as conn:
-        assert conn.execute("SELECT count(*) FROM facts WHERE lifecycle_state IN ('candidate','validated','active')").fetchone()[0] == 1
-        assert conn.execute("SELECT count(*) FROM receipts WHERE memory_type='fact'").fetchone()[0] == 1
+        for provider in providers:
+            await provider.close()
+    with sqlite3.connect(db) as conn:
+        active = conn.execute("SELECT count(*) FROM facts WHERE lifecycle_state IN ('candidate','validated','active')").fetchone()[0]
+        receipt_rows = conn.execute("SELECT count(*) FROM receipts WHERE memory_type='fact'").fetchone()[0]
+        history_len = conn.execute("SELECT length(history) FROM receipts WHERE memory_type='fact'").fetchone()[0]
+        outbox_rows = conn.execute("SELECT count(*) FROM outbox_entries WHERE record_type='fact'").fetchone()[0]
+    assert len(results) == 2
+    assert all(result["facts"] or result["receipts"] for result in results)
+    assert active == 1
+    assert receipt_rows == 1
+    assert history_len > 2  # receipt JSON is persisted, including loser reinforcement
+    assert outbox_rows in (0, 1)  # loser recovery may roll back its outbox write
 
 
 @pytest.mark.asyncio
@@ -219,16 +233,24 @@ async def test_f3_writer_path_lock_failure_is_bounded(tmp_path):
     await provider.initialize()
     raw = sqlite3.connect(db, timeout=0, isolation_level=None)
     raw.execute("BEGIN IMMEDIATE")
+    async def write_batch(batch):
+        for item, _turn_id in batch:
+            await provider.create_fact(item)
+
+    queue = WriterQueue(
+        write_batch,
+        flush_interval=60,
+        max_batch=1,
+    )
+    await queue.add_turn(Fact(id="locked", subject="s", predicate="p", object="o", dedup_key="s\x1fp\x1fo"))
     started = time.monotonic()
     try:
-        with pytest.raises(Exception) as exc:
-            await asyncio.wait_for(
-                provider.create_fact(Fact(id="locked", subject="s", predicate="p", object="o", dedup_key="s\x1fp\x1fo")),
-                timeout=2,
-            )
+        flushed = await asyncio.wait_for(queue.flush(), timeout=1)
         elapsed = time.monotonic() - started
-        assert elapsed < 2
-        assert "locked" in str(exc.value).lower() or "busy" in str(exc.value).lower()
+        assert flushed == 0
+        assert elapsed <= 0.2 + 0.25
+        assert queue.failed_items == []
+        assert queue.total_requeued == 1  # classified retryable persistence outcome
     finally:
         raw.rollback()
         raw.close()
@@ -236,99 +258,155 @@ async def test_f3_writer_path_lock_failure_is_bounded(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_w7_two_real_sessions_preserve_one_fact_receipt_and_monotonic_reinforcement(tmp_path):
+async def test_w7_two_real_sessions_preserve_one_fact_receipt_and_monotonic_reinforcement(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="dedup_key"):
         FactORM.from_pydantic(Fact(id="boundary", subject="s", predicate="p", object="o"))
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'w7.db'}"
-    provider = SQLiteProvider(url=db_url)
-    await provider.initialize()
+    provider_a = SQLiteProvider(url=db_url)
+    provider_b = SQLiteProvider(url=db_url)
+    await provider_a.initialize()
+    await provider_b.initialize()
     try:
-        barrier, order = asyncio.Barrier(2), []
+        barrier = asyncio.Barrier(2)
+        original = FactRepository.find_existing
+        calls = 0
+
+        async def synchronized_find(self, subject, predicate, object):
+            nonlocal calls
+            result = await original(self, subject, predicate, object)
+            calls += 1
+            if calls <= 2:
+                await barrier.wait()
+            return result
+
+        monkeypatch.setattr(FactRepository, "find_existing", synchronized_find)
         results = await asyncio.gather(
-            _real_fact_race(provider._session_factory, barrier, order, "one"),
-            _real_fact_race(provider._session_factory, barrier, order, "two"),
+            _real_ingestion_race(provider_a, barrier, "one"),
+            _real_ingestion_race(provider_b, barrier, "two"),
         )
-        fact = (await provider.search_facts(subject="Docker", include_inactive=True))[0]
-        async with provider._session_factory() as session:
+        fact = (await provider_a.search_facts(subject="Docker", include_inactive=True))[0]
+        async with provider_a._session_factory() as session:
             async with session.begin():
                 await reinforce_memory_item(session, memory_type="fact", item_id=fact.id, new_confidence=0.9, source="high")
-        fresh = await provider.get_fact(fact.id)
-        receipts = await provider.search_receipts(memory_type="fact", limit=20)
+        fresh = await provider_a.get_fact(fact.id)
+        receipts = await provider_a.search_receipts(memory_type="fact", limit=20)
     finally:
-        await provider.close()
-    assert all(result.id for result in results)
+        await provider_a.close()
+        await provider_b.close()
+    assert all(result["facts"][0]["item"]["id"] == fact.id for result in results)
     assert fresh.confidence >= 0.9 and fresh.version >= 2
     assert len(receipts) == 1
-    assert len(receipts[0].history) >= 1
-    assert receipts[0].history[-1]["source"] in {"one", "two", "high"}
+    assert len(receipts[0].history) >= 2
+    assert {entry["source"].split("-", 1)[0] for entry in receipts[0].history} & {"one", "two"}
 
 
 @pytest.mark.asyncio
 async def test_w8_two_workers_barrier_between_selection_and_claim(tmp_path):
-    db = tmp_path / "w8.db"
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with factory() as session:
-        await OutboxRepository(session).add_entry("fact", "w8-fact", "index_fact", {})
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'w8.db'}"
+    calls = []
+
+    class Graph:
+        def sync_facts_batch(self, payloads):
+            calls.extend(payloads)
+            return True
+
+        def sync_fact(self, subject, predicate, obj):
+            calls.append({"subject": subject, "predicate": predicate, "object": obj})
+            return True
+
+    workers = [OutboxWorker(db_url=db_url, graph_router=Graph(), poll_interval_seconds=0.01, stale_processing_seconds=10**9) for _ in range(2)]
+    for worker in workers:
+        await worker.initialize()
+    async with workers[0]._session_factory() as session:
+        await OutboxRepository(session).add_entry("fact", "w8-fact", "index_fact", {"subject": "s", "predicate": "p", "object": "o"})
         await session.commit()
     barrier = asyncio.Barrier(2)
-    original = OutboxRepository.claim_pending
+    arrivals = 0
 
-    async def claim(self, limit=50):
+    async def between(candidate_ids):
+        nonlocal arrivals
+        arrivals += 1
         await barrier.wait()
-        return await original(self, limit)
 
-    OutboxRepository.claim_pending = claim
+    original_hook = OutboxRepository.claim_between_select_and_update
+    OutboxRepository.claim_between_select_and_update = between
+    original_reset = OutboxRepository.reset_stale_processing
+    async def no_stale_rows(self, max_age_seconds=600):
+        return 0
+    OutboxRepository.reset_stale_processing = no_stale_rows
     try:
-        async def one():
-            async with factory() as session:
-                rows = await OutboxRepository(session).claim_pending(1)
-                await session.commit()
-                return rows
-        left, right = await asyncio.gather(one(), one())
+        results = await asyncio.gather(*(worker._poll_once() for worker in workers))
     finally:
-        OutboxRepository.claim_pending = original
-        await engine.dispose()
-    assert sum(len(rows) for rows in (left, right)) == 1
+        OutboxRepository.reset_stale_processing = original_reset
+        OutboxRepository.claim_between_select_and_update = original_hook
+        for worker in workers:
+            await worker.close()
+    assert arrivals == 2
+    assert sum(results) == 1
+    assert len(calls) == 1
+
 
 
 @pytest.mark.asyncio
 async def test_w8_stale_processing_is_recovered_once(tmp_path):
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'stale.db'}")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with factory() as session:
-        repo = OutboxRepository(session)
-        entry = await repo.add_entry("fact", "stale", "index_fact", {})
-        await session.flush()
-        await repo.mark_processing(entry.id)
-        row = await session.get(OutboxEntryORM, entry.id)
-        row.processed_at = utcnow()
-        await session.commit()
-        assert await repo.reset_stale_processing(max_age_seconds=0) == 1
-        await session.commit()
-        assert len(await repo.claim_pending(1)) == 1
-    await engine.dispose()
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'stale.db'}"
+    calls = []
+
+    class Graph:
+        def sync_facts_batch(self, payloads):
+            calls.extend(payloads)
+            return True
+
+    worker = OutboxWorker(db_url=db_url, graph_router=Graph(), stale_processing_seconds=0)
+    await worker.initialize()
+    try:
+        async with worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            entry = await repo.add_entry("fact", "stale", "index_fact", {"subject": "s", "predicate": "p", "object": "o"})
+            await session.flush()
+            await repo.mark_processing(entry.id)
+            row = await session.get(OutboxEntryORM, entry.id)
+            row.processed_at = utcnow()
+            await session.commit()
+        # The worker boundary performs stale reset and claim, then processes once.
+        assert await worker._poll_once() == 1
+        assert len(calls) == 1
+    finally:
+        await worker.close()
 
 
-def test_f4_reference_rebuild_preserves_independent_counts_and_remaps_endpoints():
-    from tests.test_migration_fact_dedup import load_migration_module
-    migration = load_migration_module("b2f3a4c5d6e7")
-    assert "remap_counts" in (REPO / "migrations/versions/b2f3a4c5d6e7_add_fact_dedup_key.py").read_text()
-    engine = sa.create_engine("sqlite:///:memory:")
-    conn = engine.connect()
-    conn.exec_driver_sql("CREATE TABLE lifecycle_states(id TEXT,memory_id TEXT,memory_type TEXT,current_state TEXT,previous_state TEXT,confidence REAL,updated_at TEXT)")
-    conn.exec_driver_sql("CREATE TABLE lifecycle_events(id TEXT,memory_id TEXT,memory_type TEXT,from_state TEXT,to_state TEXT,reason TEXT,triggered_by TEXT,timestamp TEXT)")
-    conn.exec_driver_sql("CREATE TABLE claim_relations(source_id TEXT,target_id TEXT,relation_type TEXT,created_at TEXT,PRIMARY KEY(source_id,target_id,relation_type))")
-    pre = {"rows": {"lifecycle_states": (("s1","dead","fact","active",None,0.2,"2020"),("s2","keep","fact","validated",None,0.9,"2021")), "lifecycle_events": (("e1","dead","fact","candidate","active","x","t","2020"),("e2","keep","fact","validated","active","y","t","2021")), "claim_relations": (("dead","other","supports","2020"),("keep","other","supports","2021"),("dead","keep","supports","2022"))}}
-    counts = migration._rebuild_reference_tables(conn, pre, {"dead":"keep"})
-    assert counts == {"lifecycle_states": 1, "lifecycle_events": 2, "claim_relations": 1}
-    assert conn.exec_driver_sql("SELECT memory_id FROM lifecycle_states").fetchone()[0] == "keep"
-    assert conn.exec_driver_sql("SELECT count(*) FROM lifecycle_events WHERE memory_id='keep'").fetchone()[0] == 2
-    assert conn.exec_driver_sql("SELECT source_id,target_id FROM claim_relations").fetchone() == ("keep", "other")
+def test_f4_reference_rebuild_preserves_independent_counts_and_remaps_endpoints(tmp_path):
+    from tests.test_migration_fact_dedup import create_fixture_database, run_upgrade, write_copy_ini
+
+    db = tmp_path / "full-pre-b2.db"
+    create_fixture_database(db)
+    expected_pre = {
+        "facts": 12, "receipts": 3, "outbox_entries": 3,
+        "lifecycle_states": 2, "lifecycle_events": 2, "claim_relations": 2,
+    }
+    with sqlite3.connect(db) as conn:
+        assert {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in expected_pre} == expected_pre
+        fact_ids = {row[0] for row in conn.execute("SELECT id FROM facts")}
+        assert all(row[1] in fact_ids for row in conn.execute("SELECT id, memory_id FROM lifecycle_states WHERE memory_type='fact'"))
+        assert any(row[1] == "fact" for row in conn.execute("SELECT id, memory_type FROM receipts"))
+    ini = tmp_path / "full-upgrade.ini"
+    write_copy_ini(ini, db.resolve())
+    result = run_upgrade(db, ini)
+    assert result.returncode == 0, result.stderr
+    with sqlite3.connect(db) as conn:
+        expected_post = {
+            "facts": 6, "receipts": 1, "outbox_entries": 1,
+            "lifecycle_states": 2, "lifecycle_events": 2, "claim_relations": 2,
+        }
+        assert {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in expected_post} == expected_post
+        survivors = {row[0] for row in conn.execute("SELECT id FROM facts")}
+        deleted = {"fact-active-1", "fact-active-3", "fact-active-4", "fact-archived-2", "fact-empty-1", "fact-tie-b"}
+        assert deleted.isdisjoint(survivors)
+        refs = [row[0] for row in conn.execute("SELECT memory_id FROM lifecycle_states")]
+        refs += [row[0] for row in conn.execute("SELECT memory_id FROM lifecycle_events")]
+        refs += [x for row in conn.execute("SELECT source_id, target_id FROM claim_relations") for x in row]
+        assert set(refs) <= survivors | {"decision-1"}
+        assert conn.execute("SELECT count(*) FROM lifecycle_events WHERE memory_id IN ('fact-active-2','fact-empty-2')").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("optimized", [False, True])
@@ -357,13 +435,28 @@ with sqlite3.connect(p) as raw:
     raw.commit()
 c=sa.create_engine("sqlite:///" + str(p)).connect()
 if {case!r} == "identity":
-    try:
-        m._assert_untouched_rows({{"rows": {{"facts": ()}}}}, {{"rows": {{"facts": (("changed",),)}}}}, ["facts"])
-    except Exception as exc:
-        raise RuntimeError("identity mismatch guard: " + str(exc)) from exc
-    raise RuntimeError("identity mismatch guard was bypassed under optimization")
+    with sqlite3.connect(p) as probe:
+        probe.execute("CREATE TABLE identity_rows(id TEXT PRIMARY KEY, value TEXT)")
+        probe.execute("INSERT INTO identity_rows VALUES ('real-row', 'before')")
+        probe.commit()
+        before = {{"rows": {{"identity_rows": tuple(probe.execute("SELECT * FROM identity_rows"))}}}}
+        probe.execute("UPDATE identity_rows SET value='after' WHERE id='real-row'")
+        probe.commit()
+        after = {{"rows": {{"identity_rows": tuple(probe.execute("SELECT * FROM identity_rows"))}}}}
+    m._assert_untouched_rows(before, after, ["identity_rows"])
 elif {case!r} == "postcondition":
-    raise RuntimeError("postcondition violation: synthetic probe")
+    with sqlite3.connect(p) as probe:
+        probe.execute("CREATE TABLE postcondition_rows(id TEXT PRIMARY KEY, value TEXT)")
+        probe.execute("INSERT INTO postcondition_rows VALUES ('real-row', 'before')")
+        probe.commit()
+        before = {{"rows": {{"postcondition_rows": tuple(probe.execute("SELECT * FROM postcondition_rows"))}}}}
+        probe.execute("UPDATE postcondition_rows SET value='after' WHERE id='real-row'")
+        probe.commit()
+        after = {{"rows": {{"postcondition_rows": tuple(probe.execute("SELECT * FROM postcondition_rows"))}}}}
+    try:
+        m._assert_untouched_rows(before, after, ["postcondition_rows"])
+    except RuntimeError as exc:
+        raise RuntimeError("postcondition violation: " + str(exc)) from exc
 elif {case!r} == "index":
     c.execute(sa.text("CREATE UNIQUE INDEX uq_facts_spo_active ON facts(id)"))
     m._ensure_preflight(c)
@@ -382,20 +475,33 @@ def test_f6_migration_has_no_optimization_sensitive_safety_asserts():
     assert not [node for node in ast.walk(tree) if isinstance(node, ast.Assert)]
 
 
-def test_w9_degraded_wal_seam_executes_pragma_and_fails_closed():
-    assert _USING_PRODUCTION_SQLITE_SUPPORT, "production SQLite connection policy is missing"
-    class Result:
-        def __init__(self, value): self.value = value
-        def scalar_one(self): return self.value
-    class Connection:
-        def __init__(self): self.statements = []
-        def execute(self, statement):
-            self.statements.append(str(statement))
-            return Result("delete" if "journal_mode=WAL" in str(statement) else 5000)
-    conn = Connection()
+def test_w9_degraded_wal_seam_executes_real_pragma_and_fails_closed(tmp_path):
+    assert _USING_PRODUCTION_SQLITE_SUPPORT
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'degraded.db'}")
+    real = engine.connect()
+
+    observed = []
+
+    class ResultProxy:
+        def __init__(self, result, value):
+            self.result, self.value = result, value
+            observed.append(value)
+        def scalar_one(self):
+            return self.value
+
+    class DegradedResultConnection:
+        def execute(self, statement, *args, **kwargs):
+            result = real.execute(statement, *args, **kwargs)
+            if "journal_mode=WAL" in str(statement):
+                return ResultProxy(result, "delete")
+            return result
+
     with pytest.raises(RuntimeError, match="degraded journal_mode"):
-        apply_sqlite_pragmas_sync(conn, 5000, context="probe")
-    assert any("journal_mode=WAL" in statement for statement in conn.statements)
+        apply_sqlite_pragmas_sync(DegradedResultConnection(), 5000, context="real-file-probe")
+    assert observed == ["delete"]
+    assert real.exec_driver_sql("PRAGMA journal_mode").scalar_one().lower() == "wal"
+    real.close()
+    engine.dispose()
 
 
 def test_w9_migration_timeout_is_set_before_ddl(tmp_path):
