@@ -476,6 +476,7 @@ class HermesProvider:
             compact_cleanup_hours=settings.outbox_compact_cleanup_hours,
             stale_processing_seconds=settings.outbox_stale_processing_seconds,
             process_pending_limit=settings.outbox_process_pending_limit,
+            busy_timeout_ms=60000,
         )
         await self._outbox_worker.initialize()
 

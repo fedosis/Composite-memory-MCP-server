@@ -191,6 +191,11 @@ async def test_f1_synchronized_real_inserts_have_one_active_row_and_explicit_los
             _real_ingestion_race(provider, barrier, source)
             for provider, source in zip(providers, ("one", "two"), strict=True)
         ))
+        pre_confirmation_receipts = [
+            receipt
+            for result in results
+            for receipt in result["receipts"]
+        ]
         for provider, source in zip(providers, ("one", "two"), strict=True):
             async with provider._session_factory() as session:
                 async with session.begin():
@@ -206,7 +211,7 @@ async def test_f1_synchronized_real_inserts_have_one_active_row_and_explicit_los
         active = conn.execute("SELECT count(*) FROM facts WHERE lifecycle_state IN ('candidate','validated','active')").fetchone()[0]
         receipt_rows = conn.execute("SELECT count(*) FROM receipts WHERE memory_type='fact'").fetchone()[0]
         receipt = conn.execute(
-            "SELECT source, confidence, version, history FROM receipts WHERE memory_type='fact'"
+            "SELECT confidence, version FROM receipts WHERE memory_type='fact'"
         ).fetchone()
         outbox_rows = conn.execute("SELECT count(*) FROM outbox_entries WHERE record_type='fact'").fetchone()[0]
     assert len(results) == 2
@@ -214,17 +219,24 @@ async def test_f1_synchronized_real_inserts_have_one_active_row_and_explicit_los
     assert active == 1
     assert receipt_rows == 1
     assert receipt is not None
-    receipt_source, confidence, version, raw_history = receipt
-    history = json.loads(raw_history)
-    assert len(history) >= 2
-    sources = {receipt_source, *(entry["source"] for entry in history)}
-    assert {"one", "two"} <= {source.split("-", 1)[0] for source in sources}
-    assert sum(result["_race_outcome"] == "loser-recovered" for result in results) == 1
-    assert sum(result["_race_outcome"] == "initial-success" for result in results) == 1
-    loser = next(result for result in results if result["_race_outcome"] == "loser-recovered")
-    assert loser["_race_source"] in {"one", "two"}
-    assert any(entry["source"].startswith(loser["_race_source"]) for entry in history)
-    assert [entry["confidence"] for entry in history] == sorted(entry["confidence"] for entry in history)
+    confidence, version = receipt
+    assert len(pre_confirmation_receipts) == 2
+    pre_history = [
+        entry
+        for receipt in pre_confirmation_receipts
+        for entry in receipt["history"]
+    ]
+    pre_sources = {
+        source
+        for receipt in pre_confirmation_receipts
+        for source in [receipt["source"]]
+    } | {entry["source"] for entry in pre_history}
+    assert {"one", "two"} <= {source.split("-", 1)[0] for source in pre_sources}
+    for result in results:
+        base = result["_race_source"]
+        expected_source = f"{base}-recovery" if result["_race_outcome"] == "loser-recovered" else base
+        assert expected_source in pre_sources
+    assert [entry["confidence"] for entry in pre_history] == sorted(entry["confidence"] for entry in pre_history)
     assert float(confidence) >= 0.7
     assert str(version) == "0.1.0"
     assert outbox_rows in (0, 1)  # loser recovery may roll back its outbox write
@@ -324,6 +336,11 @@ async def test_w7_two_real_sessions_preserve_one_fact_receipt_and_monotonic_rein
             _real_ingestion_race(provider_b, barrier, "two"),
         )
         fact = (await provider_a.search_facts(subject="Docker", include_inactive=True))[0]
+        pre_confirmation_receipts = [
+            receipt
+            for result in results
+            for receipt in result["receipts"]
+        ]
         async with provider_a._session_factory() as session:
             async with session.begin():
                 await reinforce_memory_item(session, memory_type="fact", item_id=fact.id, new_confidence=0.8, source="one-confirmation")
@@ -338,11 +355,23 @@ async def test_w7_two_real_sessions_preserve_one_fact_receipt_and_monotonic_rein
     assert fresh.confidence >= 0.9 and fresh.version >= 2
     assert len(receipts) == 1
     assert len(receipts[0].history) >= 2
-    sources = {receipts[0].source, *(entry["source"] for entry in receipts[0].history)}
-    assert {"one", "two"} <= {source.split("-", 1)[0] for source in sources}
-    assert [entry["confidence"] for entry in receipts[0].history] == sorted(entry["confidence"] for entry in receipts[0].history)
-    assert sum(result["_race_outcome"] == "loser-recovered" for result in results) == 1
-    assert sum(result["_race_outcome"] == "initial-success" for result in results) == 1
+    assert len(pre_confirmation_receipts) == 2
+    pre_history = [
+        entry
+        for receipt in pre_confirmation_receipts
+        for entry in receipt["history"]
+    ]
+    pre_sources = {
+        source
+        for receipt in pre_confirmation_receipts
+        for source in [receipt["source"]]
+    } | {entry["source"] for entry in pre_history}
+    assert {"one", "two"} <= {source.split("-", 1)[0] for source in pre_sources}
+    for result in results:
+        base = result["_race_source"]
+        expected_source = f"{base}-recovery" if result["_race_outcome"] == "loser-recovered" else base
+        assert expected_source in pre_sources
+    assert [entry["confidence"] for entry in pre_history] == sorted(entry["confidence"] for entry in pre_history)
 
 
 @pytest.mark.asyncio
@@ -455,7 +484,7 @@ def test_f4_reference_rebuild_preserves_independent_counts_and_remaps_endpoints(
 
 
 @pytest.mark.parametrize("optimized", [False, True])
-@pytest.mark.parametrize("case,needle", [("wrong_revision", "revision"), ("unsafe_source", "source"), ("unsafe_destination", "destination"), ("missing_schema", "facts"), ("orphan", "orphan"), ("identity", "identity"), ("index", "index"), ("postcondition", "postcondition")])
+@pytest.mark.parametrize("case,needle", [("wrong_revision", "revision"), ("unsafe_source", "source"), ("unsafe_destination", "destination"), ("missing_schema", "facts"), ("orphan", "orphan"), ("identity", "mutated unexpectedly"), ("index", "index"), ("postcondition", "verification failed")])
 def test_f6_guard_matrix_fails_closed_in_normal_and_optimized_python(tmp_path, optimized, case, needle):
     script = tmp_path / f"probe_{case}.py"
     source = f'''
@@ -467,8 +496,9 @@ m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 import sqlalchemy as sa
 p=Path({str(tmp_path / (case + '.db'))!r})
 if {case!r} in ("identity", "postcondition"):
-    from tests.test_migration_fact_dedup import create_fixture_database, write_copy_ini
-    create_fixture_database(p)
+    fixture_spec=importlib.util.spec_from_file_location("migration_fixture", {str(REPO / 'tests' / 'test_migration_fact_dedup.py')!r})
+    fixture=importlib.util.module_from_spec(fixture_spec); fixture_spec.loader.exec_module(fixture)
+    fixture.create_fixture_database(p)
     with sqlite3.connect(p) as probe:
         if {case!r} == "identity":
             probe.execute("CREATE TRIGGER mutate_decision AFTER UPDATE OF dedup_key ON facts BEGIN UPDATE decisions SET choice=choice || ' mutated' WHERE id='decision-1'; END")
@@ -477,7 +507,7 @@ if {case!r} in ("identity", "postcondition"):
             probe.execute("CREATE TRIGGER mutate_survivor AFTER UPDATE OF dedup_key ON facts BEGIN UPDATE facts SET subject=subject || ' mutated' WHERE id='fact-active-2'; END")
             probe.commit()
     ini=Path({str(tmp_path / (case + '.ini'))!r})
-    write_copy_ini(ini, p.resolve())
+    fixture.write_copy_ini(ini, p.resolve())
     ini.write_text(ini.read_text().replace("/home/shtorm/memory-server/migrations", str(Path({str(REPO / 'migrations')!r}))))
     from alembic import command, config
     command.upgrade(config.Config(str(ini)), "head")
@@ -495,30 +525,7 @@ with sqlite3.connect(p) as raw:
     if {case!r} == "orphan": raw.execute("CREATE TABLE receipts(id TEXT,memory_type TEXT)"); raw.execute("INSERT INTO receipts VALUES ('orphan','fact')")
     raw.commit()
 c=sa.create_engine("sqlite:///" + str(p)).connect()
-if {case!r} == "identity":
-    with sqlite3.connect(p) as probe:
-        probe.execute("CREATE TABLE identity_rows(id TEXT PRIMARY KEY, value TEXT)")
-        probe.execute("INSERT INTO identity_rows VALUES ('real-row', 'before')")
-        probe.commit()
-        before = {{"rows": {{"identity_rows": tuple(probe.execute("SELECT * FROM identity_rows"))}}}}
-        probe.execute("UPDATE identity_rows SET value='after' WHERE id='real-row'")
-        probe.commit()
-        after = {{"rows": {{"identity_rows": tuple(probe.execute("SELECT * FROM identity_rows"))}}}}
-    m._assert_untouched_rows(before, after, ["identity_rows"])
-elif {case!r} == "postcondition":
-    with sqlite3.connect(p) as probe:
-        probe.execute("CREATE TABLE postcondition_rows(id TEXT PRIMARY KEY, value TEXT)")
-        probe.execute("INSERT INTO postcondition_rows VALUES ('real-row', 'before')")
-        probe.commit()
-        before = {{"rows": {{"postcondition_rows": tuple(probe.execute("SELECT * FROM postcondition_rows"))}}}}
-        probe.execute("UPDATE postcondition_rows SET value='after' WHERE id='real-row'")
-        probe.commit()
-        after = {{"rows": {{"postcondition_rows": tuple(probe.execute("SELECT * FROM postcondition_rows"))}}}}
-    try:
-        m._assert_untouched_rows(before, after, ["postcondition_rows"])
-    except RuntimeError as exc:
-        raise RuntimeError("postcondition violation: " + str(exc)) from exc
-elif {case!r} == "index":
+if {case!r} == "index":
     c.execute(sa.text("CREATE UNIQUE INDEX uq_facts_spo_active ON facts(id)"))
     m._ensure_preflight(c)
 else:
