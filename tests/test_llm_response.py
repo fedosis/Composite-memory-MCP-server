@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from memory_server.extractors.llm_response import (
     ExtractedResult,
     _clean,
@@ -226,9 +228,9 @@ class TestValidateLlmResult:
 
     def test_deeply_nested_json_is_invalid(self):
         """Deeply nested JSON returns None instead of escaping RecursionError."""
-        payload = json.dumps([[[[]]]])
-        for _ in range(1996):
-            payload = "[" + payload + "]"
+        payload = "[" * 10000 + "]" * 10000
+        with pytest.raises(RecursionError):
+            json.loads(payload)
         assert validate_llm_result(payload) is None
 
     def test_extremely_long_integer_literal_is_invalid(self):
