@@ -682,6 +682,97 @@ def create_fixture_database(db_path: Path, *, pinned_index: str = "absent") -> N
     assert db_path.exists()
 
 
+def create_large_duplicate_fixture(db_path: Path, group_count: int = 1200) -> None:
+    create_fixture_database(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        facts = []
+        receipts = []
+        outbox = []
+        for index in range(group_count):
+            subject = f"large-subject-{index:04d}"
+            keeper_id = f"large-{index:04d}-keeper"
+            duplicate_id = f"large-{index:04d}-duplicate"
+            facts.extend(
+                [
+                    (
+                        keeper_id,
+                        subject,
+                        "has-value",
+                        "same-value",
+                        0.9,
+                        "fixture",
+                        "test",
+                        "2026-08-01 00:00:00.000000",
+                        "2026-08-01 00:00:00.000000",
+                        "verified",
+                        "active",
+                        "0.1.0",
+                    ),
+                    (
+                        duplicate_id,
+                        subject,
+                        "has-value",
+                        "same-value",
+                        0.8,
+                        "fixture",
+                        "test",
+                        "2026-08-01 00:01:00.000000",
+                        "2026-08-01 00:01:00.000000",
+                        "verified",
+                        "active",
+                        "0.1.0",
+                    ),
+                ]
+            )
+            receipts.append(
+                (
+                    duplicate_id,
+                    "fact",
+                    "fixture",
+                    "test",
+                    "2026-08-01 00:01:00.000000",
+                    0.8,
+                    "verified",
+                    "{}",
+                    "2026-08-01 00:01:00.000000",
+                    "active",
+                    "0.1.0",
+                )
+            )
+            outbox.append(
+                (
+                    f"outbox-{duplicate_id}",
+                    "fact",
+                    duplicate_id,
+                    "index_fact",
+                    "{}",
+                    "pending",
+                    0,
+                    None,
+                    "2026-08-01 00:01:00.000000",
+                    None,
+                )
+            )
+        conn.executemany(
+            "INSERT INTO facts (id, subject, predicate, object, confidence, source, creator, "
+            "created_at, updated_at, verification_status, lifecycle_state, version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            facts,
+        )
+        conn.executemany(
+            "INSERT INTO receipts (id, memory_type, source, created_by, timestamp, confidence, "
+            "verification_status, history, updated_at, lifecycle_state, version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            receipts,
+        )
+        conn.executemany(
+            "INSERT INTO outbox_entries (id, record_type, record_id, operation, payload_json, "
+            "status, retry_count, error, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            outbox,
+        )
+        conn.commit()
+
+
 def index_exists_on_copy(db_path: Path, name: str) -> bool:
     with sqlite3.connect(f"file:{db_path.resolve(strict=True)}?mode=ro", uri=True) as conn:
         return any(row[1] == name for row in conn.execute("PRAGMA index_list('facts')"))
@@ -1349,6 +1440,35 @@ def test_subprocess_event_enabled(tmp_path):
         for table, columns in reference_tables:
             rows = conn.execute(f"SELECT {', '.join(columns)} FROM {table}").fetchall()
             assert not any(value in deleted_ids for row in rows for value in row)
+
+
+def test_large_duplicate_groups_batch_owned_child_selects(tmp_path):
+    db_path = tmp_path / "large-duplicate-groups.db"
+    ini_path = tmp_path / "large-duplicate-groups.ini"
+    group_count = 1200
+    create_large_duplicate_fixture(db_path, group_count)
+    write_copy_ini(ini_path, db_path.resolve(strict=True))
+
+    run = run_upgrade(db_path, ini_path)
+    assert run.returncode == 0, run.stderr
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "b2f3a4c5d6e7"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE subject LIKE 'large-subject-%'"
+        ).fetchone()[0] == group_count
+        assert conn.execute(
+            "SELECT COUNT(DISTINCT subject) FROM facts WHERE subject LIKE 'large-subject-%'"
+        ).fetchone()[0] == group_count
+        assert conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE subject LIKE 'large-subject-%' AND lifecycle_state = 'active'"
+        ).fetchone()[0] == group_count
+        assert conn.execute(
+            "SELECT COUNT(*) FROM receipts WHERE id LIKE 'large-%-duplicate'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM outbox_entries WHERE record_id LIKE 'large-%-duplicate'"
+        ).fetchone()[0] == 0
 
 
 def test_owned_child_reconciliation_rejects_omitted_fact_receipt(tmp_path, monkeypatch):

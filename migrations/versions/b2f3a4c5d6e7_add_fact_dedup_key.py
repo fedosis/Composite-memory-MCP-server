@@ -852,19 +852,22 @@ def upgrade() -> None:
 
     def delete_owned_children(table: str, column: str, kind: str) -> int:
         deleted = 0
+        child_batch_size = _effective_batch(bind, params_per_row=1, fixed_params=0)
         for chunk in deleted_id_chunks():
-            params = {f"id_{i}": value for i, value in enumerate(chunk)}
-            placeholders = ", ".join(f":id_{i}" for i in range(len(chunk)))
-            owner = "memory_type='fact' AND id" if table == "receipts" else "record_type='fact' AND record_id"
-            result = _execute(
-                bind,
-                f"SELECT {column} FROM {table} WHERE {owner} IN ({placeholders})",
-                params,
-                kind=kind,
-                params_per_row=1,
-            )
-            child_batch = [str(row[0]) for row in result.fetchall()]
-            deleted += _delete_ids(bind, table, column, child_batch)
+            for start in range(0, len(chunk), child_batch_size):
+                sub = chunk[start : start + child_batch_size]
+                params = {f"id_{i}": value for i, value in enumerate(sub)}
+                placeholders = ", ".join(f":id_{i}" for i in range(len(sub)))
+                owner = "memory_type='fact' AND id" if table == "receipts" else "record_type='fact' AND record_id"
+                result = _execute(
+                    bind,
+                    f"SELECT {column} FROM {table} WHERE {owner} IN ({placeholders})",
+                    params,
+                    kind=kind,
+                    params_per_row=1,
+                )
+                child_batch = [str(row[0]) for row in result.fetchall()]
+                deleted += _delete_ids(bind, table, column, child_batch)
         return deleted
 
     receipt_deleted = delete_owned_children("receipts", "id", "child_select") if deleted_fact_ids else 0
