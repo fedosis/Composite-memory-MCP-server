@@ -146,7 +146,12 @@ def _invoke(*, base_url: str, model: str, key: str, text: str,
                     return None
                 else:
                     try:
-                        result = validate_llm_result(raw)  # exactly once
+                        content = raw["choices"][0]["message"]["content"]  # type: ignore[index]
+                    except (KeyError, IndexError, TypeError):
+                        _warn("validation_failure", mode=mode)
+                        return None
+                    try:
+                        result = validate_llm_result(content)  # exactly once
                     except (ValueError, TypeError):
                         _warn("validation_failure", mode=mode)
                         return None

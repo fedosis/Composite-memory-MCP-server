@@ -41,8 +41,14 @@ class FakeClient:
         return action
 
 
-def response(status=200, body=None):
-    return httpx.Response(status, json=body if body is not None else {"facts": [], "decisions": []})
+def response(status=200, payload=None, body=None):
+    if body is not None:
+        return httpx.Response(status, json=body)
+    content = payload if payload is not None else '{"facts": [], "decisions": []}'
+    return httpx.Response(status, json={
+        "choices": [{"message": {"content": content}}],
+        "usage": {},
+    })
 
 
 def make_cfg(mode="llm", model="model", timeout=5.0, max_input_chars=8000):
@@ -178,22 +184,22 @@ def test_pooltimeout_precedes_timeout(monkeypatch):
 
 
 def test_validator_once_first_and_after_retry(monkeypatch):
-    raw = {"facts": [], "decisions": []}
+    payload = '{"facts": [], "decisions": []}'
     validator = Mock(return_value=ExtractedResult((), ()))
     monkeypatch.setattr(factory, "validate_llm_result", validator)
-    FakeClient.plan = [response(200, raw)]
+    FakeClient.plan = [response(200, payload)]
     assert build_valid(monkeypatch)("x") == ExtractedResult((), ())
-    validator.assert_called_once_with(raw)
+    validator.assert_called_once_with(payload)
     validator.reset_mock()
-    FakeClient.plan = [httpx.ReadError("x"), response(200, raw)]
+    FakeClient.plan = [httpx.ReadError("x"), response(200, payload)]
     FakeClient.plan[0].request = httpx.Request("POST", "https://unit.test")
     assert build_valid(monkeypatch)("x") == ExtractedResult((), ())
-    validator.assert_called_once_with(raw)
+    validator.assert_called_once_with(payload)
 
 
 @pytest.mark.parametrize("body", ["not-json", {"facts": [{"bad": 1}], "decisions": []}])
 def test_parse_and_validation_failures_close_client(monkeypatch, caplog, body):
-    item = httpx.Response(200, content=body.encode()) if isinstance(body, str) else response(body=body)
+    item = response(payload=body) if isinstance(body, dict) else httpx.Response(200, content=body.encode())
     FakeClient.plan = [item]
     with caplog.at_level(logging.WARNING):
         assert build_valid(monkeypatch)("x") is None
@@ -218,6 +224,27 @@ def test_valid_response_returns_frozen_result_and_closes(monkeypatch):
     result = build_valid(monkeypatch)("x")
     assert result == ExtractedResult((), ())
     assert FakeClient.instances[-1].closed
+
+
+def test_real_chat_completion_body_extracts_content(monkeypatch):
+    payload = '{"facts": [{"subject": "Пользователь", "predicate": "любит", "object": "чай"}], "decisions": []}'
+    FakeClient.plan = [response(payload=payload)]
+    result = build_valid(monkeypatch)("x")
+    assert result is not None
+    assert result.facts[0]["object"] == "чай"
+
+
+def test_missing_chat_completion_content_is_validation_failure(monkeypatch, caplog):
+    FakeClient.plan = [response(body={"choices": [{"message": {}}], "usage": {}})]
+    with caplog.at_level(logging.WARNING):
+        assert build_valid(monkeypatch)("x") is None
+    assert "category=validation_failure mode=llm" in caplog.text
+
+
+def test_fenced_chat_completion_content_is_validated_as_string(monkeypatch):
+    payload = "```json" + chr(10) + '{"facts": [], "decisions": []}' + chr(10) + "```"
+    FakeClient.plan = [response(payload=payload)]
+    assert build_valid(monkeypatch)("x") == ExtractedResult((), ())
 
 
 def test_sentinel_and_mutation_proof(monkeypatch):
