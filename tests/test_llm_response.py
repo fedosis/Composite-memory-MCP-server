@@ -213,6 +213,32 @@ class TestValidateLlmResult:
         for conf in ("NaN", "Infinity", "-Infinity"):
             assert validate_llm_result(_conf_payload(conf)) is None
 
+    def test_extremely_large_integer_confidence_whole_response(self):
+        """Huge integer confidence is invalid in dict and raw-JSON forms."""
+        fact = _fact("A", "b", "c", 10**400)
+        assert validate_llm_result({"facts": [fact], "decisions": []}) is None
+
+        payload = (
+            '{"facts":[{"subject":"A","predicate":"b","object":"c",'
+            '"confidence":' + "9" * 400 + '}],"decisions":[]}'
+        )
+        assert validate_llm_result(payload) is None
+
+    def test_deeply_nested_json_is_invalid(self):
+        """Deeply nested JSON returns None instead of escaping RecursionError."""
+        payload = json.dumps([[[[]]]])
+        for _ in range(1996):
+            payload = "[" + payload + "]"
+        assert validate_llm_result(payload) is None
+
+    def test_extremely_long_integer_literal_is_invalid(self):
+        """JSON integers beyond Python's conversion limit return None."""
+        payload = (
+            '{"facts":[{"subject":"A","predicate":"b","object":"c",'
+            '"confidence":' + "9" * 4301 + '}],"decisions":[]}'
+        )
+        assert validate_llm_result(payload) is None
+
     def test_any_malformed_item_invalidates_whole(self):
         """One bad item discards the WHOLE response (no partial extraction)."""
         good_fact = _fact("A", "is", "B")

@@ -24,13 +24,13 @@ def _clean(value: str) -> str:
 
 
 def _confidence_ok(value: object) -> bool:
-    # bool is NOT a number (True/False are ints in Python); NaN/Inf are NOT
-    # valid (json.loads parses NaN/Infinity/-Infinity by default!).
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool):
         return False
-    if not math.isfinite(float(value)):
-        return False
-    return 0.0 <= float(value) <= 1.0
+    if isinstance(value, int):
+        return 0 <= value <= 1
+    if isinstance(value, float):
+        return math.isfinite(value) and 0.0 <= value <= 1.0
+    return False
 
 
 def _fact_ok(item: object) -> bool:
@@ -81,7 +81,7 @@ def validate_llm_result(raw: object) -> ExtractedResult | None:
             payload = s
         try:
             data = json.loads(payload)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, RecursionError):
             return None
     elif isinstance(raw, dict):
         data = raw
