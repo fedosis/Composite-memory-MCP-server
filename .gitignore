@@ -37,3 +37,9 @@ htmlcov/
 =*.0
 data/
 .worktrees/
+
+# Черновики будущих направлений (не входят в активные карточки)
+PLAN-claim-stacks.md
+scripts/claim_stacks_insert.sql
+specs/access-control-architecture.md
+specs/cmms-graph-batch.diff
