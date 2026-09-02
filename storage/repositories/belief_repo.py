@@ -106,16 +106,22 @@ class BeliefRepository:
 
     @staticmethod
     def _fts5_query(text_query: str) -> str:
-        """Convert a plain-text query into FTS5 query syntax."""
+        """Convert a plain-text query into FTS5 query syntax.
+
+        - Splits on whitespace
+        - Appends * for prefix matching on each term
+        - Quotes each term; FTS5 string literals make operator chars
+          (^ + - * ( ) ~ < > { } [ ]) literal, so the ONLY character that
+          needs escaping inside a term is the double quote itself, and FTS5
+          escapes it by DOUBLING (""), not by backslash (FTS5 has no
+          backslash escape — \" terminates the string early).
+        - Joins with AND (all terms must match)
+        """
         if not text_query or not text_query.strip():
             return ""
-        special_chars = set('^+-*()~<>"{}')
         terms = []
         for term in text_query.strip().split():
-            sanitized = "".join(
-                f'\\{ch}' if ch in special_chars else ch
-                for ch in term
-            )
+            sanitized = term.replace('"', '""')
             if sanitized:
                 terms.append(f'"{sanitized}"*')
         return " AND ".join(terms)
