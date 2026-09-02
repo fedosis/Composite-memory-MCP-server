@@ -43,6 +43,48 @@ SOURCE_TURN = "hermes_turn_e2e"
 TURN_ID = "e2e"
 
 
+def test_extract_turn_text_filters_non_conversational_roles():
+    messages = [
+        {"role": "user", "content": "user text"},
+        {"role": "tool", "content": "n if event_path is not None"},
+        {"role": "assistant", "content": "assistant text"},
+        {"role": "system", "content": "system instructions"},
+    ]
+
+    assert HermesProvider._extract_turn_text(messages) == "user text\nassistant text"
+
+
+def test_extract_turn_text_keeps_legacy_dict_branch_unchanged():
+    assert HermesProvider._extract_turn_text({
+        "user_content": "user text",
+        "assistant_content": "assistant text",
+    }) == "user text\nassistant text"
+
+
+def test_extract_turn_text_accepts_only_structured_roleless_legacy_items():
+    messages = [
+        {"user_content": "legacy user", "assistant_content": "legacy assistant"},
+        {"content": "ambiguous roleless content"},
+    ]
+
+    assert HermesProvider._extract_turn_text(messages) == (
+        "legacy user\nlegacy assistant"
+    )
+
+
+def test_extract_turn_text_flattens_text_blocks():
+    messages = [{
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "first"},
+            {"type": "image", "url": "ignored"},
+            {"type": "text", "text": "second"},
+        ],
+    }]
+
+    assert HermesProvider._extract_turn_text(messages) == "first\nsecond"
+
+
 # ---------------------------------------------------------------------------
 # §1.1 Cleanup registry (suite-owned resources; SPEC fixture step 1)
 # ---------------------------------------------------------------------------

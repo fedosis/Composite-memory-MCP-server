@@ -233,7 +233,10 @@ def test_sentinel_and_mutation_proof(monkeypatch):
     FakeClient.plan = [response()]
     fn(sentinel)
     call = FakeClient.instances[-1].calls[0]
-    assert call["json"]["messages"][0]["content"] == sentinel
+    assert call["json"]["messages"][0]["role"] == "system"
+    assert "Return ONLY JSON" in call["json"]["messages"][0]["content"]
+    assert call["json"]["messages"][1]["role"] == "user"
+    assert call["json"]["messages"][1]["content"] == sentinel
     assert call["json"]["model"] == "model-A"
     assert call["headers"]["Authorization"] == "Bearer key-A"
     assert call["url"] == "https://first.example/v1/chat/completions"

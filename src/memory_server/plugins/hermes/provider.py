@@ -2112,7 +2112,12 @@ class HermesProvider:
 
     @staticmethod
     def _extract_turn_text(messages: list | dict) -> str:
-        """Extract meaningful text from turn messages for ingestion."""
+        """Extract conversational text from turn messages for ingestion.
+
+        List items without ``role`` are accepted only when they use the legacy
+        ``user_content``/``assistant_content`` shape handled by the dict branch;
+        content-only roleless message items are excluded as ambiguous.
+        """
         if isinstance(messages, dict):
             return messages.get("user_content", "") + "\n" + messages.get("assistant_content", "")
 
@@ -2120,6 +2125,14 @@ class HermesProvider:
             parts = []
             for msg in messages:
                 if isinstance(msg, dict):
+                    role = msg.get("role")
+                    if role is None:
+                        if "user_content" in msg or "assistant_content" in msg:
+                            parts.append(msg.get("user_content", ""))
+                            parts.append(msg.get("assistant_content", ""))
+                        continue
+                    if role not in {"user", "assistant"}:
+                        continue
                     content = msg.get("content", "")
                     if isinstance(content, list):
                         for block in content:

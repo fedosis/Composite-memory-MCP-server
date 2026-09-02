@@ -20,6 +20,15 @@ _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _MAX_ATTEMPTS = 3
 _RETRYABLE_EXCEPTIONS = (httpx.ConnectError, httpx.ReadError,
                          httpx.WriteError, httpx.PoolTimeout)
+_SYSTEM_PROMPT = """Return ONLY JSON, no prose, no markdown fences:
+{"facts": [{"subject": str, "predicate": str, "object": str, "confidence": float 0..1}],
+ "decisions": [{"context": str, "choice": str, "reason": str, "alternatives": [str]}]}
+- Facts are durable subject-predicate-object statements about the user, their
+  projects, systems, decisions, preferences — stated as concrete claims.
+- SKIP ephemeral chatter, code fragments, commands, tool output, syntax noise,
+  line-level trivia, anything that is not a durable claim.
+- If nothing durable is found, return {"facts": [], "decisions": []}.
+- Confidence: 1.0 for explicitly stated facts, 0.7-0.9 for inferred."""
 
 
 def _warn(category: str, *, mode: object = None) -> None:
@@ -91,7 +100,10 @@ def _request_once(client: httpx.Client, *, base_url: str, model: str,
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {key}",
                  "Content-Type": "application/json"},
-        json={"model": model, "messages": [{"role": "user", "content": text}],
+        json={"model": model, "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ],
               "temperature": 0},
         timeout=timeout,
     )
