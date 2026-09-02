@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 from storage.base import Base
 from storage.outbox import OutboxEntry, OutboxRepository
+from storage.sqlite_support import apply_sqlite_pragmas_async, install_busy_timeout_listener, validate_busy_timeout_ms
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ class OutboxWorker:
         self._compact_cleanup_hours = compact_cleanup_hours
         self._stale_processing_seconds = stale_processing_seconds
         self._process_pending_limit = process_pending_limit
-        self._busy_timeout_ms = busy_timeout_ms
+        self._busy_timeout_ms = validate_busy_timeout_ms(busy_timeout_ms)
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
         self._stop_requested = False
         self._last_compact_at: float = 0.0
@@ -113,14 +114,22 @@ class OutboxWorker:
         """Initialize the worker — create session factory from existing engine."""
         if self._engine is None:
             self._engine = create_async_engine(self._db_url, echo=False)
+        install_busy_timeout_listener(self._engine, self._busy_timeout_ms)
+        engine_url = self._db_url or str(getattr(self._engine, "url", ""))
+        allow_degraded_mode = engine_url in {
+            "sqlite+aiosqlite://",
+            "sqlite+aiosqlite:///:memory:",
+        }
 
-            async with self._engine.connect() as conn:
-                await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
-                await conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
-                await conn.exec_driver_sql(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
-
-            async with self._engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+        async with self._engine.connect() as conn:
+            await apply_sqlite_pragmas_async(
+                conn,
+                self._busy_timeout_ms,
+                context="OutboxWorker",
+                allow_degraded_mode=allow_degraded_mode,
+            )
+        async with self._engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
         self._session_factory = async_sessionmaker(
             self._engine,
@@ -220,7 +229,7 @@ class OutboxWorker:
             await repo.reset_stale_processing(
                 max_age_seconds=self._stale_processing_seconds
             )
-            entries = await repo.get_pending(limit=self._poll_batch_size)
+            entries = await repo.claim_pending(limit=self._poll_batch_size)
 
             if not entries:
                 return 0
@@ -230,11 +239,6 @@ class OutboxWorker:
                 len(entries),
             )
 
-            # Claim: mark as processing and commit immediately. This is a
-            # short write lock; the heavy embed/upsert below runs outside
-            # any SQLite transaction so other writers are not blocked.
-            for entry in entries:
-                await repo.mark_processing(entry.id)
             await session.commit()
 
         # Batch-friendly operations: group index_fact entries and process
@@ -391,9 +395,6 @@ class OutboxWorker:
             - ``"failed"`` — retries exhausted; marked failed in this run.
             - ``"pending"`` — failed retryably; reset to pending for retry.
         """
-        # Mark as processing
-        await repo.mark_processing(entry.id)
-
         try:
             if entry.operation == "index_fact":
                 await self._process_index_fact(entry)
@@ -586,7 +587,8 @@ class OutboxWorker:
 
         async with self._session_factory() as session:
             repo = OutboxRepository(session)
-            entries = await repo.get_pending(limit=self._process_pending_limit)
+            entries = await repo.claim_pending(limit=self._process_pending_limit)
+            await session.commit()
 
             for entry in entries:
                 status = await self._process_entry(session, repo, entry)

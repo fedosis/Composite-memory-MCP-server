@@ -172,9 +172,50 @@ class TestWriterQueue:
         await queue.add_turn([{"role": "user", "content": "test"}], turn_id="t1")
         flushed = await queue.flush()
 
-        # Even on failure, flush returns the count (items removed from queue)
+        # First failure is requeued; nothing is flushed yet.
+        assert flushed == 0
+        assert queue.total_flushed == 0
+        assert queue.total_requeued == 1
+        assert queue.total_failed == 0
+
+        await queue.shutdown()
+
+    async def test_partial_batch_success_and_retries(self):
+        """Verify per-item outcomes, retries, and failed-list diagnostics."""
+
+        attempts: dict[str, int] = {}
+
+        async def write_fn(batch):
+            outcomes = []
+            for messages, turn_id in batch:
+                attempts[turn_id] = attempts.get(turn_id, 0) + 1
+                if turn_id == "ok":
+                    outcomes.append(((messages, turn_id), True, None))
+                else:
+                    outcomes.append(((messages, turn_id), False, f"boom:{turn_id}:{attempts[turn_id]}"))
+            return outcomes
+
+        queue = WriterQueue(write_callback=write_fn, flush_interval=10.0, max_batch=10)
+        await queue.start()
+
+        await queue.add_turn([{"role": "user", "content": "ok"}], turn_id="ok")
+        await queue.add_turn([{"role": "user", "content": "fail"}], turn_id="fail")
+
+        flushed = await queue.flush()
         assert flushed == 1
+        assert queue.total_flushed == 1
+        assert queue.total_requeued == 1
+        assert queue.total_failed == 0
+
+        await asyncio.sleep(0.06)
+        await queue.flush()
+        await asyncio.sleep(0.11)
+        await queue.flush()
+        assert attempts["fail"] == 3
         assert queue.total_failed == 1
+        assert queue.failed_items
+        assert queue.failed_items[0]["turn_id"] == "fail"
+        assert "boom:fail:3" in queue.failed_items[0]["error"]
 
         await queue.shutdown()
 

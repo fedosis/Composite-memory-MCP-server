@@ -196,6 +196,30 @@ class OutboxRepository:
             for row in result.scalars().all()
         ]
 
+    async def claim_pending(self, limit: int = 50) -> list[OutboxEntry]:
+        """Atomically claim the oldest pending entries.
+
+        Only rows that were still pending at UPDATE time are returned.
+        """
+        pending_ids = (
+            select(OutboxEntryORM.id)
+            .where(OutboxEntryORM.status == "pending")
+            .order_by(OutboxEntryORM.created_at.asc(), OutboxEntryORM.id.asc())
+            .limit(limit)
+            .cte("pending_ids")
+        )
+        stmt = (
+            update(OutboxEntryORM)
+            .where(
+                OutboxEntryORM.id.in_(select(pending_ids.c.id)),
+                OutboxEntryORM.status == "pending",
+            )
+            .values(status="processing", processed_at=utcnow())
+            .returning(OutboxEntryORM)
+        )
+        result = await self._session.execute(stmt)
+        return [OutboxEntry.from_orm(row) for row in result.scalars().all()]
+
     async def get_failed(self, limit: int = 50) -> list[OutboxEntry]:
         """Get all failed entries, oldest first.
 
@@ -222,13 +246,14 @@ class OutboxRepository:
 
         Returns True if the entry existed, False otherwise.
         """
-        orm = await self._session.get(OutboxEntryORM, entry_id)
-        if orm is None:
-            return False
-        orm.status = "processing"
-        orm.processed_at = utcnow()
-        # Note: caller must commit
-        return True
+        stmt = (
+            update(OutboxEntryORM)
+            .where(OutboxEntryORM.id == entry_id, OutboxEntryORM.status == "pending")
+            .values(status="processing", processed_at=utcnow())
+            .returning(OutboxEntryORM.id)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none() is not None
 
     async def mark_completed(self, entry_id: str) -> bool:
         """Mark an entry as completed.

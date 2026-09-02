@@ -24,6 +24,7 @@ import sqlalchemy
 import storage.outbox_worker as storage_outbox_mod
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
+from storage.dedup import fact_dedup_key
 from storage.models.fact import FactORM
 from storage.outbox_worker import OutboxWorker
 
@@ -887,7 +888,10 @@ async def test_two_connection_lock_conflict_bounded(tmp_path, monkeypatch):
             conn_a = await session_a.connection()
             await conn_a.exec_driver_sql("BEGIN IMMEDIATE")      # acquires the write lock
             await conn_a.execute(
-                insert(FactORM).values(id="lock-a", subject="s", predicate="p", object="o")
+                insert(FactORM).values(
+                    id="lock-a", subject="s", predicate="p", object="o",
+                    dedup_key=fact_dedup_key("s", "p", "o"),
+                )
             )
             # HOLD — no commit (WAL: writer holds the write lock from first write until commit)
 
@@ -903,7 +907,10 @@ async def test_two_connection_lock_conflict_bounded(tmp_path, monkeypatch):
             async def conflicting_write():
                 await conn_b.exec_driver_sql("BEGIN IMMEDIATE")  # blocks ~60s on A's lock
                 await conn_b.execute(
-                    insert(FactORM).values(id="lock-b", subject="s", predicate="p", object="o")
+                    insert(FactORM).values(
+                        id="lock-b", subject="t", predicate="p", object="o",
+                        dedup_key=fact_dedup_key("t", "p", "o"),
+                    )
                 )
                 await session_b.commit()
 
@@ -1262,7 +1269,7 @@ def test_poisoned_guards_initialize_is_available_require_provider(
         # _require_provider -> poison raise -> batch dropped, no write.
         caplog.set_level(logging.WARNING)
         _queue_turn(provider, "Alice is a tester", turn_id="t1")
-        assert provider._writer.total_failed >= 1
+        assert provider._writer.total_requeued >= 1
         assert "flush failed" in caplog.text.lower()
     finally:
         _poisoned_teardown(loop, provider, worker)

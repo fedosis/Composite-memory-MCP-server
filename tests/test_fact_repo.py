@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from storage.base import Base
+from storage.dedup import fact_dedup_key
 from storage.repositories.fact_repo import FactRepository
 
 from memory_server.models import Fact
@@ -87,10 +88,24 @@ class TestFactRepoFTSFallback:
 
     async def _seed(self, repo):
         await repo.create(
-            Fact(id="f1", subject="Docker", predicate="runs_on", object="OMV", source="test")
+            Fact(
+                id="f1",
+                subject="Docker",
+                predicate="runs_on",
+                object="OMV",
+                source="test",
+                dedup_key=fact_dedup_key("Docker", "runs_on", "OMV"),
+            )
         )
         await repo.create(
-            Fact(id="f2", subject="Nginx", predicate="proxies", object="Web", source="test")
+            Fact(
+                id="f2",
+                subject="Nginx",
+                predicate="proxies",
+                object="Web",
+                source="test",
+                dedup_key=fact_dedup_key("Nginx", "proxies", "Web"),
+            )
         )
 
     async def test_fts_normal_path_used(self, repo):

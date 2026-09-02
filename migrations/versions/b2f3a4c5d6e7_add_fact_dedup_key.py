@@ -37,7 +37,8 @@ def _record_event(name: str, **fields: Any) -> None:
         with Path(event_path).open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, sort_keys=True) + "\n")
     else:
-        assert "B2_EVENT_PATH" not in os.environ
+        if "B2_EVENT_PATH" in os.environ:
+            raise RuntimeError("B2_EVENT_PATH is set but no event path is available")
 
 
 def sqlite_base_error_code(exc: sqlite3.OperationalError) -> int | None:
@@ -56,7 +57,8 @@ def _source_uri(path: Path) -> str:
 def source_alembic_revision(source: Path) -> str:
     with sqlite3.connect(_source_uri(source), uri=True) as conn:
         row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert row is not None
+    if row is None:
+        raise RuntimeError("source database is missing alembic_version")
     return str(row[0])
 
 
@@ -71,7 +73,8 @@ def source_metadata_snapshot(source: Path) -> dict[str, Any]:
         )
         facts_schema = tuple(tuple(row) for row in conn.execute("PRAGMA table_info('facts')"))
         version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-    assert version is not None
+    if version is None:
+        raise RuntimeError("source metadata snapshot is missing alembic_version")
     return {
         "realpath": str(resolved),
         "schema": schema,
@@ -83,29 +86,39 @@ def source_metadata_snapshot(source: Path) -> dict[str, Any]:
 def guarded_cleanup(destination: Path, source: Path) -> None:
     dst = destination.resolve(strict=False)
     src = source.resolve(strict=True)
-    assert not destination.is_symlink()
-    assert dst != src
-    assert dst.parent == destination.parent.resolve()
+    if destination.is_symlink():
+        raise RuntimeError("destination must not be a symlink")
+    if dst == src:
+        raise RuntimeError("destination resolves to source")
+    if dst.parent != destination.parent.resolve():
+        raise RuntimeError("destination parent resolution mismatch")
     for path in (
         destination,
         Path(str(destination) + "-wal"),
         Path(str(destination) + "-shm"),
     ):
         if path.exists() or path.is_symlink():
-            assert not path.is_symlink()
-            assert path.resolve(strict=False) != src
+            if path.is_symlink():
+                raise RuntimeError(f"refusing to unlink symlinked sidecar: {path}")
+            if path.resolve(strict=False) == src:
+                raise RuntimeError(f"refusing to unlink sidecar pointing at source: {path}")
             path.unlink()
 
 
 def guarded_backup(source: Path, destination: Path) -> None:
     src = source.resolve(strict=True)
     dst = destination.resolve(strict=False)
-    assert not source.is_symlink()
-    assert not destination.is_symlink()
-    assert src != dst
-    assert dst.parent.exists()
+    if source.is_symlink():
+        raise RuntimeError("source must not be a symlink")
+    if destination.is_symlink():
+        raise RuntimeError("destination must not be a symlink")
+    if src == dst:
+        raise RuntimeError("source and destination must differ")
+    if not dst.parent.exists():
+        raise RuntimeError("destination parent directory does not exist")
     for sidecar in (Path(str(dst) + "-wal"), Path(str(dst) + "-shm")):
-        assert sidecar.resolve(strict=False) != src
+        if sidecar.resolve(strict=False) == src:
+            raise RuntimeError(f"sidecar would overlap source: {sidecar}")
 
     captured_revision = source_alembic_revision(src)
     attempts, delay = 5, 0.1
@@ -116,12 +129,16 @@ def guarded_backup(source: Path, destination: Path) -> None:
                 with sqlite3.connect(str(dst)) as out:
                     ro.backup(out)
                     out.commit()
-            assert source_alembic_revision(src) == captured_revision
+            if source_alembic_revision(src) != captured_revision:
+                raise RuntimeError("source revision changed during backup")
             with sqlite3.connect(str(dst)) as check:
                 row = check.execute("SELECT version_num FROM alembic_version").fetchone()
-                assert row is not None
-                assert str(row[0]) == captured_revision
-                assert check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+                if row is None:
+                    raise RuntimeError("backed up database is missing alembic_version")
+                if str(row[0]) != captured_revision:
+                    raise RuntimeError("backed up database revision mismatch")
+                if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise RuntimeError("backed up database failed integrity check")
             return
         except sqlite3.OperationalError as exc:
             base_code = sqlite_base_error_code(exc)
@@ -133,9 +150,12 @@ def guarded_backup(source: Path, destination: Path) -> None:
                 guarded_cleanup(destination, source)
                 raise
             guarded_cleanup(destination, source)
-            assert not dst.exists()
-            assert not Path(str(dst) + "-wal").exists()
-            assert not Path(str(dst) + "-shm").exists()
+            if dst.exists():
+                raise RuntimeError("destination still exists after cleanup")
+            if Path(str(dst) + "-wal").exists():
+                raise RuntimeError("destination WAL sidecar still exists after cleanup")
+            if Path(str(dst) + "-shm").exists():
+                raise RuntimeError("destination SHM sidecar still exists after cleanup")
             time.sleep(delay)
             delay *= 2
         except Exception:
@@ -314,11 +334,16 @@ def _tables_with_orphans(bind: sa.engine.Connection) -> None:
 
 
 def _ensure_preflight(bind: sa.engine.Connection) -> str:
-    assert current_version(bind) == "6a7b8c9d0e1f"
-    assert table_exists(bind, "facts")
-    assert table_exists(bind, "receipts")
-    assert table_exists(bind, "outbox_entries")
-    assert "dedup_key" not in {row["name"] for row in table_info(bind, "facts")}
+    if current_version(bind) != "6a7b8c9d0e1f":
+        raise RuntimeError("unexpected source migration revision")
+    if not table_exists(bind, "facts"):
+        raise RuntimeError("facts table is missing before migration")
+    if not table_exists(bind, "receipts"):
+        raise RuntimeError("receipts table is missing before migration")
+    if not table_exists(bind, "outbox_entries"):
+        raise RuntimeError("outbox_entries table is missing before migration")
+    if "dedup_key" in {row["name"] for row in table_info(bind, "facts")}:
+        raise RuntimeError("facts.dedup_key already exists before migration")
     _tables_with_orphans(bind)
     return inspect_pinned_index(bind)
 
@@ -545,9 +570,154 @@ def _full_state_snapshot(bind: sa.engine.Connection) -> dict[str, Any]:
     }
 
 
+def _parsed_snapshot_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = str(value)
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return datetime.min
+
+
+def _lifecycle_state_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        _parsed_snapshot_datetime(row["updated_at"]),
+        float(row["confidence"]),
+        str(row["id"]),
+    )
+
+
+def _relation_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        _parsed_snapshot_datetime(row["created_at"]),
+        str(row["source_id"]),
+        str(row["target_id"]),
+        str(row["relation_type"]),
+    )
+
+
+def _bulk_insert_rows(
+    bind: sa.engine.Connection,
+    table: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+) -> None:
+    if not rows:
+        return
+    placeholders = ", ".join(f":{column}" for column in columns)
+    statement = sa.text(
+        f"INSERT INTO {table} (" + ", ".join(columns) + f") VALUES ({placeholders})"
+    )
+    batch_size = _effective_batch(bind, params_per_row=len(columns), fixed_params=0)
+    for start in range(0, len(rows), batch_size):
+        bind.execute(statement, rows[start : start + batch_size])
+
+
+def _rebuild_reference_tables(
+    bind: sa.engine.Connection,
+    pre_state: dict[str, Any],
+    keeper_map: dict[str, str],
+) -> dict[str, int]:
+    lifecycle_state_rows: list[dict[str, Any]] = []
+    lifecycle_event_rows: list[dict[str, Any]] = []
+
+    for row in pre_state["rows"]["lifecycle_states"]:
+        memory_id = str(row[1])
+        remapped_memory_id = keeper_map.get(memory_id, memory_id)
+        lifecycle_state_rows.append(
+            {
+                "id": str(row[0]),
+                "memory_id": remapped_memory_id,
+                "memory_type": str(row[2]),
+                "current_state": str(row[3]),
+                "previous_state": row[4],
+                "confidence": row[5],
+                "updated_at": row[6],
+            }
+        )
+
+    lifecycle_state_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in lifecycle_state_rows:
+        lifecycle_state_groups.setdefault((row["memory_type"], row["memory_id"]), []).append(row)
+
+    deduped_lifecycle_states: list[dict[str, Any]] = []
+    for group_rows in lifecycle_state_groups.values():
+        winner = sorted(group_rows, key=_lifecycle_state_sort_key, reverse=True)[0]
+        deduped_lifecycle_states.append(winner)
+
+    for row in pre_state["rows"]["lifecycle_events"]:
+        memory_id = str(row[1])
+        remapped_memory_id = keeper_map.get(memory_id, memory_id)
+        lifecycle_event_rows.append(
+            {
+                "id": str(row[0]),
+                "memory_id": remapped_memory_id,
+                "memory_type": str(row[2]),
+                "from_state": str(row[3]),
+                "to_state": str(row[4]),
+                "reason": str(row[5]),
+                "triggered_by": str(row[6]),
+                "timestamp": row[7],
+            }
+        )
+
+    relation_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in pre_state["rows"]["claim_relations"]:
+        source_id = str(row[0])
+        target_id = str(row[1])
+        relation_type = str(row[2])
+        remapped_source = keeper_map.get(source_id, source_id)
+        remapped_target = keeper_map.get(target_id, target_id)
+        if remapped_source == remapped_target:
+            continue
+        remapped_row = {
+            "source_id": remapped_source,
+            "target_id": remapped_target,
+            "relation_type": relation_type,
+            "created_at": row[3],
+        }
+        relation_groups.setdefault(
+            (remapped_source, remapped_target, relation_type), []
+        ).append(remapped_row)
+
+    deduped_relations: list[dict[str, Any]] = []
+    for group_rows in relation_groups.values():
+        deduped_relations.append(sorted(group_rows, key=_relation_sort_key)[0])
+
+    bind.execute(sa.text("DELETE FROM lifecycle_states"))
+    bind.execute(sa.text("DELETE FROM lifecycle_events"))
+    bind.execute(sa.text("DELETE FROM claim_relations"))
+
+    _bulk_insert_rows(
+        bind,
+        "lifecycle_states",
+        ["id", "memory_id", "memory_type", "current_state", "previous_state", "confidence", "updated_at"],
+        deduped_lifecycle_states,
+    )
+    _bulk_insert_rows(
+        bind,
+        "lifecycle_events",
+        ["id", "memory_id", "memory_type", "from_state", "to_state", "reason", "triggered_by", "timestamp"],
+        lifecycle_event_rows,
+    )
+    _bulk_insert_rows(
+        bind,
+        "claim_relations",
+        ["source_id", "target_id", "relation_type", "created_at"],
+        deduped_relations,
+    )
+    return {
+        "lifecycle_states": len(deduped_lifecycle_states),
+        "lifecycle_events": len(lifecycle_event_rows),
+        "claim_relations": len(deduped_relations),
+    }
+
+
 def _assert_untouched_rows(before: dict[str, Any], after: dict[str, Any], tables: Sequence[str]) -> None:
     for table in tables:
-        assert after["rows"][table] == before["rows"][table], f"mutated untouched {table} rows"
+        if after["rows"][table] != before["rows"][table]:
+            raise RuntimeError(f"mutated untouched {table} rows")
 
 
 def _recreate_saved_indexes(
@@ -604,7 +774,10 @@ def upgrade() -> None:
     op.add_column("facts", sa.Column("dedup_key", sa.String(), nullable=True))
 
     _update_dedup_keys(bind)
-    assert int(_scalar(bind, "SELECT COUNT(*) FROM facts")) == int(_scalar(bind, "SELECT COUNT(dedup_key) FROM facts"))
+    if int(_scalar(bind, "SELECT COUNT(*) FROM facts")) != int(
+        _scalar(bind, "SELECT COUNT(dedup_key) FROM facts")
+    ):
+        raise RuntimeError("facts.dedup_key backfill incomplete")
 
     facts_copy = sa.Table(
         "facts",
@@ -638,9 +811,12 @@ def upgrade() -> None:
     # scanning, child-ID processing, SQL parameter batches, and other working sets.
     keeper_ids: list[str] = []
     deleted_fact_ids: list[str] = []
+    keeper_map: dict[str, str] = {}
     for keeper_id, group_deletes in _stream_keeper_decisions(_group_fact_rows(bind)):
         keeper_ids.append(keeper_id)
         deleted_fact_ids.extend(group_deletes)
+        for deleted_id in group_deletes:
+            keeper_map[deleted_id] = keeper_id
     keeper_ids = sorted(keeper_ids)
     deleted_fact_ids = sorted(set(deleted_fact_ids))
     pre_delete_ids = {str(row[0]) for row in _execute(bind, "SELECT id FROM facts", {}, kind="identity_snapshot")}
@@ -695,17 +871,30 @@ def upgrade() -> None:
     outbox_deleted = delete_owned_children("outbox_entries", "record_id", "child_select") if deleted_fact_ids else 0
     fact_deleted = sum(_delete_ids(bind, "facts", "id", chunk) for chunk in deleted_id_chunks())
 
-    assert fact_deleted == len(deleted_fact_ids)
+    if fact_deleted != len(deleted_fact_ids):
+        raise RuntimeError("fact duplicate deletion count mismatch")
     deleted_receipt_count = receipt_deleted
     deleted_outbox_count = outbox_deleted
-    assert pre_delete_ids == pre_rebuild_ids
+    if pre_delete_ids != pre_rebuild_ids:
+        raise RuntimeError("pre-delete identity changed during rebuild")
+
+    if deleted_fact_ids:
+        remap_counts = _rebuild_reference_tables(bind, pre_state, keeper_map)
+    else:
+        remap_counts = {
+            "lifecycle_states": len(pre_state["rows"]["lifecycle_states"]),
+            "lifecycle_events": len(pre_state["rows"]["lifecycle_events"]),
+            "claim_relations": len(pre_state["rows"]["claim_relations"]),
+        }
 
     _recreate_saved_indexes(bind, saved_indexes, pinned_state)
 
-    assert primary_key_info(bind, "facts") == ["id"]
+    if primary_key_info(bind, "facts") != ["id"]:
+        raise RuntimeError("facts primary key changed during migration")
     columns = table_info(bind, "facts")
-    assert len(columns) == 13
-    assert [column["name"] for column in columns] == [
+    if len(columns) != 13:
+        raise RuntimeError("facts schema does not include dedup_key")
+    if [column["name"] for column in columns] != [
         "id",
         "subject",
         "predicate",
@@ -719,13 +908,18 @@ def upgrade() -> None:
         "lifecycle_state",
         "version",
         "dedup_key",
-    ]
-    assert int(columns[-1]["notnull"]) == 1
+    ]:
+        raise RuntimeError("facts schema columns mismatch after migration")
+    if int(columns[-1]["notnull"]) != 1:
+        raise RuntimeError("facts.dedup_key is nullable after migration")
     post_ids = {str(row[0]) for row in _execute(bind, "SELECT id FROM facts", {}, kind="identity_scan")}
-    assert post_ids == pre_rebuild_ids - set(deleted_fact_ids)
-    assert len(post_ids) == pre_rebuild_count - len(deleted_fact_ids)
+    if post_ids != pre_rebuild_ids - set(deleted_fact_ids):
+        raise RuntimeError("unexpected surviving fact ids after migration")
+    if len(post_ids) != pre_rebuild_count - len(deleted_fact_ids):
+        raise RuntimeError("fact survivor count mismatch")
     for row in _execute(bind, "SELECT subject, predicate, object, dedup_key FROM facts", {}, kind="dedup_verify"):
-        assert str(row[3]) == fact_dedup_key(row[0], row[1], row[2])
+        if str(row[3]) != fact_dedup_key(row[0], row[1], row[2]):
+            raise RuntimeError("fact dedup_key backfill verification failed")
 
     if not index_exists(bind, _INDEX_NAME):
         if pinned_state == "absent":
@@ -739,29 +933,33 @@ def upgrade() -> None:
         else:
             _execute(bind, _expected_pinned_sql(), {}, kind="index_restore")
 
-    assert index_exists(bind, _INDEX_NAME)
+    if not index_exists(bind, _INDEX_NAME):
+        raise RuntimeError("pinned fact index missing after migration")
     saved_pinned_sql = next(
         (index["sql"] for index in saved_indexes if index["name"] == _INDEX_NAME),
         None,
     )
     current_sql = read_index_sql(bind, _INDEX_NAME) or ""
     if saved_pinned_sql is not None:
-        assert canonical_pinned_index_sql(current_sql) == canonical_pinned_index_sql(saved_pinned_sql)
+        if canonical_pinned_index_sql(current_sql) != canonical_pinned_index_sql(saved_pinned_sql):
+            raise RuntimeError("pinned fact index definition changed unexpectedly")
     else:
-        assert canonical_pinned_index_sql(current_sql) == EXPECTED_PINNED_CANONICAL
+        if canonical_pinned_index_sql(current_sql) != EXPECTED_PINNED_CANONICAL:
+            raise RuntimeError("pinned fact index definition mismatch")
 
     post_state = _full_state_snapshot(bind)
-    _assert_untouched_rows(
-        pre_state, post_state, ("decisions", "lifecycle_states", "lifecycle_events", "claim_relations")
-    )
+    if post_state["rows"]["decisions"] != pre_state["rows"]["decisions"]:
+        raise RuntimeError("decision rows were mutated unexpectedly")
     deleted_ids = set(deleted_fact_ids)
     pre_fact_ids = {str(row[0]) for row in pre_state["rows"]["facts"]}
     pre_facts = {str(row[0]): row for row in pre_state["rows"]["facts"]}
     post_facts = {str(row[0]): row for row in post_state["rows"]["facts"]}
     expected_survivors = pre_fact_ids - deleted_ids
-    assert set(post_facts) == expected_survivors
+    if set(post_facts) != expected_survivors:
+        raise RuntimeError("fact survivor set mismatch")
     for fact_id in expected_survivors:
-        assert post_facts[fact_id][:-1] == pre_facts[fact_id], f"mutated fact row {fact_id}"
+        if post_facts[fact_id][:-1] != pre_facts[fact_id]:
+            raise RuntimeError(f"mutated fact row {fact_id}")
 
     pre_receipts = pre_state["rows"]["receipts"]
     post_receipts = post_state["rows"]["receipts"]
@@ -773,12 +971,16 @@ def upgrade() -> None:
     post_owned_receipts = tuple(
         row for row in post_receipts if str(row[1]) == "fact" and str(row[0]) in pre_fact_ids
     )
-    assert sorted(post_owned_receipts) == sorted(surviving_receipts)
-    assert not tuple(row for row in post_owned_receipts if str(row[0]) in deleted_ids)
-    assert receipt_deleted == len(deleted_receipts)
-    assert tuple(row for row in post_receipts if str(row[1]) != "fact") == tuple(
+    if sorted(post_owned_receipts) != sorted(surviving_receipts):
+        raise RuntimeError("fact receipts were not reconciled to surviving ids")
+    if tuple(row for row in post_owned_receipts if str(row[0]) in deleted_ids):
+        raise RuntimeError("deleted fact receipt ids remain after migration")
+    if receipt_deleted != len(deleted_receipts):
+        raise RuntimeError("deleted fact receipt count mismatch")
+    if tuple(row for row in post_receipts if str(row[1]) != "fact") != tuple(
         row for row in pre_receipts if str(row[1]) != "fact"
-    ), "mutated or unexpected non-fact receipt row"
+    ):
+        raise RuntimeError("mutated or unexpected non-fact receipt row")
 
     pre_outbox = pre_state["rows"]["outbox_entries"]
     post_outbox = post_state["rows"]["outbox_entries"]
@@ -790,18 +992,50 @@ def upgrade() -> None:
     post_owned_outbox = tuple(
         row for row in post_outbox if str(row[1]) == "fact" and str(row[2]) in pre_fact_ids
     )
-    assert sorted(post_owned_outbox) == sorted(surviving_outbox)
-    assert not tuple(row for row in post_owned_outbox if str(row[2]) in deleted_ids)
-    assert outbox_deleted == len(deleted_outbox)
-    assert tuple(row for row in post_outbox if str(row[1]) != "fact") == tuple(
+    if sorted(post_owned_outbox) != sorted(surviving_outbox):
+        raise RuntimeError("fact outbox rows were not reconciled to surviving ids")
+    if tuple(row for row in post_owned_outbox if str(row[2]) in deleted_ids):
+        raise RuntimeError("deleted fact outbox ids remain after migration")
+    if outbox_deleted != len(deleted_outbox):
+        raise RuntimeError("deleted fact outbox count mismatch")
+    if tuple(row for row in post_outbox if str(row[1]) != "fact") != tuple(
         row for row in pre_outbox if str(row[1]) != "fact"
-    ), "mutated or unexpected non-fact outbox row"
-    assert tuple(row for row in post_outbox if str(row[1]) == "decision") == tuple(
+    ):
+        raise RuntimeError("mutated or unexpected non-fact outbox row")
+    if tuple(row for row in post_outbox if str(row[1]) == "decision") != tuple(
         row for row in pre_outbox if str(row[1]) == "decision"
-    ), "mutated decision-owned outbox row"
-    assert tuple(row for row in post_receipts if str(row[1]) == "decision") == tuple(
+    ):
+        raise RuntimeError("mutated decision-owned outbox row")
+    if tuple(row for row in post_receipts if str(row[1]) == "decision") != tuple(
         row for row in pre_receipts if str(row[1]) == "decision"
-    ), "mutated decision-owned receipt row"
+    ):
+        raise RuntimeError("mutated decision-owned receipt row")
+
+    lifecycle_state_refs = {
+        str(row[1])
+        for row in post_state["rows"]["lifecycle_states"]
+    }
+    lifecycle_event_refs = {
+        str(row[1])
+        for row in post_state["rows"]["lifecycle_events"]
+    }
+    relation_refs = {
+        ref
+        for row in post_state["rows"]["claim_relations"]
+        for ref in (str(row[0]), str(row[1]))
+    }
+    if deleted_ids & lifecycle_state_refs:
+        raise RuntimeError("deleted fact ids remain in lifecycle_states")
+    if deleted_ids & lifecycle_event_refs:
+        raise RuntimeError("deleted fact ids remain in lifecycle_events")
+    if deleted_ids & relation_refs:
+        raise RuntimeError("deleted fact ids remain in claim_relations")
+    if remap_counts["lifecycle_states"] != len(post_state["rows"]["lifecycle_states"]):
+        raise RuntimeError("lifecycle_state rebuild count mismatch")
+    if remap_counts["lifecycle_events"] != len(post_state["rows"]["lifecycle_events"]):
+        raise RuntimeError("lifecycle_event rebuild count mismatch")
+    if remap_counts["claim_relations"] != len(post_state["rows"]["claim_relations"]):
+        raise RuntimeError("claim_relation rebuild count mismatch")
 
     remaining_dupe_keys = [
         str(row[0])

@@ -180,6 +180,14 @@ def _turn(provider, text: str = TEXT_DOCKER) -> None:
                                  {"role": "assistant", "content": ""}])
 
 
+def _turn_without_messages(provider, user_content: str, assistant_content: str = "") -> None:
+    provider.sync_turn(
+        user_content=user_content,
+        assistant_content=assistant_content,
+        session_id=TURN_ID,
+    )
+
+
 def _docker_result(confidence: float = 0.85) -> ExtractedResult:
     return ExtractedResult(
         facts=({"subject": "Docker", "predicate": "is", "object": "container",
@@ -562,6 +570,33 @@ def test_e2e_invocation_exactly_once_per_learn(tmp_path, monkeypatch):
                 _unregister(provider)
 
 
+def test_e2e_sync_turn_without_messages_persists_fact(tmp_path, monkeypatch):
+    """Omitted messages uses the supported turn dict path and persists memory."""
+    provider = None
+    try:
+        provider = _make_provider(tmp_path, monkeypatch, spy=None,
+                                  extraction_cfg={"extraction_mode": "regex"})
+        _turn_without_messages(provider, user_content=TEXT_DOCKER)
+        provider.on_session_switch(new_session_id="next-session")
+        _bounded_wait(
+            "no-messages fact persisted",
+            lambda: _count_facts(provider, "Docker") >= 1 and provider._writer.total_flushed >= 1,
+            provider=provider,
+        )
+        row = _fact_row(provider)
+        assert row is not None
+        assert (row.subject, row.predicate, row.object) == ("Docker", "is", "container")
+        assert provider._writer.total_queued == 1
+        assert provider._writer.total_failed == 0
+        assert provider._writer.total_requeued == 0
+    finally:
+        if provider is not None:
+            try:
+                _e2e_teardown(provider, primary=sys.exc_info()[1])
+            finally:
+                _unregister(provider)
+
+
 def test_e2e_regex_fallback_when_no_callable(tmp_path, monkeypatch):
     """SPEC scenario 3: llm_extractor=None -> regex fallback, zero LLM calls."""
     provider = None
@@ -731,42 +766,43 @@ def test_e2e_b3b_passthrough_nondefaults(tmp_path, monkeypatch):
 
 
 def test_e2e_bounded_failure_diagnostics(tmp_path, monkeypatch, caplog):
-    """SPEC scenario 6: bounded failure diagnostics — queue counters +
-    captured ERROR identifies the failed turn; naked timeout insufficient."""
+    """SPEC scenario 6: bounded failure diagnostics with bounded retries."""
     provider = None
     try:
-        def spy(text):  # noqa: ARG001
-            return _docker_result()
+        import storage.repositories.fact_repo as fact_repo_mod
 
-        provider = _make_provider(tmp_path, monkeypatch, spy=spy)
-        real_handler = provider._writer._write_callback
+        attempts = {"n": 0}
 
-        async def wrapper(batch):
-            # REAL handler first — its normal logging path executes and the
-            # fact is written — THEN inject the failure (W3).
-            await real_handler(batch)
-            raise RuntimeError(f"injected batch failure (turn {TURN_ID})")
+        async def failing_create(self, fact):  # noqa: ARG001
+            attempts["n"] += 1
+            raise RuntimeError(f"learn boom {attempts['n']}")
 
-        provider._writer._write_callback = wrapper
+        monkeypatch.setattr(fact_repo_mod.FactRepository, "create", failing_create)
+        provider = _make_provider(tmp_path, monkeypatch, spy=None,
+                                  extraction_cfg={"extraction_mode": "regex"})
+
         caplog.set_level(logging.ERROR,
                          logger="memory_server.plugins.hermes.writer")
-        _turn(provider)
-        _run_async(provider._writer.flush(), timeout=5.0)
-        _bounded_wait("failure counted",
-                      lambda: provider._writer.total_failed >= 1, provider=provider)
+        _turn_without_messages(provider, user_content=TEXT_DOCKER)
+        provider.on_session_switch(new_session_id="next-session")
+        _bounded_wait(
+            "failure counted",
+            lambda: provider._writer.total_failed >= 1 and provider._writer.total_requeued == 2,
+            provider=provider,
+        )
         w = provider._writer
         assert w.total_queued == 1
-        assert w.total_flushed == 0, "post-callback increment must not run"
+        assert w.total_flushed == 0
         assert w.total_failed == 1
-        assert "flush failed for 1 items" in caplog.text
-        assert f"injected batch failure (turn {TURN_ID})" in caplog.text
-        # the REAL handler ran first: the fact is persisted
-        assert _count_facts(provider, "Docker") == 1
-        provider._writer._write_callback = real_handler
+        assert w.total_requeued == 2
+        assert w.failed_items and w.failed_items[0]["turn_id"] == TURN_ID
+        assert "learn boom 3" in w.failed_items[0]["error"]
+        assert "failed turn e2e after 3 attempts" in caplog.text
+        assert _count_facts(provider, "Docker") == 0
+        assert _count_receipts(provider) == 0
+        assert attempts["n"] == 3
     finally:
         if provider is not None:
-            if provider._writer is not None:
-                provider._writer._write_callback = real_handler
             try:
                 _e2e_teardown(provider, primary=sys.exc_info()[1])
             finally:

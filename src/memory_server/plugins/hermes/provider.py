@@ -883,9 +883,10 @@ class HermesProvider:
             "session_id": session_id or self._session_id,
             "timestamp": time.time(),
         }
+        turn_messages = messages if messages is not None else turn_data
 
         _run_async(
-            self._writer.add_turn(messages or [turn_data], turn_id=session_id),
+            self._writer.add_turn(turn_messages, turn_id=session_id or self._session_id),
             timeout=5.0,
         )
 
@@ -2062,19 +2063,23 @@ class HermesProvider:
     # Writer queue batch handler
     # ------------------------------------------------------------------
 
-    async def _handle_batch_write(self, batch: list[tuple[list, str | None]]):
+    async def _handle_batch_write(self, batch: list[tuple[object, str | None]]):
         """Process a batch of turn observations.
 
         Called by WriterQueue during periodic or explicit flushes.
         Each item is a (messages, turn_id) tuple.
         """
+        outcomes: list[tuple[tuple[object, str | None], bool, str | None]] = []
         if not self._provider:
             logger.warning("HermesProvider: cannot write batch — not initialized")
-            return
+            error = "HermesProvider not initialized"
+            return [((messages, turn_id), False, error) for messages, turn_id in batch]
 
         provider = self._require_provider()
 
         for messages, turn_id in batch:
+            error_text: str | None = None
+            ok = False
             try:
                 # Extract text from the turn for CMMS ingestion
                 text_content = self._extract_turn_text(messages)
@@ -2094,11 +2099,15 @@ class HermesProvider:
                         llm_max_input_chars=self._extractor_runtime.llm_max_input_chars,
                         llm_confidence_gate=self._extractor_runtime.llm_confidence_gate,
                     )
-            except Exception:
+                ok = True
+            except Exception as exc:
+                error_text = str(exc)
                 logger.exception(
                     "HermesProvider: failed to write turn %s in batch",
                     turn_id,
                 )
+            outcomes.append(((messages, turn_id), ok, error_text))
+        return outcomes
 
     @staticmethod
     def _extract_turn_text(messages: list | dict) -> str:

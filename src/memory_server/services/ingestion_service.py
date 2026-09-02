@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from storage.dedup import fact_dedup_key
 from storage.outbox import OutboxRepository
 from storage.repositories import (
     BeliefRepository,
@@ -163,6 +164,7 @@ class MemoryIngestionService:
                     subject=subject,
                     predicate=predicate,
                     object=object,
+                    dedup_key=fact_dedup_key(subject, predicate, object),
                     confidence=confidence,
                     source=source,
                     created_at=now,
@@ -438,20 +440,51 @@ class MemoryIngestionService:
                         receipts.append(stored_receipt.model_dump(mode="json"))
                         continue
                     fact_id = str(uuid4())
+                    dedup_key = fact_dedup_key(subject, predicate, object)
                     fact = Fact(
                         id=fact_id,
                         subject=subject,
                         predicate=predicate,
                         object=object,
+                        dedup_key=dedup_key,
                         confidence=ef.get("confidence", 0.5),
                         source=source,
                         created_at=now,
                     )
-                    stored_fact = await fact_repo.create(fact)
+                    try:
+                        async with session.begin_nested():
+                            stored_fact = await fact_repo.create(fact)
+                    except IntegrityError:
+                        logger.debug(
+                            "Concurrent duplicate fact insert for "
+                            "(subject=%r, predicate=%r, object=%r) — unique index "
+                            "fired, treating as duplicate (race loser)",
+                            subject,
+                            predicate,
+                            object,
+                        )
+                        keeper_fact = await fact_repo.find_existing(subject, predicate, object)
+                        if keeper_fact is None:
+                            raise RuntimeError("fact dedup race lost but keeper could not be reloaded")
+                        stored_fact, stored_receipt = await reinforce_memory_item(
+                            session,
+                            memory_type="fact",
+                            item_id=keeper_fact.id,
+                            new_confidence=ef.get("confidence", 0.5),
+                            source=source,
+                            previous_confidence=keeper_fact.confidence,
+                        )
+                        facts_result.append({
+                            "receipt": stored_receipt.model_dump(mode="json"),
+                            "item": stored_fact.model_dump(mode="json"),
+                        })
+                        receipts.append(stored_receipt.model_dump(mode="json"))
+                        created_facts.append(stored_fact)
+                        continue
                     created_facts.append(stored_fact)
 
                     receipt = MemoryReceipt(
-                        id=fact_id,
+                        id=stored_fact.id,
                         memory_type="fact",
                         source=source,
                         created_by="learn",
@@ -463,7 +496,7 @@ class MemoryIngestionService:
 
                     await outbox_repo.add_entry(
                         record_type="fact",
-                        record_id=fact_id,
+                        record_id=stored_fact.id,
                         operation="index_fact",
                         payload={
                             "subject": ef.get("subject", ""),

@@ -3,13 +3,16 @@ import sys
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool, text
+from sqlalchemy import engine_from_config, pool
 
 # Add project root to sys.path so storage.models is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Import all storage models to populate Base.metadata
 from storage.models import Base  # noqa: E402
+from storage.sqlite_support import apply_sqlite_pragmas_sync, validate_busy_timeout_ms
+
+from memory_server.settings import get_settings  # noqa: E402
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -67,9 +70,11 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        # Enable WAL mode for SQLite
-        connection.execute(text("PRAGMA journal_mode=WAL"))
-        connection.execute(text("PRAGMA synchronous=NORMAL"))
+        apply_sqlite_pragmas_sync(
+            connection,
+            validate_busy_timeout_ms(get_settings().sqlite_busy_timeout_ms),
+            context="Alembic migrations",
+        )
         connection.commit()
 
         context.configure(

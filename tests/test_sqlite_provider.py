@@ -2,10 +2,21 @@
 
 import pytest
 from sqlalchemy import event
+from storage.adapters.legacy_provider import LegacySQLiteProviderAdapter
+from storage.dedup import fact_dedup_key
+from storage.outbox_worker import OutboxWorker
 
 import memory_server.providers.sqlite_provider as sqlite_provider_module
-from memory_server.models import Fact, MemoryReceipt, VerificationStatus
+from memory_server.models import Fact as DomainFact
+from memory_server.models import MemoryReceipt, VerificationStatus
 from memory_server.providers.sqlite_provider import SQLiteProvider
+
+
+def make_fact(**kwargs):
+    return DomainFact(
+        **kwargs,
+        dedup_key=fact_dedup_key(kwargs["subject"], kwargs["predicate"], kwargs["object"]),
+    )
 
 
 @pytest.fixture
@@ -20,13 +31,13 @@ async def provider():
 @pytest.mark.asyncio
 class TestFactCRUD:
     async def test_create_fact(self, provider):
-        f = Fact(id="f1", subject="Docker", predicate="runs_on", object="OMV8")
+        f = make_fact(id="f1", subject="Docker", predicate="runs_on", object="OMV8")
         created = await provider.create_fact(f)
         assert created.id == "f1"
         assert created.subject == "Docker"
 
     async def test_get_fact(self, provider):
-        f = Fact(id="f2", subject="Test", predicate="is", object="Working")
+        f = make_fact(id="f2", subject="Test", predicate="is", object="Working")
         await provider.create_fact(f)
         retrieved = await provider.get_fact("f2")
         assert retrieved is not None
@@ -40,43 +51,43 @@ class TestFactCRUD:
 
     async def test_search_facts_by_subject(self, provider):
         await provider.create_fact(
-            Fact(id="f3", subject="Docker", predicate="uses", object="Port 8080")
+            make_fact(id="f3", subject="Docker", predicate="uses", object="Port 8080")
         )
         await provider.create_fact(
-            Fact(id="f4", subject="Nginx", predicate="uses", object="Port 80")
+            make_fact(id="f4", subject="Nginx", predicate="uses", object="Port 80")
         )
         results = await provider.search_facts(subject="Docker")
         assert len(results) == 1
         assert results[0].id == "f3"
 
     async def test_search_facts_by_predicate(self, provider):
-        await provider.create_fact(Fact(id="f5", subject="A", predicate="runs_on", object="X"))
-        await provider.create_fact(Fact(id="f6", subject="B", predicate="depends_on", object="Y"))
+        await provider.create_fact(make_fact(id="f5", subject="A", predicate="runs_on", object="X"))
+        await provider.create_fact(make_fact(id="f6", subject="B", predicate="depends_on", object="Y"))
         results = await provider.search_facts(predicate="runs_on")
         assert len(results) == 1
         assert results[0].id == "f5"
 
     async def test_search_facts_by_object(self, provider):
-        await provider.create_fact(Fact(id="f7", subject="S1", predicate="has", object="Target"))
+        await provider.create_fact(make_fact(id="f7", subject="S1", predicate="has", object="Target"))
         results = await provider.search_facts(object="Target")
         assert len(results) == 1
 
     async def test_search_facts_by_source(self, provider):
         await provider.create_fact(
-            Fact(id="f8", subject="X", predicate="is", object="Y", source="manual")
+            make_fact(id="f8", subject="X", predicate="is", object="Y", source="manual")
         )
         await provider.create_fact(
-            Fact(id="f9", subject="X", predicate="is", object="Z", source="auto")
+            make_fact(id="f9", subject="X", predicate="is", object="Z", source="auto")
         )
         results = await provider.search_facts(source="manual")
         assert len(results) == 1
 
     async def test_search_facts_text_search(self, provider):
         await provider.create_fact(
-            Fact(id="f10", subject="Docker", predicate="is", object="Container")
+            make_fact(id="f10", subject="Docker", predicate="is", object="Container")
         )
         await provider.create_fact(
-            Fact(id="f11", subject="Caddy", predicate="is", object="Web Server")
+            make_fact(id="f11", subject="Caddy", predicate="is", object="Web Server")
         )
         results = await provider.search_facts(text="Docker")
         assert len(results) == 1
@@ -87,10 +98,10 @@ class TestFactCRUD:
 
     async def test_search_facts_excludes_inactive_by_default(self, provider):
         active = await provider.create_fact(
-            Fact(id="f-inactive-1", subject="Active", predicate="is", object="Visible")
+            make_fact(id="f-inactive-1", subject="Active", predicate="is", object="Visible")
         )
         inactive = await provider.create_fact(
-            Fact(id="f-inactive-2", subject="Old", predicate="is", object="Hidden")
+            make_fact(id="f-inactive-2", subject="Old", predicate="is", object="Hidden")
         )
         await provider.update_fact(inactive.id, lifecycle_state="superseded")
 
@@ -101,7 +112,7 @@ class TestFactCRUD:
         assert {fact.id for fact in all_results} == {active.id, inactive.id}
 
     async def test_update_fact(self, provider):
-        f = Fact(id="f12", subject="Old", predicate="is", object="Value")
+        f = make_fact(id="f12", subject="Old", predicate="is", object="Value")
         await provider.create_fact(f)
         updated = await provider.update_fact("f12", object="NewValue")
         assert updated is not None
@@ -115,7 +126,7 @@ class TestFactCRUD:
         assert result is None
 
     async def test_delete_fact(self, provider):
-        f = Fact(id="f13", subject="Temp", predicate="is", object="Removed")
+        f = make_fact(id="f13", subject="Temp", predicate="is", object="Removed")
         await provider.create_fact(f)
         result = await provider.delete_fact("f13")
         assert result is True
@@ -135,7 +146,7 @@ class TestProviderInitialization:
         provider = SQLiteProvider(url=db_url)
         await provider.initialize()
         await provider.create_fact(
-            Fact(id="fts-existing", subject="Docker", predicate="runs_on", object="OMV")
+            make_fact(id="fts-existing", subject="Docker", predicate="runs_on", object="OMV")
         )
         await provider.close()
 
@@ -174,7 +185,7 @@ class TestProviderInitialization:
         provider = SQLiteProvider(url=db_url)
         await provider.initialize()
         await provider.create_fact(
-            Fact(id="fts-rebuild", subject="Docker", predicate="runs_on", object="OMV")
+            make_fact(id="fts-rebuild", subject="Docker", predicate="runs_on", object="OMV")
         )
 
         engine = provider.engine
@@ -201,6 +212,54 @@ class TestProviderInitialization:
 
         assert [fact.id for fact in results] == ["fts-rebuild"]
         assert count == 1
+
+
+@pytest.mark.asyncio
+class TestFileBackedJournalMode:
+    async def test_file_backed_connections_have_wal_and_busy_timeout(self, tmp_path):
+        db_url = f"sqlite+aiosqlite:///{tmp_path / 'journal-policy.db'}"
+
+        provider = SQLiteProvider(url=db_url)
+        await provider.initialize()
+        try:
+            engine = provider.engine
+            assert engine is not None
+            async with engine.connect() as conn:
+                journal_mode = (await conn.exec_driver_sql("PRAGMA journal_mode")).scalar_one()
+                busy_timeout = (await conn.exec_driver_sql("PRAGMA busy_timeout")).scalar_one()
+            assert str(journal_mode).lower() == "wal"
+            assert busy_timeout == provider._busy_timeout_ms
+        finally:
+            await provider.close()
+
+        adapter = LegacySQLiteProviderAdapter(url=db_url)
+        await adapter.initialize()
+        try:
+            engine = adapter._engine
+            assert engine is not None
+            async with engine.connect() as conn:
+                journal_mode = (await conn.exec_driver_sql("PRAGMA journal_mode")).scalar_one()
+                busy_timeout = (await conn.exec_driver_sql("PRAGMA busy_timeout")).scalar_one()
+            assert str(journal_mode).lower() == "wal"
+            assert busy_timeout == 5000
+        finally:
+            await adapter.close()
+
+        provider_for_worker = SQLiteProvider(url=db_url)
+        await provider_for_worker.initialize()
+        worker = OutboxWorker(engine=provider_for_worker.engine, db_url=db_url)
+        await worker.initialize()
+        try:
+            engine = worker._engine
+            assert engine is not None
+            async with engine.connect() as conn:
+                journal_mode = (await conn.exec_driver_sql("PRAGMA journal_mode")).scalar_one()
+                busy_timeout = (await conn.exec_driver_sql("PRAGMA busy_timeout")).scalar_one()
+            assert str(journal_mode).lower() == "wal"
+            assert busy_timeout == worker._busy_timeout_ms
+        finally:
+            await worker.close()
+            await provider_for_worker.close()
 
 
 @pytest.mark.asyncio

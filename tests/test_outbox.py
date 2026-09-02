@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from storage.base import Base, utcnow
+from storage.dedup import fact_dedup_key
 from storage.outbox import OutboxEntry, OutboxEntryORM, OutboxRepository
 from storage.outbox_worker import OutboxWorker
 
@@ -172,6 +173,37 @@ class TestOutboxRepository:
             pending = await repo.get_pending(limit=3)
             assert len(pending) == 3
 
+    async def test_claim_pending_is_atomic_under_concurrency(self, empty_db):
+        """Two concurrent claims must not return the same outbox row."""
+        factory, _ = empty_db
+        async with factory() as session:
+            repo = OutboxRepository(session)
+            entry = await repo.add_entry("fact", "f-claim", "index_fact", {"x": "claim"})
+            await session.commit()
+
+        start = asyncio.Event()
+
+        async def claim_once():
+            async with factory() as session:
+                repo = OutboxRepository(session)
+                await start.wait()
+                claimed = await repo.claim_pending(limit=1)
+                await session.commit()
+                return claimed
+
+        task_one = asyncio.create_task(claim_once())
+        task_two = asyncio.create_task(claim_once())
+        start.set()
+        left, right = await asyncio.gather(task_one, task_two)
+
+        claimed_ids = [row.id for rows in (left, right) for row in rows]
+        assert claimed_ids == [entry.id]
+
+        async with factory() as session:
+            row = await session.get(OutboxEntryORM, entry.id)
+            assert row is not None
+            assert row.status == "processing"
+
     async def test_mark_completed(self, empty_db):
         """Marking an entry as completed updates status."""
         factory, _ = empty_db
@@ -270,6 +302,14 @@ class TestOutboxRepository:
             assert pending[0].id == entry.id
             assert pending[0].status == "pending"
             assert pending[0].processed_at is None
+
+            claimed = await repo.claim_pending(limit=1)
+            assert len(claimed) == 1
+            assert claimed[0].id == entry.id
+            await session.commit()
+            row = await session.get(OutboxEntryORM, entry.id)
+            assert row is not None
+            assert row.status == "processing"
 
     async def test_reset_stale_processing_keeps_fresh_entry(self, empty_db):
         """A processing entry newer than the cutoff is NOT reset."""
@@ -1092,6 +1132,7 @@ class TestServerOutboxIntegration:
             subject="Transactional",
             predicate="is",
             object="Atomic",
+            dedup_key=fact_dedup_key("Transactional", "is", "Atomic"),
             confidence=1.0,
             source="test",
             created_at=datetime.now(timezone.utc),

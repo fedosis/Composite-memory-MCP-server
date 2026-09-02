@@ -10,6 +10,7 @@ import os
 
 import pytest
 from storage.base import Base as StorageBase
+from storage.dedup import fact_dedup_key
 from storage.models import (
     EntityORM,
     LifecycleEventORM,
@@ -263,7 +264,13 @@ class TestFactRepositoryCRUD:
                 await engine.dispose()
 
     async def test_create_and_get(self, repo):
-        f = Fact(id="repo-f1", subject="Docker", predicate="runs_on", object="OMV8")
+        f = Fact(
+            id="repo-f1",
+            subject="Docker",
+            predicate="runs_on",
+            object="OMV8",
+            dedup_key=fact_dedup_key("Docker", "runs_on", "OMV8"),
+        )
         created = await repo.create(f)
         assert created.id == "repo-f1"
 
@@ -276,19 +283,27 @@ class TestFactRepositoryCRUD:
         assert result is None
 
     async def test_search(self, repo):
-        await repo.create(Fact(id="sf1", subject="A", predicate="is", object="X"))
-        await repo.create(Fact(id="sf2", subject="B", predicate="is", object="Y"))
+        await repo.create(
+            Fact(id="sf1", subject="A", predicate="is", object="X", dedup_key=fact_dedup_key("A", "is", "X"))
+        )
+        await repo.create(
+            Fact(id="sf2", subject="B", predicate="is", object="Y", dedup_key=fact_dedup_key("B", "is", "Y"))
+        )
         results = await repo.search(subject="A")
         assert len(results) == 1
 
     async def test_update(self, repo):
-        await repo.create(Fact(id="uf1", subject="Old", predicate="is", object="Val"))
+        await repo.create(
+            Fact(id="uf1", subject="Old", predicate="is", object="Val", dedup_key=fact_dedup_key("Old", "is", "Val"))
+        )
         updated = await repo.update("uf1", object="NewVal")
         assert updated is not None
         assert updated.object == "NewVal"
 
     async def test_delete(self, repo):
-        await repo.create(Fact(id="df1", subject="Del", predicate="is", object="Gone"))
+        await repo.create(
+            Fact(id="df1", subject="Del", predicate="is", object="Gone", dedup_key=fact_dedup_key("Del", "is", "Gone"))
+        )
         result = await repo.delete("df1")
         assert result is True
         assert await repo.get("df1") is None

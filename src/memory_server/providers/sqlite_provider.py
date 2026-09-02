@@ -29,6 +29,7 @@ from storage.repositories import (
     RelationRepository,
     SkillRepository,
 )
+from storage.sqlite_support import apply_sqlite_pragmas_async, install_busy_timeout_listener, validate_busy_timeout_ms
 
 from memory_server.models import (
     Belief,
@@ -59,7 +60,7 @@ class SQLiteProvider:
         busy_timeout_ms: int = 5000,
     ):
         self._url = url
-        self._busy_timeout_ms = busy_timeout_ms
+        self._busy_timeout_ms = validate_busy_timeout_ms(busy_timeout_ms)
         self._engine = None
         self._session_factory = None
 
@@ -96,12 +97,19 @@ class SQLiteProvider:
     async def initialize(self):
         """Create engine, tables, and session factory with WAL mode."""
         self._engine = create_async_engine(self._url, echo=False)
+        install_busy_timeout_listener(self._engine, self._busy_timeout_ms)
 
         # Enable WAL mode for concurrent read performance
         async with self._engine.connect() as conn:
-            await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
-            await conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
-            await conn.exec_driver_sql(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+            await apply_sqlite_pragmas_async(
+                conn,
+                self._busy_timeout_ms,
+                context="SQLiteProvider",
+                allow_degraded_mode=self._url in {
+                    "sqlite+aiosqlite://",
+                    "sqlite+aiosqlite:///:memory:",
+                },
+            )
 
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

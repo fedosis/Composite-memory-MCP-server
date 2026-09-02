@@ -1303,11 +1303,11 @@ def assert_post_migration_state(db_path: Path, before: dict[str, Any] | None = N
             ("decision-2", "use Caddy or Nginx"),
         ]
         assert _rows(conn, "lifecycle_states", ["id", "memory_id"]) == [
-            ("ls-fact-1", "fact-active-1"),
+            ("ls-fact-1", "fact-active-2"),
             ("ls-decision-1", "decision-1"),
         ]
         assert _rows(conn, "claim_relations", ["source_id", "target_id", "relation_type"]) == [
-            ("fact-active-1", "fact-empty-1", "related_to"),
+            ("fact-active-2", "fact-empty-2", "related_to"),
             ("decision-1", "fact-tie-a", "depends_on"),
         ]
 
@@ -1337,9 +1337,18 @@ def test_subprocess_event_enabled(tmp_path):
     assert_post_migration_state(db_path, before)
     with sqlite3.connect(str(db_path)) as conn:
         assert full_table_snapshot(conn, "decisions") == before["decisions"]
-        assert full_table_snapshot(conn, "lifecycle_states") == before["lifecycle_states"]
-        assert full_table_snapshot(conn, "lifecycle_events") == before["lifecycle_events"]
-        assert full_table_snapshot(conn, "claim_relations") == before["claim_relations"]
+        deleted_ids = {
+            "fact-active-1", "fact-active-3", "fact-active-4",
+            "fact-archived-2", "fact-empty-1", "fact-tie-b",
+        }
+        reference_tables = (
+            ("lifecycle_states", ("memory_id",)),
+            ("lifecycle_events", ("memory_id",)),
+            ("claim_relations", ("source_id", "target_id")),
+        )
+        for table, columns in reference_tables:
+            rows = conn.execute(f"SELECT {', '.join(columns)} FROM {table}").fetchall()
+            assert not any(value in deleted_ids for row in rows for value in row)
 
 
 def test_owned_child_reconciliation_rejects_omitted_fact_receipt(tmp_path, monkeypatch):
@@ -1355,7 +1364,7 @@ def test_owned_child_reconciliation_rejects_omitted_fact_receipt(tmp_path, monke
 
     monkeypatch.setattr(module, "_delete_ids", omit_receipt_delete)
     engine = sa.create_engine(f"sqlite:///{db_path}")
-    with pytest.raises(AssertionError):
+    with pytest.raises((RuntimeError, AssertionError)):
         with engine.begin() as connection:
             module.op = Operations(MigrationContext.configure(connection, opts={"transactional_ddl": True}))
             module.upgrade()

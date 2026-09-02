@@ -20,6 +20,7 @@ class Fact(BaseModel):
     subject: str
     predicate: str
     object: str
+    dedup_key: Optional[str] = None
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     source: Optional[str] = None
     creator: str = "system"

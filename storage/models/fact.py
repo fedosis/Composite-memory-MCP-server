@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, String
+from sqlalchemy import DateTime, Float, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import Fact
@@ -14,11 +14,20 @@ class FactORM(Base):
     """SQLAlchemy ORM model for Facts — canonical fields."""
 
     __tablename__ = "facts"
+    __table_args__ = (
+        Index(
+            "uq_facts_spo_active",
+            "dedup_key",
+            unique=True,
+            sqlite_where=text("lifecycle_state IN ('candidate', 'validated', 'active')"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     subject: Mapped[str] = mapped_column(String, nullable=False, index=True)
     predicate: Mapped[str] = mapped_column(String, nullable=False, index=True)
     object: Mapped[str] = mapped_column(String, nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     creator: Mapped[str] = mapped_column(String, default="system")
@@ -34,6 +43,7 @@ class FactORM(Base):
             subject=self.subject,
             predicate=self.predicate,
             object=self.object,
+            dedup_key=self.dedup_key,
             confidence=self.confidence,
             source=self.source,
             creator=self.creator,
@@ -46,11 +56,14 @@ class FactORM(Base):
 
     @classmethod
     def from_pydantic(cls, fact: Fact) -> "FactORM":
+        if fact.dedup_key is None:
+            raise ValueError("Fact.dedup_key is required before persistence")
         return cls(
             id=fact.id,
             subject=fact.subject,
             predicate=fact.predicate,
             object=fact.object,
+            dedup_key=fact.dedup_key,
             confidence=fact.confidence,
             source=fact.source,
             creator=fact.creator,

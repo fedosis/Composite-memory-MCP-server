@@ -29,7 +29,14 @@ def make_fact(fact_id="fact-1", confidence=0.4, **kwargs):
     return Fact(
         id=fact_id, subject=kwargs.get("subject", "Docker"),
         predicate=kwargs.get("predicate", "is"),
-        object=kwargs.get("object", "container"), confidence=confidence,
+        object=kwargs.get("object", "container"),
+        dedup_key=fact_dedup_key(
+            kwargs.get("subject", "Docker"),
+            kwargs.get("predicate", "is"),
+            kwargs.get("object", "container"),
+        ),
+        confidence=confidence,
+        lifecycle_state=kwargs.get("lifecycle_state", "active"),
         source="seed", created_at=datetime.now(timezone.utc),
     )
 
@@ -302,7 +309,7 @@ async def test_stale_guard_preserves_existing_receipt(provider):
 
 @pytest.mark.asyncio
 async def test_find_existing_orders_active_candidates_and_rejects_case_change(provider):
-    low = await provider.create_fact(make_fact("low", confidence=0.4))
+    low = await provider.create_fact(make_fact("low", confidence=0.4, lifecycle_state="rejected"))
     high = await provider.create_fact(make_fact("high", confidence=0.8))
     async with provider._session_factory() as session:
         found = await FactRepository(session).find_existing("Docker", "is", "container")
