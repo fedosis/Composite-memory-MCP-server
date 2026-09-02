@@ -5,9 +5,16 @@ across both module aliases, resolver/factory exactly-once caching, the four
 explicit llm_* kwargs on the writer path, busy_timeout wiring proofs, per-
 initialization-step failure injection (FP0a-FP3c), POISONED/CLOSE_FAILED
 lifecycle states, and single-owner engine disposal ([R4-F1]).
+
+Canonical focused run (round-2, C-W1): the bare repo command
+`pytest tests/test_provider_wiring.py -x -q` can resolve the STALE installed
+`memory_server` package from site-packages and fail before importing this
+file's subject. Always run the source-tree gate:
+`PYTHONPATH=src pytest tests/test_provider_wiring.py -x -q`.
 """
 
 import asyncio
+import inspect
 import logging
 import threading
 import time
@@ -586,6 +593,112 @@ def test_writer_path_passes_four_explicit_kwargs(tmp_path, monkeypatch, case):
             assert svc_kw.get("llm_confidence_gate", 0.7) == 0.7
     finally:
         provider.shutdown()
+
+
+async def test_cached_none_effective_defaults_at_real_service_boundary(
+    tmp_path, monkeypatch
+):
+    """C-W2: cached-None effective values OBSERVED at the real A2 boundary.
+
+    The cached-none case in test_writer_path_passes_four_explicit_kwargs uses
+    a NON-delegating service recorder, so its 15.0/8000/0.7 effective values
+    come from the test's dict.get(...) fallback. This test DELEGATES to the
+    REAL MemoryIngestionService.learn and reads the effective defaults from
+    the real service signature (ingestion_service.py:239-242 +
+    LLM_CONFIDENCE_GATE) — the actual values a cached-None resolution
+    produces at the service boundary — while KEEPING the separate leg-1
+    explicit-key assertion.
+    """
+    monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "lancedb")
+    import memory_server.providers.embedding_provider as embedding_module
+
+    monkeypatch.setattr(
+        embedding_module, "SentenceTransformerEmbeddingProvider", MockEmbeddingProvider
+    )
+    _deterministic_extraction_env(monkeypatch)
+
+    def stub_resolver(cfg, settings):
+        return ExtractorRuntimeConfig(
+            extraction_mode="regex",
+            llm_model=None,
+            llm_timeout_seconds=None,
+            llm_max_input_chars=None,
+            llm_confidence_gate=None,
+        )
+
+    monkeypatch.setattr(provider_mod, "resolve_extractor_settings", stub_resolver)
+    # factory stays REAL: regex mode -> None
+
+    # Leg 1 spy: provider -> api.learn (delegating).
+    import memory_server.api.learn as learn_mod
+
+    leg1_calls: list[dict] = []
+    orig_learn = learn_mod.learn
+
+    async def learn_recorder(**kwargs):
+        leg1_calls.append(kwargs)
+        return await orig_learn(**kwargs)
+
+    monkeypatch.setattr(learn_mod, "learn", learn_recorder)
+
+    # Leg 2 spy: api.learn -> REAL MemoryIngestionService.learn (delegating).
+    leg2_calls: list[dict] = []
+    orig_svc_learn = svc_mod.MemoryIngestionService.learn
+
+    async def service_recorder(self, **kwargs):
+        leg2_calls.append(kwargs)
+        return await orig_svc_learn(self, **kwargs)
+
+    monkeypatch.setattr(svc_mod.MemoryIngestionService, "learn", service_recorder)
+
+    provider = None
+    try:
+        provider = _init_inmemory_provider(tmp_path, monkeypatch)
+        assert provider._llm_extractor is None
+        assert provider._extractor_runtime.llm_timeout_seconds is None
+        assert provider._extractor_runtime.llm_max_input_chars is None
+        assert provider._extractor_runtime.llm_confidence_gate is None
+
+        _queue_turn(provider, "Alice is a tester", turn_id="t1")
+
+        # Leg 1 (kept, not weakened): ALL FOUR explicit keys, explicit None.
+        assert len(leg1_calls) == 1
+        call = leg1_calls[0]
+        assert call["llm_extractor"] is None
+        assert call["llm_timeout_seconds"] is None
+        assert call["llm_max_input_chars"] is None
+        assert call["llm_confidence_gate"] is None
+
+        # Leg 2: the REAL service received NO extraction kwargs (omission rule).
+        assert len(leg2_calls) == 1
+        svc_kw = leg2_calls[0]
+        assert "llm_extractor" not in svc_kw
+        assert "llm_timeout_seconds" not in svc_kw
+        assert "llm_max_input_chars" not in svc_kw
+        assert "llm_confidence_gate" not in svc_kw
+
+        # Effective values ARE the real A2 defaults — read from the REAL
+        # service signature, not from test-supplied fallbacks.
+        sig = inspect.signature(orig_svc_learn)
+        assert sig.parameters["llm_extractor"].default is None
+        assert sig.parameters["llm_timeout_seconds"].default == 15.0
+        assert sig.parameters["llm_max_input_chars"].default == 8000
+        assert (
+            sig.parameters["llm_confidence_gate"].default
+            == svc_mod.LLM_CONFIDENCE_GATE
+        )
+        assert svc_mod.LLM_CONFIDENCE_GATE == 0.7
+
+        # The REAL service consumed the cached-None resolution end-to-end:
+        # regex facts stored (no extractor, no provider substitution).
+        async with provider._provider._session_factory() as session:
+            row = await session.execute(
+                sqlalchemy.text("SELECT count(*) FROM facts WHERE subject = 'Alice'")
+            )
+            assert row.scalar() >= 1
+    finally:
+        if provider is not None:
+            provider.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -1321,6 +1434,78 @@ def test_cleanup_auxiliary_close_failure_retains_handle_and_blocks_clean(
         assert len([e for e in log if e[0] == "dispose"]) == 1
 
         provider.shutdown()
+        assert len([e for e in log if e[0] == "dispose"]) == 1
+    finally:
+        if provider is not None:
+            provider.shutdown()
+
+
+def test_cleanup_failed_operational_guards_block_use(tmp_path, monkeypatch):
+    """C-F1 regression: CLOSE_FAILED instances are fail-closed for use.
+
+    After a REAL close failure (T15): is_available() is False,
+    _require_provider() raises, and the operational entry points (prefetch,
+    queue_prefetch, handle_tool_call, the write batch handler) fail closed —
+    all BEFORE the retry shutdown (T16) succeeds.
+    """
+    log: list[tuple[str, object]] = []
+    real_close = SQLiteProvider.close
+    close_calls = {"n": 0}
+
+    async def flaky_close(self):
+        close_calls["n"] += 1
+        if close_calls["n"] == 1:
+            raise RuntimeError("close-fp")
+        return await real_close(self)
+
+    monkeypatch.setattr(SQLiteProvider, "close", flaky_close)
+    monkeypatch.setattr(AsyncEngine, "dispose", spy_engine_dispose(log))
+
+    provider = None
+    try:
+        provider = _init_inmemory_provider(tmp_path, monkeypatch)
+        # Even a cached context must NOT be served while the instance is
+        # LOCKED — the guard fires before the cache lookup.
+        provider._context_cache["prefetch"] = "cached-context"
+
+        # T15: real close failure -> CLOSE_FAILED, provider retained.
+        with pytest.raises(
+            RuntimeError, match=r"cleanup failed; resources retained \(close-failed\)"
+        ):
+            provider.shutdown()
+        assert provider._cleanup_failed is True
+        assert provider._provider is not None
+        assert provider._shut_down is False
+
+        # CLOSE_FAILED fail-closed guards: locked for use until T16.
+        assert provider.is_available() is False
+        with pytest.raises(RuntimeError, match="close-failed"):
+            provider._require_provider()
+
+        # Operational entry points fail closed WITHOUT touching the retained
+        # provider: prefetch returns no context, tools return an error.
+        assert provider.prefetch("some query") == ""
+        provider.queue_prefetch("some query")  # no-op — must not raise or schedule
+        tool_result = provider.handle_tool_call("search", {"query": "x"})
+        assert "error" in tool_result
+        assert "close-failed" in tool_result
+
+        # The write path raises through _require_provider (batch dropped).
+        with pytest.raises(RuntimeError, match="close-failed"):
+            asyncio.run(
+                provider._handle_batch_write(
+                    [([{"role": "user", "content": "Alice is a tester"}], "t1")]
+                )
+            )
+
+        # None of the guarded calls released the retained engine.
+        assert len([e for e in log if e[0] == "dispose"]) == 0
+
+        # T16: retry shutdown -> the RETAINED close succeeds -> CLEAN.
+        provider.shutdown()
+        assert provider._provider is None
+        assert provider._cleanup_failed is False
+        assert provider._shut_down is True
         assert len([e for e in log if e[0] == "dispose"]) == 1
     finally:
         if provider is not None:

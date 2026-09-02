@@ -303,6 +303,8 @@ class HermesProvider:
         """
         if self._outbox_stop_failed:                  # T12 poison guard (NEW)
             return False
+        if self._cleanup_failed:                      # T15/T17 CLOSE_FAILED guard (NEW)
+            return False
         if self._initialized:
             return self._provider is not None
         if self._shut_down:
@@ -431,6 +433,11 @@ class HermesProvider:
         if self._outbox_stop_failed:                  # T12 poison guard
             raise RuntimeError(
                 "HermesProvider is poisoned (outbox stop failed); "
+                "resources retained — call shutdown() to retry"
+            )
+        if self._cleanup_failed:                      # T15/T17 CLOSE_FAILED guard (NEW)
+            raise RuntimeError(
+                "HermesProvider cleanup failed (close-failed); "
                 "resources retained — call shutdown() to retry"
             )
         if self._provider is None:
@@ -752,6 +759,8 @@ class HermesProvider:
         """
         if not self._provider:
             return
+        if self._cleanup_failed:                      # CLOSE_FAILED fail-closed guard (NEW)
+            return
         try:
             loop = _get_loop()
             asyncio.run_coroutine_threadsafe(
@@ -769,6 +778,8 @@ class HermesProvider:
         synchronous load as fallback.
         """
         if not self._provider:
+            return ""
+        if self._cleanup_failed:                      # CLOSE_FAILED fail-closed guard (NEW)
             return ""
 
         # Return cached context if available
@@ -1319,6 +1330,13 @@ class HermesProvider:
         """
         if not self._provider:
             return json.dumps({"error": "HermesProvider not initialized"})
+        if self._cleanup_failed:                      # CLOSE_FAILED fail-closed guard (NEW)
+            return json.dumps(
+                {
+                    "error": "HermesProvider cleanup failed (close-failed); "
+                    "resources retained"
+                }
+            )
 
         handler = self._get_tool_handler(tool_name)
         if handler is None:
