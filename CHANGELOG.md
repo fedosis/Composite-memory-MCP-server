@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/)
 versioning with SemVer-like semantics.
 
+## 0.12.0b1 — 2026-09-02
+
+Major CMMS series hardening: 30 cards across the fact-extraction,
+dedup, migration, and review-gate pipeline (cmms series A1..B3d).
+
+### Added
+
+- **LLM extraction contracts + service boundary** (Cards A1/A2)
+  - `llm_response.py` — strict validated LLM response contract
+    (exact-one-fence JSON grammar, non-string rejection before
+    stringification, total confidence handling; never raises on
+    malformed numeric/structural input).
+  - `noise_filter.py` — facts noise filter (stopwords, fragment
+    enders, demonstrative prefixes, em-dash predicate reject).
+  - `learn()` gains `llm_extractor` / `llm_timeout_seconds` /
+    `llm_max_input_chars` / `llm_confidence_gate` kwargs with
+    timeout + fallback boundary; LLM-mode confidence gate >= 0.7.
+- **Fact dedup + copy migration** (Cards B1/B2)
+  - `dedup_key` on facts with partial unique active index;
+    ORM/migration parity; copy-only migration with child-row
+    cleanup and ZERO deleted-id references post-upgrade.
+- **Real-boundary regression gates** (cmms-series-fixes)
+  - Interleaving-agnostic race invariants (no exact-outcome
+    counts); pre-confirmation receipt-history proofs;
+    fail-closed F6 guard matrix oracles on actual guard text
+    (normal and `python -O`).
+- **Outbox worker on plugin path** — `busy_timeout_ms=60000`
+  passed explicitly to OutboxWorker in the Hermes plugin path
+  (was silently downgraded to 5000 on the shared engine).
+
+### Fixed
+
+- OverflowError on integer confidence > 1.7e308 and uncaught
+  ValueError/RecursionError from `json.loads` — validator is now
+  total over malformed input (returns None per contract).
+- Race-test flakiness (~20-40% full-file failure on green code):
+  exact loser/winner outcome counts replaced with invariants that
+  hold for every legitimate interleaving.
+
 ## 0.11.0b1 — 2026-07-22
 
 First CMMS beta release. Shifts from the `alpha` pre-release track to `beta`,
