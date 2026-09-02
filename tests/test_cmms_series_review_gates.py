@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +25,8 @@ from storage.repositories import FactRepository
 from memory_server.api.learn import learn
 from memory_server.api.remember import remember
 from memory_server.models import Fact
+from memory_server.plugins.hermes.provider import HermesProvider
+from memory_server.plugins.hermes.resolver import ExtractorRuntimeConfig
 from memory_server.plugins.hermes.writer import WriterQueue
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.services.ingestion_service import reinforce_memory_item
@@ -137,7 +141,7 @@ async def _real_ingestion_race(provider, barrier, source):
         return result
 
     try:
-        return await learn(
+        result = await learn(
             provider,
             "Docker is container",
             source=source,
@@ -146,14 +150,20 @@ async def _real_ingestion_race(provider, barrier, source):
                 "decisions": [],
             },
         )
+        result["_race_outcome"] = "initial-success"
+        result["_race_source"] = source
+        return result
     except (OperationalError, IntegrityError) as exc:
         # SQLite snapshot upgrade can classify the loser as busy; recover by
         # re-entering the same production ingestion boundary.
         assert "locked" in str(exc).lower() or "busy" in str(exc).lower() or "unique" in str(exc).lower()
-        return await learn(
+        result = await learn(
             provider, "Docker is container", source=f"{source}-recovery",
             llm_extractor=lambda _text: {"facts": [{"subject": "Docker", "predicate": "is", "object": "container", "confidence": 0.7}], "decisions": []},
         )
+        result["_race_outcome"] = "loser-recovered"
+        result["_race_source"] = source
+        return result
 
 
 @pytest.mark.asyncio
@@ -181,19 +191,42 @@ async def test_f1_synchronized_real_inserts_have_one_active_row_and_explicit_los
             _real_ingestion_race(provider, barrier, source)
             for provider, source in zip(providers, ("one", "two"), strict=True)
         ))
+        for provider, source in zip(providers, ("one", "two"), strict=True):
+            async with provider._session_factory() as session:
+                async with session.begin():
+                    fact = (await provider.search_facts(subject="Docker", include_inactive=True))[0]
+                    await reinforce_memory_item(
+                        session, memory_type="fact", item_id=fact.id,
+                        new_confidence=0.8, source=f"{source}-confirmation",
+                    )
     finally:
         for provider in providers:
             await provider.close()
     with sqlite3.connect(db) as conn:
         active = conn.execute("SELECT count(*) FROM facts WHERE lifecycle_state IN ('candidate','validated','active')").fetchone()[0]
         receipt_rows = conn.execute("SELECT count(*) FROM receipts WHERE memory_type='fact'").fetchone()[0]
-        history_len = conn.execute("SELECT length(history) FROM receipts WHERE memory_type='fact'").fetchone()[0]
+        receipt = conn.execute(
+            "SELECT source, confidence, version, history FROM receipts WHERE memory_type='fact'"
+        ).fetchone()
         outbox_rows = conn.execute("SELECT count(*) FROM outbox_entries WHERE record_type='fact'").fetchone()[0]
     assert len(results) == 2
     assert all(result["facts"] or result["receipts"] for result in results)
     assert active == 1
     assert receipt_rows == 1
-    assert history_len > 2  # receipt JSON is persisted, including loser reinforcement
+    assert receipt is not None
+    receipt_source, confidence, version, raw_history = receipt
+    history = json.loads(raw_history)
+    assert len(history) >= 2
+    sources = {receipt_source, *(entry["source"] for entry in history)}
+    assert {"one", "two"} <= {source.split("-", 1)[0] for source in sources}
+    assert sum(result["_race_outcome"] == "loser-recovered" for result in results) == 1
+    assert sum(result["_race_outcome"] == "initial-success" for result in results) == 1
+    loser = next(result for result in results if result["_race_outcome"] == "loser-recovered")
+    assert loser["_race_source"] in {"one", "two"}
+    assert any(entry["source"].startswith(loser["_race_source"]) for entry in history)
+    assert [entry["confidence"] for entry in history] == sorted(entry["confidence"] for entry in history)
+    assert float(confidence) >= 0.7
+    assert str(version) == "0.1.0"
     assert outbox_rows in (0, 1)  # loser recovery may roll back its outbox write
 
 
@@ -233,24 +266,30 @@ async def test_f3_writer_path_lock_failure_is_bounded(tmp_path):
     await provider.initialize()
     raw = sqlite3.connect(db, timeout=0, isolation_level=None)
     raw.execute("BEGIN IMMEDIATE")
-    async def write_batch(batch):
-        for item, _turn_id in batch:
-            await provider.create_fact(item)
-
+    hermes = HermesProvider()
+    hermes._provider = provider
+    hermes._extractor_runtime = ExtractorRuntimeConfig("regex", None, 5.0, 10000, 0.0)
+    hermes._llm_extractor = lambda _text: {
+        "facts": [{"subject": "locked", "predicate": "is", "object": "busy", "confidence": 0.7}],
+        "decisions": [],
+    }
     queue = WriterQueue(
-        write_batch,
+        hermes._handle_batch_write,
         flush_interval=60,
         max_batch=1,
     )
-    await queue.add_turn(Fact(id="locked", subject="s", predicate="p", object="o", dedup_key="s\x1fp\x1fo"))
+    await queue.add_turn({"user_content": "locked is busy", "assistant_content": ""}, "locked-turn")
     started = time.monotonic()
     try:
-        flushed = await asyncio.wait_for(queue.flush(), timeout=1)
+        flushed = await asyncio.wait_for(queue.shutdown(), timeout=1)
         elapsed = time.monotonic() - started
         assert flushed == 0
-        assert elapsed <= 0.2 + 0.25
-        assert queue.failed_items == []
-        assert queue.total_requeued == 1  # classified retryable persistence outcome
+        assert elapsed <= 0.2 * 3 + 0.4
+        assert queue.failed_items
+        assert "OperationalError" in queue.failed_items[0]["error"]
+        assert "locked" in queue.failed_items[0]["error"].lower()
+        assert queue.total_requeued == 2
+        assert queue.total_failed == 1
     finally:
         raw.rollback()
         raw.close()
@@ -287,6 +326,8 @@ async def test_w7_two_real_sessions_preserve_one_fact_receipt_and_monotonic_rein
         fact = (await provider_a.search_facts(subject="Docker", include_inactive=True))[0]
         async with provider_a._session_factory() as session:
             async with session.begin():
+                await reinforce_memory_item(session, memory_type="fact", item_id=fact.id, new_confidence=0.8, source="one-confirmation")
+                await reinforce_memory_item(session, memory_type="fact", item_id=fact.id, new_confidence=0.85, source="two-confirmation")
                 await reinforce_memory_item(session, memory_type="fact", item_id=fact.id, new_confidence=0.9, source="high")
         fresh = await provider_a.get_fact(fact.id)
         receipts = await provider_a.search_receipts(memory_type="fact", limit=20)
@@ -297,7 +338,11 @@ async def test_w7_two_real_sessions_preserve_one_fact_receipt_and_monotonic_rein
     assert fresh.confidence >= 0.9 and fresh.version >= 2
     assert len(receipts) == 1
     assert len(receipts[0].history) >= 2
-    assert {entry["source"].split("-", 1)[0] for entry in receipts[0].history} & {"one", "two"}
+    sources = {receipts[0].source, *(entry["source"] for entry in receipts[0].history)}
+    assert {"one", "two"} <= {source.split("-", 1)[0] for source in sources}
+    assert [entry["confidence"] for entry in receipts[0].history] == sorted(entry["confidence"] for entry in receipts[0].history)
+    assert sum(result["_race_outcome"] == "loser-recovered" for result in results) == 1
+    assert sum(result["_race_outcome"] == "initial-success" for result in results) == 1
 
 
 @pytest.mark.asyncio
@@ -421,6 +466,22 @@ spec=importlib.util.spec_from_file_location("b2", {str(MIGRATION)!r})
 m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 import sqlalchemy as sa
 p=Path({str(tmp_path / (case + '.db'))!r})
+if {case!r} in ("identity", "postcondition"):
+    from tests.test_migration_fact_dedup import create_fixture_database, write_copy_ini
+    create_fixture_database(p)
+    with sqlite3.connect(p) as probe:
+        if {case!r} == "identity":
+            probe.execute("CREATE TRIGGER mutate_decision AFTER UPDATE OF dedup_key ON facts BEGIN UPDATE decisions SET choice=choice || ' mutated' WHERE id='decision-1'; END")
+    if {case!r} == "postcondition":
+        with sqlite3.connect(p) as probe:
+            probe.execute("CREATE TRIGGER mutate_survivor AFTER UPDATE OF dedup_key ON facts BEGIN UPDATE facts SET subject=subject || ' mutated' WHERE id='fact-active-2'; END")
+            probe.commit()
+    ini=Path({str(tmp_path / (case + '.ini'))!r})
+    write_copy_ini(ini, p.resolve())
+    ini.write_text(ini.read_text().replace("/home/shtorm/memory-server/migrations", str(Path({str(REPO / 'migrations')!r}))))
+    from alembic import command, config
+    command.upgrade(config.Config(str(ini)), "head")
+    raise RuntimeError("real guard accepted a violating fixture")
 if {case!r} == "unsafe_source":
     m.guarded_backup(Path({str(tmp_path / 'missing.db')!r}), Path({str(tmp_path / 'destination.db')!r}))
 if {case!r} == "unsafe_destination":
@@ -505,16 +566,36 @@ def test_w9_degraded_wal_seam_executes_real_pragma_and_fails_closed(tmp_path):
 
 
 def test_w9_migration_timeout_is_set_before_ddl(tmp_path):
+    from tests.test_migration_fact_dedup import create_fixture_database, write_copy_ini
+
     db = tmp_path / "contention.db"
-    conn = sqlite3.connect(db, timeout=0)
-    conn.execute("CREATE TABLE marker(x INTEGER)")
-    conn.commit()
+    create_fixture_database(db)
+    ini = tmp_path / "contention.ini"
+    write_copy_ini(ini, db.resolve())
+    ini.write_text(ini.read_text().replace("/home/shtorm/memory-server/migrations", str(REPO / "migrations")))
+    events = tmp_path / "migration-connection.jsonl"
+    conn = sqlite3.connect(db, timeout=0, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("BEGIN IMMEDIATE")
-    contender = sqlite3.connect(db, timeout=0.2)
+    env = os.environ.copy()
+    env["MEMORY_SERVER_SQLITE_BUSY_TIMEOUT_MS"] = "200"
+    env["B2_MIGRATION_CONNECTION_EVENT_PATH"] = str(events)
     started = time.monotonic()
-    with pytest.raises(sqlite3.OperationalError, match="locked"):
-        contender.execute("CREATE TABLE before_ddl_probe(x INTEGER)")
-    assert time.monotonic() - started < 1
-    contender.close()
-    conn.rollback()
-    conn.close()
+    try:
+        run = subprocess.run(
+            [sys.executable, "-m", "alembic", "-c", str(ini), "upgrade", "head"],
+            cwd=str(REPO), env=env, capture_output=True, text=True, check=False,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        conn.rollback()
+        conn.close()
+    assert run.returncode != 0
+    assert elapsed < 1.5
+    records = [json.loads(line) for line in events.read_text().splitlines()]
+    assert records and records[0]["event"] == "before_first_ddl"
+    assert records[0]["busy_timeout"] == 200
+    assert records[0]["journal_mode"] == "wal"
+    with sqlite3.connect(db) as check:
+        assert check.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert "locked" in (run.stdout + run.stderr).lower() or "busy" in (run.stdout + run.stderr).lower()

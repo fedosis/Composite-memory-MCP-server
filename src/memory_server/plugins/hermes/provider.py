@@ -2101,7 +2101,7 @@ class HermesProvider:
                     )
                 ok = True
             except Exception as exc:
-                error_text = str(exc)
+                error_text = f"{type(exc).__name__}: {exc}"
                 logger.exception(
                     "HermesProvider: failed to write turn %s in batch",
                     turn_id,

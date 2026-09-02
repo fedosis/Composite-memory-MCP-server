@@ -1,6 +1,8 @@
+import json
 import os
 import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
@@ -25,6 +27,13 @@ if config.config_file_name is not None:
 
 # Set target metadata from our storage models
 target_metadata = Base.metadata
+
+
+def _record_migration_connection(**fields) -> None:
+    path = os.environ.get("B2_MIGRATION_CONNECTION_EVENT_PATH")
+    if path:
+        with Path(path).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(fields, sort_keys=True) + "\n")
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
@@ -74,6 +83,13 @@ def run_migrations_online() -> None:
             connection,
             validate_busy_timeout_ms(get_settings().sqlite_busy_timeout_ms),
             context="Alembic migrations",
+        )
+        busy_timeout = connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+        journal_mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
+        _record_migration_connection(
+            event="before_first_ddl",
+            busy_timeout=int(busy_timeout),
+            journal_mode=str(journal_mode).lower(),
         )
         connection.commit()
 
