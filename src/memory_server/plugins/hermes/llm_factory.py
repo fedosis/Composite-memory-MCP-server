@@ -12,7 +12,7 @@ import httpx
 
 from memory_server.extractors.llm_response import ExtractedResult, validate_llm_result
 from memory_server.plugins.hermes.resolver import ExtractorRuntimeConfig
-from memory_server.settings import get_openai_api_key
+from memory_server.settings import get_llm_api_key, get_openai_api_key
 
 logger = logging.getLogger(__name__)
 LLMExtractorFn = Callable[[str], ExtractedResult | None]
@@ -72,11 +72,11 @@ def _capture(cfg: ExtractorRuntimeConfig, hermes_home: str | Path,
     except (TypeError, ValueError, OSError):
         _warn("invalid_home", mode=mode)  # noqa: E702
         return None
-    key = get_openai_api_key()                    # exactly once, build time
+    key = get_llm_api_key() or get_openai_api_key()
     if not isinstance(key, str) or not key.strip():
         _warn("missing_api_key", mode=mode)  # noqa: E702
         return None
-    configured = os.environ.get("OPENAI_BASE_URL")
+    configured = cfg.llm_base_url or os.environ.get("OPENAI_BASE_URL")
     base = _valid_base_url(configured)
     if base is None:
         if configured is not None and configured.strip():
@@ -96,15 +96,21 @@ class _TerminalHTTP(Exception):  # noqa: N818
 
 def _request_once(client: httpx.Client, *, base_url: str, model: str,
                   key: str, text: str, timeout: float) -> object:
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0,
+    }
+    if model.lower().startswith("deepseek"):
+        payload["thinking"] = {"type": "disabled"}
     response = client.post(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {key}",
                  "Content-Type": "application/json"},
-        json={"model": model, "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
-              "temperature": 0},
+        json=payload,
         timeout=timeout,
     )
     if response.status_code == 429 or 500 <= response.status_code <= 599:

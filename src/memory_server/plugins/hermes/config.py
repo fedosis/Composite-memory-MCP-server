@@ -63,6 +63,10 @@ class HermesPluginConfig:
     llm_timeout_seconds: float | None = None
     llm_max_input_chars: int | None = None
     llm_confidence_gate: float | None = None
+    # Explicit LLM endpoint for the extraction model (env or the
+    # ``memory.providers.memory_server`` config block). API keys stay in the
+    # environment; enables self-hosted OpenAI-compatible endpoints.
+    llm_base_url: str | None = None
 
     @classmethod
     def from_dict(
@@ -108,6 +112,12 @@ class HermesPluginConfig:
             llm_timeout_seconds=data.get("llm_timeout_seconds"),
             llm_max_input_chars=data.get("llm_max_input_chars"),
             llm_confidence_gate=data.get("llm_confidence_gate"),
+            llm_base_url=(
+                os.environ.get("MEMORY_SERVER_LLM_BASE_URL")
+                if use_env
+                else None
+            )
+            or data.get("llm_base_url"),
         )
 
     @classmethod
@@ -134,6 +144,7 @@ class HermesPluginConfig:
                 ),
             ),
             max_facts=int(os.environ.get("MEMORY_SERVER_MAX_FACTS", "5")),
+            llm_base_url=os.environ.get("MEMORY_SERVER_LLM_BASE_URL"),
         )
 
     def validate_shared_root(self, expected: str | None = None) -> None:

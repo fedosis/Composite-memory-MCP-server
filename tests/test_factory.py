@@ -64,6 +64,7 @@ def build_valid(monkeypatch):
 def fake_transport(monkeypatch):
     FakeClient.instances = []
     FakeClient.plan = []
+    monkeypatch.delenv("MEMORY_SERVER_LLM_API_KEY", raising=False)
     monkeypatch.setattr(factory.httpx, "Client", FakeClient)
 
 
@@ -224,6 +225,23 @@ def test_valid_response_returns_frozen_result_and_closes(monkeypatch):
     result = build_valid(monkeypatch)("x")
     assert result == ExtractedResult((), ())
     assert FakeClient.instances[-1].closed
+
+
+@pytest.mark.parametrize(
+    ("model", "has_thinking"),
+    [
+        ("deepseek-v4-flash", True),
+        ("llama-3.1", False),
+    ],
+)
+def test_thinking_is_sent_only_to_deepseek_models(monkeypatch, model, has_thinking):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    FakeClient.plan = [response()]
+    extractor = build_llm_extractor_from_cfg(make_cfg(model=model))
+    assert extractor is not None
+    assert extractor("x") == ExtractedResult((), ())
+    payload = FakeClient.instances[-1].calls[0]["json"]
+    assert ("thinking" in payload) is has_thinking
 
 
 def test_real_chat_completion_body_extracts_content(monkeypatch):

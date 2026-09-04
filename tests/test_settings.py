@@ -99,6 +99,7 @@ EXPECTED_FIELDS = frozenset({
     "llm_timeout_seconds",
     "llm_max_input_chars",
     "llm_confidence_gate",
+    "llm_base_url",
 })
 
 # Byte-for-byte defaults == today's hardcoded values (verified against source).
@@ -192,6 +193,7 @@ DEFAULTS: dict[str, object] = {
     "llm_timeout_seconds": 15.0,
     "llm_max_input_chars": 8000,
     "llm_confidence_gate": 0.7,
+    "llm_base_url": None,
 }
 
 
@@ -384,7 +386,7 @@ class TestPrecedenceContextB:
         )
 
     def test_public_shape_unchanged(self):
-        """HermesPluginConfig keeps old fields plus five extraction fields."""
+        """HermesPluginConfig keeps old fields plus six non-secret extraction fields."""
         from memory_server.plugins.hermes.config import HermesPluginConfig
 
         config = HermesPluginConfig.from_dict({})
@@ -399,6 +401,7 @@ class TestPrecedenceContextB:
             "llm_timeout_seconds",
             "llm_max_input_chars",
             "llm_confidence_gate",
+            "llm_base_url",
         }
         assert set(config.__dataclass_fields__) == expected
 

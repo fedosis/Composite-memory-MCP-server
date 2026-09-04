@@ -11,9 +11,9 @@ YAML config inside ``HermesPluginConfig.from_dict`` before delegating here
 (Context B: canonical env > YAML > legacy env > ``.env`` > default).
 
 Secrets policy: API keys are NOT model fields. Providers read
-``OPENAI_API_KEY`` / ``QDRANT_API_KEY`` from ``os.environ`` at use time via
-the ``get_openai_api_key()`` / ``get_qdrant_api_key()`` accessors, so they
-can never appear in ``model_dump()`` / JSON serialization.
+``OPENAI_API_KEY`` / ``QDRANT_API_KEY`` / ``MEMORY_SERVER_LLM_API_KEY`` from
+``os.environ`` at use time via accessors, so they can never appear in
+``model_dump()`` / JSON serialization.
 """
 
 from __future__ import annotations
@@ -90,6 +90,24 @@ def _coerce_confidence_gate(value: object) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return result if math.isfinite(result) and 0.0 <= result <= 1.0 else None
+
+
+def _coerce_base_url(value: object) -> str | None:
+    """Accept an explicit LLM base URL (cloud or self-hosted).
+
+    Self-hosted OpenAI-compatible endpoints (Ollama, vLLM, LM Studio,
+    llama.cpp) are valid: http://127.0.0.1:11434/v1 etc.
+    """
+    if not isinstance(value, str):
+        return None
+    result = value.strip().rstrip("/")
+    if not result:
+        return None
+    if not (result.startswith("http://") or result.startswith("https://")):
+        return None
+    if any(ch.isspace() for ch in result):
+        return None
+    return result
 
 
 class Settings(BaseSettings):
@@ -252,6 +270,9 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 15.0
     llm_max_input_chars: int = 8000
     llm_confidence_gate: float = 0.7
+    # Explicit LLM endpoint for the extraction model. The API key remains an
+    # environment-only secret; see get_llm_api_key().
+    llm_base_url: str | None = None
 
     # --- Validators ----------------------------------------------------------
 
@@ -302,6 +323,14 @@ class Settings(BaseSettings):
         if parsed is None:
             logger.warning("Invalid llm_confidence_gate %r; using default 0.7", value)
             return 0.7
+        return parsed
+
+    @field_validator("llm_base_url", mode="before")
+    @classmethod
+    def _raw_llm_base_url(cls, value: object) -> str | None:
+        parsed = _coerce_base_url(value)
+        if value is not None and parsed is None:
+            logger.warning("Invalid llm_base_url %r; using default None", value)
         return parsed
 
     @field_validator(
@@ -367,6 +396,11 @@ def get_settings() -> Settings:
 def get_openai_api_key() -> str | None:
     """Return the OpenAI API key from the environment (never a model field)."""
     return os.environ.get("OPENAI_API_KEY")
+
+
+def get_llm_api_key() -> str | None:
+    """Return the extraction LLM API key from the environment, never a model field."""
+    return os.environ.get("MEMORY_SERVER_LLM_API_KEY")
 
 
 def get_qdrant_api_key() -> str | None:

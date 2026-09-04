@@ -17,6 +17,7 @@ ENV = {
     "llm_timeout_seconds": "MEMORY_SERVER_LLM_TIMEOUT_SECONDS",
     "llm_max_input_chars": "MEMORY_SERVER_LLM_MAX_INPUT_CHARS",
     "llm_confidence_gate": "MEMORY_SERVER_LLM_CONFIDENCE_GATE",
+    "llm_base_url": "MEMORY_SERVER_LLM_BASE_URL",
 }
 DEFAULT = {
     "extraction_mode": "regex",
@@ -24,6 +25,7 @@ DEFAULT = {
     "llm_timeout_seconds": 15.0,
     "llm_max_input_chars": 8000,
     "llm_confidence_gate": 0.7,
+    "llm_base_url": None,
 }
 
 
@@ -52,6 +54,14 @@ def make(cfg=None, settings=None):
         pytest.param("llm_timeout_seconds", "2.5", 3.5, 4.5, 2.5, id="timeout-env-yaml-settings"),
         pytest.param("llm_max_input_chars", "3", 4, 5, 3, id="max-env-yaml-settings"),
         pytest.param("llm_confidence_gate", "0.2", 0.3, 0.4, 0.2, id="confidence-env-yaml-settings"),
+        pytest.param(
+            "llm_base_url",
+            "https://env.example/v1",
+            "https://yaml.example/v1",
+            "https://settings.example/v1",
+            "https://env.example/v1",
+            id="base-url-env-yaml-settings",
+        ),
     ],
 )
 def test_env_beats_yaml_and_settings(
@@ -70,6 +80,13 @@ def test_env_beats_yaml_and_settings(
         pytest.param("llm_timeout_seconds", 3.5, 4.5, 3.5, id="timeout-yaml-settings"),
         pytest.param("llm_max_input_chars", -4, 5, -4, id="max-yaml-settings-negative"),
         pytest.param("llm_confidence_gate", 0.3, 0.4, 0.3, id="confidence-yaml-settings"),
+        pytest.param(
+            "llm_base_url",
+            "https://yaml.example/v1",
+            "https://settings.example/v1",
+            "https://yaml.example/v1",
+            id="base-url-yaml-settings",
+        ),
     ],
 )
 def test_yaml_beats_settings(clear_extraction_env, field, cfg_value, settings_value, expected):
@@ -84,6 +101,12 @@ def test_yaml_beats_settings(clear_extraction_env, field, cfg_value, settings_va
         pytest.param("llm_timeout_seconds", 4.5, 4.5, id="timeout-settings-default"),
         pytest.param("llm_max_input_chars", 0, 0, id="max-settings-default-zero"),
         pytest.param("llm_confidence_gate", 0.4, 0.4, id="confidence-settings-default"),
+        pytest.param(
+            "llm_base_url",
+            "https://settings.example/v1",
+            "https://settings.example/v1",
+            id="base-url-settings-default",
+        ),
     ],
 )
 def test_settings_beats_default(clear_extraction_env, field, settings_value, expected):
@@ -231,7 +254,10 @@ def test_from_env_does_not_overlay_extraction_environment(monkeypatch):
 
     config = HermesPluginConfig.from_env()
 
-    assert {field: getattr(config, field) for field in ENV} == {field: None for field in ENV}
+    assert {field: getattr(config, field) for field in ENV} == {
+        field: (f"env-{field}" if field == "llm_base_url" else None)
+        for field in ENV
+    }
 
 
 def test_dto_is_exact_and_frozen(clear_extraction_env):
@@ -264,7 +290,7 @@ def test_snapshot_reads_each_key_once(monkeypatch):
         return original(key, default)
 
     monkeypatch.setattr(os.environ, "get", counted)
-    resolve_extractor_settings(HermesPluginConfig.from_dict({}), Settings())
+    resolve_extractor_settings(HermesPluginConfig(), Settings())
     assert calls == list(ENV.values())
 
 

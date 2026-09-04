@@ -7,6 +7,7 @@ from typing import Callable, Literal, TypeVar
 from memory_server.plugins.hermes.config import HermesPluginConfig
 from memory_server.settings import (
     Settings,
+    _coerce_base_url,
     _coerce_confidence_gate,
     _coerce_extraction_mode,
     _coerce_max_input_chars,
@@ -23,6 +24,7 @@ class ExtractorRuntimeConfig:
     llm_timeout_seconds: float
     llm_max_input_chars: int
     llm_confidence_gate: float
+    llm_base_url: str | None = None
 
 
 def _coerce_model(value: object) -> str | None:
@@ -51,6 +53,7 @@ def resolve_extractor_settings(
         "llm_timeout_seconds": os.environ.get("MEMORY_SERVER_LLM_TIMEOUT_SECONDS"),
         "llm_max_input_chars": os.environ.get("MEMORY_SERVER_LLM_MAX_INPUT_CHARS"),
         "llm_confidence_gate": os.environ.get("MEMORY_SERVER_LLM_CONFIDENCE_GATE"),
+        "llm_base_url": os.environ.get("MEMORY_SERVER_LLM_BASE_URL"),
     }
     return ExtractorRuntimeConfig(
         extraction_mode=_first_valid(
@@ -80,5 +83,10 @@ def resolve_extractor_settings(
              settings.llm_confidence_gate),
             _coerce_confidence_gate,
             0.7,
+        ),
+        llm_base_url=_first_valid(
+            (env["llm_base_url"], cfg.llm_base_url, settings.llm_base_url),
+            _coerce_base_url,
+            None,
         ),
     )
