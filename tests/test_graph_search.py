@@ -108,3 +108,46 @@ class TestGraphSearchTool:
         assert edge["relation"] == "contradicts"
         assert edge["source_name"] == "Claim A"
         assert edge["target_name"] == "Claim B"
+
+
+class TestGraphSearchDiamondAndCycle:
+    """PROV-6 via the server tool: pathfinding must keep all simple paths.
+
+    Uses the graph_test_isolation fixture (tmp_path snapshot), so the live
+    data/graph.json is never touched.
+    """
+
+    @pytest.fixture(autouse=True)
+    async def setup_graph(self, graph_test_isolation):
+        yield
+
+    @staticmethod
+    def _path_ids(path):
+        return tuple(n["id"] for n in path)
+
+    async def _build_diamond(self):
+        router = await _get_graph_router()
+        # ServerA -> App1 -> Db  and  ServerA -> App2 -> Db
+        router.sync_fact(subject="ServerA", predicate="hosts", object="App1")
+        router.sync_fact(subject="ServerA", predicate="hosts", object="App2")
+        router.sync_fact(subject="App1", predicate="uses", object="Db")
+        router.sync_fact(subject="App2", predicate="uses", object="Db")
+        return router
+
+    async def test_pathfinding_diamond_returns_both_paths(self):
+        await self._build_diamond()
+        result = json.loads(await graph_search_fn(source_id="servera", target_id="db"))
+        path_sigs = {self._path_ids(p) for p in result["paths"]}
+        assert path_sigs == {("servera", "app1", "db"), ("servera", "app2", "db")}
+
+    async def test_pathfinding_with_cycle_terminates_and_returns_simple_path(self):
+        router = await _get_graph_router()
+        router.sync_fact(subject="CycA", predicate="links", object="CycB")
+        router.sync_fact(subject="CycB", predicate="links", object="CycA")  # cycle
+        router.sync_fact(subject="CycB", predicate="reaches", object="Goal")
+
+        result = json.loads(await graph_search_fn(source_id="cyca", target_id="goal"))
+        assert len(result["paths"]) >= 1
+        for path in result["paths"]:
+            ids = self._path_ids(path)
+            assert len(ids) == len(set(ids)), f"non-simple path returned: {ids}"

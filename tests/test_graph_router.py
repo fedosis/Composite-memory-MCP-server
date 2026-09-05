@@ -173,3 +173,49 @@ class TestGraphRouter:
         assert result["entities"] == []
         assert result["relations"] == []
         assert result["paths"] == []
+
+
+class TestGraphRouterDiamondAndCycle:
+    """PROV-6: router pathfinding must surface every simple path.
+
+    GraphRouter.query() delegates to SimpleGraph.find_path; a shared
+    visited set would hide diamond alternatives and cycle-safe simple paths.
+    """
+
+    @staticmethod
+    def _path_ids(path):
+        return tuple(n["id"] for n in path)
+
+    def test_query_returns_both_diamond_paths(self):
+        g = SimpleGraph()
+        for nid, name in [("a", "Alpha"), ("b", "Bravo"), ("c", "Charlie"),
+                          ("d", "Delta"), ("e", "Epsilon")]:
+            g.add_node(id=nid, type="entity", name=name)
+        g.add_edge(source_id="a", target_id="b", relation="links")
+        g.add_edge(source_id="a", target_id="c", relation="links")
+        g.add_edge(source_id="b", target_id="d", relation="links")
+        g.add_edge(source_id="c", target_id="d", relation="links")
+        g.add_edge(source_id="d", target_id="e", relation="links")
+        router = GraphRouter(graph=g)
+
+        result = router.query("Alpha Epsilon")
+        path_sigs = {self._path_ids(p) for p in result["paths"]}
+        assert path_sigs == {("a", "b", "d", "e"), ("a", "c", "d", "e")}
+
+    def test_query_with_cycle_returns_simple_path_only(self):
+        g = SimpleGraph()
+        for nid, name in [("a", "Alpha"), ("b", "Bravo"), ("c", "Charlie"),
+                          ("d", "Delta"), ("e", "Epsilon")]:
+            g.add_node(id=nid, type="entity", name=name)
+        g.add_edge(source_id="a", target_id="b", relation="links")
+        g.add_edge(source_id="b", target_id="c", relation="links")
+        g.add_edge(source_id="c", target_id="a", relation="links")  # cycle
+        g.add_edge(source_id="c", target_id="d", relation="links")
+        g.add_edge(source_id="d", target_id="e", relation="links")
+        router = GraphRouter(graph=g)
+
+        result = router.query("Alpha Epsilon")
+        assert result["paths"], "expected a path despite the cycle"
+        for path in result["paths"]:
+            ids = self._path_ids(path)
+            assert len(ids) == len(set(ids)), f"non-simple path returned: {ids}"

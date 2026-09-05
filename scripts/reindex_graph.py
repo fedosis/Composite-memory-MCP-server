@@ -116,23 +116,39 @@ def reindex(
 
     # --- 1. Load existing graph (merge, never replace) -------------------
     # Guard against silently clobbering a corrupt snapshot: SimpleGraph's
-    # load_snapshot swallows parse errors and leaves an empty graph, which a
-    # later save would overwrite. Validate the JSON shape up front instead.
+    # load_snapshot logs and leaves an empty graph on parse/validation
+    # errors, which a later save would otherwise rebuild from nothing over
+    # the corrupt file. Validate the full snapshot shape up front instead
+    # and abort rather than reindex over it (MIG-6 / PR-11).
     if graph_path.exists():
         try:
             import json as _json
 
-            raw = _json.loads(graph_path.read_text(encoding="utf-8"))
+            try:
+                raw = _json.loads(graph_path.read_text(encoding="utf-8"))
+            except ValueError:
+                raise SystemExit(
+                    f"Aborting: {graph_path} exists but is not valid JSON — "
+                    "refusing to reindex over a possibly corrupt snapshot. "
+                    "Inspect the file first."
+                ) from None
             if not isinstance(raw, dict) or "nodes" not in raw:
                 raise SystemExit(
                     f"Aborting: {graph_path} exists but is not a valid graph "
                     "snapshot (missing 'nodes' key). Inspect the file first."
                 )
-        except ValueError:
+            # Full structural validation (nodes/edges shape, dangling edge
+            # endpoints, duplicate ids) — same rules SimpleGraph.from_dict
+            # enforces, so a malformed file can never be half-loaded and
+            # then republished by this process.
+            SimpleGraph._build_state_from(raw)
+        except SystemExit:
+            raise
+        except Exception as exc:
             raise SystemExit(
-                f"Aborting: {graph_path} exists but is not valid JSON — "
-                "refusing to reindex over a possibly corrupt snapshot. "
-                "Inspect the file first."
+                f"Aborting: {graph_path} exists but is structurally invalid "
+                f"({exc}) — refusing to reindex over a possibly corrupt "
+                "snapshot. Inspect the file first."
             ) from None
 
     graph = SimpleGraph(snapshot_path=graph_path)

@@ -14,6 +14,9 @@ from types import ModuleType
 
 import pytest  # noqa: F401  (kept for symmetry with sibling test modules)
 
+from memory_server.providers.graph_provider import SimpleGraph
+from memory_server.router.graph_router import GraphRouter
+
 
 def _load_script() -> ModuleType:
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "reindex_graph.py"
@@ -136,3 +139,86 @@ class TestReindexGraph:
         mod.reindex(db, graph_file)
 
         assert db.read_bytes() == before
+
+
+class TestReindexGraphProtocol:
+    """PR-11 / MIG-6: reindex runs under the same persistence protocol as
+    the gateway writer and never republishes a stale generation.
+
+    The real scripts/reindex_graph.py process merges facts into the shared
+    graph.json while the test process holds a STALE SimpleGraph snapshot
+    (the "gateway").  The gateway's later mutation must merge with, not
+    clobber, the reindexed facts.
+    """
+
+    def test_stale_gateway_write_does_not_clobber_reindex(self, tmp_path):
+        import subprocess
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "reindex_graph.py"
+        db = tmp_path / "memory.db"
+        graph_file = tmp_path / "graph.json"
+        _make_db(db, FACTS)
+        _make_graph(graph_file, nodes={}, edges=[])
+
+        # "Gateway" loads the (empty) snapshot and keeps the instance alive
+        # across the reindex — this is the stale in-memory generation.
+        gateway = SimpleGraph(snapshot_path=graph_file)
+        gateway.load_snapshot()
+        assert gateway.get_all_nodes() == []
+
+        # REAL reindex in a separate process.
+        completed = subprocess.run(
+            [sys.executable, str(script), "--db", str(db), "--graph", str(graph_file)],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "REINDEX COMPLETE" in completed.stdout
+
+        # The stale gateway now adds a fact. Pre-fix this whole-state write
+        # reverted every reindexed fact; now it must merge under the lock.
+        GraphRouter(graph=gateway).sync_fact(
+            subject="Gateway", predicate="after_reindex", object="Node"
+        )
+
+        reopened = SimpleGraph(snapshot_path=graph_file)
+        reopened.load_snapshot()
+        ids = {n.id for n in reopened.get_all_nodes()}
+        assert "gateway" in ids and "node" in ids
+        # All reindexed fact entities survived the gateway write.
+        assert {"docker", "omv8", "postgresql", "kubernetes", "container", "database"} <= ids
+
+    def test_reindex_aborts_on_structurally_invalid_graph(self, tmp_path):
+        """Never reindex over a dangling-edge / malformed snapshot."""
+        mod = _load_script()
+        db = tmp_path / "memory.db"
+        graph_file = tmp_path / "graph.json"
+        _make_db(db, FACTS)
+        graph_file.write_text(
+            __import__("json").dumps(
+                {
+                    "nodes": {"a": {"id": "a", "type": "entity", "name": "A"}},
+                    "edges": [{"source_id": "a", "target_id": "ghost"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        before = graph_file.read_bytes()
+        with pytest.raises(SystemExit):
+            mod.reindex(db, graph_file)
+        assert graph_file.read_bytes() == before
+
+    def test_reindex_aborts_on_invalid_json(self, tmp_path):
+        mod = _load_script()
+        db = tmp_path / "memory.db"
+        graph_file = tmp_path / "graph.json"
+        _make_db(db, FACTS)
+        graph_file.write_text("{ not json", encoding="utf-8")
+        before = graph_file.read_bytes()
+        with pytest.raises(SystemExit):
+            mod.reindex(db, graph_file)
+        assert graph_file.read_bytes() == before
