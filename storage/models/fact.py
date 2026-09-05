@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import Fact
 from storage.base import Base, utcnow
+from storage.dedup import fact_dedup_key
 
 
 class FactORM(Base):
@@ -56,14 +57,15 @@ class FactORM(Base):
 
     @classmethod
     def from_pydantic(cls, fact: Fact) -> "FactORM":
-        if fact.dedup_key is None:
-            raise ValueError("Fact.dedup_key is required before persistence")
+        dedup_key = fact.dedup_key
+        if dedup_key is None:
+            dedup_key = fact_dedup_key(fact.subject, fact.predicate, fact.object)
         return cls(
             id=fact.id,
             subject=fact.subject,
             predicate=fact.predicate,
             object=fact.object,
-            dedup_key=fact.dedup_key,
+            dedup_key=dedup_key,
             confidence=fact.confidence,
             source=fact.source,
             creator=fact.creator,

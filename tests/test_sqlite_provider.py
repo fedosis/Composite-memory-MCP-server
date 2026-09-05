@@ -30,6 +30,24 @@ async def provider():
 
 @pytest.mark.asyncio
 class TestFactCRUD:
+    async def test_create_fact_without_key_persists_computed_key(self, tmp_path):
+        url = f"sqlite+aiosqlite:///{tmp_path / 'facts.db'}"
+        first = SQLiteProvider(url=url)
+        await first.initialize()
+        fact = DomainFact(id="no-key", subject="Docker", predicate="runs_on", object="OMV8")
+        created = await first.create_fact(fact)
+        await first.close()
+
+        second = SQLiteProvider(url=url)
+        await second.initialize()
+        retrieved = await second.get_fact("no-key")
+        await second.close()
+
+        expected = fact_dedup_key("Docker", "runs_on", "OMV8")
+        assert created.dedup_key == expected
+        assert retrieved is not None
+        assert retrieved.dedup_key == expected
+
     async def test_create_fact(self, provider):
         f = make_fact(id="f1", subject="Docker", predicate="runs_on", object="OMV8")
         created = await provider.create_fact(f)

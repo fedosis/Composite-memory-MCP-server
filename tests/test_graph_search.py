@@ -4,9 +4,6 @@ import json
 
 import pytest
 
-import memory_server.server as server_module
-from memory_server.providers.graph_provider import SimpleGraph
-from memory_server.router.graph_router import GraphRouter
 from memory_server.server import _get_graph_router, graph_search_fn
 
 
@@ -15,11 +12,8 @@ class TestGraphSearchTool:
     """Test graph_search MCP tool."""
 
     @pytest.fixture(autouse=True)
-    async def setup_graph(self):
-        """Ensure a fresh graph router for each test."""
-        # The singleton is lazily created — we can't clean if already dirty,
-        # but tests in fresh processes work fine. For the same session,
-        # we let _get_graph_router reuse the existing one.
+    async def setup_graph(self, graph_test_isolation):
+        """Give every graph test its own persisted snapshot and singletons."""
         yield
 
     async def test_search_by_entity_name(self):
@@ -101,17 +95,11 @@ class TestGraphSearchTool:
         assert "target_id" in edge
         assert "relation" in edge
 
-    async def test_search_by_relation_type(self, monkeypatch):
+    async def test_search_by_relation_type(self):
         """Relation-aware search returns typed relation pairs."""
-        graph = SimpleGraph()
-        graph.add_node(id="claim-a", type="fact", name="Claim A")
-        graph.add_node(id="claim-b", type="fact", name="Claim B")
-        graph.add_node(id="claim-c", type="fact", name="Claim C")
-        graph.add_edge(source_id="claim-a", target_id="claim-b", relation="contradicts")
-        graph.add_edge(source_id="claim-a", target_id="claim-c", relation="supports")
-
-        monkeypatch.setattr(server_module, "_graph", graph)
-        monkeypatch.setattr(server_module, "_graph_router", GraphRouter(graph=graph))
+        router = await _get_graph_router()
+        router.sync_fact(subject="Claim A", predicate="contradicts", object="Claim B")
+        router.sync_fact(subject="Claim A", predicate="supports", object="Claim C")
 
         result = json.loads(await graph_search_fn(relation_type="contradicts"))
         assert result["paths"] == []
