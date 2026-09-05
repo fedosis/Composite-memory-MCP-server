@@ -12,6 +12,7 @@ import time
 from unittest.mock import Mock
 
 import pytest
+from storage.dedup import fact_dedup_key
 
 import memory_server.services.ingestion_service as svc
 from memory_server.extractors.llm_response import ExtractedResult
@@ -189,9 +190,10 @@ async def test_factory_validated_result_skips_second_validation(monkeypatch, pro
         "subject": "Helios",
         "predicate": "powers",
         "object": "Aurora",
+        "dedup_key": fact_dedup_key("Helios", "powers", "Aurora"),
         "confidence": 0.93,
         "source": "user",
-        "creator": "system",
+        "creator": "user",
         "created_at": result["facts"][0]["item"]["created_at"],
         "updated_at": result["facts"][0]["item"]["updated_at"],
         "verification_status": "candidate",
@@ -205,10 +207,10 @@ async def test_factory_validated_result_skips_second_validation(monkeypatch, pro
         "rejected_alternatives": ["choose Atlas"],
         "reason": "lower operational risk",
         "source": "user",
-        "creator": "system",
+        "creator": "user",
         "created_at": result["decisions"][0]["item"]["created_at"],
         "updated_at": result["decisions"][0]["item"]["updated_at"],
-        "confidence": 1.0,
+        "confidence": 0.88,
         "verification_status": "candidate",
         "lifecycle_state": "active",
         "version": "0.1.0",
@@ -299,10 +301,10 @@ async def test_one_combined_call_stores_both(monkeypatch, provider):
     assert d["choice"] == "use Caddy"
     assert d["reason"] == "simple"
     assert d["rejected_alternatives"] == []
-    # write-loop reality: Decision() is constructed without a confidence, so
-    # the item carries the model default 1.0; the input 0.8 lands in the
-    # receipt (write region is byte-identical by AC4 — not touched by A2).
-    assert d["confidence"] == 1.0
+    # SVC-1: item and receipt carry the SAME extraction confidence (0.8) —
+    # the item no longer keeps the model default 1.0 while the receipt says
+    # 0.8.
+    assert d["confidence"] == 0.8
     assert result["decisions"][0]["receipt"]["confidence"] == 0.8
 
     # stored content matches the captured validated object

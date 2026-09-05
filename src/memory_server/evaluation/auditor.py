@@ -465,13 +465,22 @@ class MemoryAuditor:
         has_receipt = entry.get("has_receipt")
         if has_receipt is None:
             has_receipt = bool(receipt_id) or entry.get("fact_id") in self._receipt_ids
+        # ROUTE-6: normalize lifecycle aliases on read. Persisted rows may
+        # still carry the legacy v0.5 values 'trusted'/'deprecated'; they map
+        # to 'active'/'stale' and are NOT lifecycle violations. The public
+        # policy (transition table, state machine) is untouched.
+        normalized_status = normalize_lifecycle_state(str(raw_status))
         return {
             "fact_id": str(entry.get("fact_id", "")),
             "memory_type": str(entry.get("memory_type", "fact")),
-            "status": normalize_lifecycle_state(str(raw_status)),
+            "status": normalized_status,
             "confidence": confidence,
             "verification_status": verification_status,
-            "lifecycle_state": raw_lifecycle_state if isinstance(raw_lifecycle_state, str) else None,
+            "lifecycle_state": (
+                normalize_lifecycle_state(raw_lifecycle_state)
+                if isinstance(raw_lifecycle_state, str)
+                else None
+            ),
             "receipt_id": str(receipt_id) if receipt_id else None,
             "has_receipt": bool(has_receipt),
         }

@@ -216,7 +216,9 @@ async def test_duplicate_decision_is_skipped_but_direct_reinforcement_works(prov
                 session, memory_type="decision", item_id=decision.id,
                 new_confidence=0.9, source="direct",
             )
-    assert reinforced.confidence == 1.0
+            # The learned decision carries extraction confidence 0.5 (aligned
+            # with its receipt); reinforcement takes max(0.5, 0.9) = 0.9.
+            assert reinforced.confidence == 0.9
 
 
 @pytest.mark.asyncio

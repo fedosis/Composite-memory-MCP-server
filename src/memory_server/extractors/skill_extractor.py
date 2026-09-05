@@ -12,10 +12,40 @@ Confidence scoring:
 - LLM mode: 0.7-0.9 configurable (default 0.85)
 """
 
+import logging
 import re
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 LLMExtractorFn = Callable[[str], list[dict]]
+
+
+def _normalize_steps(value: Any) -> list[str]:
+    """Coerce a raw steps value to a clean list of non-empty strings.
+
+    Malformed LLM entries (missing key, non-list, or list containing
+    non-string items) become ``[]`` — the caller then skips the skill as
+    unrecognized instead of letting the model constructor crash.
+    """
+    if not isinstance(value, list):
+        return []
+    steps: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            steps.append(item.strip())
+    return steps
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    """Coerce constraints/validation lists the same defensive way."""
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return out
 
 
 class SkillExtractor:
@@ -56,6 +86,11 @@ class SkillExtractor:
 
         Returns:
             List of dicts with keys: purpose, steps, constraints, confidence.
+
+        Only structurally valid skills are returned (SVC-3): an entry must
+        have a non-empty string purpose and at least one recognized step.
+        Anything malformed is skipped here, before the ingestion service ever
+        builds a Skill model, so a bad body can never crash learn().
         """
         if not text or not text.strip():
             return []
@@ -87,11 +122,23 @@ class SkillExtractor:
             llm_skills = self._llm_extractor(text)
             if llm_skills:
                 for s in llm_skills:
+                    if not isinstance(s, dict):
+                        continue
+                    purpose = s.get("purpose", "")
+                    if not isinstance(purpose, str) or not purpose.strip():
+                        continue  # malformed: no usable purpose
+                    steps = _normalize_steps(s.get("steps"))
+                    if not steps:
+                        # Malformed / no recognized step — skip safely
+                        # (never reach the Skill constructor).
+                        continue
                     skills.append(
                         {
-                            "purpose": s.get("purpose", ""),
-                            "steps": s.get("steps", []),
-                            "constraints": s.get("constraints", []),
+                            "purpose": purpose.strip(),
+                            "steps": steps,
+                            "constraints": _normalize_string_list(
+                                s.get("constraints")
+                            ),
                             "confidence": self._llm_confidence,
                         }
                     )
@@ -99,12 +146,21 @@ class SkillExtractor:
         return skills
 
     def _parse_steps(self, body: str) -> list[str]:
-        """Parse numbered steps from the body text."""
+        """Parse numbered steps from the body text.
+
+        A body that contains no numbered list is treated as a single
+        unnumbered step (``do: run the backup``), so a valid regex match can
+        never produce an empty step list that would fail the Skill model's
+        ``steps: min_length=1`` at construction time (SVC-3).
+        """
         steps = []
         for step_match in self._STEP_PATTERN.finditer(body):
-            step_text = step_match.group(1).strip().strip(",.?!")
+            step_text = step_match.group(1).strip().strip(", .?!")
             if step_text:
                 steps.append(step_text)
+        if not steps and body.strip():
+            # Unnumbered body -> one step.
+            steps = [body.strip().strip(", .?!")]
         return steps
 
     def _parse_constraints(self, text: str) -> list[str]:

@@ -2,10 +2,15 @@
 
 Config is loaded from Hermes config.yaml under memory.providers.memory_server,
 or from environment variables with MEMORY_SERVER_ prefix.
+
+HERM-1/2: a single env resolver (``_env_overrides``) feeds BOTH constructors
+(``from_dict`` with ``use_env=True`` and ``from_env``). ``use_env=False``
+skips every env-backed field — config-file values are validated raw.
 """
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +18,90 @@ from typing import Any
 
 from memory_server.paths import cmms_repo_root
 from memory_server.settings import get_settings
+
+# Env vars that this config block resolves itself. Extraction/LLM tuning
+# values (MEMORY_SERVER_LLM_MODEL etc.) are deliberately NOT part of the
+# snapshot — they are resolved by the resolver layer at runtime; from_env
+# keeps them None (except llm_base_url, which is both a config block value
+# and a data-plane env var).
+_ENV_PATH = "MEMORY_SERVER_PATH"
+_ENV_DB_URL = "MEMORY_SERVER_DB_URL"
+_ENV_MAX_FACTS = "MEMORY_SERVER_MAX_FACTS"
+_ENV_WRITER_FLUSH_INTERVAL = "MEMORY_SERVER_WRITER_FLUSH_INTERVAL"
+_ENV_WRITER_MAX_BATCH = "MEMORY_SERVER_WRITER_MAX_BATCH"
+_ENV_LLM_BASE_URL = "MEMORY_SERVER_LLM_BASE_URL"
+
+
+def _env_str(name: str) -> str | None:
+    """Read a string env var; empty/blank values count as unset."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip()
+    return value or None
+
+
+def _env_float(name: str) -> float | None:
+    """Read a float env var; malformed/non-finite values count as unset."""
+    raw = _env_str(name)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _env_int(name: str) -> int | None:
+    """Read an int env var; malformed values count as unset."""
+    raw = _env_str(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
+def _env_overrides(use_env: bool) -> dict[str, Any]:
+    """Single env snapshot for the config block.
+
+    Reads each env var at most once and normalizes every value (blank ->
+    unset, malformed numbers -> unset). With ``use_env=False`` no env var is
+    read at all — every entry stays None so constructors fall through to
+    config-file values/defaults.
+    """
+    if not use_env:
+        return {
+            "path": None,
+            "db_url": None,
+            "max_facts": None,
+            "writer_flush_interval": None,
+            "writer_max_batch": None,
+            "llm_base_url": None,
+        }
+    return {
+        "path": _env_str(_ENV_PATH),
+        "db_url": _env_str(_ENV_DB_URL),
+        "max_facts": _env_int(_ENV_MAX_FACTS),
+        "writer_flush_interval": _env_float(_ENV_WRITER_FLUSH_INTERVAL),
+        "writer_max_batch": _env_int(_ENV_WRITER_MAX_BATCH),
+        "llm_base_url": _env_str(_ENV_LLM_BASE_URL),
+    }
+
+
+def _coerce_max_facts(value: Any, default: int) -> int:
+    """Coerce max_facts from env/config; malformed values fall to default."""
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -84,10 +173,15 @@ class HermesPluginConfig:
         validate the raw config value).
         """
         data = data or {}
+        env = _env_overrides(use_env=use_env)
 
-        writer_cfg = WriterConfig.from_dict(data.get("writer", {}))
+        writer_cfg = WriterConfig.from_dict(data.get("writer", {}) or {})
+        if env["writer_flush_interval"] is not None:
+            writer_cfg.flush_interval = env["writer_flush_interval"]
+        if env["writer_max_batch"] is not None:
+            writer_cfg.max_batch = env["writer_max_batch"]
 
-        env_path = os.environ.get("MEMORY_SERVER_PATH") if use_env else None
+        env_path = env["path"]
         config_path = data.get("path")
         if env_path:
             cmms_path, source = env_path, "env"
@@ -97,15 +191,14 @@ class HermesPluginConfig:
             cmms_path, source = str(cmms_repo_root()), "default"
 
         return cls(
-            db_url=os.environ.get(
-                "MEMORY_SERVER_DB_URL",
-                data.get("db_url") or get_settings().db_url,
-            ),
+            db_url=env["db_url"] or data.get("db_url") or str(get_settings().db_url),
             cmms_path=cmms_path,
             cmms_path_source=source,
             writer=writer_cfg,
-            max_facts=int(
-                os.environ.get("MEMORY_SERVER_MAX_FACTS", data.get("max_facts") or 5)
+            max_facts=_coerce_max_facts(
+                env["max_facts"] if env["max_facts"] is not None
+                else data.get("max_facts"),
+                5,
             ),
             extraction_mode=data.get("extraction_mode"),
             llm_model=data.get("llm_model"),
@@ -113,38 +206,38 @@ class HermesPluginConfig:
             llm_max_input_chars=data.get("llm_max_input_chars"),
             llm_confidence_gate=data.get("llm_confidence_gate"),
             llm_base_url=(
-                os.environ.get("MEMORY_SERVER_LLM_BASE_URL")
-                if use_env
-                else None
-            )
-            or data.get("llm_base_url"),
+                env["llm_base_url"] or data.get("llm_base_url")
+            ),
         )
 
     @classmethod
     def from_env(cls) -> HermesPluginConfig:
         """Create config from environment variables only."""
-        env_path = os.environ.get("MEMORY_SERVER_PATH")
-        if env_path:
-            cmms_path, source = env_path, "env"
+        env = _env_overrides(use_env=True)
+        if env["path"]:
+            cmms_path, source = env["path"], "env"
         else:
             cmms_path, source = str(cmms_repo_root()), "default"
         return cls(
-            db_url=os.environ.get(
-                "MEMORY_SERVER_DB_URL",
-                get_settings().db_url,
-            ),
+            db_url=env["db_url"] or str(get_settings().db_url),
             cmms_path=cmms_path,
             cmms_path_source=source,
             writer=WriterConfig(
-                flush_interval=float(
-                    os.environ.get("MEMORY_SERVER_WRITER_FLUSH_INTERVAL", "5.0")
+                flush_interval=(
+                    env["writer_flush_interval"]
+                    if env["writer_flush_interval"] is not None
+                    else 5.0
                 ),
-                max_batch=int(
-                    os.environ.get("MEMORY_SERVER_WRITER_MAX_BATCH", "50")
+                max_batch=(
+                    env["writer_max_batch"]
+                    if env["writer_max_batch"] is not None
+                    else 50
                 ),
             ),
-            max_facts=int(os.environ.get("MEMORY_SERVER_MAX_FACTS", "5")),
-            llm_base_url=os.environ.get("MEMORY_SERVER_LLM_BASE_URL"),
+            max_facts=(
+                env["max_facts"] if env["max_facts"] is not None else 5
+            ),
+            llm_base_url=env["llm_base_url"],
         )
 
     def validate_shared_root(self, expected: str | None = None) -> None:

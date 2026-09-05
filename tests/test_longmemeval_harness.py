@@ -249,3 +249,102 @@ def test_cli_benchmark_longmemeval_runs_builtin_baseline(tmp_path):
     assert "hermes_builtin_lexical" in result.output
     assert "recall@5" in result.output
     assert output_path.exists()
+
+
+def _q_with_turn_fixture() -> BenchmarkQuery:
+    """Query whose source session has TWO turns: 0 (no answer) and 1 (answer).
+
+    The loader derives source_turn_ids = ("q1:s:1",) — only the answering
+    turn — while the whole session s stays in source_session_ids.
+    """
+    return BenchmarkQuery(
+        query_id="q1",
+        question="What did the user say?",
+        answer="answer",
+        question_type="single-topic",
+        source_session_ids=("s",),
+        source_turn_ids=("q1:s:1",),
+        sessions=(({"content": "filler"}, {"content": "answer", "has_answer": True}),),
+        session_ids=("s",),
+    )
+
+
+def test_raw_target_requires_exact_source_turn_not_whole_session():
+    """ROUTE-2: RAW credit is turn-exact.
+
+    In a source session with turn 0 (no answer) and turn 1 (answer), the
+    non-answering raw turn must NOT be RAW-eligible — only q1:s:1 is.
+    Session fallback stays for SOURCE, so SOURCE/CANONICAL keep working.
+    """
+    query = _q_with_turn_fixture()
+    filler = MemoryItem(
+        memory_id="q1:s:0",
+        kind="raw_turn",
+        content="filler",
+        source_turn_ids=("q1:s:0",),
+        source_session_ids=("s",),
+        raw=True,
+        canonical=False,
+    )
+    answer = MemoryItem(
+        memory_id="q1:s:1",
+        kind="raw_turn",
+        content="answer",
+        source_turn_ids=("q1:s:1",),
+        source_session_ids=("s",),
+        raw=True,
+        canonical=False,
+    )
+    belief = MemoryItem(
+        memory_id="belief-1",
+        kind="belief",
+        content="user said answer",
+        source_turn_ids=("q1:s:1",),
+        source_session_ids=("s",),
+        raw=False,
+        canonical=True,
+        currentness="current",
+    )
+
+    target_sets = build_target_sets(query, [filler, answer, belief])
+
+    assert target_sets[Target.RAW] == {"q1:s:1"}, (
+        "non-answering session turn must not be RAW-eligible; "
+        f"got {target_sets[Target.RAW]}"
+    )
+    # SOURCE still credits the session fallback + the answer turn's derived
+    # descendants; CANONICAL still credits the derived current belief.
+    assert target_sets[Target.SOURCE] == {"q1:s:0", "q1:s:1", "belief-1"}
+    assert target_sets[Target.CANONICAL] == {"belief-1"}
+
+
+def test_metric_change_is_target_set_fix_not_retrieval_change():
+    """Fixing RAW must not alter the stored retrieval trace (ROUTE-2)."""
+    query = _q_with_turn_fixture()
+    baseline = BuiltInMemoryBaseline()
+    items = baseline.ingest(query)
+    trace = baseline.retrieve(query, top_k=10)
+
+    before = trace.ranked_ids
+    _ = build_target_sets(query, items)
+    after = trace.ranked_ids
+
+    assert after == before, "target-set scoring must never mutate retrieval"
+    # With the corrected RAW set, a trace that found the answer turn scores
+    # raw recall 1.0; if the filler turn alone were credited it would have
+    # scored too (the inflated metric the fix removes).
+    scores = rescore_trace(query, items, trace, ks=(10,))
+    filler_only_trace = RetrievalTrace(
+        query_id="q1",
+        benchmark="longmemeval_s",
+        retriever="test",
+        top_k=(RetrievedItem(rank=1, memory_id="q1:s:0", score=1.0),),
+    )
+    filler_scores = rescore_trace(query, items, filler_only_trace, ks=(10,))
+    assert scores[Target.RAW].recall_at[10] == 1.0
+    assert filler_scores[Target.RAW].recall_at[10] == 0.0, (
+        "filler-turn-only trace must not score on RAW"
+    )
+    # SOURCE keeps its session fallback: the filler turn is one of the two
+    # session-anchored raw items -> recall 1/2.
+    assert filler_scores[Target.SOURCE].recall_at[10] == 0.5

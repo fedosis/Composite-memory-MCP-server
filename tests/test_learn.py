@@ -310,3 +310,152 @@ class TestLearn:
         finally:
             await provider_a.close()
             await provider_b.close()
+
+
+@pytest.mark.asyncio
+class TestLearnSemantics:
+    """SVC-1/2/3: confidence/source/creator propagation and safe skill writes.
+
+    learn() writes against a REAL SQLite; the regex path runs with no mocks;
+    the LLM boundary is controlled by passing an extractor callable.
+    """
+
+    async def test_learn_decision_item_matches_receipt_semantics(self, provider):
+        """A stored Decision must carry the SAME confidence/source/creator
+        semantics as its receipt — the extraction confidence is not 1.0 by
+        default while the receipt says 0.5.
+
+        Regression: the item kept the model default (1.0) while the receipt
+        stored the extractor confidence (0.5) — item and receipt diverged.
+        """
+        result = await learn(
+            provider,
+            text="we decided to use Caddy because it is simpler",
+            source="svc-session-1",
+        )
+        assert len(result["decisions"]) == 1
+        d = result["decisions"][0]
+        item = d["item"]
+        receipt = d["receipt"]
+
+        assert item["source"] == "svc-session-1"
+        assert item["creator"] == "svc-session-1"
+        assert receipt["source"] == "svc-session-1"
+        assert item["confidence"] == receipt["confidence"] == 0.5, (
+            "decision item and receipt confidence must agree "
+            f"(item={item['confidence']}, receipt={receipt['confidence']})"
+        )
+
+        # And the DB row agrees with both.
+        stored = await provider.get_decision(receipt["id"])
+        assert stored is not None
+        assert stored.confidence == receipt["confidence"]
+        assert stored.creator == "svc-session-1"
+
+    async def test_learn_skill_carries_source_creator_and_real_success_rate(
+        self, provider
+    ):
+        """Skill rows from learn() must propagate source/creator/confidence and
+        must NOT store extraction confidence into success_rate.
+
+        Regression: skill.source stayed None, creator stayed 'system', and
+        the extraction confidence (0.5) was written into success_rate — the
+        observed operational metric — with no observation history.
+        """
+        result = await learn(
+            provider,
+            text="to deploy docker, do: 1) pull image, 2) run container",
+            source="svc-session-2",
+        )
+        assert len(result["skills"]) == 1
+        s = result["skills"][0]
+        item = s["item"]
+        receipt = s["receipt"]
+
+        assert item["source"] == "svc-session-2"
+        assert item["creator"] == "svc-session-2"
+        assert receipt["source"] == "svc-session-2"
+        # Extraction confidence lives on Skill.confidence (and the receipt)…
+        assert item["confidence"] == receipt["confidence"] == 0.5
+        # …while success_rate — an OBSERVED metric — stays unset (0.0), not 0.5.
+        assert item["success_rate"] == 0.0, (
+            f"success_rate must not borrow extraction confidence, got {item['success_rate']}"
+        )
+
+        stored = await provider.get_skill(receipt["id"])
+        assert stored is not None
+        assert stored.success_rate == 0.0
+        assert stored.creator == "svc-session-2"
+
+    async def test_learn_skill_with_unnumbered_body_does_not_crash(self, provider):
+        """A regex skill whose body has no numbered steps must not fail learn().
+
+        Regression: 'to X, do: <unnumbered>' matched the skill pattern but
+        produced steps == [], which violated Skill's steps:min_length=1 at
+        construction time and aborted the whole learn transaction.
+        """
+        result = await learn(
+            provider,
+            text="to deploy docker, do: pull image then run container",
+            source="svc-session-3",
+        )
+        # The whole learn() succeeded…
+        assert "skills" in result
+        # …and the unnumbered body was recognized as a single step.
+        assert len(result["skills"]) == 1
+        item = result["skills"][0]["item"]
+        assert item["purpose"] == "deploy docker"
+        assert len(item["steps"]) == 1
+        assert "pull image then run container" in item["steps"][0]
+
+    async def test_learn_fact_creator_is_source(self, provider):
+        """Fact rows from learn() record the source as creator (like remember)."""
+        result = await learn(
+            provider,
+            text="Docker is container",
+            source="svc-session-4",
+        )
+        assert len(result["facts"]) == 1
+        item = result["facts"][0]["item"]
+        receipt = result["facts"][0]["receipt"]
+        assert item["creator"] == "svc-session-4"
+        assert item["confidence"] == receipt["confidence"] == 0.5
+
+    async def test_learn_llm_mode_uses_external_extractor_boundary(self, provider):
+        """The LLM response is controlled at the external boundary: a stubbed
+        extractor's validated facts/decisions (with their confidences) reach
+        the DB, and item+receipt stay aligned."""
+        def fake_llm(text: str) -> dict:
+            return {
+                "facts": [
+                    {"subject": "Kubernetes", "predicate": "orchestrates",
+                     "object": "containers", "confidence": 0.95},
+                ],
+                "decisions": [
+                    {"context": "cluster tooling", "choice": "use K3s",
+                     "reason": "lightweight", "alternatives": [],
+                     "confidence": 0.9},
+                ],
+            }
+
+        result = await learn(
+            provider,
+            text="Kubernetes orchestrates containers. We decided to use K3s.",
+            source="svc-session-5",
+            llm_extractor=fake_llm,
+        )
+        assert len(result["facts"]) == 1
+        f = result["facts"][0]
+        assert f["item"]["confidence"] == 0.95
+        assert f["receipt"]["confidence"] == 0.95
+        assert f["item"]["creator"] == "svc-session-5"
+
+        assert len(result["decisions"]) == 1
+        d = result["decisions"][0]
+        assert d["item"]["confidence"] == 0.9
+        assert d["receipt"]["confidence"] == 0.9
+
+        stored_fact = await provider.get_fact(f["receipt"]["id"])
+        assert stored_fact is not None
+        assert stored_fact.confidence == 0.95
+        assert stored_fact.creator == "svc-session-5"

@@ -285,6 +285,19 @@ class HermesProvider:
         self._hermes_home: str = ""
         self._session_id: str = ""
         self._context_cache: dict[str, Any] = {}
+        # HERM-3/4: generation guard for the async prefetch/context pipeline.
+        # Every queued load carries a token = (session, generation, seq):
+        #   * generation is bumped on every session switch — a load started
+        #     for the previous session can never publish into the new one;
+        #   * seq is monotonic per provider — when a NEWER load has already
+        #     published, an older in-flight load is dropped ("устаревший task
+        #     не публикуется"), so a slow A never overwrites a fast B;
+        #   * cache entries are tagged with the query+session they were
+        #     computed for, so prefetch() never serves one query's context to
+        #     another ("cache не выдаётся чужому запросу").
+        self._prefetch_generation: int = 0
+        self._prefetch_seq: int = 0
+        self._prefetch_tasks: dict[int, Any] = {}  # seq -> asyncio.Task
 
     # ------------------------------------------------------------------
     # Core lifecycle
@@ -711,6 +724,9 @@ class HermesProvider:
         if self._shut_down:                              # T13 / T8-completed
             return
         logger.info("HermesProvider: shutting down")
+        # HERM-3/4: invalidate any in-flight prefetch loads by bumping the
+        # generation (see on_session_switch for why we do not hard-cancel).
+        self._prefetch_generation += 1
         try:
             _run_async(self._teardown_async(), timeout=30.0)   # T6 outer bound
         except Exception as exc:
@@ -757,38 +773,92 @@ class HermesProvider:
 
         Non-blocking — schedules the async load on the background loop.
         The result is cached and returned by the next prefetch() call.
+
+        Generation guard (HERM-3/4): the load captures the current
+        (session, generation, seq) token. If the session switches or a newer
+        load is queued before this one finishes, its result is dropped at
+        publish time instead of polluting the context cache.
         """
         if not self._provider:
             return
         if self._cleanup_failed:                      # CLOSE_FAILED fail-closed guard (NEW)
             return
+        effective_session = session_id or self._session_id
         try:
             loop = _get_loop()
-            asyncio.run_coroutine_threadsafe(
-                self._queue_prefetch_async(query, max_results=self._max_facts()),
-                loop,
-            )
+            seq = self._prefetch_seq
+            self._prefetch_seq = seq + 1
+            gen = self._prefetch_generation
+
+            async def _spawn() -> None:
+                task = asyncio.create_task(
+                    self._queue_prefetch_async(
+                        query,
+                        session=effective_session,
+                        gen=gen,
+                        seq=seq,
+                        max_results=self._max_facts(),
+                    )
+                )
+                self._prefetch_tasks[seq] = task
+                try:
+                    await task
+                finally:
+                    if self._prefetch_tasks.get(seq) is task:
+                        self._prefetch_tasks.pop(seq, None)
+
+            asyncio.run_coroutine_threadsafe(_spawn(), loop)
         except Exception:
             logger.exception("HermesProvider: queue_prefetch failed")
+
+    def _cancel_prefetch_tasks(self) -> None:
+        """Cancel in-flight background prefetch loads (test/utility seam).
+
+        DANGER: only safe for loads that are NOT parked inside an async
+        SQLAlchemy call — cancelling there leaks the checked-out connection
+        and hangs engine.dispose() at shutdown. Lifecycle paths
+        (on_session_switch/shutdown) therefore use logical invalidation via
+        the generation counter instead of this method. Thread-safe:
+        ``asyncio.Task.cancel()`` only schedules cancellation on the owning
+        loop.
+        """
+        tasks = list(self._prefetch_tasks.values())
+        self._prefetch_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
 
-        Returns cached context from the PREVIOUS queue_prefetch() call.
-        Fast — never blocks on I/O. If no cached context, triggers a
-        synchronous load as fallback.
+        Returns cached context from the PREVIOUS queue_prefetch() call, but
+        only when it was computed for the SAME query and session (HERM-3/4:
+        cache is never handed to a different query). If the cached context
+        does not match, triggers a synchronous load as fallback.
+        Fast — never blocks on I/O when the cache hits.
         """
         if not self._provider:
             return ""
         if self._cleanup_failed:                      # CLOSE_FAILED fail-closed guard (NEW)
             return ""
 
-        # Return cached context if available
-        cached = self._context_cache.get("prefetch", "")
-        if cached:
-            return cached
+        effective_session = session_id or self._session_id
 
-        # Fallback: sync load (first turn, no prior queue_prefetch)
+        # Return cached context only for the exact (query, session) it was
+        # computed for — a stale entry from another query/session is never
+        # served to this request.
+        cached = self._context_cache.get("prefetch")
+        if isinstance(cached, dict):
+            entry_text = cached.get("text", "")
+            if (
+                entry_text
+                and cached.get("query") == query
+                and cached.get("session") == effective_session
+            ):
+                return entry_text
+
+        # Fallback: sync load (first turn, no prior queue_prefetch, or the
+        # cache belongs to a different query/session)
         try:
             result = _run_async(
                 self._prefetch_async(query, max_results=self._max_facts()),
@@ -802,11 +872,80 @@ class HermesProvider:
 
         return ""
 
-    async def _queue_prefetch_async(self, query: str, max_results: int = 5) -> None:
-        """Async prefetch that caches result in _context_cache."""
-        result = await self._prefetch_async(query, max_results=max_results)
-        if result:
-            self._context_cache["prefetch"] = result
+    async def _queue_prefetch_async(
+        self,
+        query: str,
+        *,
+        session: str = "",
+        gen: int | None = None,
+        seq: int | None = None,
+        max_results: int = 5,
+    ) -> None:
+        """Async prefetch that caches result in _context_cache.
+
+        Generation-guarded publish (HERM-3/4):
+          * a cancelled load never publishes;
+          * a load whose (session, generation) is stale never publishes;
+          * an older load never overwrites a newer load's cache entry.
+        """
+        if gen is None:
+            gen = self._prefetch_generation
+        if seq is None:
+            seq = self._prefetch_seq
+
+        try:
+            result = await self._prefetch_async(query, max_results=max_results)
+        except asyncio.CancelledError:
+            logger.debug(
+                "HermesProvider: prefetch load seq=%s cancelled — not publishing",
+                seq,
+            )
+            return
+        except Exception:
+            logger.exception(
+                "HermesProvider: async prefetch failed for query %r", query
+            )
+            return
+        if not result:
+            return
+
+        effective_session = session or self._session_id
+        if gen != self._prefetch_generation:
+            logger.debug(
+                "HermesProvider: dropping stale prefetch (gen %s != %s)",
+                gen,
+                self._prefetch_generation,
+            )
+            return
+        if effective_session != self._session_id:
+            logger.debug(
+                "HermesProvider: dropping prefetch for stale session %r "
+                "(current %r)",
+                effective_session,
+                self._session_id,
+            )
+            return
+
+        entry = self._context_cache.get("prefetch")
+        if (
+            isinstance(entry, dict)
+            and entry.get("session") == effective_session
+            and entry.get("seq", -1) > seq
+        ):
+            logger.debug(
+                "HermesProvider: dropping superseded prefetch load seq=%s "
+                "(newer seq=%s already published)",
+                seq,
+                entry.get("seq"),
+            )
+            return
+
+        self._context_cache["prefetch"] = {
+            "query": query,
+            "session": effective_session,
+            "seq": seq,
+            "text": result,
+        }
 
     async def _prefetch_async(self, query: str, max_results: int = 5) -> str:
         """Async prefetch implementation.
@@ -935,6 +1074,16 @@ class HermesProvider:
             _run_async(self._writer.flush(), timeout=30.0)
         except Exception:
             logger.exception("HermesProvider: on_session_switch flush failed")
+
+        # HERM-3/4 session invalidation: bump the generation and drop the
+        # session-bound cache entry. In-flight loads started for the previous
+        # session see the bumped generation at publish time and are dropped.
+        # NOTE: we intentionally do NOT hard-cancel those loads here — a load
+        # may be parked inside an async SQLAlchemy call, and cancelling it
+        # mid-await leaks the checked-out connection (engine.dispose() then
+        # hangs at shutdown). Logical invalidation is safe and sufficient.
+        self._prefetch_generation += 1
+        self._context_cache.pop("prefetch", None)
 
         # Update session state
         self._session_id = new_session_id
@@ -1485,16 +1634,18 @@ class HermesProvider:
         source_id: str = "",
         target_id: str = "",
     ) -> str:
-        from memory_server.providers.graph_provider import SimpleGraph
         from memory_server.router.graph_router import GraphRouter
 
-        if self._graph is None:
-            self._graph = SimpleGraph()
+        # HERM-3: use the shared snapshot-backed graph, never a private
+        # memory-only SimpleGraph. A bespoke in-memory graph here made the
+        # handler blind to persisted nodes AND cached itself into
+        # provider._graph, so later _get_graph() callers (route/audit) would
+        # see an empty graph instead of the snapshot.
+        graph = await _get_graph(self)
         graph_router = GraphRouter(
-            graph=self._graph,
+            graph=graph,
             max_path_depth=get_settings().graph_max_path_depth,
         )
-        graph = graph_router.graph
 
         nodes: list[dict] = []
         edges: list[dict] = []

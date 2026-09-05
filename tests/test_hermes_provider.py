@@ -10,6 +10,7 @@ These tests mock the CMMS backend (SQLiteProvider) and Hermes ABC contract.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -918,6 +919,280 @@ class TestHermesProviderSessionHooks:
         )
         assert provider._context_cache == {}
         provider.shutdown()
+
+
+class TestHermesProviderGenerationGuard:
+    """HERM-3/4: generation-guarded async prefetch pipeline.
+
+    Every queued context load carries a token (session, generation, seq):
+      - a stale-generation / stale-session load never publishes;
+      - a slow older load never overwrites a fast newer load (barrier A/B);
+      - a cancelled load never pollutes the cache;
+      - cache entries are served only to the query+session they were
+        computed for;
+      - a session switch invalidates the previous session's cache entry.
+
+    The DB-adjacent loads are monkeypatched away: these are unit tests of the
+    guard, not of get_context.
+    """
+
+    @staticmethod
+    def _make_provider() -> HermesProvider:
+        provider = HermesProvider()  # uninitialized — guard tests need no DB
+        provider._session_id = "s1"
+        return provider
+
+    def test_cache_served_only_for_same_query_and_session(self):
+        """A cache entry computed for query A is never returned for query B
+        or for another session — prefetch falls back instead of leaking."""
+        provider = self._make_provider()
+        provider._provider = object()  # bypass the not-initialized guard only
+
+        async def fake(query, max_results=5):
+            return {"qA": "CONTEXT-A", "qB": "CONTEXT-B"}.get(query, "")
+
+        provider._prefetch_async = fake
+        provider._session_id = "s1"
+        # Publish qA entry for session s1.
+        _run_async(provider._queue_prefetch_async(
+            "qA", session="s1", gen=0, seq=1,
+        ))
+
+        # Same query + same session -> served from cache.
+        assert provider.prefetch("qA", session_id="s1") == "CONTEXT-A"
+        # A DIFFERENT query must not receive qA's cached context. Pre-fix this
+        # returned qA's cached text; now the sync fallback computes qB fresh.
+        assert provider.prefetch("qB", session_id="s1") == "CONTEXT-B"
+        # The cache entry itself still belongs to qA (fallback never
+        # overwrites a queued entry with a synchronous load).
+        entry = provider._context_cache["prefetch"]
+        assert entry["query"] == "qA" and entry["session"] == "s1"
+        # A different session must not be served the s1 entry: the request
+        # misses the cache (session mismatch) and falls back.
+        assert provider.prefetch("qA", session_id="other") == "CONTEXT-A"
+        assert provider._context_cache["prefetch"]["session"] == "s1"
+
+    def test_stale_generation_task_never_publishes(self):
+        """A load whose generation predates the current one is dropped."""
+        provider = self._make_provider()
+        provider._prefetch_generation = 7
+
+        _run_async(provider._queue_prefetch_async(
+            "qOld", session="s1", gen=6, seq=1,
+        ))
+
+        assert "prefetch" not in provider._context_cache
+
+    def test_stale_session_task_never_publishes(self):
+        """A load started for an old session is dropped after a switch."""
+        provider = self._make_provider()
+        provider._session_id = "s2"  # switched away from s1
+
+        _run_async(provider._queue_prefetch_async(
+            "qA", session="s1", gen=provider._prefetch_generation, seq=1,
+        ))
+
+        assert "prefetch" not in provider._context_cache
+
+    def test_barrier_slow_a_fast_b_leaves_b(self):
+        """A slow in-flight load (A, older seq) that finishes after a fast
+        load (B, newer seq) must not overwrite B's cache entry."""
+
+        async def scenario():
+            provider = self._make_provider()
+            provider._session_id = "s1"
+            release = asyncio.Event()
+
+            async def slow(query, max_results=5):
+                await release.wait()
+                return "CONTEXT-A"
+
+            provider._prefetch_async = slow
+            task_a = asyncio.create_task(provider._queue_prefetch_async(
+                "qA", session="s1", gen=0, seq=1,
+            ))
+            await asyncio.sleep(0.01)  # A is now parked on the barrier
+
+            async def fast(query, max_results=5):
+                return "CONTEXT-B"
+
+            provider._prefetch_async = fast
+            await provider._queue_prefetch_async(
+                "qB", session="s1", gen=0, seq=2,
+            )
+            entry = provider._context_cache["prefetch"]
+            assert entry["query"] == "qB" and entry["text"] == "CONTEXT-B"
+
+            release.set()
+            await task_a  # A finishes late and must be dropped
+
+            entry = provider._context_cache["prefetch"]
+            assert entry["query"] == "qB", "stale A overwrote B"
+            assert entry["text"] == "CONTEXT-B"
+
+        asyncio.run(scenario())
+
+    def test_cancelled_task_never_publishes(self):
+        """A cancelled load leaves no trace in the cache."""
+
+        async def scenario():
+            provider = self._make_provider()
+            provider._session_id = "s1"
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def cancellable(query, max_results=5):
+                started.set()
+                await release.wait()
+                return "CONTEXT-X"
+
+            provider._prefetch_async = cancellable
+            task = asyncio.create_task(provider._queue_prefetch_async(
+                "qX", session="s1", gen=0, seq=1,
+            ))
+            await started.wait()
+            task.cancel()
+            await task  # CancelledError is swallowed inside the guard
+            assert "prefetch" not in provider._context_cache
+            release.set()  # allow the helper task to exit cleanly
+
+        asyncio.run(scenario())
+
+    def test_session_switch_invalidates_cache_entry(self):
+        """on_session_switch drops the previous session's prefetch entry and
+        bumps the generation (even without reset=True)."""
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="s1",
+            config={"db_url": "sqlite+aiosqlite://"},
+        )
+        try:
+            gen_before = provider._prefetch_generation
+            provider._context_cache["prefetch"] = {
+                "query": "qOld", "session": "s1", "seq": 1, "text": "ctx-s1",
+            }
+            provider.on_session_switch(new_session_id="s2")
+
+            assert provider._session_id == "s2"
+            assert provider._prefetch_generation == gen_before + 1
+            assert "prefetch" not in provider._context_cache
+        finally:
+            provider.shutdown()
+
+    def test_session_switch_prevents_stale_publish_into_new_session(self):
+        """An in-flight load for the old session that completes AFTER a switch
+        never publishes into the new session's cache."""
+
+        async def scenario():
+            provider = self._make_provider()
+            provider._session_id = "s1"
+            release = asyncio.Event()
+
+            async def slow(query, max_results=5):
+                await release.wait()
+                return "CONTEXT-OLD"
+
+            provider._prefetch_async = slow
+            task = asyncio.create_task(provider._queue_prefetch_async(
+                "qOld", session="s1", gen=provider._prefetch_generation, seq=1,
+            ))
+            await asyncio.sleep(0.01)
+            # Session switches while the old-session load is still running.
+            provider._prefetch_generation += 1
+            provider._session_id = "s2"
+            provider._context_cache.pop("prefetch", None)
+
+            release.set()
+            await task
+
+            assert "prefetch" not in provider._context_cache, (
+                "stale session load polluted the new session"
+            )
+
+        asyncio.run(scenario())
+
+
+class TestHermesProviderGraphHandlerSnapshot:
+    """HERM-3: _handle_graph_search uses the shared snapshot-backed graph.
+
+    Regression: the handler built a private memory-only SimpleGraph, so it
+    never saw persisted nodes AND cached that empty graph into
+    provider._graph, blinding later _get_graph() callers (route/audit).
+    """
+
+    def test_handler_sees_node_from_snapshot(self, tmp_path, monkeypatch):
+        from memory_server.settings import get_settings
+
+        snapshot = tmp_path / "graph.json"
+        monkeypatch.setenv("MEMORY_SERVER_GRAPH_SNAPSHOT_PATH", str(snapshot))
+        get_settings.cache_clear()
+        snapshot.write_text(json.dumps({
+            "nodes": {
+                "alpha": {
+                    "id": "alpha", "type": "entity", "name": "AlphaNode",
+                    "attributes": {},
+                },
+            },
+            "edges": [],
+        }), encoding="utf-8")
+
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="gh-test",
+            config={"db_url": "sqlite+aiosqlite://"},
+        )
+        try:
+            result = provider.handle_tool_call(
+                "graph_search", {"entity_id": "alpha"},
+            )
+            payload = json.loads(result)
+            names = [n.get("name") for n in payload.get("nodes", [])]
+            assert "AlphaNode" in names, (
+                f"handler must see the snapshot node, got nodes={names}"
+            )
+
+            # The shared graph is now cached on the provider and contains the
+            # snapshot node — not an empty memory-only graph.
+            assert provider._graph is not None
+            assert provider._graph.get_node("alpha") is not None
+        finally:
+            provider.shutdown()
+
+    def test_graph_search_does_not_blind_route_with_empty_graph(
+        self, tmp_path, monkeypatch,
+    ):
+        """Calling graph_search first must not replace the snapshot-backed
+        graph with an empty one for subsequent shared-graph callers."""
+        from memory_server.settings import get_settings
+
+        snapshot = tmp_path / "graph.json"
+        monkeypatch.setenv("MEMORY_SERVER_GRAPH_SNAPSHOT_PATH", str(snapshot))
+        get_settings.cache_clear()
+        snapshot.write_text(json.dumps({
+            "nodes": {
+                "beta": {
+                    "id": "beta", "type": "entity", "name": "BetaNode",
+                    "attributes": {},
+                },
+            },
+            "edges": [],
+        }), encoding="utf-8")
+
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="gh-test2",
+            config={"db_url": "sqlite+aiosqlite://"},
+        )
+        try:
+            provider.handle_tool_call("graph_search", {"entity_id": "beta"})
+            # A subsequent _get_graph consumer (e.g. route) sees the same
+            # snapshot-backed graph with the node present.
+            from memory_server.plugins.hermes.provider import _get_graph
+
+            graph = _run_async(_get_graph(provider))
+            assert graph.get_node("beta") is not None
+        finally:
+            provider.shutdown()
 
 
 class TestHermesPluginConfig:

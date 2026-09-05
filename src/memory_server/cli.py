@@ -47,6 +47,11 @@ VALID_CONFIG_SECTION = """\
 
 BACKUP_FILE = ".memory-provider-backup"
 
+# Explicit marker written to the backup file when install finds NO previous
+# ``memory.provider`` key. uninstall maps it back to "remove the key" so the
+# pre-install state (absence) is restored exactly (CORE-1/2).
+ABSENT_PROVIDER_MARKER = "<absent>"
+
 
 def _find_hermes_home(provided: str | None) -> str:
     """Resolve Hermes home directory.
@@ -83,6 +88,18 @@ def _set_memory_provider(yaml_data, provider: str) -> str | None:
     memory = yaml_data.setdefault("memory", {})
     memory["provider"] = provider
     return old
+
+
+def _is_first_switch(previous: str | None) -> bool:
+    """True when install is actually switching AWAY from a different provider
+    (or recording that there was no provider key at all).
+
+    False when ``memory.provider`` is already ``memory_server`` — that is a
+    re-install, and it must not overwrite the original backup (CORE-1).
+    """
+    if previous is None:
+        return True  # no key yet — absence must be recorded explicitly
+    return previous != "memory_server"
 
 
 def _add_provider_entry(yaml_data, cmms_path: str) -> bool:
@@ -178,8 +195,11 @@ def _do_install(
         out(f"🔍 Dry-run — would write to: {cfg_path}")
         out(f"   CMMS path: {cmms_path}")
         out(f"   memory.provider: {previous!r} → 'memory_server'")
-        if previous is not None:
-            out(f"   Backup old provider to: {back_path}")
+        if _is_first_switch(previous):
+            if previous is None:
+                out(f"   Backup absence marker to: {back_path}")
+            else:
+                out(f"   Backup old provider to: {back_path}")
         out("\nTarget config.yaml changes:")
         # Dump the modified YAML so the user can review
         from ruamel.yaml import YAML
@@ -190,9 +210,16 @@ def _do_install(
         return 0
 
     # --- backup old provider ---
-    if previous is not None:
+    # CORE-1/2: backup ONLY on the FIRST switch (previous provider differs
+    # from 'memory_server', including the no-key case, which records an
+    # explicit absence marker). A re-install over an already-active
+    # memory_server provider must NEVER overwrite the backup, otherwise the
+    # second install would clobber the original provider and uninstall would
+    # restore the wrong value.
+    if _is_first_switch(previous):
+        backup_value = previous if previous is not None else ABSENT_PROVIDER_MARKER
         try:
-            back_path.write_text(previous + "\n")
+            back_path.write_text(backup_value + "\n")
         except OSError as exc:
             out(f"⚠️  Could not write backup file {back_path}: {exc}")
             out("   Continuing anyway...")
@@ -207,12 +234,46 @@ def _do_install(
     out(f"✅ CMMS registered as Hermes MemoryProvider in {cfg_path}")
     out(f"   Plugin path: memory_server.plugins.hermes.provider.HermesProvider")  # noqa: F541
     out(f"   memory.provider: {previous!r} → 'memory_server'")
-    if previous is not None:
-        out(f"   Backup saved to: {back_path}")
+    if _is_first_switch(previous):
+        if previous is None:
+            out(f"   Backup (absence marker) saved to: {back_path}")
+        else:
+            out(f"   Backup saved to: {back_path}")
+    else:
+        out(f"   Provider already active — existing backup kept: {back_path}")
     out("")
     out("👉 Restart Hermes gateway to activate:")
     out("   hermes gateway restart")
     return 0
+
+
+def _restore_previous_provider(
+    yaml_data,
+    *,
+    current_provider: str | None,
+    restored_provider: str | None,
+    restore_absence: bool,
+) -> str:
+    """Restore the pre-install ``memory.provider`` state.
+
+    Only acts while ``memory_server`` is still the active provider — if the
+    user manually switched to another provider after install, that choice is
+    never clobbered. ``restore_absence`` (backup held the absence marker, or
+    no backup exists) removes the ``memory.provider`` key entirely, matching
+    the pre-install "no key" state (CORE-1/2).
+
+    Returns a human-readable description of the action ('' when nothing was
+    done).
+    """
+    if current_provider != "memory_server":
+        return ""
+    memory = yaml_data.setdefault("memory", {})
+    if restore_absence or restored_provider is None:
+        if memory.get("provider") == "memory_server":
+            del memory["provider"]
+        return "memory.provider removed (restored absence — no prior key)"
+    memory["provider"] = restored_provider
+    return f"memory.provider restored: {current_provider!r} → {restored_provider!r}"
 
 
 def _do_uninstall(
@@ -234,36 +295,47 @@ def _do_uninstall(
     removed = _remove_provider_entry(data)
     current_provider = _current_memory_provider(data)
 
-    # Try to restore previous provider from backup
-    restored_provider = None
+    # Read the backup: a provider name to restore, the absence marker, or
+    # nothing (missing file -> absence as the last resort).
+    restored_provider: str | None = None
+    restore_absence = False
     if back_path.is_file():
-        restored_provider = back_path.read_text().strip()
+        raw = back_path.read_text().strip()
+        if raw == ABSENT_PROVIDER_MARKER:
+            restore_absence = True
+        elif raw:
+            restored_provider = raw
+    else:
+        restore_absence = True  # no recorded prior state -> key was absent
 
     if not removed:
         out("ℹ️  memory_server provider was not registered — nothing to remove")
         return 0
 
+    action = _restore_previous_provider(
+        data,
+        current_provider=current_provider,
+        restored_provider=restored_provider,
+        restore_absence=restore_absence,
+    )
+
     if dry_run:
         out(f"🔍 Dry-run — would write to: {cfg_path}")
-        if restored_provider:
-            out(f"   Restore memory.provider: {current_provider!r} → {restored_provider!r}")
+        if action:
+            out(f"   {action}")
+        else:
+            out("   memory.provider left unchanged (not memory_server)")
         out(f"   Remove backup file: {back_path}")
         out("\nTarget config.yaml changes:")
         from ruamel.yaml import YAML
 
         y = YAML()
         y.preserve_quotes = True
-        # If we would restore, set the provider
-        if restored_provider and current_provider == "memory_server":
-            data["memory"]["provider"] = restored_provider
         y.dump(data, sys.stdout)
         return 0
 
-    # Restore previous provider if current is memory_server
-    if restored_provider and current_provider == "memory_server":
-        memory = data.setdefault("memory", {})
-        memory["provider"] = restored_provider
-        out(f"   memory.provider restored: {current_provider!r} → {restored_provider!r}")
+    if action:
+        out(f"   {action}")
 
     # Write
     try:

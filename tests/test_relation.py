@@ -7,18 +7,16 @@ Tests cover:
 - Edge cases: empty input, borderline cases
 """
 
-import pytest
 from datetime import datetime, timezone
 
 from memory_server.evaluation.relation import (
     RelationClassifier,
-    RelationResult,
-    detect_contradictions,
-    detect_relations,
-    _tokenize,
     _has_opposite_sentiment,
     _has_same_subject,
     _has_shared_sentiment,
+    _tokenize,
+    detect_contradictions,
+    detect_relations,
 )
 from memory_server.models.belief import Belief
 

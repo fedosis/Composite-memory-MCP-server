@@ -164,3 +164,80 @@ async def test_bulk_import_memory_md_skips_ephemeral_and_imports_durable(tmp_pat
     objects = {fact.object for fact in facts}
     assert "User prefers concise terminal-friendly responses." in objects
     assert "IMPORTANT: Never disable logging or rollback safeguards." in objects
+
+
+def test_embedded_words_are_not_false_positives():
+    """SVC-4: 'knows'/'nowhere' must not trip the transient 'now' term and
+    'mustard' must not trip the important 'must' term."""
+    gate = MemoryAdmissionGate()
+
+    knows = gate.classify("User knows the server IP address")
+    assert knows.admitted is True
+    assert knows.tag is not MemoryTag.EPHEMERAL
+    assert "low_signal" not in knows.reason_codes
+
+    nowhere = gate.classify("The fix is nowhere near ready")
+    assert nowhere.admitted is True
+    assert nowhere.tag is not MemoryTag.EPHEMERAL
+
+    mustard = gate.classify("The mustard jar is on the shelf")
+    assert mustard.tag is not MemoryTag.IMPORTANT, (
+        "'mustard' embeds 'must' and must not classify as IMPORTANT"
+    )
+    assert mustard.admitted is True
+
+
+def test_genuine_now_and_must_still_match():
+    """Real 'now' (transient) and 'must' (important) words still classify."""
+    gate = MemoryAdmissionGate()
+
+    now_text = gate.classify("Backup the config now")
+    assert now_text.tag is MemoryTag.EPHEMERAL
+    assert "low_signal" in now_text.reason_codes
+
+    must_text = gate.classify("You must back up before migrating")
+    assert must_text.tag is MemoryTag.IMPORTANT
+    assert "explicit_importance" in must_text.reason_codes
+
+
+def test_punctuation_is_covered():
+    """Punctuation must not hide noise/importance/transience."""
+    gate = MemoryAdmissionGate()
+
+    assert gate.classify("ok.").tag is MemoryTag.EPHEMERAL
+    assert gate.classify("thanks!").tag is MemoryTag.EPHEMERAL
+    # 'now' before '!' is a genuine transient mention.
+    assert gate.classify("Write scratch note now!").tag is MemoryTag.EPHEMERAL
+    # Multi-word phrase 'do not' with punctuation.
+    decision = gate.classify("Do NOT disable logging.")
+    assert decision.tag is MemoryTag.IMPORTANT
+    assert decision.metadata["memory_kind"] == "system_policy"
+    # Multi-word noise phrase with punctuation.
+    assert gate.classify("got it.").tag is MemoryTag.EPHEMERAL
+    assert gate.classify("thank you!").tag is MemoryTag.EPHEMERAL
+
+
+def test_unicode_phrase_matching():
+    """Cyrillic transient/important terms match as whole words."""
+    gate = MemoryAdmissionGate()
+
+    today = gate.classify("сегодня это черновик заметки")
+    assert today.tag is MemoryTag.EPHEMERAL, "today/draft in Russian is transient"
+
+    important = gate.classify("обязательно сделать резервную копию")
+    assert important.tag is MemoryTag.IMPORTANT
+
+
+def test_receipt_updated_at_default_is_utc_aware():
+    """SVC-7: MemoryReceipt.updated_at defaults to a UTC-aware datetime."""
+    from memory_server.models.receipt import MemoryReceipt
+
+    receipt = MemoryReceipt(
+        id="r1",
+        memory_type="fact",
+        source="src",
+        created_by="test",
+        timestamp=datetime.now(timezone.utc),
+    )
+    assert receipt.updated_at.tzinfo is not None
+    assert receipt.updated_at.utcoffset() == timedelta(0)

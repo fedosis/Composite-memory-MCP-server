@@ -16,7 +16,7 @@ from memory_server.evaluation.validator import (
     is_valid_transition,
     normalize_lifecycle_state,
 )
-from memory_server.models.receipt import LifecycleState, VerificationStatus
+from memory_server.models.receipt import LifecycleState
 
 
 @pytest.fixture

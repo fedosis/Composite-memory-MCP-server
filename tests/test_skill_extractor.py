@@ -1,6 +1,5 @@
 """Tests for SkillExtractor (Card 014)."""
 
-import pytest
 
 from memory_server.extractors.skill_extractor import SkillExtractor
 
@@ -95,3 +94,58 @@ class TestSkillExtractor:
             "to set up monitoring stack, do: 1) install prometheus, 2) configure grafana"
         )
         assert skills[0]["purpose"] == "set up monitoring stack"
+
+    def test_unnumbered_body_is_a_single_step(self):
+        """'do: <unnumbered body>' must not produce an empty step list.
+
+        SVC-3 regression: a valid regex match with no numbered list yielded
+        steps == [], which violated the Skill model's steps:min_length=1 and
+        crashed learn(). The body is recognized as one step instead.
+        """
+        extractor = SkillExtractor()
+        skills = extractor.extract(
+            "to deploy docker, do: pull image then run container"
+        )
+        assert len(skills) == 1
+        s = skills[0]
+        assert s["purpose"] == "deploy docker"
+        assert len(s["steps"]) == 1
+        assert s["steps"][0] == "pull image then run container"
+        assert s["confidence"] == 0.5
+
+    def test_numbered_body_keeps_numbered_steps(self):
+        """A numbered body still splits into numbered steps (no fallback)."""
+        extractor = SkillExtractor()
+        skills = extractor.extract(
+            "to deploy docker, do: 1) pull image, 2) run container"
+        )
+        assert skills[0]["steps"] == ["pull image", "run container"]
+
+    def test_malformed_llm_skills_are_skipped_safely(self):
+        """Malformed LLM entries never reach the Skill constructor (SVC-3).
+
+        Entries without a usable purpose or with no recognizable string steps
+        are skipped; valid entries survive with steps coerced to strings.
+        """
+
+        def bad_llm(text: str) -> list:  # deliberately returns junk entries
+            return [
+                {"purpose": "valid skill",
+                 "steps": ["one", "two"], "constraints": ["a"]},
+                {"purpose": "no steps"},
+                {"purpose": "empty steps", "steps": []},
+                {"purpose": "non-string steps", "steps": "one, two"},
+                {"purpose": "mixed steps",
+                 "steps": ["ok", 5, None, "  padded  "]},
+                {"steps": ["missing purpose"]},
+                "not a dict",
+            ]
+
+        extractor = SkillExtractor(llm_extractor=bad_llm)
+        skills = extractor.extract("arbitrary text")
+        # Only the valid entry and the mixed-step entry (coerced) survive.
+        assert len(skills) == 2, f"expected 2 clean skills, got {skills}"
+        by_purpose = {s["purpose"]: s for s in skills}
+        assert by_purpose["valid skill"]["steps"] == ["one", "two"]
+        assert by_purpose["mixed steps"]["steps"] == ["ok", "padded"]
+        assert by_purpose["mixed steps"]["constraints"] == []

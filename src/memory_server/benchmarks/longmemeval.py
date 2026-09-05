@@ -188,17 +188,34 @@ class LongMemEvalLoader:
 
 
 def build_target_sets(query: BenchmarkQuery, memory_items: Iterable[MemoryItem]) -> dict[Target, set[str]]:
-    """Build raw/source/canonical eligible memory ID sets for one query."""
+    """Build raw/source/canonical eligible memory ID sets for one query.
+
+    ROUTE-2: the RAW target is credited ONLY to items anchored on the exact
+    source/evidence TURNS (``source_turn_ids``). A raw turn that merely
+    belongs to a source SESSION but carries no answer is NOT raw-eligible —
+    including it inflated raw recall. The session fallback remains for the
+    SOURCE/CANONICAL targets (raw memories plus derived descendants sharing
+    the source anchor).
+    """
 
     source_turns = set(query.source_turn_ids)
     source_sessions = set(query.source_session_ids)
     targets: dict[Target, set[str]] = {target: set() for target in Target}
 
     for item in memory_items:
-        if not _shares_source_anchor(item, source_turns, source_sessions):
+        item_turn_ids = set(item.source_turn_ids)
+        item_session_ids = set(item.source_session_ids)
+        turn_anchored = bool(source_turns and (item_turn_ids & source_turns))
+        session_anchored = bool(
+            source_sessions and (item_session_ids & source_sessions)
+        )
+        if not (turn_anchored or session_anchored):
             continue
         if item.raw:
-            targets[Target.RAW].add(item.memory_id)
+            # RAW credit is turn-exact: an evidence turn counts, a same-
+            # session filler turn does not.
+            if turn_anchored:
+                targets[Target.RAW].add(item.memory_id)
             targets[Target.SOURCE].add(item.memory_id)
             continue
 

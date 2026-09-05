@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -25,6 +26,229 @@ logger = logging.getLogger(__name__)
 DEFAULT_TABLE = "memories"
 DEFAULT_VECTOR_SIZE = 384
 
+# Restricted filter contract (CORE-5/6, PROV-4).
+#
+# The provider turns caller-supplied filter dicts into LanceDB filter
+# expressions. Two rules keep that translation safe:
+#   1. Field identifiers are validated against the *actual* table schema
+#      (allowlist), and only scalar, non-payload columns are accepted.
+#   2. Values are rendered as typed literals with proper escaping — never
+#      interpolated raw into the expression string.
+# Qdrant-style must/should/must_not are fully supported (AND/OR/NOT), never
+# silently ignored. Unsupported expressions raise ProviderSearchError before
+# reaching the backend.
+_FIELD_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Columns that can never be filter targets: `vector` is the embedding itself
+# and `_metadata` is a JSON *string* column (LanceDB cannot filter inside a
+# JSON string — it is not a struct/map column).
+_NON_FILTERABLE_COLUMNS = frozenset({"vector", "_metadata"})
+_SUPPORTED_FILTER_KEYS = frozenset({"must", "should", "must_not"})
+# Match conditions whose shape we cannot translate (e.g. qdrant range/geo).
+_SUPPORTED_MATCH_KEYS = frozenset({"value"})
+
+
+def _quote_literal(value: Any) -> str:
+    """Render a Python scalar as a safe LanceDB filter literal.
+
+    Strings are single-quoted with embedded quotes doubled (LanceDB filter
+    syntax follows SQL string-literal escaping: ``'it''s'`` == ``it's``).
+    Booleans/numbers are rendered unquoted. Any other type is rejected —
+    a list/dict/None can never be a safe equality literal.
+    """
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    raise ProviderSearchError(
+        "unsupported filter value type "
+        f"{type(value).__name__!r}: only str/int/float/bool are allowed"
+    )
+
+
+def _validate_field_identifier(field: Any, schema_names: list[str]) -> str:
+    """Validate a filter field identifier against the table schema.
+
+    Returns the canonical identifier or raises ProviderSearchError.
+    """
+    if not isinstance(field, str) or not _FIELD_IDENTIFIER_RE.match(field):
+        raise ProviderSearchError(
+            f"invalid filter field identifier {field!r}: expected a plain "
+            "identifier matching [A-Za-z_][A-Za-z0-9_]*"
+        )
+    if field not in schema_names:
+        allowed = [n for n in schema_names if n not in _NON_FILTERABLE_COLUMNS]
+        raise ProviderSearchError(
+            f"filter field {field!r} not present in table schema; "
+            f"filterable columns: {sorted(allowed) or 'none'}"
+        )
+    if field in _NON_FILTERABLE_COLUMNS:
+        raise ProviderSearchError(
+            f"filter field {field!r} is not filterable "
+            f"(excluded: {sorted(_NON_FILTERABLE_COLUMNS)})"
+        )
+    return field
+
+
+def _validate_filter_value(field: str, value: Any, schema) -> None:
+    """Validate that ``value`` is comparable to the column's scalar type."""
+    col_type = schema.field(field).type
+    import pyarrow as pa
+
+    if pa.types.is_string(col_type) or pa.types.is_large_string(col_type):
+        if not isinstance(value, str):
+            raise ProviderSearchError(
+                f"filter field {field!r} is a string column; got "
+                f"{type(value).__name__} value {value!r} — use a string"
+            )
+    elif pa.types.is_boolean(col_type):
+        if not isinstance(value, bool):
+            raise ProviderSearchError(
+                f"filter field {field!r} is a boolean column; got "
+                f"{type(value).__name__} value {value!r} — use True/False"
+            )
+    elif pa.types.is_integer(col_type):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ProviderSearchError(
+                f"filter field {field!r} is an integer column; got "
+                f"{type(value).__name__} value {value!r} — use an int"
+            )
+    elif pa.types.is_floating(col_type):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ProviderSearchError(
+                f"filter field {field!r} is a float column; got "
+                f"{type(value).__name__} value {value!r} — use a number"
+            )
+    else:
+        raise ProviderSearchError(
+            f"filter field {field!r} has non-scalar column type "
+            f"{col_type} — filtering is unsupported"
+        )
+
+
+def _compile_condition(cond: Any, schema_names: list[str], schema) -> str:
+    """Compile one Qdrant-style FieldCondition (key + match.value)."""
+    if not isinstance(cond, dict):
+        raise ProviderSearchError(
+            "unsupported filter condition "
+            f"{cond!r}: expected dict with 'key' and 'match'"
+        )
+    if "key" not in cond or "match" not in cond:
+        raise ProviderSearchError(
+            "unsupported filter condition "
+            f"{cond!r}: expected 'key' and 'match'"
+        )
+    extra = set(cond) - {"key", "match"}
+    if extra:
+        raise ProviderSearchError(
+            f"unsupported filter condition keys {sorted(extra)}: "
+            "only 'key' and 'match' are supported"
+        )
+    match = cond["match"]
+    if not isinstance(match, dict):
+        raise ProviderSearchError(
+            "unsupported filter match "
+            f"{match!r}: expected dict like {{'value': ...}}"
+        )
+    extra = set(match) - _SUPPORTED_MATCH_KEYS
+    if extra:
+        raise ProviderSearchError(
+            f"unsupported filter match keys {sorted(extra)}: "
+            "only equality match {'value': ...} is supported"
+        )
+    field = _validate_field_identifier(cond["key"], schema_names)
+    value = match.get("value")
+    _validate_filter_value(field, value, schema)
+    return f"{field} = {_quote_literal(value)}"
+
+
+def _dict_to_filter(filter_: dict[str, Any], schema_names: list[str], schema) -> str | None:
+    """Compile a restricted dict filter into a LanceDB filter expression.
+
+    Supported shapes:
+      * Flat equality:   {"field": value, ...}          -> AND of equalities
+      * Qdrant-style:    {"must": [...], "should": [...], "must_not": [...]}
+        - must     -> each condition ANDed
+        - should   -> conditions ORed (fully supported, not ignored)
+        - must_not -> each condition negated and ANDed
+    Mixed flat + structured input and any other expression (range/geo/nested)
+    raise ProviderSearchError *before* the backend is called.
+    """
+    if not isinstance(filter_, dict):
+        raise ProviderSearchError(
+            f"unsupported filter type {type(filter_).__name__}: "
+            "expected dict or LanceDB filter string"
+        )
+
+    structured_keys = _SUPPORTED_FILTER_KEYS & set(filter_)
+    flat_keys = set(filter_) - _SUPPORTED_FILTER_KEYS
+
+    if structured_keys:
+        if flat_keys:
+            raise ProviderSearchError(
+                "mixed structured/flat filter is unsupported; pass either "
+                "must/should/must_not or plain field equalities, not both "
+                f"(flat keys: {sorted(flat_keys)})"
+            )
+        # Qdrant-style: each condition is {'key': ..., 'match': {'value': ...}}.
+        # Semantics follow Qdrant Filter: must = AND, should = OR,
+        # must_not = NOT (each negated, all ANDed). Empty groups contribute
+        # nothing; groups are combined with AND.
+        groups: list[str] = []
+        must_items = [_compile_condition(i, schema_names, schema)
+                      for i in (filter_.get("must", []) or [])]
+        if must_items:
+            groups.append("(" + " AND ".join(
+                f"({m})" for m in must_items
+            ) + ")")
+        should_items = [_compile_condition(i, schema_names, schema)
+                        for i in (filter_.get("should", []) or [])]
+        if should_items:
+            groups.append("(" + " OR ".join(
+                f"({s})" for s in should_items
+            ) + ")")
+        must_not_items = [_compile_condition(i, schema_names, schema)
+                          for i in (filter_.get("must_not", []) or [])]
+        if must_not_items:
+            groups.append("(" + " AND ".join(
+                f"(NOT {m})" for m in must_not_items
+            ) + ")")
+        if not groups:
+            return None  # all groups empty -> match all
+        return " AND ".join(groups)
+
+    # Flat equality: {field: value, ...}. Values must be scalars.
+    parts = []
+    for field, value in filter_.items():
+        f = _validate_field_identifier(field, schema_names)
+        if isinstance(value, (dict, list)):
+            raise ProviderSearchError(
+                f"unsupported filter value for field {f!r}: {value!r} — "
+                "only scalar equality filters are supported"
+            )
+        _validate_filter_value(f, value, schema)
+        parts.append(f"{f} = {_quote_literal(value)}")
+    if not parts:
+        return None
+    return " AND ".join(parts)
+
+
+def _compile_filter(
+    filter_: dict | str | None, schema_names: list[str], schema
+) -> str | None:
+    """Restricted entry point: compile a filter for a known table schema."""
+    if filter_ is None:
+        return None
+    if isinstance(filter_, str):
+        # Trusted LanceDB-native filter string. Kept as the documented escape
+        # hatch for callers that manage their own expressions; the restricted
+        # dict path above is what validates identifiers/literals.
+        return filter_
+    return _dict_to_filter(filter_, schema_names, schema)
+
 
 def _normalize_metric(metric: str) -> str:
     """Normalize metric name to LanceDB format."""
@@ -37,64 +261,6 @@ def _normalize_metric(metric: str) -> str:
         "dot_product": "dot",
     }
     return mapping.get(metric.lower(), "cosine")
-
-
-def _dict_to_filter(filter_: dict[str, Any] | None) -> str | None:
-    """Convert a simple dict filter to LanceDB filter expression.
-
-    Supports simple equality filters in the form:
-        {"field": "value"} -> 'field = "value"'
-        {"field": 123} -> 'field = 123'
-
-    For complex filters (must, should, must_not), returns None which
-    lets the caller handle or fall back to post-filter.
-    """
-    if filter_ is None:
-        return None
-
-    # LanceDB-native string filters pass through
-    if isinstance(filter_, str):
-        return filter_
-
-    # Try simple dict -> equality filter
-    if isinstance(filter_, dict):
-        # Check if it's a Qdrant-style filter with must/should/must_not
-        if any(k in filter_ for k in ("must", "should", "must_not")):
-            # Extract first simple equality if possible
-            must_list = filter_.get("must", [])
-            if len(must_list) == 1:
-                item = must_list[0]
-                key = item.get("key", "")
-                match = item.get("match", {})
-                value = match.get("value", "")
-                if isinstance(value, str):
-                    return f'{key} = "{value}"'
-                return f"{key} = {value}"
-            # Multi-condition: combine with AND
-            conditions = []
-            for item in must_list:
-                key = item.get("key", "")
-                match = item.get("match", {})
-                value = match.get("value", "")
-                if isinstance(value, str):
-                    conditions.append(f'{key} = "{value}"')
-                else:
-                    conditions.append(f"{key} = {value}")
-            if conditions:
-                return " AND ".join(conditions)
-            return None
-
-        # Simple field:value dict
-        parts = []
-        for k, v in filter_.items():
-            if isinstance(v, str):
-                parts.append(f'{k} = "{v}"')
-            else:
-                parts.append(f"{k} = {v}")
-        if parts:
-            return " AND ".join(parts)
-
-    return None
 
 
 class LanceDBProvider:
@@ -404,7 +570,15 @@ class LanceDBProvider:
         try:
             table = await self._get_table(collection)
             import numpy as np  # lazy: optional dep, only needed for search
-            lance_filter = _dict_to_filter(filter_) if isinstance(filter_, dict) else filter_
+            lance_filter = None
+            if filter_ is not None:
+                schema = await self._run(lambda: table.schema)
+                # Restricted contract: dict filters are validated/compiled here
+                # (allowlist identifiers, safe literals) BEFORE reaching backend;
+                # unsupported expressions raise ProviderSearchError.
+                lance_filter = _compile_filter(
+                    filter_, list(schema.names), schema
+                )
             query = table.search(np.array(vector, dtype=np.float32))
 
             if self._metric == "cosine":
@@ -417,28 +591,26 @@ class LanceDBProvider:
             if lance_filter:
                 query = query.where(lance_filter, prefilter=True)
 
+            # where() is applied before limit(): the prefilter narrows the
+            # candidate set and only then is the top-k limit taken.
             results = await self._run(query.limit(limit).to_list)
 
             parsed = []
             for r in results:
-                score = r.get("_distance", 0.0)
-                # LanceDB returns distance (lower = more similar).
-                # Convert to similarity score for API consistency.
-                if self._metric == "cosine":
-                    # Cosine distance: 0 = same, 2 = opposite
-                    # Cosine similarity: 1 - (distance / 2)
-                    # Also handle the case where LanceDB returns negative values
-                    similarity = 1.0 - (abs(score) / 2.0)
-                    if similarity < 0:
-                        similarity = 0.0
-                elif self._metric == "dot":
-                    # Dot product: higher = more similar
-                    # Normalize to 0-1 using sigmoid-like approach
-                    similarity = 1.0 / (1.0 + abs(score))
+                raw_distance = r.get("_distance", 0.0)
+                if self._metric in ("cosine", "dot"):
+                    # LanceDB (installed 0.34) reports distance = 1 - sim
+                    # (cosine similarity, or the raw dot product for the dot
+                    # metric), monotone DECREASING in similarity. Expose
+                    # score = 1 - distance/2 = (1 + sim)/2 — monotone
+                    # INCREASING in similarity. No abs(): a negative
+                    # distance (dot > 1 on unnormalized vectors) must rank
+                    # ABOVE distance 0, not collapse into a tie with the
+                    # abs() of a large positive distance.
+                    similarity = 1.0 - (raw_distance / 2.0)
                 else:  # l2
-                    # L2 distance: lower = more similar
-                    # Convert: 1.0 / (1.0 + distance)
-                    similarity = 1.0 / (1.0 + abs(score))
+                    # L2 distance: [0, +inf), lower = closer.
+                    similarity = 1.0 / (1.0 + raw_distance)
 
                 if score_threshold is not None and similarity < score_threshold:
                     continue
@@ -461,6 +633,8 @@ class LanceDBProvider:
                 })
 
             return parsed
+        except ProviderSearchError:
+            raise
         except Exception as exc:
             logger.error("Search failed: %s", exc)
             raise ProviderSearchError(f"lancedb search failed: {exc}") from exc
@@ -483,10 +657,19 @@ class LanceDBProvider:
         """
         try:
             table = await self._get_table(collection)
-            lance_filter = _dict_to_filter(filter_) if isinstance(filter_, dict) else filter_
-            results = await self._run(
-                table.search().limit(limit).to_list
-            )
+            lance_filter = None
+            if filter_ is not None:
+                schema = await self._run(lambda: table.schema)
+                # Same restricted filter contract as search(): unsupported
+                # expressions raise before the backend is called.
+                lance_filter = _compile_filter(
+                    filter_, list(schema.names), schema
+                )
+            query = table.search()
+            if lance_filter:
+                query = query.where(lance_filter, prefilter=True)
+            # where() before limit(): the limit applies to filtered rows.
+            results = await self._run(query.limit(limit).to_list)
 
             parsed = []
             for r in results:
@@ -506,13 +689,9 @@ class LanceDBProvider:
                     "payload": payload,
                 })
 
-            # Apply filter post-hoc if we can't push it down
-            if lance_filter and parsed:
-                # Simple post-filter — only applied when we can't
-                # push filter to LanceDB query
-                pass
-
             return parsed
+        except ProviderSearchError:
+            raise
         except Exception as exc:
             logger.error("Scroll failed: %s", exc)
             raise ProviderSearchError(f"lancedb scroll failed: {exc}") from exc
@@ -534,8 +713,12 @@ class LanceDBProvider:
         try:
             table = await self._get_table(collection)
             pid = str(point_id)
-            await self._run(table.delete, f'id = "{pid}"')
+            # Safe literal: point_id may contain quotes/injection-like text —
+            # it must be escaped as a string literal, never interpolated raw.
+            await self._run(table.delete, f"id = {_quote_literal(pid)}")
             return True
+        except ProviderSearchError:
+            raise
         except ProviderWriteError:
             raise
         except Exception as exc:

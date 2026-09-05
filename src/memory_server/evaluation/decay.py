@@ -194,7 +194,9 @@ class DecayEngine:
         expired: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc)
         for item_id, item in self._items.items():
-            created_at = item["created_at"]
+            created_at = DecayEngine._as_utc(item["created_at"])
+            if created_at is None:
+                continue
             age_days = (now - created_at).total_seconds() / 86400.0
             ttl = self._per_type_ttl.get(item["type"], self._default_ttl_days)
             if age_days > ttl:
@@ -354,12 +356,27 @@ class DecayEngine:
 
     @staticmethod
     def _age_in_days(created_at: datetime | None) -> float:
-        """Compute age in days. Returns 0 for None."""
-        if created_at is None:
+        """Compute age in days. Returns 0 for None.
+
+        ROUTE-1: SQLite round trips return NAIVE datetimes; they are treated
+        as UTC so ``now - created_at`` never mixes aware/naive operands and
+        a persisted item ages identically to its pre-write form.
+        """
+        created = DecayEngine._as_utc(created_at)
+        if created is None:
             return 0.0
         now = datetime.now(timezone.utc)
-        delta = now - created_at
+        delta = now - created
         return max(0.0, delta.total_seconds() / 86400.0)
+
+    @staticmethod
+    def _as_utc(dt: datetime | None) -> datetime | None:
+        """Normalize a timestamp to UTC-aware (naive == UTC, ROUTE-1)."""
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def get_ttl(self, item_type: str) -> float:
         """Get the TTL for a given item type."""

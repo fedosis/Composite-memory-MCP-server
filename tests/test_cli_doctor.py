@@ -159,3 +159,148 @@ class TestDoDoctor:
         assert problems == 0
         assert "All CMMS profiles point at shared data root" in out
         assert "env overrides" not in out
+
+
+class TestInstallUninstallBackupRestore:
+    """CORE-1/2: install backs up ONLY on the first switch; uninstall restores
+    the original provider — or removes the key when there was none.
+
+    Everything runs against a temporary HERMES_HOME; the real user Hermes
+    config is never touched.
+    """
+
+    def _write_config(self, home: Path, *, provider: str | None) -> None:
+        home.mkdir(parents=True, exist_ok=True)
+        provider_line = (
+            f"  provider: {provider}\n" if provider is not None else ""
+        )
+        (home / "config.yaml").write_text(
+            "model:\n"
+            "  default: x\n"
+            "memory:\n"
+            f"{provider_line}"
+            "  providers:\n"
+            "    other_memory:\n"
+            "      plugin: some.other.Provider\n",
+            encoding="utf-8",
+        )
+
+    def _provider(self, home: Path) -> str | None:
+        from memory_server.cli import (
+            _config_path,
+            _current_memory_provider,
+            _load_config,
+        )
+
+        data = _load_config(_config_path(str(home)))
+        return _current_memory_provider(data)
+
+    def test_original_to_install_to_install_to_uninstall(self, tmp_path):
+        """Second install must NOT overwrite the first install's backup —
+        uninstall restores the ORIGINAL provider, not 'memory_server'."""
+        from memory_server.cli import (
+            _backup_path,
+            _do_install,
+            _do_uninstall,
+        )
+
+        home = tmp_path / "hermes-home"
+        self._write_config(home, provider="openai_memory")
+
+        # First install: switch away from the original provider.
+        out1 = []
+        assert _do_install(str(home), False, out=out1.append) == 0
+        assert self._provider(home) == "memory_server"
+        back = _backup_path(str(home))
+        assert back.is_file()
+        assert back.read_text().strip() == "openai_memory"
+
+        # Second install (re-install): provider already memory_server —
+        # the backup must be left untouched.
+        out2 = []
+        assert _do_install(str(home), False, out=out2.append) == 0
+        assert back.read_text().strip() == "openai_memory", (
+            "re-install clobbered the original provider backup"
+        )
+
+        # Uninstall restores the ORIGINAL provider from the untouched backup.
+        out3 = []
+        assert _do_uninstall(str(home), False, out=out3.append) == 0
+        assert self._provider(home) == "openai_memory"
+        assert not back.exists()
+        assert "openai_memory" in "\n".join(out3)
+
+    def test_missing_provider_key_to_install_to_uninstall(self, tmp_path):
+        """With no prior memory.provider key, install records an explicit
+        absence marker and uninstall removes the key entirely (absence
+        restored)."""
+        from memory_server.cli import (
+            ABSENT_PROVIDER_MARKER,
+            _backup_path,
+            _do_install,
+            _do_uninstall,
+        )
+
+        home = tmp_path / "hermes-home-2"
+        self._write_config(home, provider=None)
+        assert self._provider(home) is None
+
+        out1 = []
+        assert _do_install(str(home), False, out=out1.append) == 0
+        assert self._provider(home) == "memory_server"
+        back = _backup_path(str(home))
+        assert back.read_text().strip() == ABSENT_PROVIDER_MARKER, (
+            "absence must be recorded with the explicit marker"
+        )
+
+        out2 = []
+        assert _do_uninstall(str(home), False, out=out2.append) == 0
+        # The provider KEY is gone again — absence restored, not 'memory_server'.
+        assert self._provider(home) is None
+        assert not back.exists()
+
+    def test_dry_run_does_not_write_backup_or_config(self, tmp_path):
+        from memory_server.cli import _backup_path, _do_install, _do_uninstall
+
+        home = tmp_path / "hermes-home-3"
+        self._write_config(home, provider="original_provider")
+        cfg = home / "config.yaml"
+        before = cfg.read_bytes()
+
+        out = []
+        assert _do_install(str(home), True, out=out.append) == 0
+        assert not _backup_path(str(home)).exists()
+        assert cfg.read_bytes() == before
+        assert self._provider(home) == "original_provider"
+
+        # Dry-run uninstall after a REAL install must preview the restore.
+        assert _do_install(str(home), False, out=out.append) == 0
+        out2 = []
+        assert _do_uninstall(str(home), True, out=out2.append) == 0
+        assert self._provider(home) == "memory_server"  # still active (dry)
+        assert _backup_path(str(home)).exists()
+        assert "original_provider" in "\n".join(out2)
+
+    def test_uninstall_does_not_clobber_manually_changed_provider(self, tmp_path):
+        """If the user switched providers after install, uninstall leaves the
+        manual choice alone."""
+        from memory_server.cli import (
+            _config_path,
+            _do_install,
+            _do_uninstall,
+            _load_config,
+            _save_config,
+        )
+
+        home = tmp_path / "hermes-home-4"
+        self._write_config(home, provider="original_provider")
+        assert _do_install(str(home), False, out=lambda s: None) == 0
+
+        # Simulate the user switching to a different provider post-install.
+        data = _load_config(_config_path(str(home)))
+        data["memory"]["provider"] = "manual_choice"
+        _save_config(_config_path(str(home)), data)
+
+        out = []
+        assert _do_uninstall(str(home), False, out=out.append) == 0
+        assert self._provider(home) == "manual_choice"

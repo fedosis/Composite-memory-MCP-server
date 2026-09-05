@@ -170,17 +170,27 @@ class RankMerger:
     def semantic_from_qdrant(
         qdrant_results: list[dict[str, Any]],
     ) -> list[RankResult]:
-        """Convert Qdrant search results to semantic RankResults."""
+        """Convert Qdrant search results to semantic RankResults.
+
+        ROUTE-4/6: a single bad payload (e.g. a non-string ``content`` value
+        that would crash ``.strip()``) is isolated — the row still resolves to
+        subject/predicate/object or the ``No content`` placeholder and the
+        remaining valid hits are returned unchanged (no good hit is lost).
+        """
         results: list[RankResult] = []
         for r in qdrant_results:
             payload = r.get("payload", {})
-            content = payload.get("content")
+            raw_content = payload.get("content")
+            content = (
+                raw_content.strip()
+                if isinstance(raw_content, str)
+                else ""
+            )
             if not content:
                 subj = payload.get("subject", "")
                 pred = payload.get("predicate", "")
                 obj = payload.get("object", "")
-                content = f"{subj} {pred} {obj}"
-            content = content.strip()
+                content = f"{subj} {pred} {obj}".strip()
             score = r.get("score", 0.0)
             results.append(RankResult(
                 content=content or "No content",

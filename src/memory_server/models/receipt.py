@@ -1,6 +1,6 @@
 """MemoryReceipt model — provenance metadata for every memory operation."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
@@ -133,7 +133,9 @@ class MemoryReceipt(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     verification_status: VerificationStatus = VerificationStatus.UNVERIFIED
     history: list[Any] = Field(default_factory=list)
-    updated_at: datetime = Field(default_factory=lambda: datetime.now())
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     lifecycle_state: str = "active"
     version: str = "0.1.0"
 

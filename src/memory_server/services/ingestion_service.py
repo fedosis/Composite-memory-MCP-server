@@ -54,6 +54,42 @@ logger = logging.getLogger(__name__)
 LLM_CONFIDENCE_GATE = 0.7
 
 
+def _safe_confidence(value: Any, default: float = 0.5) -> float:
+    """Coerce an extraction-confidence value to a finite [0, 1] number.
+
+    Booleans and malformed/non-finite values fall back to ``default`` so a
+    bad extractor artifact can never abort the write transaction.
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return max(0.0, min(1.0, float(value)))
+    return default
+
+
+def _valid_skill_purpose(value: Any) -> str:
+    """Return a stripped non-empty purpose string, or '' when unusable."""
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _valid_skill_steps(value: Any) -> list[str]:
+    """Return a clean list of non-empty string steps, or [] when unusable.
+
+    The Skill model requires ``steps: min_length=1``; an entry with no
+    recognizable step must be skipped BEFORE the constructor so a malformed
+    skill can never crash learn() (SVC-3).
+    """
+    if not isinstance(value, list):
+        return []
+    steps: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            steps.append(item.strip())
+    return steps
+
+
 async def reinforce_memory_item(
     session: AsyncSession, *, memory_type: str, item_id: str,
     new_confidence: float, source: str,
@@ -559,7 +595,9 @@ class MemoryIngestionService:
                             session,
                             memory_type="fact",
                             item_id=existing.id,
-                            new_confidence=ef.get("confidence", 0.5),
+                            new_confidence=_safe_confidence(
+                                ef.get("confidence", 0.5)
+                            ),
                             source=source,
                             previous_confidence=existing.confidence,
                         )
@@ -571,14 +609,16 @@ class MemoryIngestionService:
                         continue
                     fact_id = str(uuid4())
                     dedup_key = fact_dedup_key(subject, predicate, object)
+                    fact_conf = _safe_confidence(ef.get("confidence", 0.5))
                     fact = Fact(
                         id=fact_id,
                         subject=subject,
                         predicate=predicate,
                         object=object,
                         dedup_key=dedup_key,
-                        confidence=ef.get("confidence", 0.5),
+                        confidence=fact_conf,
                         source=source,
+                        creator=source,
                         created_at=now,
                     )
                     try:
@@ -600,7 +640,9 @@ class MemoryIngestionService:
                             session,
                             memory_type="fact",
                             item_id=keeper_fact.id,
-                            new_confidence=ef.get("confidence", 0.5),
+                            new_confidence=_safe_confidence(
+                                ef.get("confidence", 0.5)
+                            ),
                             source=source,
                             previous_confidence=keeper_fact.confidence,
                         )
@@ -619,7 +661,7 @@ class MemoryIngestionService:
                         source=source,
                         created_by="learn",
                         timestamp=now,
-                        confidence=ef.get("confidence", 0.5),
+                        confidence=fact_conf,
                         verification_status=VerificationStatus.CANDIDATE,
                     )
                     stored_receipt = await receipt_repo.create(receipt)
@@ -677,6 +719,7 @@ class MemoryIngestionService:
                         continue
 
                     decision_id = str(uuid4())
+                    decision_conf = _safe_confidence(ed.get("confidence", 0.5))
                     decision = Decision(
                         id=decision_id,
                         context=context,
@@ -684,6 +727,8 @@ class MemoryIngestionService:
                         rejected_alternatives=ed.get("alternatives", []),
                         reason=ed.get("reason", ""),
                         source=source,
+                        creator=source,
+                        confidence=decision_conf,
                         created_at=now,
                     )
                     try:
@@ -712,7 +757,7 @@ class MemoryIngestionService:
                         source=source,
                         created_by="learn",
                         timestamp=now,
-                        confidence=ed.get("confidence", 0.5),
+                        confidence=decision_conf,
                         verification_status=VerificationStatus.CANDIDATE,
                     )
                     stored_receipt = await receipt_repo.create(receipt)
@@ -735,16 +780,39 @@ class MemoryIngestionService:
                     receipts.append(stored_receipt.model_dump(mode="json"))
 
                 for es in extracted_skills:
+                    # SVC-3: validate BEFORE the Skill constructor. The model
+                    # requires a purpose and at least one string step; a
+                    # malformed skill (missing purpose, non-list/empty steps,
+                    # non-string items) must be skipped, never crash learn().
+                    purpose = _valid_skill_purpose(es.get("purpose"))
+                    steps = _valid_skill_steps(es.get("steps"))
+                    if not purpose or not steps:
+                        logger.debug(
+                            "Skipping malformed skill (purpose=%r, steps=%r)",
+                            purpose,
+                            steps,
+                        )
+                        continue
+                    skill_conf = _safe_confidence(es.get("confidence", 0.5))
                     skill_id = str(uuid4())
                     skill = Skill(
                         id=skill_id,
                         name="",
                         version="1.0.0",
-                        purpose=es.get("purpose", ""),
-                        steps=es.get("steps", []),
-                        constraints=es.get("constraints", []),
+                        purpose=purpose,
+                        steps=steps,
+                        constraints=_valid_skill_steps(es.get("constraints")),
                         validation=[],
-                        success_rate=es.get("confidence", 0.5),
+                        # SVC-2: success_rate is the OBSERVED operational
+                        # success metric (measured over executions), not the
+                        # extraction confidence. A freshly extracted skill has
+                        # no observation history, so it stays at the model
+                        # default 0.0; the extraction confidence is carried by
+                        # Skill.confidence (kept in lockstep with the receipt).
+                        success_rate=0.0,
+                        source=source,
+                        creator=source,
+                        confidence=skill_conf,
                         created_at=now,
                     )
                     stored_skill = await skill_repo.create(skill)
@@ -755,7 +823,7 @@ class MemoryIngestionService:
                         source=source,
                         created_by="learn",
                         timestamp=now,
-                        confidence=es.get("confidence", 0.5),
+                        confidence=skill_conf,
                         verification_status=VerificationStatus.CANDIDATE,
                     )
                     stored_receipt = await receipt_repo.create(receipt)
@@ -765,8 +833,8 @@ class MemoryIngestionService:
                         record_id=skill_id,
                         operation="index_skill",
                         payload={
-                            "purpose": es.get("purpose", ""),
-                            "steps": es.get("steps", []),
+                            "purpose": purpose,
+                            "steps": steps,
                         },
                     )
 

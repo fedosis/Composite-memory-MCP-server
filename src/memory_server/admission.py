@@ -7,6 +7,7 @@ retrieval/admission layers can use to avoid tool-call drift.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -112,6 +113,21 @@ _SECURITY_TERMS = {
 }
 
 
+def _has_phrase(lower: str, phrase: str) -> bool:
+    """True when *phrase* appears in *lower* as a whole phrase.
+
+    Unicode-aware and punctuation-tolerant (SVC-4/7): matching is by word
+    boundaries, never by raw substring, so ``now`` does NOT match inside
+    ``knows``/``nowhere`` and ``must`` does NOT match inside ``mustard``,
+    while genuine ``now``/``must`` followed by punctuation (``Backup now!``,
+    ``you must not.``) DO match. Multi-word phrases match after the input is
+    whitespace-collapsed (``do not`` matches ``Do NOT...``).
+    """
+    if not phrase:
+        return False
+    return re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", lower) is not None
+
+
 @dataclass(frozen=True)
 class AdmissionDecision:
     """Decision returned by :class:`MemoryAdmissionGate`."""
@@ -168,12 +184,14 @@ class MemoryAdmissionGate:
         ttl_days: int | None = 365
         score = 0.65
 
-        if self._is_low_signal(lower) or any(term in lower for term in _TRANSIENT_TERMS):
+        if self._is_low_signal(lower) or any(
+            _has_phrase(lower, term) for term in _TRANSIENT_TERMS
+        ):
             tag = MemoryTag.EPHEMERAL
             ttl_days = 1
             score = 0.05
             reason_codes.append("low_signal")
-        elif any(term in lower for term in _IMPORTANT_TERMS):
+        elif any(_has_phrase(lower, term) for term in _IMPORTANT_TERMS):
             tag = MemoryTag.IMPORTANT
             ttl_days = None
             score = 0.95
@@ -215,44 +233,73 @@ class MemoryAdmissionGate:
 
     @staticmethod
     def _is_low_signal(lower: str) -> bool:
+        """True for empty, pure-noise, or ultra-short noise text.
+
+        Punctuation-insensitive and Unicode-aware: tokens are extracted as
+        word runs, so ``ok.``/``thanks!`` and ``спасибо`` are handled without
+        the punctuation leaking into the token. Multi-word noise phrases
+        (``thank you``, ``got it``) match on the space-joined tokens.
+        """
         if not lower:
             return True
-        stripped = lower.strip(" .!?,;:-")
-        if stripped in _NOISE_PHRASES:
+        tokens = re.findall(r"\w+", lower)
+        if not tokens:
             return True
-        words = stripped.replace(",", " ").split()
+        if " ".join(tokens) in _NOISE_PHRASES:
+            return True
+        words = [t for t in tokens if t not in {"", " "}]
         return len(words) <= 3 and all(word in _NOISE_PHRASES for word in words)
 
     @staticmethod
     def _memory_kind(lower: str, tag: MemoryTag) -> str:
-        if tag is MemoryTag.IMPORTANT and any(term in lower for term in _SECURITY_TERMS):
+        if tag is MemoryTag.IMPORTANT and any(
+            _has_phrase(lower, term) for term in _SECURITY_TERMS
+        ):
             return "system_policy"
-        if "prefer" in lower or "prefers" in lower or "предпоч" in lower:
-            if any(term in lower for term in _STYLE_TERMS):
+        if re.search(r"(?<!\w)prefer", lower) or "предпоч" in lower:
+            if any(_has_phrase(lower, term) for term in _STYLE_TERMS):
                 return "user_preference_style"
-            if any(term in lower for term in _WORKFLOW_TERMS):
+            if any(_has_phrase(lower, term) for term in _WORKFLOW_TERMS):
                 return "user_preference_workflow"
             return "user_preference"
         if tag is MemoryTag.EPHEMERAL:
             return "episodic_observation"
-        if any(term in lower for term in {"project", "repo", "docker", "python", "postgres", "sqlite"}):
+        if any(
+            _has_phrase(lower, term)
+            for term in {"project", "repo", "docker", "python", "postgres", "sqlite"}
+        ):
             return "project_fact"
         return "user_constraint_explicit" if tag is MemoryTag.IMPORTANT else "summary_observation"
 
     @staticmethod
     def _risk_tags(lower: str) -> list[str]:
         tags: list[str] = []
-        if any(term in lower for term in {"approval", "permission", "confirm", "ask"}):
+        if any(
+            _has_phrase(lower, term)
+            for term in {"approval", "permission", "confirm", "ask"}
+        ):
             tags.append("approval_sensitive")
-        if any(term in lower for term in {"public", "private", "share", "visibility"}):
+        if any(
+            _has_phrase(lower, term)
+            for term in {"public", "private", "share", "visibility"}
+        ):
             tags.append("visibility_sensitive")
-        if any(term in lower for term in {"delete", "destructive", "overwrite", "reset"}):
+        if any(
+            _has_phrase(lower, term)
+            for term in {"delete", "destructive", "overwrite", "reset"}
+        ):
             tags.append("destructive_sensitive")
         if any(
-            term in lower for term in {"secret", "password", "token", "api key", "credential", "security", "safety"}
+            _has_phrase(lower, term)
+            for term in {
+                "secret", "password", "token", "api key",
+                "credential", "security", "safety",
+            }
         ):
             tags.append("security_sensitive")
-        if any(term in lower for term in {"logging", "rollback"}):
+        if any(
+            _has_phrase(lower, term) for term in {"logging", "rollback"}
+        ):
             tags.append("logging_sensitive")
             if "security_sensitive" not in tags:
                 tags.append("security_sensitive")

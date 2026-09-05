@@ -11,16 +11,16 @@ Card 001 (v0.9): Ternary Relation Classifier fixes the false positive where
 detected as contradiction. It is now correctly classified as entailment.
 """
 
-import pytest
 from datetime import datetime, timedelta, timezone
 
-from memory_server.models import Belief, Evidence
-from memory_server.providers.sqlite_provider import SQLiteProvider
+import pytest
+
 from memory_server.api.reflect import (
     ReflectEngine,
     detect_contradictions,
-    _tokenize,
 )
+from memory_server.models import Belief, Evidence
+from memory_server.providers.sqlite_provider import SQLiteProvider
 
 # =========================================================================
 # Helper: build mock belief

@@ -420,3 +420,56 @@ class TestDecayTransitionFailures:
         state["fail"] = True
         assert validator_engine.tick("f2") is None
         assert validator_engine.transition_failures == 2
+
+
+class TestDecayNaiveUtcRoundTrip:
+    """ROUTE-1: naive timestamps (SQLite round trip) are treated as UTC.
+
+    Regression: ``now - naive`` raised TypeError, so decay/get_expired/tick
+    crashed on any item read back from SQLite.
+    """
+
+    def test_decay_naive_equals_aware(self, hour_engine):
+        aware_past = datetime.now(timezone.utc) - timedelta(minutes=30)
+        naive_past = aware_past.replace(tzinfo=None)  # what SQLite returns
+
+        aware_item = {"type": "fact", "created_at": aware_past, "confidence": 1.0}
+        naive_item = {"type": "fact", "created_at": naive_past, "confidence": 1.0}
+
+        aware_score = hour_engine.decay(aware_item)
+        naive_score = hour_engine.decay(naive_item)
+        assert naive_score == pytest.approx(aware_score)
+        assert 0.0 < naive_score < 1.0
+
+    def test_get_expired_with_naive_created_at(self, hour_engine):
+        past = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(
+            tzinfo=None
+        )
+        hour_engine.register("naive-expired", "fact", past, lifecycle_state="active")
+        expired = hour_engine.get_expired()
+        ids = [e["id"] for e in expired]
+        assert "naive-expired" in ids
+
+    def test_get_expired_aware_and_naive_agree(self, hour_engine):
+        aware_past = datetime.now(timezone.utc) - timedelta(hours=2)
+        hour_engine.register("aware-expired", "fact", aware_past, "active")
+        hour_engine.register(
+            "naive-expired", "fact", aware_past.replace(tzinfo=None), "active"
+        )
+        ids = {e["id"] for e in hour_engine.get_expired()}
+        assert {"aware-expired", "naive-expired"} <= ids
+
+    def test_tick_with_naive_created_at(self, validator_engine):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=45)).replace(
+            tzinfo=None
+        )
+        validator_engine.register("f", "fact", past, lifecycle_state="active")
+        # 45 min >= 70% of the 1h TTL -> active -> stale
+        assert validator_engine.tick("f") == "stale"
+
+    def test_should_archive_with_naive_created_at(self, hour_engine):
+        past = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(
+            tzinfo=None
+        )
+        item = {"type": "fact", "id": "f", "created_at": past, "confidence": 1.0}
+        assert hour_engine.should_archive(item) is True

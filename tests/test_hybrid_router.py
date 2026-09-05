@@ -11,8 +11,8 @@ class TestHybridRouter:
 
     @pytest.fixture
     def router(self):
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
 
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
         embedder = MockEmbeddingProvider(vector_size=384)

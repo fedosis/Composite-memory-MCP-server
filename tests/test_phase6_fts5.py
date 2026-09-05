@@ -250,6 +250,43 @@ class TestRankMerger:
         result = merger.merge(fts, [], [])
         assert len(result) == 1
 
+    def test_semantic_bad_nonstring_content_isolated(self):
+        """A non-string payload ``content`` (e.g. ``5``) must not crash the
+        whole batch: the bad hit resolves to subject/predicate/object and the
+        valid hits survive unchanged (ROUTE-4/6)."""
+        results = RankMerger.semantic_from_qdrant([
+            {
+                "id": "bad",
+                "payload": {
+                    "content": 5,
+                    "subject": "X", "predicate": "is", "object": "Y",
+                },
+                "score": 0.9,
+            },
+            {
+                "id": "good",
+                "payload": {"content": "valid content"},
+                "score": 0.8,
+            },
+        ])
+        assert len(results) == 2
+        by_id = {r.metadata["id"]: r for r in results}
+        # Bad hit isolated via the structured fallback (no crash, no empty).
+        assert by_id["bad"].content == "X is Y"
+        assert by_id["bad"].score == 0.9
+        # Good hit untouched.
+        assert by_id["good"].content == "valid content"
+        assert by_id["good"].score == 0.8
+
+    def test_semantic_nonstring_content_without_spo_falls_back(self):
+        """Non-string content with no subject/predicate/object degrades to the
+        placeholder without raising."""
+        results = RankMerger.semantic_from_qdrant([
+            {"id": "only-num", "payload": {"content": 5}, "score": 0.7},
+        ])
+        assert len(results) == 1
+        assert results[0].content == "No content"
+
     def test_fts_from_facts(self, provider):
         """fts_from_facts should convert fact list to RankResults."""
         # Use a simple sync approach since we need inline facts
@@ -332,8 +369,8 @@ class TestFTS5RouteIntegration:
 
     async def test_route_uses_rankmerger(self, provider):
         """Route should return unified ranked results via RankMerger."""
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.router.hybrid_router import HybridRouter
         from memory_server.router.rules import RoutingRuleSet
 
@@ -356,8 +393,8 @@ class TestFTS5RouteIntegration:
 
     async def test_route_fts_wins_with_matching_data(self, provider):
         """When FTS has results and semantic/graph don't, FTS should be top."""
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.router.hybrid_router import HybridRouter
         from memory_server.router.rules import RoutingRuleSet
 
@@ -379,8 +416,8 @@ class TestFTS5RouteIntegration:
 
     async def test_route_dedup_across_sources(self, provider):
         """Route should deduplicate results across sources."""
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.router.hybrid_router import HybridRouter
         from memory_server.router.rules import RoutingRuleSet
 
@@ -404,8 +441,8 @@ class TestFTS5RouteIntegration:
 
     async def test_route_multiple_sources_counted(self, provider):
         """Route should report per-source result counts."""
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.router.hybrid_router import HybridRouter
         from memory_server.router.rules import RoutingRuleSet
 
@@ -432,8 +469,8 @@ class TestFTS5RouteIntegration:
 
     async def test_route_empty_query(self, provider):
         """Empty query should return LLM fallback."""
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.router.hybrid_router import HybridRouter
 
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
@@ -448,8 +485,8 @@ class TestFTS5RouteIntegration:
 
     async def test_route_non_matching_query(self, provider):
         """Non-matching query should return LLM fallback."""
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.router.hybrid_router import HybridRouter
 
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
@@ -464,8 +501,8 @@ class TestFTS5RouteIntegration:
 
     async def test_route_normalized_scores(self, provider):
         """All scores in route() results should be 0.0-1.0."""
-        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.qdrant_provider import QdrantProvider
         from memory_server.router.hybrid_router import HybridRouter
         from memory_server.router.rules import RoutingRuleSet
 

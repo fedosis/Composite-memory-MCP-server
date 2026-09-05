@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-
 COMMON = Path(__file__).resolve().parents[1] / "scripts" / "_common.py"
 
 

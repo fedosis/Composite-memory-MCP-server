@@ -19,7 +19,6 @@ from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.router.embedding_router import EmbeddingRouter
 from memory_server.router.rules import RoutingRule
 
-
 # ------------------------------------------------------------------
 # Unit-level integration: EmbeddingRouter + real Qdrant in-memory
 # ------------------------------------------------------------------

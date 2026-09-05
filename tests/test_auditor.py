@@ -382,6 +382,58 @@ class TestPersistedAuditEntries:
         assert stats["total"] == 1
         assert stats["low_confidence"] == ["fallback-low"]
 
+    def test_persisted_trusted_deprecated_aliases_are_normalized(self):
+        """ROUTE-6: persisted legacy 'trusted'/'deprecated' lifecycle values
+        are normalized on read (-> active/stale), not flagged as violations.
+        Genuinely invalid states still are."""
+        auditor = MemoryAuditor(
+            validator=Validator(),
+            persisted_records=[
+                {
+                    "fact_id": "legacy-trusted",
+                    "memory_type": "fact",
+                    "status": "trusted",
+                    "confidence": 0.9,
+                    "lifecycle_state": "trusted",
+                    "verification_status": "validated",
+                    "receipt_id": "legacy-trusted",
+                    "has_receipt": True,
+                },
+                {
+                    "fact_id": "legacy-deprecated",
+                    "memory_type": "fact",
+                    "status": "deprecated",
+                    "confidence": 0.5,
+                    "lifecycle_state": "deprecated",
+                    "verification_status": "validated",
+                    "receipt_id": "legacy-deprecated",
+                    "has_receipt": True,
+                },
+                {
+                    "fact_id": "genuinely-invalid",
+                    "memory_type": "fact",
+                    "status": "active",
+                    "confidence": 0.8,
+                    "lifecycle_state": "not_a_state",
+                    "verification_status": "validated",
+                    "receipt_id": "genuinely-invalid",
+                    "has_receipt": True,
+                },
+            ],
+        )
+
+        violations = auditor.check_lifecycle_violations()
+        assert violations == [
+            "Item 'genuinely-invalid' has invalid lifecycle state 'not_a_state'"
+        ], f"aliases must normalize; got {violations}"
+
+        entries = auditor._audit_entries()
+        by_id = {e["fact_id"]: e for e in entries}
+        assert by_id["legacy-trusted"]["status"] == "active"
+        assert by_id["legacy-trusted"]["lifecycle_state"] == "active"
+        assert by_id["legacy-deprecated"]["status"] == "stale"
+        assert by_id["legacy-deprecated"]["lifecycle_state"] == "stale"
+
 
 class TestPhase7DriftDetection:
     """Phase 7 — SQL/vector and SQL/graph drift."""

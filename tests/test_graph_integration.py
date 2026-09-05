@@ -9,6 +9,8 @@ import json
 
 import pytest
 
+# Import server globals so we can inject the test graph
+from memory_server import server as server_module
 from memory_server.api.learn import learn as learn_fn
 from memory_server.api.remember import remember as remember_fn
 from memory_server.providers.embedding_provider import MockEmbeddingProvider
@@ -17,10 +19,6 @@ from memory_server.providers.qdrant_provider import QdrantProvider
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.graph_router import GraphRouter
 from memory_server.router.hybrid_router import HybridRouter
-
-
-# Import server globals so we can inject the test graph
-from memory_server import server as server_module
 
 
 @pytest.mark.asyncio

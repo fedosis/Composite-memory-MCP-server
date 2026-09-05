@@ -741,3 +741,113 @@ class TestReflectMToolEdgeCases:
         result_str = await reflect_tool(mode="confidence")
         data = json.loads(result_str)
         assert data["mode"] == "confidence"
+
+
+@pytest.mark.asyncio
+class TestReflectCorrectAggregation:
+    """API-3 / CORE-3 / API-4: reflect overview aggregation fixes.
+
+    - no_evidence_count is computed over the SELECTED beliefs via the
+      evidence aggregate (it used to stay 0 forever);
+    - the confidence bands use the explicit documented boundaries
+      (0.8-1.0 / 0.5-0.8 / 0.0-0.5), so 0.85 lands in high, not medium;
+    - evidence-repository failures surface as an explicit error/partial
+      status instead of a successful zero/empty result.
+    """
+
+    async def test_overview_no_evidence_count_over_selected(self, provider):
+        """Two beliefs without evidence plus one with: no_evidence_count == 2."""
+        no_ev_a = Belief(proposition="No evidence A", confidence=0.7, tags=["x"])
+        no_ev_b = Belief(proposition="No evidence B", confidence=0.7, tags=["x"])
+        with_ev = Belief(proposition="With evidence", confidence=0.9, tags=["x"])
+        for b in (no_ev_a, no_ev_b):
+            await provider.create_belief(b)
+        await provider.create_belief(
+            with_ev,
+            [Evidence(belief_id=with_ev.id, source_type="fact",
+                      source_id="src1", weight=0.9)],
+        )
+
+        engine = ReflectEngine(provider)
+        result = await engine.overview(topic="x")
+        assert result["total_beliefs"] == 3
+        assert result["evidence_stats_status"] == "ok"
+        assert result["no_evidence_count"] == 2, (
+            "no_evidence_count must reflect the aggregate over selected beliefs"
+        )
+
+    async def test_overview_no_evidence_respects_topic_filter(self, provider):
+        """no_evidence_count follows the SELECTED (filtered) belief set."""
+        with_ev = Belief(proposition="Docker fact", confidence=0.9, tags=["docker"])
+        await provider.create_belief(
+            with_ev,
+            [Evidence(belief_id=with_ev.id, source_type="fact",
+                      source_id="s", weight=1.0)],
+        )
+        await provider.create_belief(
+            Belief(proposition="Other no evidence", confidence=0.5, tags=["other"])
+        )
+
+        engine = ReflectEngine(provider)
+        docker_view = await engine.overview(topic="docker")
+        assert docker_view["total_beliefs"] == 1
+        assert docker_view["no_evidence_count"] == 0
+
+    async def test_overview_confidence_bands_explicit_boundaries(self, provider):
+        """0.85 is in the documented high band (0.8-1.0), not medium.
+
+        Regression: bands were re-derived from the 5-bin histogram, so 0.85
+        fell into the 0.7_0.9 bin and was reported as medium.
+        """
+        beliefs = [
+            Belief(proposition="High .85", confidence=0.85),
+            Belief(proposition="High .95", confidence=0.95),
+            Belief(proposition="Medium .79", confidence=0.79),
+            Belief(proposition="Low .4", confidence=0.4),
+        ]
+        for b in beliefs:
+            await provider.create_belief(b)
+
+        engine = ReflectEngine(provider)
+        result = await engine.overview()
+        conf = result["confidence"]
+        assert conf["high_0.8_1.0"] == 2, conf
+        assert conf["medium_0.5_0.8"] == 1, conf
+        assert conf["low_0.0_0.5"] == 1, conf
+
+    async def test_evidence_audit_db_error_is_partial_not_zero(
+        self, provider, monkeypatch
+    ):
+        """A repository failure must yield an explicit error/partial status —
+        never a successful all-zero result (CORE-3)."""
+        from storage.repositories.evidence_repo import EvidenceRepository
+
+        async def boom(self, belief_ids):
+            raise RuntimeError("evidence repo down")
+
+        monkeypatch.setattr(EvidenceRepository, "aggregate_stats", boom)
+        await provider.create_belief(Belief(proposition="Belief", confidence=0.8))
+
+        engine = ReflectEngine(provider)
+        result = await engine.evidence_audit()
+        assert result["evidence_stats_status"] == "error"
+        assert "evidence repo down" in result["evidence_stats_error"]
+        assert result["with_evidence"] is None, (
+            "DB error must not masquerade as a computed zero"
+        )
+
+    async def test_overview_db_error_is_partial_not_zero(self, provider, monkeypatch):
+        """Overview evidence stats failing surfaces status=error (CORE-3)."""
+        from storage.repositories.evidence_repo import EvidenceRepository
+
+        async def boom(self, belief_ids):
+            raise RuntimeError("evidence repo down")
+
+        monkeypatch.setattr(EvidenceRepository, "aggregate_stats", boom)
+        await provider.create_belief(Belief(proposition="Belief", confidence=0.8))
+
+        engine = ReflectEngine(provider)
+        result = await engine.overview()
+        assert result["evidence_stats_status"] == "error"
+        assert "evidence repo down" in result["evidence_stats_error"]
+        assert result["no_evidence_count"] is None

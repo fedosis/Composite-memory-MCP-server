@@ -1,7 +1,8 @@
 """Tests for Qdrant provider (Card 008)."""
 
-import pytest
 import uuid
+
+import pytest
 
 from memory_server.providers.qdrant_provider import QdrantProvider
 

@@ -127,6 +127,47 @@ def _build_histogram(beliefs: list[Belief]) -> dict[str, int]:
     return histogram
 
 
+def _explicit_confidence_bands(beliefs: list[Belief]) -> dict[str, int]:
+    """Count beliefs by EXPLICIT documented boundaries (API-3).
+
+    The overview contract documents high = 0.8-1.0, medium = 0.5-0.8 and
+    low = 0.0-0.5. The old code re-derived these from the 5-bin histogram
+    (whose 0.7_0.9/0.5_0.7 buckets have different boundaries), so a belief
+    at 0.85 was counted as medium even though it is in the documented high
+    band. Counting directly on the documented boundaries fixes it.
+    """
+    high = sum(1 for b in beliefs if b.confidence >= 0.8)
+    medium = sum(1 for b in beliefs if 0.5 <= b.confidence < 0.8)
+    low = sum(1 for b in beliefs if b.confidence < 0.5)
+    return {"high": high, "medium": medium, "low": low}
+
+
+async def _evidence_stats(
+    provider: SQLiteProvider, belief_ids: list[str]
+) -> tuple[dict[str, Any], str | None]:
+    """Aggregate evidence stats for the selected beliefs.
+
+    Returns ``(stats, None)`` on success or ``({}, error_message)`` when the
+    evidence repository fails — the caller must surface the error as a
+    partial/error status instead of reporting successful empty data (CORE-3).
+    Providers without a session slot (test doubles) yield ``({}, None)`` with
+    no error and no stats — the caller decides how to interpret that.
+    """
+    if not belief_ids:
+        return {}, None
+    if not hasattr(provider, "_get_session"):
+        return {}, None
+    try:
+        from storage.repositories.evidence_repo import EvidenceRepository
+
+        async with await provider._get_session() as session:
+            ev_repo = EvidenceRepository(session)
+            return await ev_repo.aggregate_stats(belief_ids), None
+    except Exception as exc:  # noqa: BLE001 - boundary: report, never swallow
+        logger.error("reflect: evidence stats failed: %s", exc)
+        return {}, f"{type(exc).__name__}: {exc}"
+
+
 # ---------------------------------------------------------------------------
 # ReflectEngine
 # ---------------------------------------------------------------------------
@@ -202,8 +243,28 @@ class ReflectEngine:
                 if newest is None or age < newest:
                     newest = age
 
-        # Confidence buckets
-        histogram = _build_histogram(beliefs)
+        # Confidence buckets (kept for the standalone confidence_histogram
+        # mode; overview counts via explicit documented bands below).
+        bands = _explicit_confidence_bands(beliefs)
+
+        # Evidence aggregation over the SELECTED beliefs (CORE-3): count how
+        # many of the analysed beliefs have no evidence at all. A repository
+        # failure must surface as an explicit partial/error status, never as
+        # a successful no-evidence/zero result.
+        evidence_status = "ok"
+        evidence_error = None
+        belief_ids = [b.id for b in beliefs]
+        if belief_ids and hasattr(self._provider, "_get_session"):
+            stats, evidence_error = await _evidence_stats(self._provider, belief_ids)
+            if evidence_error:
+                evidence_status = "error"
+                no_evidence_count = None  # uncomputable — not a success zero
+            else:
+                no_evidence_count = sum(
+                    1
+                    for b in beliefs
+                    if (stats.get(b.id) or {}).get("count", 0) == 0
+                )
 
         # Conflicts section
         contradicted_bs = [b for b in beliefs if b.lifecycle_state == "contradicted"]
@@ -254,11 +315,9 @@ class ReflectEngine:
             "by_lifecycle_state": dict(sorted(by_state.items())),
             "by_topics": dict(sorted(by_tags.items(), key=lambda x: x[1], reverse=True)),
             "confidence": {
-                "high_0.8_1.0": histogram.get("0.9_1.0", 0),  # only 0.9-1.0
-                "medium_0.5_0.8": (
-                    histogram.get("0.7_0.9", 0) + histogram.get("0.5_0.7", 0)
-                ),
-                "low_0.0_0.5": histogram.get("0.3_0.5", 0) + histogram.get("0.0_0.3", 0),
+                "high_0.8_1.0": bands["high"],
+                "medium_0.5_0.8": bands["medium"],
+                "low_0.0_0.5": bands["low"],
                 "average": (
                     round(sum(confidences) / max(len(confidences), 1), 4)
                     if confidences else 0.0
@@ -274,6 +333,12 @@ class ReflectEngine:
             "stale_count": stale_count,
             "decaying_next_7d": decaying_next_7d,
             "no_evidence_count": no_evidence_count,
+            "evidence_stats_status": evidence_status,
+            **(
+                {"evidence_stats_error": evidence_error}
+                if evidence_error is not None
+                else {}
+            ),
             "oldest_belief_days": round(oldest, 1) if oldest is not None else 0,
             "newest_belief_days": round(newest, 1) if newest is not None else 0,
         }
@@ -510,18 +575,21 @@ class ReflectEngine:
         """
         beliefs = await self._fetch_beliefs(topic, min_confidence, limit)
         total = len(beliefs)
-
-        from storage.repositories.evidence_repo import EvidenceRepository
-
         belief_ids = [b.id for b in beliefs]
-        try:
-            if hasattr(self._provider, "_get_session"):
-                async with await self._provider._get_session() as session:
-                    ev_repo = EvidenceRepository(session)
-                    stats = await ev_repo.aggregate_stats(belief_ids)
-                    # Count zero-weight evidence entries
-                    if belief_ids:
-                        placeholders = ",".join(f":bid_{i}" for i in range(len(belief_ids)))
+
+        # CORE-3: a repository failure is surfaced as an explicit partial
+        # status — never masked as a successful all-zero/empty result.
+        stats: dict[str, Any] = {}
+        zero_weight = 0
+        stats_error: str | None = None
+        if belief_ids and hasattr(self._provider, "_get_session"):
+            stats, stats_error = await _evidence_stats(self._provider, belief_ids)
+            if not stats_error:
+                try:
+                    async with await self._provider._get_session() as session:
+                        placeholders = ",".join(
+                            f":bid_{i}" for i in range(len(belief_ids))
+                        )
                         params = {f"bid_{i}": bid for i, bid in enumerate(belief_ids)}
                         sql_text = (
                             "SELECT COUNT(*) FROM evidence "
@@ -530,14 +598,22 @@ class ReflectEngine:
                         sql = __import__("sqlalchemy").text(sql_text)
                         result = await session.execute(sql, params)
                         zero_weight = result.scalar() or 0
-                    else:
-                        zero_weight = 0
-            else:
-                stats = {}
-                zero_weight = 0
-        except Exception:
-            stats = {}
-            zero_weight = 0
+                except Exception as exc:  # noqa: BLE001 - boundary: report
+                    stats_error = f"{type(exc).__name__}: {exc}"
+
+        if stats_error:
+            return {
+                "mode": "evidence_audit",
+                "total": total,
+                "evidence_stats_status": "error",
+                "evidence_stats_error": stats_error,
+                "with_evidence": None,
+                "without_evidence": None,
+                "avg_evidence_per_belief": None,
+                "by_source_type": {},
+                "zero_weight_entries": None,
+                "recommendation": "",
+            }
 
         with_evidence = 0
         without_evidence = 0
@@ -578,6 +654,7 @@ class ReflectEngine:
             "by_source_type": dict(sorted(by_source_type.items())),
             "zero_weight_entries": zero_weight,
             "recommendation": recommendation,
+            "evidence_stats_status": "ok",
         }
 
     async def confidence_histogram(
