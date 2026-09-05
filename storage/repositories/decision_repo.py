@@ -89,13 +89,25 @@ class DecisionRepository:
 
     async def search(
         self,
+        context: Optional[str] = None,
         choice: Optional[str] = None,
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
+        creator: Optional[str] = None,
         text: Optional[str] = None,
         limit: int = 50,
     ) -> list[Decision]:
         stmt = select(DecisionORM)
+        if context is not None:
+            stmt = stmt.where(DecisionORM.context == context)
         if choice is not None:
             stmt = stmt.where(DecisionORM.choice == choice)
+        if reason is not None:
+            stmt = stmt.where(DecisionORM.reason == reason)
+        if source is not None:
+            stmt = stmt.where(DecisionORM.source == source)
+        if creator is not None:
+            stmt = stmt.where(DecisionORM.creator == creator)
         if text is not None:
             pattern = f"%{text}%"
             stmt = stmt.where(
@@ -105,9 +117,9 @@ class DecisionRepository:
             )
         # Deterministic ordering: newest first, id DESC as final tie-break so
         # rows sharing a created_at (same ingestion batch) have a stable order.
-        stmt = stmt.limit(limit).order_by(
+        stmt = stmt.order_by(
             DecisionORM.created_at.desc(), DecisionORM.id.desc()
-        )
+        ).limit(limit)
         result = await self._session.execute(stmt)
         return [row.to_pydantic() for row in result.scalars().all()]
 

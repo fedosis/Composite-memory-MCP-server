@@ -114,6 +114,28 @@ class TestFactRepoFTSFallback:
         results = await repo.search(text="Docker")
         assert [f.id for f in results] == ["f1"]
 
+    async def test_active_lifecycle_filter_includes_validated_facts(self, repo):
+        """The active filter includes every configured active lifecycle state."""
+        await repo.create(
+            Fact(
+                id="validated-fact",
+                subject="Validated Docker",
+                predicate="runs_on",
+                object="OMV",
+                source="test",
+                lifecycle_state="validated",
+                dedup_key=fact_dedup_key("Validated Docker", "runs_on", "OMV"),
+            )
+        )
+
+        results = await repo.search(
+            subject="Validated Docker", lifecycle_state="active"
+        )
+
+        assert [fact.id for fact in results] == ["validated-fact"]
+        fts_results = await repo.search(text="Validated", lifecycle_state="active")
+        assert [fact.id for fact in fts_results] == ["validated-fact"]
+
     async def test_probe_expected_failure_disables_fts_and_falls_back(
         self, repo, monkeypatch, caplog
     ):

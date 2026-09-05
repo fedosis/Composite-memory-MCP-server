@@ -235,23 +235,19 @@ class SQLiteProvider:
         max_confidence: Optional[float] = None,
         limit: int = 50,
         include_inactive: bool = False,
+        lifecycle_state: Optional[str] = None,
     ) -> list[Fact]:
         async with await self._get_session() as session:
             repo = await self._get_fact_repo(session)
-            results = await repo.search(
-                subject=subject, predicate=predicate, text=text, limit=limit
+            effective_state = lifecycle_state
+            if effective_state is None and not include_inactive:
+                effective_state = "active"
+            return await repo.search(
+                subject=subject, predicate=predicate, object=object,
+                source=source, text=text, min_confidence=min_confidence,
+                max_confidence=max_confidence, lifecycle_state=effective_state,
+                limit=limit,
             )
-            if not include_inactive:
-                active_states = {"candidate", "validated", "active"}
-                results = [r for r in results if r.lifecycle_state in active_states]
-            # Apply additional filters in-memory for backward compat
-            if source is not None:
-                results = [r for r in results if r.source == source]
-            if min_confidence is not None:
-                results = [r for r in results if r.confidence >= min_confidence]
-            if max_confidence is not None:
-                results = [r for r in results if r.confidence <= max_confidence]
-            return results[:limit]
 
     async def update_fact(self, fact_id: str, **kwargs: Any) -> Optional[Fact]:
         async with await self._get_session() as session:
@@ -304,10 +300,8 @@ class SQLiteProvider:
     ) -> list[Decision]:
         async with await self._get_session() as session:
             repo = await self._get_decision_repo(session)
-            results = await repo.search(choice=choice, text=text, limit=limit)
-            if source is not None:
-                results = [r for r in results if r.source == source]
-            return results[:limit]
+            return await repo.search(context=context, choice=choice, reason=reason,
+                                     source=source, text=text, limit=limit)
 
     async def delete_decision(self, decision_id: str) -> bool:
         async with await self._get_session() as session:
@@ -340,10 +334,8 @@ class SQLiteProvider:
     ) -> list[Skill]:
         async with await self._get_session() as session:
             repo = await self._get_skill_repo(session)
-            results = await repo.search(purpose=purpose, limit=limit)
-            if name is not None:
-                results = [r for r in results if r.name == name]
-            return results[:limit]
+            return await repo.search(purpose=purpose, name=name, text=text,
+                                     min_success_rate=min_success_rate, limit=limit)
 
     async def delete_skill(self, skill_id: str) -> bool:
         async with await self._get_session() as session:
@@ -375,7 +367,8 @@ class SQLiteProvider:
     ) -> list[MemoryReceipt]:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
-            return await repo.search(memory_type=memory_type, source=source, limit=limit)
+            return await repo.search(memory_type=memory_type, source=source,
+                                     created_by=created_by, limit=limit)
 
     async def count_facts(self, include_inactive: bool = True) -> int:
         async with await self._get_session() as session:
@@ -577,6 +570,7 @@ class SQLiteProvider:
         min_confidence: Optional[float] = None,
         source: Optional[str] = None,
         creator: Optional[str] = None,
+        source_id: Optional[str] = None,
         limit: int = 10,
         include_inactive: bool = False,
     ) -> list[Belief]:
@@ -593,6 +587,7 @@ class SQLiteProvider:
                 min_confidence=min_confidence,
                 source=source,
                 creator=creator,
+                source_id=source_id,
                 limit=limit,
             )
 

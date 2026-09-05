@@ -46,6 +46,7 @@ class ReceiptRepository:
         self,
         memory_type: Optional[str] = None,
         source: Optional[str] = None,
+        created_by: Optional[str] = None,
         limit: int = 50,
     ) -> list[MemoryReceipt]:
         stmt = select(MemoryReceiptORM)
@@ -53,6 +54,16 @@ class ReceiptRepository:
             stmt = stmt.where(MemoryReceiptORM.memory_type == memory_type)
         if source is not None:
             stmt = stmt.where(MemoryReceiptORM.source == source)
-        stmt = stmt.limit(limit).order_by(MemoryReceiptORM.timestamp.desc())
+        if created_by is not None:
+            stmt = stmt.where(MemoryReceiptORM.created_by == created_by)
+        stmt = stmt.order_by(MemoryReceiptORM.timestamp.desc()).limit(limit)
         result = await self._session.execute(stmt)
         return [row.to_pydantic() for row in result.scalars().all()]
+
+    async def delete(self, receipt_id: str) -> bool:
+        orm = await self._session.get(MemoryReceiptORM, receipt_id)
+        if orm is None:
+            return False
+        await self._session.delete(orm)
+        await self._session.flush()
+        return True

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from memory_server.models import Decision, Fact, MemoryReceipt, Skill
 from storage.base import Base
+from storage.models.skill import SkillORM
 from storage.repositories import (
     DecisionRepository,
     FactRepository,
@@ -87,8 +88,9 @@ class LegacySQLiteProviderAdapter:
 
     async def create_fact(self, fact: Fact) -> Fact:
         async with await self._get_session() as session:
-            repo = await self._get_fact_repo(session)
-            return await repo.create(fact)
+            async with session.begin():
+                repo = await self._get_fact_repo(session)
+                return await repo.create(fact)
 
     async def get_fact(self, fact_id: str) -> Optional[Fact]:
         async with await self._get_session() as session:
@@ -108,39 +110,40 @@ class LegacySQLiteProviderAdapter:
     ) -> list[Fact]:
         async with await self._get_session() as session:
             repo = await self._get_fact_repo(session)
-            results = await repo.search(
-                subject=subject, predicate=predicate, text=text, limit=limit
-            )
-            # Apply additional filters in-memory for backward compat
-            if source is not None:
-                results = [r for r in results if r.source == source]
-            if min_confidence is not None:
-                results = [r for r in results if r.confidence >= min_confidence]
-            if max_confidence is not None:
-                results = [r for r in results if r.confidence <= max_confidence]
-            return results[:limit]
+            return await repo.search(subject=subject, predicate=predicate, object=object,
+                                     source=source, text=text,
+                                     min_confidence=min_confidence,
+                                     max_confidence=max_confidence, limit=limit)
 
     async def update_fact(self, fact_id: str, **kwargs: Any) -> Optional[Fact]:
         async with await self._get_session() as session:
-            repo = await self._get_fact_repo(session)
-            return await repo.update(fact_id, **kwargs)
+            async with session.begin():
+                repo = await self._get_fact_repo(session)
+                return await repo.update(fact_id, **kwargs)
 
     async def delete_fact(self, fact_id: str) -> bool:
         async with await self._get_session() as session:
-            repo = await self._get_fact_repo(session)
-            return await repo.delete(fact_id)
+            async with session.begin():
+                repo = await self._get_fact_repo(session)
+                return await repo.delete(fact_id)
 
     # --- Decision CRUD ---
 
     async def create_decision(self, decision: Decision) -> Decision:
         async with await self._get_session() as session:
-            repo = await self._get_decision_repo(session)
-            return await repo.create(decision)
+            async with session.begin():
+                repo = await self._get_decision_repo(session)
+                return await repo.create(decision)
 
     async def get_decision(self, decision_id: str) -> Optional[Decision]:
         async with await self._get_session() as session:
             repo = await self._get_decision_repo(session)
             return await repo.get(decision_id)
+
+    async def update_decision(self, decision_id: str, **kwargs: Any) -> Optional[Decision]:
+        async with await self._get_session() as session:
+            async with session.begin():
+                return await (await self._get_decision_repo(session)).update(decision_id, **kwargs)
 
     async def search_decisions(
         self,
@@ -153,27 +156,45 @@ class LegacySQLiteProviderAdapter:
     ) -> list[Decision]:
         async with await self._get_session() as session:
             repo = await self._get_decision_repo(session)
-            results = await repo.search(choice=choice, text=text, limit=limit)
-            if source is not None:
-                results = [r for r in results if r.source == source]
-            return results[:limit]
+            return await repo.search(context=context, choice=choice, reason=reason,
+                                     source=source, text=text, limit=limit)
 
     async def delete_decision(self, decision_id: str) -> bool:
         async with await self._get_session() as session:
-            repo = await self._get_decision_repo(session)
-            return await repo.delete(decision_id)
+            async with session.begin():
+                repo = await self._get_decision_repo(session)
+                return await repo.delete(decision_id)
 
     # --- Skill CRUD ---
 
     async def create_skill(self, skill: Skill) -> Skill:
         async with await self._get_session() as session:
-            repo = await self._get_skill_repo(session)
-            return await repo.create(skill)
+            async with session.begin():
+                repo = await self._get_skill_repo(session)
+                return await repo.create(skill)
 
     async def get_skill(self, skill_id: str) -> Optional[Skill]:
         async with await self._get_session() as session:
-            repo = await self._get_skill_repo(session)
-            return await repo.get(skill_id)
+            return await (await self._get_skill_repo(session)).get(skill_id)
+
+    async def update_skill(self, skill_id: str, **kwargs: Any) -> Optional[Skill]:
+        async with await self._get_session() as session:
+            async with session.begin():
+                orm = await session.get(SkillORM, skill_id)
+                if orm is None:
+                    return None
+                for key, value in kwargs.items():
+                    if hasattr(orm, key):
+                        setattr(orm, key, value)
+                await session.flush()
+                await session.refresh(orm)
+                return orm.to_pydantic()
+
+    async def delete_skill(self, skill_id: str) -> bool:
+        async with await self._get_session() as session:
+            async with session.begin():
+                repo = await self._get_skill_repo(session)
+                return await repo.delete(skill_id)
 
     async def search_skills(
         self,
@@ -185,22 +206,31 @@ class LegacySQLiteProviderAdapter:
     ) -> list[Skill]:
         async with await self._get_session() as session:
             repo = await self._get_skill_repo(session)
-            results = await repo.search(purpose=purpose, limit=limit)
-            if name is not None:
-                results = [r for r in results if r.name == name]
-            return results[:limit]
+            return await repo.search(purpose=purpose, name=name, text=text,
+                                     min_success_rate=min_success_rate, limit=limit)
 
     # --- Receipt CRUD ---
 
     async def create_receipt(self, receipt: MemoryReceipt) -> MemoryReceipt:
         async with await self._get_session() as session:
-            repo = await self._get_receipt_repo(session)
-            return await repo.create(receipt)
+            async with session.begin():
+                repo = await self._get_receipt_repo(session)
+                return await repo.create(receipt)
 
     async def get_receipt(self, receipt_id: str) -> Optional[MemoryReceipt]:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
             return await repo.get(receipt_id)
+
+    async def update_receipt(self, receipt_id: str, **kwargs: Any) -> Optional[MemoryReceipt]:
+        async with await self._get_session() as session:
+            async with session.begin():
+                return await (await self._get_receipt_repo(session)).update(receipt_id, **kwargs)
+
+    async def delete_receipt(self, receipt_id: str) -> bool:
+        async with await self._get_session() as session:
+            async with session.begin():
+                return await (await self._get_receipt_repo(session)).delete(receipt_id)
 
     async def search_receipts(
         self,
@@ -211,4 +241,5 @@ class LegacySQLiteProviderAdapter:
     ) -> list[MemoryReceipt]:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
-            return await repo.search(memory_type=memory_type, source=source, limit=limit)
+            return await repo.search(memory_type=memory_type, source=source,
+                                     created_by=created_by, limit=limit)

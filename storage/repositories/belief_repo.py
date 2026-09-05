@@ -26,13 +26,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import ValidationError
-from sqlalchemy import cast, select, text
+from sqlalchemy import cast, exists, select, text
 from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import String
 
 from memory_server.models.belief import Belief
-from storage.models.belief import BeliefORM
+from storage.models.belief import BeliefORM, EvidenceORM
 from storage.repositories.lifecycle_repo import _cas_transition
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,9 @@ FTS5_SEARCH_SQL = text("""
     FROM beliefs_fts
     JOIN beliefs ON beliefs_fts.rowid = beliefs.rowid
     WHERE beliefs_fts MATCH :query
+      AND (:source_id IS NULL OR EXISTS
+           (SELECT 1 FROM evidence WHERE evidence.belief_id = beliefs.id
+            AND evidence.source_id = :source_id))
     ORDER BY rank
     LIMIT :limit
 """)
@@ -149,6 +152,7 @@ class BeliefRepository:
         min_confidence: Optional[float] = None,
         source: Optional[str] = None,
         creator: Optional[str] = None,
+        source_id: Optional[str] = None,
         limit: int = 10,
     ) -> list[Belief]:
         """Search beliefs with FTS5 full-text search or LIKE/WHERE fallback."""
@@ -157,10 +161,9 @@ class BeliefRepository:
             fts5_q = self._fts5_query(proposition)
             if fts5_q:
                 try:
-                    fetch_limit = limit * 5 if limit > 0 else 100000  # effectively unlimited
                     result = await self._session.execute(
                         FTS5_SEARCH_SQL,
-                        {"query": fts5_q, "limit": fetch_limit},  # fetch extra for filtering
+                        {"query": fts5_q, "limit": limit, "source_id": source_id},
                     )
                     rows = result.mappings().all()
                     if rows:
@@ -207,6 +210,9 @@ class BeliefRepository:
             conditions.append(BeliefORM.source == source)
         if creator is not None:
             conditions.append(BeliefORM.creator == creator)
+        if source_id is not None:
+            conditions.append(exists().where(EvidenceORM.belief_id == BeliefORM.id,
+                                             EvidenceORM.source_id == source_id))
 
         for cond in conditions:
             stmt = stmt.where(cond)

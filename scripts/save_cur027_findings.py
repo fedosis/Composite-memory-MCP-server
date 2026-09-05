@@ -1,9 +1,6 @@
 import asyncio
-import sys
 
 from _common import get_db_url
-
-sys.path.insert(0, "/home/shtorm/memory-server/src")
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from memory_server.api.remember import remember

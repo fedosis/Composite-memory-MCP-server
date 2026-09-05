@@ -2,8 +2,9 @@
 
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import cast, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.types import String
 
 from memory_server.models import Skill
 from storage.models.skill import SkillORM
@@ -26,11 +27,23 @@ class SkillRepository:
         result = await self._session.get(SkillORM, skill_id)
         return result.to_pydantic() if result else None
 
-    async def search(self, purpose: Optional[str] = None, limit: int = 50) -> list[Skill]:
+    async def search(self, purpose: Optional[str] = None, name: Optional[str] = None,
+                     text: Optional[str] = None, min_success_rate: Optional[float] = None,
+                     limit: int = 50) -> list[Skill]:
         stmt = select(SkillORM)
         if purpose is not None:
             stmt = stmt.where(SkillORM.purpose == purpose)
-        stmt = stmt.limit(limit).order_by(SkillORM.created_at.desc())
+        if name is not None:
+            stmt = stmt.where(SkillORM.name == name)
+        if min_success_rate is not None:
+            stmt = stmt.where(SkillORM.success_rate >= min_success_rate)
+        if text is not None:
+            pattern = f"%{text}%"
+            stmt = stmt.where(or_(SkillORM.name.like(pattern), SkillORM.purpose.like(pattern),
+                                  cast(SkillORM.steps, String).like(pattern),
+                                  cast(SkillORM.constraints, String).like(pattern),
+                                  cast(SkillORM.validation, String).like(pattern)))
+        stmt = stmt.order_by(SkillORM.created_at.desc()).limit(limit)
         result = await self._session.execute(stmt)
         return [row.to_pydantic() for row in result.scalars().all()]
 

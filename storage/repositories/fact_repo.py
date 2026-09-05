@@ -46,6 +46,23 @@ FTS5_SEARCH_SQL = text("""
     FROM facts_fts
     JOIN facts ON facts_fts.rowid = facts.rowid
     WHERE facts_fts MATCH :query
+      AND (:subject IS NULL OR facts.subject = :subject)
+      AND (:predicate IS NULL OR facts.predicate = :predicate)
+      AND (:object IS NULL OR facts.object = :object)
+      AND (:source IS NULL OR facts.source = :source)
+      AND (:min_confidence IS NULL OR facts.confidence >= :min_confidence)
+      AND (:max_confidence IS NULL OR facts.confidence <= :max_confidence)
+      AND (
+          :lifecycle_state IS NULL
+          OR (
+              :lifecycle_state = 'active'
+              AND facts.lifecycle_state IN ('candidate', 'validated', 'active')
+          )
+          OR (
+              :lifecycle_state != 'active'
+              AND facts.lifecycle_state = :lifecycle_state
+          )
+      )
     ORDER BY rank
     LIMIT :limit
 """)
@@ -173,7 +190,12 @@ class FactRepository:
         self,
         subject: Optional[str] = None,
         predicate: Optional[str] = None,
+        object: Optional[str] = None,
+        source: Optional[str] = None,
         text: Optional[str] = None,
+        min_confidence: Optional[float] = None,
+        max_confidence: Optional[float] = None,
+        lifecycle_state: Optional[str] = None,
         limit: int = 50,
     ) -> list[Fact]:
         """Search facts with FTS5 full-text search or LIKE fallback.
@@ -189,7 +211,14 @@ class FactRepository:
                 try:
                     result = await self._session.execute(
                         FTS5_SEARCH_SQL,
-                        {"query": fts5_q, "limit": limit},
+                        {
+                            "query": fts5_q, "limit": limit,
+                            "subject": subject, "predicate": predicate,
+                            "object": object, "source": source,
+                            "min_confidence": min_confidence,
+                            "max_confidence": max_confidence,
+                            "lifecycle_state": lifecycle_state,
+                        },
                     )
                     rows = result.mappings().all()
                     if rows:
@@ -214,6 +243,19 @@ class FactRepository:
             stmt = stmt.where(FactORM.subject == subject)
         if predicate is not None:
             stmt = stmt.where(FactORM.predicate == predicate)
+        if object is not None:
+            stmt = stmt.where(FactORM.object == object)
+        if source is not None:
+            stmt = stmt.where(FactORM.source == source)
+        if min_confidence is not None:
+            stmt = stmt.where(FactORM.confidence >= min_confidence)
+        if max_confidence is not None:
+            stmt = stmt.where(FactORM.confidence <= max_confidence)
+        if lifecycle_state is not None:
+            if lifecycle_state == "active":
+                stmt = stmt.where(FactORM.lifecycle_state.in_(ACTIVE_LIFECYCLE_STATES))
+            else:
+                stmt = stmt.where(FactORM.lifecycle_state == lifecycle_state)
         if text is not None:
             pattern = f"%{text}%"
             stmt = stmt.where(
@@ -221,7 +263,7 @@ class FactRepository:
                 | FactORM.predicate.like(pattern)
                 | FactORM.object.like(pattern)
             )
-        stmt = stmt.limit(limit).order_by(FactORM.created_at.desc())
+        stmt = stmt.order_by(FactORM.created_at.desc()).limit(limit)
         result = await self._session.execute(stmt)
         return [row.to_pydantic() for row in result.scalars().all()]
 

@@ -929,16 +929,9 @@ async def get_belief_tool(
             tags=parsed_tags,
             source=source or None,
             creator=creator or None,
+            source_id=source_id or None,
             limit=min(limit, 100),
         )
-
-        # Filter by source_id if specified
-        if source_id:
-            logger.warning(
-                "source_id filter applied in-memory (deferred to SQL in v0.7+): source_id=%s",
-                source_id,
-            )
-            results = [b for b in results if source_id in b.source_ids]
 
         serialized = {
             "total": len(results),
