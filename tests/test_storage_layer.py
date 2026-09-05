@@ -8,6 +8,7 @@
 
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from storage.base import Base as StorageBase
 from storage.dedup import fact_dedup_key
 from storage.models import (
@@ -209,6 +210,91 @@ class TestDecisionRepositoryCRUD:
         await repo.create(d)
         assert await repo.delete("d3") is True
         assert await repo.get("d3") is None
+
+    async def test_create_stores_canonical_context(self, repo):
+        # DB-4: Python strip (not SQLite trim) is the canonical-context
+        # contract — spaces, tabs, newlines and Unicode whitespace are
+        # stripped from the OUTER edges at the persistence boundary.
+        padded = Decision(
+            id="cc1",
+            context="  ctx  ",
+            choice="A",
+            reason="R",
+        )
+        created = await repo.create(padded)
+        assert created.context == "ctx"
+
+        for idx, (raw, canonical) in enumerate(
+            [
+                ("\tctx\n", "ctx"),
+                ("\u00a0ctx\u00a0", "ctx"),
+                (" \u2003ctx ", "ctx"),
+                ("\r\nctx\r\n", "ctx"),
+                ("", ""),
+                ("ctx", "ctx"),
+            ]
+        ):
+            # Distinct choice per row so only the context normalization is
+            # exercised (canonical context + dedup_key is unique per row).
+            d = Decision(
+                id=f"cc-{idx}",
+                context=raw,
+                choice=f"B-{idx}",
+                reason="R",
+            )
+            stored = await repo.create(d)
+            assert stored.context == canonical, (raw, stored.context)
+
+    async def test_find_existing_matches_canonical_context(self, repo):
+        # A row persisted under canonical context is found by any whitespace
+        # variant of the same context (write-path dedup agreement).
+        await repo.create(Decision(id="fe1", context="  ctx  ", choice="X", reason="R"))
+        found = await repo.find_existing("ctx", "X")
+        assert found is not None
+        assert found.id == "fe1"
+        found_padded = await repo.find_existing("\t ctx \n", "X")
+        assert found_padded is not None
+        assert found_padded.id == "fe1"
+
+    async def test_reingest_does_not_create_active_duplicate(self, repo):
+        # Canonical (context, dedup_key) is enforced by the partial unique
+        # index: a second ACTIVE row that only differs by context whitespace
+        # must be rejected (DB-4 duplicate source).
+        await repo.create(
+            Decision(id="dup1", context="ctx", choice="pick Caddy", reason="R")
+        )
+        with pytest.raises(IntegrityError):
+            await repo.create(
+                Decision(id="dup2", context="  ctx  ", choice="pick Caddy", reason="R")
+            )
+        # The failed flush left the session in rollback-required state.
+        await repo._session.rollback()
+        # An archived row with the same canonical key is still allowed (W3).
+        archived = Decision(
+            id="dup3",
+            context="ctx",
+            choice="pick Caddy",
+            reason="R",
+            lifecycle_state="archived",
+        )
+        created = await repo.create(archived)
+        assert created.id == "dup3"
+
+    async def test_search_canonicalizes_context_filter(self, repo):
+        await repo.create(Decision(id="sc1", context="ctx", choice="A", reason="R"))
+        await repo.create(Decision(id="sc2", context="other", choice="A", reason="R"))
+        results = await repo.search(context="  ctx  ")
+        assert [r.id for r in results] == ["sc1"]
+        results_tab = await repo.search(context="\tctx\n")
+        assert [r.id for r in results_tab] == ["sc1"]
+
+    async def test_update_canonicalizes_context(self, repo):
+        await repo.create(Decision(id="uc1", context="old", choice="A", reason="R"))
+        updated = await repo.update("uc1", context="  new ctx  ")
+        assert updated is not None
+        assert updated.context == "new ctx"
+        fetched = await repo.get("uc1")
+        assert fetched.context == "new ctx"
 
 
 class TestSkillRepositoryCRUD:

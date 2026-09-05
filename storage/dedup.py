@@ -58,6 +58,26 @@ def fact_dedup_key(subject: object, predicate: object, object: object) -> str:
     )
 
 
+def canonical_context(context: object) -> str:
+    """Return the canonical (outer-stripped) decision context.
+
+    Contract (DB-4): the canonical context is ``str.strip()`` — Python
+    Unicode-whitespace semantics. SQLite's ``trim()`` only removes ASCII
+    spaces, so it is NOT equivalent for tabs/newlines/Unicode whitespace and
+    must never be used where this canonical value is required. Data
+    migrations must repeat this exact contract (see the
+    canonical_decision_context migration).
+
+    This is applied at every persistence/query seam: ORM write
+    (``DecisionORM.from_pydantic``), ``DecisionRepository.update`` /
+    ``search``, ``decision_dedup_key``, and the backfill migration — so the
+    stored ``context`` column, the partial unique index on
+    ``(context, dedup_key)``, write-path dedup, read-path collapse and search
+    all agree.
+    """
+    return str(context or "").strip()
+
+
 def normalize_choice(choice: object, prefix_len: int = DECISION_DEDUP_PREFIX_LEN) -> str:
     """Collapse whitespace and truncate ``choice`` to a stable prefix.
 
@@ -70,11 +90,15 @@ def normalize_choice(choice: object, prefix_len: int = DECISION_DEDUP_PREFIX_LEN
 
 
 def decision_dedup_key(context: object, choice: object) -> tuple[str, str]:
-    """Return the normalized dedup key ``(context.strip(), choice_normalized)``.
+    """Return the normalized dedup key ``(canonical_context, choice_normalized)``.
 
     This is the single source of truth used by:
     - ``DecisionRepository.find_existing`` (write-path dedup)
     - ``get_context`` read-path dedup
     - the ``dedup_key`` column + partial unique index in ``DecisionORM``
+
+    Since DB-4 the context part is the SAME canonical value that is stored in
+    the ``context`` column (see ``canonical_context``), so padded/Unicode-
+    whitespace variants never split a logical key.
     """
-    return (str(context or "").strip(), normalize_choice(choice))
+    return (canonical_context(context), normalize_choice(choice))

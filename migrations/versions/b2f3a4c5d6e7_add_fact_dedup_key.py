@@ -351,10 +351,13 @@ def _tables_with_orphans(bind: sa.engine.Connection) -> None:
 
 def _ensure_preflight(bind: sa.engine.Connection) -> str:
     installed = installed_versions(bind)
-    if "6a7b8c9d0e1f" not in installed:
+    # PR-8: revision 7a1b2c3d4e5f (canonical decision context) supersedes
+    # 6a7b8c9d0e1f in the alembic_version row once applied, so its presence
+    # is equivalent evidence that the decision dedup track is installed.
+    if "6a7b8c9d0e1f" not in installed and "7a1b2c3d4e5f" not in installed:
         raise RuntimeError(
-            "B2 requires migration 6a7b8c9d0e1f to be installed "
-            f"(installed={installed!r})"
+            "B2 requires migration 6a7b8c9d0e1f (or its canonical-context "
+            f"successor 7a1b2c3d4e5f) to be installed (installed={installed!r})"
         )
     if not table_exists(bind, "facts"):
         raise RuntimeError("facts table is missing before migration")

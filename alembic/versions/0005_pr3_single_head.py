@@ -9,7 +9,7 @@ from pathlib import Path
 from alembic import util
 
 revision = "0005"
-down_revision = ("b2f3a4c5d6e7", "6a7b8c9d0e1f")
+down_revision = ("b2f3a4c5d6e7", "7a1b2c3d4e5f")
 branch_labels = None
 depends_on = None
 

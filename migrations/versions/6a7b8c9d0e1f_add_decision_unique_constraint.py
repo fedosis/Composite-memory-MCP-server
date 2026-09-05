@@ -26,11 +26,18 @@ Steps:
   1. Add the `dedup_key` column (NOT NULL, default '').
   2. Backfill `dedup_key` for existing rows using the same normalization as
      storage.dedup (inlined here so the migration stays self-contained).
-  3. Deduplicate existing rows by (context, dedup_key): keep the best row per
-     key (active first, then confidence desc, created_at desc, id desc) and
-     delete the rest together with their receipts and outbox entries —
-     required so the unique index can be created on any pre-existing data.
-  4. Create the partial unique index.
+  3. Deduplicate existing ACTIVE rows (candidate/validated/active) by
+     (context, dedup_key): keep the best row per key (confidence desc,
+     created_at desc, id desc) and delete the rest together with their
+     receipts and outbox entries — required so the partial unique index can
+     be created on any pre-existing data. Dedup NEVER touches
+     archived/rejected/inactive rows: they do not participate in the partial
+     index (W3), so an inactive row that shares a (context, dedup_key) with
+     an active row is preserved together with its receipts/outbox. Only
+     ACTIVE duplicates are collapsed; history is never deleted (MIG-2).
+  4. Create the partial unique index (same predicate as the ORM:
+     uq_decisions_context_dedup_active, lifecycle_state IN
+     ('candidate','validated','active')).
 
 """
 
@@ -98,8 +105,13 @@ def upgrade() -> None:
         )
 
     # 3. Deduplicate by (context, dedup_key) so the unique index can be
-    #    created. Keep the best row per key: ACTIVE rows first, then higher
-    #    confidence, then newest (created_at DESC, id DESC).
+    #    created. Only ACTIVE rows (candidate/validated/active) participate —
+    #    the same predicate as the partial unique index below (W3). The best
+    #    ACTIVE row per key is kept: higher confidence, then newest
+    #    (created_at DESC), then highest id. archived/rejected/inactive rows
+    #    are never considered for deletion: they are not constrained by the
+    #    partial index, so their history and references must survive even when
+    #    they share a key with an active row (MIG-2).
     decision_rows = bind.execute(
         sa.text(
             "SELECT id, context, dedup_key, confidence, created_at, lifecycle_state "
@@ -112,19 +124,16 @@ def upgrade() -> None:
 
     delete_ids: list[str] = []
     for key, group in groups.items():
-        if len(group) <= 1:
+        active_rows = [r for r in group if r.lifecycle_state in _ACTIVE_STATES]
+        if len(active_rows) <= 1:
             continue
 
+        # All candidates are ACTIVE here, so only quality ordering remains.
         def sort_key(r):
-            return (
-                r.lifecycle_state in _ACTIVE_STATES,
-                r.confidence,
-                r.created_at,
-                r.id,
-            )
+            return (r.confidence, r.created_at, r.id)
 
-        keeper = max(group, key=sort_key)
-        delete_ids.extend(r.id for r in group if r.id != keeper.id)
+        keeper = max(active_rows, key=sort_key)
+        delete_ids.extend(r.id for r in active_rows if r.id != keeper.id)
 
     if delete_ids:
         _delete_in_chunks(

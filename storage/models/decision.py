@@ -8,7 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import Decision
 from storage.base import Base, utcnow
-from storage.dedup import normalize_choice
+from storage.dedup import canonical_context, normalize_choice
 
 
 class DecisionORM(Base):
@@ -38,6 +38,11 @@ class DecisionORM(Base):
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    #: Canonical context (outer whitespace stripped, Unicode-aware — DB-4).
+    #: ``from_pydantic`` stores ``canonical_context(decision.context)`` and the
+    #: canonical_decision_context migration backfills legacy rows, so the raw
+    #: ``context`` column always holds the canonical value and the partial
+    #: unique index below operates on canonical keys.
     context: Mapped[str] = mapped_column(String, default="")
     choice: Mapped[str] = mapped_column(String, nullable=False)
     #: Normalized dedup key (whitespace-collapsed 200-char prefix of choice) —
@@ -80,7 +85,7 @@ class DecisionORM(Base):
 
         return cls(
             id=decision.id,
-            context=decision.context,
+            context=canonical_context(decision.context),
             choice=decision.choice,
             dedup_key=normalize_choice(decision.choice),
             rejected_alternatives=json.dumps(decision.rejected_alternatives),

@@ -6,7 +6,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memory_server.models import Decision
-from storage.dedup import ACTIVE_LIFECYCLE_STATES, decision_dedup_key
+from storage.dedup import (
+    ACTIVE_LIFECYCLE_STATES,
+    canonical_context,
+    decision_dedup_key,
+)
 from storage.models.decision import DecisionORM
 
 
@@ -33,6 +37,11 @@ class DecisionRepository:
             return None
         for key, value in kwargs.items():
             if hasattr(orm, key):
+                # DB-4: the context column stores ONLY the canonical value, so
+                # every write seam applies the same normalization as the ORM
+                # factory and the backfill migration.
+                if key == "context":
+                    value = canonical_context(value)
                 setattr(orm, key, value)
         await self._session.flush()
         await self._session.refresh(orm)
@@ -99,7 +108,9 @@ class DecisionRepository:
     ) -> list[Decision]:
         stmt = select(DecisionORM)
         if context is not None:
-            stmt = stmt.where(DecisionORM.context == context)
+            # DB-4: stored context is canonical, so the filter is canonicalized
+            # with the same contract (' ctx ' finds 'ctx').
+            stmt = stmt.where(DecisionORM.context == canonical_context(context))
         if choice is not None:
             stmt = stmt.where(DecisionORM.choice == choice)
         if reason is not None:
