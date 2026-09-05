@@ -1211,20 +1211,34 @@ class TestServerOutboxIntegration:
             assert result.retry_count == 0
 
     async def test_migration_creates_outbox_table(self):
-        """Verify Alembic --sql output includes outbox_entries table."""
+        """Verify an online Alembic upgrade creates outbox_entries."""
         project_dir = os.path.join(os.path.dirname(__file__), "..")
+        db_path = os.path.join(project_dir, "tests", f"tmp_outbox_migration_{uuid.uuid4().hex}.db")
+        ini_path = os.path.join(project_dir, f"tmp_outbox_migration_{uuid.uuid4().hex}.ini")
+        with open(os.path.join(project_dir, "alembic.ini"), encoding="utf-8") as stream:
+            ini_text = stream.read().replace("sqlite:///memory.db", f"sqlite:///{db_path}")
+        with open(ini_path, "w", encoding="utf-8") as stream:
+            stream.write(ini_text)
 
-        result = subprocess.run(
-            ["alembic", "upgrade", "head", "--sql"],
-            cwd=project_dir,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        assert result.returncode == 0, f"alembic upgrade --sql failed: {result.stderr}"
-
-        sql_output = result.stdout
-        assert "CREATE TABLE outbox_entries" in sql_output, "Migration should create outbox_entries table"
+        try:
+            result = subprocess.run(
+                ["alembic", "-c", ini_path, "upgrade", "head"],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert result.returncode == 0, f"online alembic upgrade failed: {result.stderr}"
+            import sqlite3
+            with sqlite3.connect(db_path) as connection:
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )}
+            assert "outbox_entries" in tables
+        finally:
+            for path in (db_path, ini_path):
+                if os.path.exists(path):
+                    os.unlink(path)
 
 
 # =============================================================================

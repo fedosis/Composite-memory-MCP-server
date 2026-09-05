@@ -324,7 +324,21 @@ class MemoryIngestionService:
                 now = datetime.now(timezone.utc)
                 fact_id = str(uuid4())
 
-                # Create fact
+                fact_repo = FactRepository(session)
+                existing = await fact_repo.find_existing(subject, predicate, object)
+                if existing is not None:
+                    stored_fact, stored_receipt = await reinforce_memory_item(
+                        session,
+                        memory_type="fact",
+                        item_id=existing.id,
+                        new_confidence=confidence,
+                        source=source,
+                        previous_confidence=existing.confidence,
+                    )
+                    return {"receipt": stored_receipt, "fact": stored_fact}
+
+                # Create fact. The savepoint makes a concurrent duplicate
+                # recoverable without aborting the caller's outer UoW.
                 fact = Fact(
                     id=fact_id,
                     subject=subject,
@@ -335,8 +349,22 @@ class MemoryIngestionService:
                     source=source,
                     created_at=now,
                 )
-                fact_repo = FactRepository(session)
-                stored_fact = await fact_repo.create(fact)
+                try:
+                    async with session.begin_nested():
+                        stored_fact = await fact_repo.create(fact)
+                except IntegrityError:
+                    keeper = await fact_repo.find_existing(subject, predicate, object)
+                    if keeper is None:
+                        raise
+                    stored_fact, stored_receipt = await reinforce_memory_item(
+                        session,
+                        memory_type="fact",
+                        item_id=keeper.id,
+                        new_confidence=confidence,
+                        source=source,
+                        previous_confidence=keeper.confidence,
+                    )
+                    return {"receipt": stored_receipt, "fact": stored_fact}
 
                 # Create receipt
                 receipt_history: list[dict[str, Any]] = []

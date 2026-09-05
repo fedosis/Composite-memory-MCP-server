@@ -1,6 +1,8 @@
 """Tests for remember MCP tool (Card 006)."""
 
 import pytest
+from sqlalchemy import func, select
+from storage.models.fact import FactORM
 
 from memory_server.api.remember import remember
 from memory_server.models import MemoryReceipt, VerificationStatus
@@ -206,3 +208,18 @@ class TestRemember:
         assert fact.predicate == "runs_on"
         assert fact.object == "OMV8"
         assert fact.source == "test"
+
+    async def test_repeated_fact_is_reinforced_without_duplicate_row(self, provider):
+        first = await remember(
+            provider, subject="Repeat", predicate="is", object="stable", confidence=0.4
+        )
+        second = await remember(
+            provider, subject="Repeat", predicate="is", object="stable", confidence=0.9
+        )
+
+        assert second["receipt"].id == first["receipt"].id
+        assert second["fact"].id == first["fact"].id
+        assert second["fact"].confidence == 0.9
+        async with provider._session_factory() as session:
+            count = await session.scalar(select(func.count()).select_from(FactORM))
+        assert count == 1
