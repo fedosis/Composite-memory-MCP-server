@@ -12,7 +12,6 @@ Creates:
 from typing import Sequence, Union
 
 from alembic import op
-import sqlalchemy as sa
 
 revision: str = "0002"
 down_revision: Union[str, None] = "0001"
@@ -57,11 +56,10 @@ def upgrade() -> None:
         "END"
     )
 
-    # Populate FTS index with existing data
-    op.execute(
-        "INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) "
-        "SELECT 'rebuild', rowid, subject, predicate, object FROM facts"
-    )
+    # Populate FTS index with existing data. The one-shot 'rebuild' command is
+    # the correct external-content form; a per-row 'rebuild' insert would scan
+    # the whole content table once per row and stall on populated databases.
+    op.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
 
 
 def downgrade() -> None:

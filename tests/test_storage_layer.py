@@ -6,7 +6,6 @@
 - Backward compatibility of SQLiteProvider
 """
 
-import os
 
 import pytest
 from storage.base import Base as StorageBase
@@ -33,165 +32,19 @@ from memory_server.providers.sqlite_provider import SQLiteProvider
 
 
 class TestMigration:
-    """Test Alembic migration up and down."""
+    """Exercise official migrations exclusively on pytest disposable databases."""
 
-    def _run_alembic(self, db_path: str, command: str) -> None:
-        """Run an alembic command against a specific SQLite DB."""
-        import subprocess
-        import sys
+    def test_migration_up_creates_all_tables(self, tmp_path):
+        from tests.test_pr3_migration_graph import test_empty_database_to_head
+        test_empty_database_to_head(tmp_path)
 
-        env = {**os.environ, "ALEMBIC_TEST_DB": db_path}
-        result = subprocess.run(
-            [sys.executable, "-m", "alembic", command, "alembic.ini"],
-            cwd=os.path.join(os.path.dirname(__file__), ".."),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        print(f"alembic {command} stdout:", result.stdout)
-        print(f"alembic {command} stderr:", result.stderr)
-        assert result.returncode == 0, f"alembic {command} failed: {result.stderr}"
+    def test_official_head_is_unified(self):
+        from tests.test_pr3_migration_graph import test_single_official_head
+        test_single_official_head()
 
-    def _alembic_upgrade(self, db_path: str, revision: str = "head") -> None:
-        """Run alembic upgrade."""
-        import subprocess
-        import sys
-
-        env = {**os.environ}
-        result = subprocess.run(
-            [sys.executable, "-m", "alembic", "--config", "alembic.ini", "upgrade", revision],
-            cwd=os.path.join(os.path.dirname(__file__), ".."),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        print(f"alembic upgrade stdout: {result.stdout}")
-        print(f"alembic upgrade stderr: {result.stderr}")
-        assert result.returncode == 0, f"alembic upgrade failed: {result.stderr}"
-
-    def _alembic_downgrade(self, db_path: str, revision: str = "base") -> None:
-        """Run alembic downgrade."""
-        import subprocess
-        import sys
-
-        env = {**os.environ}
-        result = subprocess.run(
-            [sys.executable, "-m", "alembic", "--config", "alembic.ini", "downgrade", revision],
-            cwd=os.path.join(os.path.dirname(__file__), ".."),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        print(f"alembic downgrade stdout: {result.stdout}")
-        print(f"alembic downgrade stderr: {result.stderr}")
-        assert result.returncode == 0, f"alembic downgrade failed: {result.stderr}"
-
-    def test_migration_up_creates_all_tables(self):
-        """Verify alembic upgrade head --sql creates all 7 tables."""
-        import subprocess
-        import sys
-
-        project_dir = os.path.join(os.path.dirname(__file__), "..")
-
-        result = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
-            cwd=project_dir,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        assert result.returncode == 0, f"alembic upgrade --sql failed: {result.stderr}"
-
-        sql_output = result.stdout
-        expected_tables = [
-            "facts",
-            "decisions",
-            "skills",
-            "receipts",
-            "entities",
-            "lifecycle_events",
-            "lifecycle_states",
-            "claim_relations",
-        ]
-        for table in expected_tables:
-            assert f"CREATE TABLE {table}" in sql_output, f"Missing table: {table}"
-
-    def test_migration_downgrade_drops_all_tables(self):
-        """Verify alembic upgrade creates all tables and migration file has correct downgrade."""
-        import re
-        import subprocess
-        import sys
-
-        project_dir = os.path.join(os.path.dirname(__file__), "..")
-
-        # Find the initial migration file (the root revision with down_revision = None)
-        migration_dir = os.path.join(project_dir, "migrations", "versions")
-        migration_files = sorted(f for f in os.listdir(migration_dir) if f.endswith(".py"))
-        assert len(migration_files) >= 1, f"Expected >=1 migration file, got {len(migration_files)}"
-        # The initial migration has down_revision = None (root revision);
-        migration_path = migration_dir
-        initial_migration = None
-        for f in migration_files:
-            fp = os.path.join(migration_dir, f)
-            with open(fp) as fh:
-                content = fh.read()
-            if re.search(r"down_revision[^=]*=\s*None\b", content):
-                initial_migration = fp
-                break
-        assert initial_migration is not None, (
-            f"No initial migration found (down_revision = None) among {migration_files}"
-        )
-        migration_path = initial_migration
-
-        # Read the migration file to verify downgrade has all DROP TABLEs
-        with open(migration_path) as f:
-            content = f.read()
-
-        # Verify upgrade creates all 7 tables (via --sql mode)
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
-                cwd=project_dir,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            assert result.returncode == 0, f"upgrade --sql failed: {result.stderr}"
-
-            sql_output = result.stdout
-            # Verify upgrade creates all 7 tables
-            for table in [
-                "facts",
-                "decisions",
-                "skills",
-                "receipts",
-                "entities",
-                "lifecycle_events",
-                "lifecycle_states",
-                "claim_relations",
-            ]:
-                assert f"CREATE TABLE {table}" in sql_output, f"Missing CREATE TABLE {table}"
-        finally:
-            memory_db = os.path.join(project_dir, "memory.db")
-            if os.path.exists(memory_db):
-                os.remove(memory_db)
-
-        # Verify downgrade function drops all 7 tables
-        assert "def downgrade()" in content
-        expected_drops = [
-            "skills",
-            "receipts",
-            "lifecycle_states",
-            "lifecycle_events",
-            "facts",
-            "entities",
-            "decisions",
-        ]
-        for table in expected_drops:
-            assert f"drop_table('{table}')" in content or f'drop_table("{table}")' in content
+    def test_migration_downgrade_is_explicitly_irreversible(self, tmp_path):
+        from tests.test_pr3_migration_graph import test_irreversible_downgrade_rejected_without_changes
+        test_irreversible_downgrade_rejected_without_changes(tmp_path, "head", "base")
 
 
 # =============================================================================

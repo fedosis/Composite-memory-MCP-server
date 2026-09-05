@@ -603,13 +603,62 @@ WAL mode allows simultaneous reads while a single writer is active, which is cri
 
 ### Alembic Migrations
 
-Database schema migrations are managed via Alembic. To apply pending migrations:
+The only supported entrypoint is `alembic.ini` (`alembic/env.py`). It loads
+both revision directories and exposes exactly one head, `0005`. The old
+`migrations/env.py` fails with instructions to use the official configuration;
+old revision files and identifiers remain available.
+
+**PR-3 is not permission to upgrade production.** The historical decision and
+fact dedup migrations still delete duplicate rows and owned records. PR-4 must
+address that destructive behavior. Test only disposable databases or a verified
+SQLite backup; never run `stamp head` to bypass schema work.
+
+Installed-revision transition map (all finish at `0005`):
+
+| Installed revision | Work remaining through the official entrypoint |
+|---|---|
+| empty/unversioned compatible runtime schema | `70e6afc8d15d`, both branches below, B2, bridge |
+| `70e6afc8d15d` | `5d4e3c2b1a0f → 6a7b8c9d0e1f` and `0001 → 0002 → 0003 → 0004`, then B2/bridge |
+| `0001` | `0002 → 0003 → 0004`, missing outbox/decision branch, B2/bridge |
+| `0002` | `0003 → 0004`, missing outbox/decision branch, B2/bridge |
+| `0003` | `0004`, missing outbox/decision branch, B2/bridge |
+| `0004` | missing outbox/decision branch, B2/bridge |
+| `5d4e3c2b1a0f` | `6a7b8c9d0e1f`, missing `0001–0004`, B2/bridge |
+| `6a7b8c9d0e1f` | missing `0001–0004`, B2/bridge |
+| `b2f3a4c5d6e7` (B2) | additive `0005` reconciliation, including absent facts/beliefs FTS, beliefs/evidence and claim relations |
+
+`0001` is now a compatibility checkpoint following the explicit historical
+initial DDL (`70e6afc8d15d`), not an import of today's ORM. B2 follows `0004`
+and depends on `6a7b8c9d0e1f`; `0005` merges those tracks. Thus claim relations
+exist before B2. Existing ORM-created tables and already-canonical dedup schemas
+are recognized rather than recreated or destructively deduplicated again.
+The bridge does not rewrite application rows; incompatible existing schemas
+are not silently stamped. Online inspection is required; offline `--sql` is
+not an installed-database migration procedure.
+
+To inspect the graph without opening a database:
 
 ```bash
-alembic upgrade head
+.venv/bin/python3.12 -m alembic -c alembic.ini heads
 ```
 
-Migrations live in `migrations/` and are automatically tested in CI (upgrade then downgrade -1).
+For a disposable copy, create a separate ini with absolute `script_location`,
+`version_locations`, `prepend_sys_path`, and `sqlalchemy.url` pointing at that
+copy. Then run `.venv/bin/python3.12 -m alembic -c /tmp/copy.ini upgrade head`
+from a temporary directory with a clean environment. Do not use the default
+relative database URL for installed databases.
+
+The CI gate runs `test_pr3_migration_graph.py`, `test_migration_fact_dedup.py`,
+and `TestMigration` on disposable databases. Frozen schemas cover all eight
+historical revisions; tests compare original row values, schema, FK/integrity,
+FTS contents, idempotence and runtime-created tables. The optional backup test
+requires `B5_COPY_SOURCE=/tmp/b5-source.db` and otherwise skips without reading
+live data. A real installed-data copy must additionally pass an independent
+before/after data comparison; synthetic fixture success is not that proof.
+
+Downgrade across `0005`, B2 or decision dedup is explicitly **irreversible** and
+raises before changing schema/version. Restore a verified backup instead;
+deleted dedup data cannot be recovered by a reverse DDL operation.
 
 ### FTS5 Full-Text Search
 
@@ -743,7 +792,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on push/PR to `main`:
 | **unit-tests** | `pytest tests/ -q` |
 | **integration-tests** | `pytest tests/ -q -k "integration or e2e or benchmark"` |
 | **contract-tests** | JSON Schema validation + `pytest tests/ -q -k "schema or contract"` |
-| **migration-tests** | `alembic upgrade head && alembic downgrade -1` |
+| **migration-tests** | Frozen legacy revisions, empty/runtime schemas, data/FK/FTS integrity, explicit irreversible downgrade |
 
 ## Roadmap
 

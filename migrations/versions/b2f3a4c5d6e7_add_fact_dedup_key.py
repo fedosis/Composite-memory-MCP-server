@@ -17,9 +17,9 @@ from alembic import op
 from storage.dedup import fact_dedup_key
 
 revision: str = "b2f3a4c5d6e7"
-down_revision: Union[str, Sequence[str], None] = "6a7b8c9d0e1f"
+down_revision: Union[str, Sequence[str], None] = "0004"
 branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = "6a7b8c9d0e1f"
 
 _ACTIVE_STATES = ("candidate", "validated", "active")
 _INDEX_NAME = "uq_facts_spo_active"
@@ -222,8 +222,24 @@ def _scalar_one_or_none(bind: sa.engine.Connection, statement: str, params: dict
     return result.scalar_one_or_none()
 
 
+def installed_versions(bind: sa.engine.Connection) -> list[str]:
+    """Return all installed heads while Alembic is between merge points."""
+    return [
+        str(row[0])
+        for row in _execute(
+            bind,
+            "SELECT version_num FROM alembic_version ORDER BY version_num",
+            {},
+            kind="version_select",
+        ).fetchall()
+    ]
+
+
 def current_version(bind: sa.engine.Connection) -> str:
-    return str(_scalar(bind, "SELECT version_num FROM alembic_version"))
+    versions = installed_versions(bind)
+    if len(versions) != 1:
+        raise RuntimeError(f"expected one Alembic version, found {versions!r}")
+    return versions[0]
 
 
 def table_exists(bind: sa.engine.Connection, name: str) -> bool:
@@ -334,14 +350,20 @@ def _tables_with_orphans(bind: sa.engine.Connection) -> None:
 
 
 def _ensure_preflight(bind: sa.engine.Connection) -> str:
-    if current_version(bind) != "6a7b8c9d0e1f":
-        raise RuntimeError("unexpected source migration revision")
+    installed = installed_versions(bind)
+    if "6a7b8c9d0e1f" not in installed:
+        raise RuntimeError(
+            "B2 requires migration 6a7b8c9d0e1f to be installed "
+            f"(installed={installed!r})"
+        )
     if not table_exists(bind, "facts"):
         raise RuntimeError("facts table is missing before migration")
     if not table_exists(bind, "receipts"):
         raise RuntimeError("receipts table is missing before migration")
     if not table_exists(bind, "outbox_entries"):
         raise RuntimeError("outbox_entries table is missing before migration")
+    if not table_exists(bind, "claim_relations"):
+        raise RuntimeError("claim_relations table is missing before migration")
     if "dedup_key" in {row["name"] for row in table_info(bind, "facts")}:
         raise RuntimeError("facts.dedup_key already exists before migration")
     _tables_with_orphans(bind)
@@ -763,6 +785,26 @@ def upgrade() -> None:
     )
     _record_event("observed_limit", observed_limit=observed_limit)
 
+    # The former 0001 entrypoint used ORM create_all and can already carry
+    # the B2 schema. Recognize that shape only on the official bridge path;
+    # verify every persisted key and the uniqueness index, never stamp it.
+    if "0004" in installed_versions(bind) and "dedup_key" in {
+        row["name"] for row in table_info(bind, "facts")
+    }:
+        if not table_exists(bind, "claim_relations"):
+            raise RuntimeError("claim_relations table is missing before migration")
+        for row in _execute(bind, "SELECT subject,predicate,object,dedup_key FROM facts", {}, kind="dedup_verify"):
+            if row[3] != fact_dedup_key(row[0], row[1], row[2]):
+                raise RuntimeError("PR-3 existing fact dedup_key is not canonical")
+        key_column = next(row for row in table_info(bind, "facts") if row["name"] == "dedup_key")
+        if not key_column["notnull"]:
+            raise RuntimeError("PR-3 existing fact dedup_key must be NOT NULL")
+        if not index_exists(bind, _INDEX_NAME):
+            _execute(bind, _expected_pinned_sql(), {}, kind="index_restore")
+        if canonical_pinned_index_sql(read_index_sql(bind, _INDEX_NAME) or "") != EXPECTED_PINNED_CANONICAL:
+            raise RuntimeError("PR-3 existing fact uniqueness index is incompatible")
+        return
+
     pinned_state = _ensure_preflight(bind)
     if os.environ.get("B2_FAIL_BEFORE_SUMMARY"):
         raise RuntimeError("B2 fail-before-summary requested")
@@ -1066,5 +1108,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(_INDEX_NAME, table_name="facts")
-    op.drop_column("facts", "dedup_key")
+    raise RuntimeError("Dedup migration is irreversible; restore a database backup instead")

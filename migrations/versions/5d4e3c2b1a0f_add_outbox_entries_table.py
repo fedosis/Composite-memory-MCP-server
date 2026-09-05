@@ -8,9 +8,8 @@ Create Date: 2026-07-07 17:30:00.000000
 
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "5d4e3c2b1a0f"
@@ -21,6 +20,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Create outbox_entries table."""
+    bind = op.get_bind()
+    if sa.inspect(bind).has_table("outbox_entries"):
+        return
     op.create_table(
         "outbox_entries",
         sa.Column("id", sa.String(), nullable=False),

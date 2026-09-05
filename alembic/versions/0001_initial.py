@@ -1,14 +1,9 @@
-"""Initial schema — tracked by Alembic.
+"""Compatibility checkpoint after the historical initial schema.
 
-Creates only the set of tables that existed before migration 0003
-(beliefs/evidence).  This keeps each migration properly additive so
-that migration 0003 can create ``beliefs`` and ``evidence`` without
-a ``table already exists`` collision.
-
-Tables created here:
-  - facts, entities, decisions, skills, receipts
-  - lifecycle_states, lifecycle_events
-  - outbox_entries
+The historical ``70e6afc8d15d`` revision owns the initial tables.  This
+revision remains an explicit installed transition for the former Alembic
+entrypoint; it verifies/repairs only missing legacy tables and deliberately
+does not add post-initialisation columns such as dedup keys.
 
 Revision ID: 0001
 Revises:
@@ -16,38 +11,18 @@ Revises:
 
 from typing import Sequence, Union
 
-from alembic import op
-import sqlalchemy as sa
-
 revision: str = "0001"
-down_revision: Union[str, None] = None
+down_revision: Union[str, None] = "70e6afc8d15d"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-# Tables that existed before migration 0003 added beliefs/evidence.
-_INITIAL_TABLES = [
-    "facts",
-    "entities",
-    "decisions",
-    "skills",
-    "receipts",
-    "lifecycle_states",
-    "lifecycle_events",
-    "outbox_entries",
-]
-
-
 def upgrade() -> None:
-    import storage.models  # noqa: F401  — register all current models
-    from storage.base import Base
-
-    bind = op.get_bind()
-    tables = [Base.metadata.tables[n] for n in _INITIAL_TABLES]
-    Base.metadata.create_all(bind, tables=tables)
+    # 70e6afc8d15d is the owner of these tables.  Keeping this revision as an
+    # explicit checkpoint is important for databases stamped by the old
+    # entrypoint, while avoiding a second copy of the initial DDL.
+    return
 
 
 def downgrade() -> None:
-    # Drop only what 0001 created (reverse order, no FK chains).
-    for name in reversed(_INITIAL_TABLES):
-        op.execute(f"DROP TABLE IF EXISTS {name}")
+    return

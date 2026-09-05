@@ -68,14 +68,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
-      - name: Install alembic
-        run: pip install alembic
-      - name: Create tables
-        run: python3 -c "from sqlalchemy import create_engine; from storage.base import Base; engine = create_engine('sqlite:///memory.db'); Base.metadata.create_all(engine)"
-      - name: Run migration test
-        run: alembic upgrade head && alembic downgrade -1
+      - name: Install migration gate dependencies
+        run: |
+          python3.12 -m venv .venv
+          .venv/bin/python3.12 -m pip install -e ".[dev]" alembic
+      - name: Gate all historical revisions on disposable databases
+        run: |
+          env -i HOME="$RUNNER_TEMP" PATH="$PATH" PYTHONPATH="$GITHUB_WORKSPACE" \
+            .venv/bin/python3.12 -m pytest -q \
+            tests/test_pr3_migration_graph.py \
+            tests/test_migration_fact_dedup.py \
+            tests/test_storage_layer.py::TestMigration \
+            --basetemp=/tmp/b5-ci-migrations
 
   release-artifacts:
     runs-on: ubuntu-latest

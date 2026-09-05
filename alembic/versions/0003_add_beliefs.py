@@ -13,8 +13,9 @@ Creates:
 
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
+from migrations.pr3_compat import create_index_if_missing, create_table_if_missing
 
 revision: str = "0003"
 down_revision: Union[str, None] = "0002"
@@ -24,7 +25,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # --- beliefs table ---
-    op.create_table(
+    create_table_if_missing(
         "beliefs",
         sa.Column("id", sa.String(), nullable=False),
         sa.Column("proposition", sa.String(2048), nullable=False),
@@ -41,11 +42,11 @@ def upgrade() -> None:
         sa.Column("lifecycle_state", sa.String(32), nullable=False, server_default="active"),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(op.f("ix_beliefs_proposition"), "beliefs", ["proposition"])
-    op.create_index(op.f("ix_beliefs_lifecycle_state"), "beliefs", ["lifecycle_state"])
+    create_index_if_missing(op.f("ix_beliefs_proposition"), "beliefs", ["proposition"])
+    create_index_if_missing(op.f("ix_beliefs_lifecycle_state"), "beliefs", ["lifecycle_state"])
 
     # --- evidence table ---
-    op.create_table(
+    create_table_if_missing(
         "evidence",
         sa.Column("id", sa.String(), nullable=False),
         sa.Column("belief_id", sa.String(), nullable=False),
@@ -61,7 +62,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(op.f("ix_evidence_belief_id"), "evidence", ["belief_id"])
+    create_index_if_missing(op.f("ix_evidence_belief_id"), "evidence", ["belief_id"])
 
     # --- FTS5 virtual table ---
     op.execute(
@@ -99,11 +100,10 @@ def upgrade() -> None:
         "END"
     )
 
-    # Populate FTS index with existing data
-    op.execute(
-        "INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) "
-        "SELECT 'rebuild', rowid, proposition FROM beliefs"
-    )
+    # Populate FTS index with existing data. The one-shot 'rebuild' command is
+    # the correct external-content form; a per-row 'rebuild' insert would scan
+    # the whole content table once per row and stall on populated databases.
+    op.execute("INSERT INTO beliefs_fts(beliefs_fts) VALUES('rebuild')")
 
 
 def downgrade() -> None:

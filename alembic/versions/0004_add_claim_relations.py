@@ -10,8 +10,8 @@ Creates:
 
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy import exc as sa_exc
 
 revision: str = "0004"

@@ -77,6 +77,9 @@ def upgrade() -> None:
     """Add dedup_key column, backfill, dedupe, and create the partial unique index."""
     bind = op.get_bind()
 
+    if "dedup_key" in {column["name"] for column in sa.inspect(bind).get_columns("decisions")}:
+        return
+
     # 1. Column (NOT NULL with a constant default — SQLite ADD COLUMN requires
     #    a default for NOT NULL columns).
     op.add_column(
@@ -155,6 +158,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Drop the unique index and the dedup_key column."""
-    op.drop_index("uq_decisions_context_dedup_active", table_name="decisions")
-    op.drop_column("decisions", "dedup_key")
+    raise RuntimeError("Dedup migration is irreversible; restore a database backup instead")

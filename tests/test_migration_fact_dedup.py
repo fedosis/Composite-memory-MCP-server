@@ -21,8 +21,7 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
-REPO = Path("/home/shtorm/memory-server")
-LIVE_DB = Path("/home/shtorm/.hermes/data/memory.db")
+REPO = Path(__file__).resolve().parents[1]
 HISTORICAL_SOURCE = REPO / "migrations/versions/70e6afc8d15d_initial_schema.py"
 EXPECTED_PINNED_CANONICAL = "unique=1;columns=dedup_key;where=lifecycle_state in ('candidate', 'validated', 'active')"
 EXPECTED_FACT_MAPPING = (
@@ -156,10 +155,11 @@ def historical_fact_column_types(source: Path) -> dict[str, str]:
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "op"
-        and node.func.attr == "create_table"
+        and ((isinstance(node.func, ast.Name) and node.func.id == "create_table_if_missing")
+             or (isinstance(node.func, ast.Attribute)
+                 and isinstance(node.func.value, ast.Name)
+                 and node.func.value.id == "op"
+                 and node.func.attr == "create_table"))
         and node.args
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value == "facts"
@@ -206,11 +206,12 @@ def assert_pre_schema_gate(conn: sqlite3.Connection) -> None:
 def write_copy_ini(ini_path: Path, copy_path: Path) -> None:
     copy_path = copy_path.resolve(strict=True)
     assert not copy_path.is_symlink()
-    assert copy_path != LIVE_DB.resolve()
     text = (
         "[alembic]\n"
-        "script_location = /home/shtorm/memory-server/migrations\n"
-        "prepend_sys_path = /home/shtorm/memory-server\n"
+        f"script_location = {REPO / 'alembic'}\n"
+        f"version_locations = {REPO / 'alembic/versions'}:{REPO / 'migrations/versions'}\n"
+        "path_separator = os\n"
+        f"prepend_sys_path = {REPO}\n"
         f"sqlalchemy.url = sqlite:////{copy_path.as_posix().lstrip('/')}\n\n"
         "[loggers]\n"
         "keys = root,sqlalchemy,alembic\n\n"
@@ -241,6 +242,26 @@ def write_copy_ini(ini_path: Path, copy_path: Path) -> None:
     )
     ini_path.write_text(text, encoding="utf-8")
     assert ini_path.read_text(encoding="utf-8") == text
+
+
+def _clean_env(*, extra: dict[str, str] | None = None) -> dict[str, str]:
+    venv_bin = REPO / ".venv/bin"
+    path_parts = [str(venv_bin), "/usr/bin", "/bin"]
+    env = {
+        "HOME": os.environ.get("HOME", str(Path.home())),
+        "PATH": os.pathsep.join(path_parts),
+        "PYTHONPATH": str(REPO),
+    }
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _python_executable() -> Path:
+    candidate = REPO / ".venv/bin/python3.12"
+    if candidate.exists():
+        return candidate
+    return Path(sys.executable)
 
 
 def _rows(conn: sqlite3.Connection, table: str, columns: list[str]) -> list[tuple]:
@@ -1046,23 +1067,24 @@ def run_upgrade(
     *,
     event_path: Path | None = None,
     fail_before_summary: bool = False,
+    target: str = "b2f3a4c5d6e7",
 ) -> CompletedProcess:
     expected_url = f"sqlalchemy.url = sqlite:////{db_path.resolve(strict=True).as_posix().lstrip('/')}"
     ini_lines = ini_path.read_text(encoding="utf-8").splitlines()
     assert expected_url in ini_lines, (expected_url, ini_lines)
-    env = os.environ.copy()
+    extra_env: dict[str, str] = {}
     if event_path is None:
-        env.pop("B2_EVENT_PATH", None)
+        extra_env.pop("B2_EVENT_PATH", None)
     else:
-        env["B2_EVENT_PATH"] = str(event_path.resolve())
+        extra_env["B2_EVENT_PATH"] = str(event_path.resolve())
     if fail_before_summary:
-        env["B2_FAIL_BEFORE_SUMMARY"] = "1"
+        extra_env["B2_FAIL_BEFORE_SUMMARY"] = "1"
     else:
-        env.pop("B2_FAIL_BEFORE_SUMMARY", None)
+        extra_env.pop("B2_FAIL_BEFORE_SUMMARY", None)
     return subprocess.run(
-        [sys.executable, "-m", "alembic", "-c", str(ini_path), "upgrade", "head"],
-        cwd=str(REPO),
-        env=env,
+        [str(_python_executable()), "-m", "alembic", "-c", str(ini_path), "upgrade", target],
+        cwd=str(ini_path.parent),
+        env=_clean_env(extra=extra_env),
         capture_output=True,
         text=True,
         check=False,
@@ -1071,9 +1093,9 @@ def run_upgrade(
 
 def run_downgrade(db_path: Path, ini_path: Path) -> CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-m", "alembic", "-c", str(ini_path), "downgrade", "6a7b8c9d0e1f"],
-        cwd=str(REPO),
-        env=os.environ.copy(),
+        [str(_python_executable()), "-m", "alembic", "-c", str(ini_path), "downgrade", "b2f3a4c5d6e7-1"],
+        cwd=str(ini_path.parent),
+        env=_clean_env(),
         capture_output=True,
         text=True,
         check=False,
@@ -1081,7 +1103,15 @@ def run_downgrade(db_path: Path, ini_path: Path) -> CompletedProcess:
 
 
 def source_db_path() -> Path:
-    return LIVE_DB
+    raw = os.environ.get("B5_COPY_SOURCE")
+    if not raw:
+        pytest.skip("set B5_COPY_SOURCE=/tmp/b5-source.db to run the optional copy migration test")
+    path = Path(raw).expanduser()
+    if path != Path("/tmp/b5-source.db"):
+        pytest.skip("set B5_COPY_SOURCE=/tmp/b5-source.db to use the approved copy source")
+    if not path.exists():
+        pytest.skip(f"copy source does not exist: {path}")
+    return path
 
 
 def prepare_subprocess_fixture(tmp_path: Path, *, event_enabled: bool):
@@ -1126,16 +1156,29 @@ def run_forced_limit(db_path: Path, ini_path: Path, tmp_path: Path) -> Completed
 
             os.environ["B2_EVENT_PATH"] = EVENT_PATH
             sqlalchemy.engine_from_config = forced_engine_from_config
-            command.upgrade(config.Config({str(ini_path.resolve())!r}), "head")
+            command.upgrade(config.Config({str(ini_path.resolve())!r}), "b2f3a4c5d6e7")
             """
         )
     )
-    return subprocess.run([sys.executable, str(bootstrap)], check=False, capture_output=True, text=True)
+    return subprocess.run(
+        [str(_python_executable()), str(bootstrap)],
+        cwd=tmp_path,
+        env=_clean_env(extra={"B2_EVENT_PATH": str(event_path.resolve())}),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_migration_module_syntax_and_import_smoke():
     assert migration.revision == "b2f3a4c5d6e7"
     assert migration.time.sleep is not None
+
+
+def test_source_db_path_requires_explicit_copy_source(monkeypatch):
+    monkeypatch.delenv("B5_COPY_SOURCE", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="B5_COPY_SOURCE"):
+        source_db_path()
 
 
 def test_w5_waiver_limits_unbounded_state_to_summary_id_arrays():
@@ -1516,20 +1559,19 @@ def test_subprocess_idempotent_noop(tmp_path):
     assert_post_migration_state(db_path)
 
 
-def test_downgrade_upgraded_copy_resets_version_without_restoring_deleted_rows(tmp_path):
+def test_downgrade_upgraded_copy_is_irreversible_and_preserves_state(tmp_path):
     db_path, ini_path, _ = prepare_subprocess_fixture(tmp_path, event_enabled=False)
-    with sqlite3.connect(db_path) as conn:
-        before_ids = {row[0] for row in conn.execute("SELECT id FROM facts")}
     upgrade = run_upgrade(db_path, ini_path)
     assert upgrade.returncode == 0, upgrade.stderr
-    deleted = set(parse_summary(upgrade.stdout)["deleted_fact_ids"])
-    downgrade = run_downgrade(db_path, ini_path)
-    assert downgrade.returncode == 0, downgrade.stderr
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "6a7b8c9d0e1f"
-        assert conn.execute("PRAGMA table_info(facts)").fetchall()[-1][1] == "version"
-        assert {row[0] for row in conn.execute("SELECT id FROM facts")} == before_ids - deleted
-        assert conn.execute("SELECT name FROM sqlite_master WHERE name=?", ("uq_facts_spo_active",)).fetchone() is None
+        before = full_state_snapshot(conn)
+        versions = conn.execute("SELECT version_num FROM alembic_version ORDER BY 1").fetchall()
+    downgrade = run_downgrade(db_path, ini_path)
+    assert downgrade.returncode != 0
+    assert "irreversible" in downgrade.stderr
+    with sqlite3.connect(db_path) as conn:
+        assert_full_state_equal(before, full_state_snapshot(conn))
+        assert conn.execute("SELECT version_num FROM alembic_version ORDER BY 1").fetchall() == versions
 
 
 def test_subprocess_failure_rolls_back_everything(tmp_path):
