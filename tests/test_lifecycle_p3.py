@@ -8,6 +8,7 @@ import json
 import pytest
 from sqlalchemy import text
 from storage.repositories import LifecycleRepository
+from storage.repositories.belief_repo import BeliefRepository
 
 import memory_server.server as server_module
 from memory_server.models import Belief, Fact
@@ -498,3 +499,82 @@ class TestLifecycleServiceP3:
         assert updated_child is not None
         assert updated_child.confidence == pytest.approx(0.4)
         assert updated_child.version == 2
+
+
+@pytest.mark.asyncio
+class TestServerBeliefReinforcement:
+    async def test_set_belief_returns_fresh_belief_and_persists_history(
+        self, provider, monkeypatch
+    ):
+        original = Belief(proposition="User prefers Docker", confidence=0.4)
+        await provider.create_belief(original)
+
+        monkeypatch.setattr(server_module, "_provider", provider)
+        monkeypatch.setattr(server_module, "_graph", None)
+        monkeypatch.setattr(server_module, "_graph_router", None)
+
+        payload = json.loads(
+            await server_module.set_belief_tool(
+                proposition="User prefers Docker",
+                confidence=0.8,
+                sources=json.dumps(
+                    [
+                        {
+                            "source_type": "fact",
+                            "source_id": "fact-1",
+                            "weight": 0.8,
+                        }
+                    ]
+                ),
+                tags=json.dumps(["docker", "infra"]),
+                source="test",
+            )
+        )
+
+        assert payload["reinforced"] is True
+        assert payload["belief"]["id"] == original.id
+        assert payload["belief"]["confidence"] == pytest.approx(0.6)
+        assert payload["receipt"]["confidence"] == pytest.approx(0.6)
+        assert payload["receipt"]["history"][-1]["kind"] == "reinforce"
+        assert payload["receipt"]["history"][-1]["previous_confidence"] == pytest.approx(0.4)
+        assert payload["receipt"]["history"][-1]["confidence"] == pytest.approx(0.6)
+        assert set(payload["belief"]["tags"]) == {"docker", "infra"}
+        assert set(payload["belief"]["source_ids"]) == {"fact-1"}
+
+        stored = await provider.get_belief(original.id)
+        fresh_receipt = await provider.get_receipt(original.id)
+        assert stored is not None
+        assert stored.confidence == pytest.approx(0.6)
+        assert set(stored.tags) == {"docker", "infra"}
+        assert set(stored.source_ids) == {"fact-1"}
+        assert fresh_receipt is not None
+        assert fresh_receipt.history[-1]["kind"] == "reinforce"
+
+    async def test_set_belief_rolls_back_when_reinforced_at_fails(
+        self, provider, monkeypatch
+    ):
+        original = Belief(proposition="Rollback Docker", confidence=0.4)
+        await provider.create_belief(original)
+
+        async def boom(self, belief_id: str):
+            raise RuntimeError("reinforced_at failed")
+
+        monkeypatch.setattr(BeliefRepository, "update_reinforced_at", boom)
+        monkeypatch.setattr(server_module, "_provider", provider)
+        monkeypatch.setattr(server_module, "_graph", None)
+        monkeypatch.setattr(server_module, "_graph_router", None)
+
+        with pytest.raises(RuntimeError, match="reinforced_at failed"):
+            await server_module.set_belief_tool(
+                proposition="Rollback Docker",
+                confidence=0.8,
+                sources="[]",
+                tags="[]",
+                source="test",
+            )
+
+        stored = await provider.get_belief(original.id)
+        receipt = await provider.get_receipt(original.id)
+        assert stored is not None
+        assert stored.confidence == pytest.approx(0.4)
+        assert receipt is None

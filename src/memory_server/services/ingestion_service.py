@@ -15,9 +15,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from storage.dedup import fact_dedup_key
+from storage.models.belief import BeliefORM
 from storage.outbox import OutboxRepository
 from storage.repositories import (
     BeliefRepository,
@@ -104,6 +106,134 @@ async def reinforce_memory_item(
     if fresh_receipt.history[-1] != entry:
         raise RuntimeError(f"reinforcement receipt mismatch: {item_id}")
     return fresh_item, fresh_receipt
+
+
+async def reinforce_belief_item(
+    session: AsyncSession,
+    *,
+    proposition: str,
+    new_confidence: float,
+    source: str,
+    parsed_sources: list[dict[str, Any]] | None = None,
+    parsed_tags: list[str] | None = None,
+) -> tuple[Belief, MemoryReceipt] | None:
+    """Reinforce an existing active belief inside the caller's UoW.
+
+    Returns ``None`` when no exact active match exists, so callers can fall
+    through to the normal create path without opening a second session.
+    """
+    belief_repo = BeliefRepository(session)
+    result = await session.execute(
+        select(BeliefORM).where(BeliefORM.lifecycle_state == "active")
+    )
+    candidates = [row.to_pydantic() for row in result.scalars().all()]
+    norm = proposition.strip().lower()
+    match = next(
+        (
+            b
+            for b in candidates
+            if b.proposition.strip().lower() == norm and b.lifecycle_state == "active"
+        ),
+        None,
+    )
+    if match is None:
+        return None
+
+    old_confidence = match.confidence
+    top_confidence = max(0.0, min(1.0, (old_confidence + new_confidence) / 2))
+    now = datetime.now(timezone.utc)
+
+    from storage.repositories.lifecycle_repo import LifecycleRepository
+
+    await LifecycleRepository(session).transition(
+        belief_repo,
+        memory_id=match.id,
+        memory_type="belief",
+        from_state=match.lifecycle_state,
+        to_state=match.lifecycle_state,
+        expected_version=match.version,
+        confidence=top_confidence,
+        reason="Belief reinforced",
+        triggered_by=source,
+    )
+    belief_orm = await session.get(BeliefORM, match.id)
+    if belief_orm is None:
+        raise RuntimeError(f"belief disappeared during reinforcement: {match.id}")
+
+    belief_orm.confidence = top_confidence
+    if parsed_tags:
+        merged_tags = list(belief_orm.tags or [])
+        for tag in parsed_tags:
+            if tag not in merged_tags:
+                merged_tags.append(tag)
+        belief_orm.tags = merged_tags
+    if parsed_sources:
+        merged_source_ids = list(belief_orm.source_ids or [])
+        for entry in parsed_sources:
+            if not isinstance(entry, dict):
+                continue
+            source_id = entry.get("source_id")
+            if source_id and source_id not in merged_source_ids:
+                merged_source_ids.append(source_id)
+        belief_orm.source_ids = merged_source_ids
+    await session.flush()
+    await belief_repo.update_reinforced_at(match.id)
+
+    receipt_repo = ReceiptRepository(session)
+    receipt = await receipt_repo.get(match.id)
+    history_entry: dict[str, Any] = {
+        "confidence": top_confidence,
+        "kind": "reinforce",
+        "source": source,
+        "previous_confidence": old_confidence,
+        "timestamp": now.isoformat(),
+    }
+    if parsed_sources:
+        history_entry["parsed_sources"] = parsed_sources
+    if parsed_tags:
+        history_entry["parsed_tags"] = parsed_tags
+
+    history = [*receipt.history, history_entry] if receipt is not None else [history_entry]
+    if receipt is None:
+        await receipt_repo.create(
+            MemoryReceipt(
+                id=match.id,
+                memory_type="belief",
+                source=source,
+                created_by=source,
+                timestamp=now,
+                confidence=top_confidence,
+                history=[],
+            )
+        )
+
+    stored_receipt = await receipt_repo.update(
+        match.id,
+        confidence=top_confidence,
+        source=source,
+        updated_at=now,
+        history=history,
+    )
+    fresh_belief = await belief_repo.get_by_id(match.id)
+    fresh_receipt = await receipt_repo.get(match.id)
+    if fresh_belief is None or stored_receipt is None or fresh_receipt is None:
+        raise RuntimeError(f"belief reinforcement reload failed: {match.id}")
+    evidence_repo = EvidenceRepository(session)
+    for entry in parsed_sources or []:
+        await evidence_repo.create(Evidence(
+            belief_id=match.id,
+            source_type=entry.get("source_type", "observation"),
+            source_id=entry.get("source_id", ""),
+            weight=entry.get("weight", 0.5),
+            contributor=source,
+        ))
+    await OutboxRepository(session).add_entry(
+        record_type="belief", record_id=match.id, operation="index_belief",
+        payload={"proposition": fresh_belief.proposition,
+                 "confidence": fresh_belief.confidence,
+                 "tags": fresh_belief.tags, "source": fresh_belief.source},
+    )
+    return fresh_belief, fresh_receipt
 
 
 class MemoryIngestionService:

@@ -34,6 +34,7 @@ from memory_server.models import Belief
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.graph_router import GraphRouter
+from memory_server.services.ingestion_service import reinforce_belief_item
 from memory_server.services.lifecycle_service import (
     LifecycleService,
     LifecycleTransitionRequest,
@@ -783,34 +784,25 @@ async def set_belief_tool(
         parsed_sources = json.loads(sources) if sources else []
         parsed_tags = json.loads(tags) if tags else []
 
-        # Reinforcement: check for existing active belief with same proposition
-        existing = await provider.search_beliefs(
-            proposition=proposition,
-            lifecycle_state=None,
-            limit=100,
-        )
-        match = _find_exact_match(existing, proposition)
-        if match:
-            # Weighted average confidence
-            new_confidence = max(0.0, min(1.0, (match.confidence + confidence) / 2))
-            await provider.update_belief_confidence(match.id, new_confidence)
-            await provider.update_belief_reinforced_at(match.id)
-            from memory_server.models.receipt import MemoryReceipt
-            receipt = MemoryReceipt(
-                id=match.id,
-                memory_type="belief",
+        async with await provider._get_session() as session:
+            reinforced = await reinforce_belief_item(
+                session,
+                proposition=proposition,
+                new_confidence=confidence,
                 source=source,
-                created_by=source,
-                timestamp=datetime.now(timezone.utc),
-                confidence=new_confidence,
+                parsed_sources=parsed_sources,
+                parsed_tags=parsed_tags,
             )
-            serialized = {
-                "belief": match.model_dump(mode="json"),
-                "receipt": receipt.model_dump(mode="json"),
-                "superseded": None,
-                "reinforced": True,
-            }
-            return json.dumps(serialized)
+            if reinforced is not None:
+                belief, receipt = reinforced
+                await session.commit()
+                serialized = {
+                    "belief": belief.model_dump(mode="json"),
+                    "receipt": receipt.model_dump(mode="json"),
+                    "superseded": None,
+                    "reinforced": True,
+                }
+                return json.dumps(serialized)
 
         # Create the belief
         belief = Belief(

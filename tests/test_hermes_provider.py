@@ -14,8 +14,11 @@ import json
 import time
 
 import pytest
+from storage.outbox import OutboxRepository
+from storage.repositories import LifecycleRepository
+from storage.repositories.belief_repo import BeliefRepository
 
-from memory_server.models import Decision
+from memory_server.models import Belief, Decision
 from memory_server.plugins.hermes.config import (
     HermesPluginConfig,
 )
@@ -258,6 +261,7 @@ class TestHermesProviderToolRouting:
         assert result["status"] == "ok"
         provider.shutdown()
 
+
     def test_remember_with_fact(self):
         """Verify remember stores a fact and returns receipt."""
         provider = HermesProvider()
@@ -476,6 +480,276 @@ class TestHermesProviderToolRouting:
             assert route_result["total"] > 0
             assert isinstance(route_result.get("all_results"), list)
             assert isinstance(route_result["all_results"][0], dict)
+        finally:
+            provider.shutdown()
+
+
+class TestHermesProviderBeliefReinforcement:
+    """Regression coverage for exact-match reinforcement."""
+
+    def _make_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "lancedb")
+        import memory_server.providers.embedding_provider as embedding_module
+
+        monkeypatch.setattr(
+            embedding_module,
+            "SentenceTransformerEmbeddingProvider",
+            MockEmbeddingProvider,
+        )
+
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="reinforce-native",
+            config={
+                "db_url": f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}",
+                "path": str(tmp_path),
+            },
+            hermes_home=str(tmp_path),
+        )
+        return provider
+
+    def test_reinforcement_returns_fresh_belief_and_persists_history(
+        self, tmp_path, monkeypatch
+    ):
+        provider = self._make_provider(tmp_path, monkeypatch)
+        try:
+            original = provider._provider.create_belief(
+                Belief(proposition="User prefers Docker", confidence=0.4)
+            )
+            # ``create_belief`` is async; initialize the belief in the backing store.
+            original = _run_async(original)
+
+            payload = json.loads(
+                provider.handle_tool_call(
+                    "set_belief",
+                    {
+                        "proposition": "User prefers Docker",
+                        "confidence": 0.8,
+                        "sources": json.dumps(
+                            [
+                                {
+                                    "source_type": "fact",
+                                    "source_id": "fact-1",
+                                    "weight": 0.8,
+                                }
+                            ]
+                        ),
+                        "tags": json.dumps(["docker", "infra"]),
+                        "source": "test",
+                    },
+                )
+            )
+
+            assert payload["reinforced"] is True
+            assert payload["belief"]["id"] == original.id
+            assert payload["belief"]["confidence"] == pytest.approx(0.6)
+            assert payload["receipt"]["confidence"] == pytest.approx(0.6)
+            assert payload["receipt"]["history"][-1]["kind"] == "reinforce"
+            assert payload["receipt"]["history"][-1]["previous_confidence"] == pytest.approx(0.4)
+            assert payload["receipt"]["history"][-1]["confidence"] == pytest.approx(0.6)
+            assert set(payload["belief"]["tags"]) == {"docker", "infra"}
+            assert set(payload["belief"]["source_ids"]) == {"fact-1"}
+
+            stored = _run_async(provider._provider.get_belief(original.id))
+            fresh_receipt = _run_async(provider._provider.get_receipt(original.id))
+            assert stored is not None
+            assert stored.confidence == pytest.approx(0.6)
+            assert set(stored.tags) == {"docker", "infra"}
+            assert set(stored.source_ids) == {"fact-1"}
+            assert fresh_receipt is not None
+            assert fresh_receipt.history[-1]["kind"] == "reinforce"
+        finally:
+            provider.shutdown()
+
+    def test_reinforcement_rolls_back_when_timestamp_update_fails(
+        self, tmp_path, monkeypatch
+    ):
+        provider = self._make_provider(tmp_path, monkeypatch)
+
+        async def boom(self, belief_id: str):
+            raise RuntimeError("reinforced_at failed")
+
+        monkeypatch.setattr(BeliefRepository, "update_reinforced_at", boom)
+        try:
+            original = _run_async(
+                provider._provider.create_belief(
+                    Belief(proposition="Rollback Docker", confidence=0.4)
+                )
+            )
+
+            payload = json.loads(
+                provider.handle_tool_call(
+                    "set_belief",
+                    {
+                        "proposition": "Rollback Docker",
+                        "confidence": 0.8,
+                        "sources": "[]",
+                        "tags": "[]",
+                        "source": "test",
+                    },
+                )
+            )
+            assert payload["error"] == "reinforced_at failed"
+
+            stored = _run_async(provider._provider.get_belief(original.id))
+            receipt = _run_async(provider._provider.get_receipt(original.id))
+            async def _inspect():
+                async with await provider._provider._get_session() as session:
+                    lifecycle_repo = LifecycleRepository(session)
+                    events = await lifecycle_repo.get_events(original.id)
+                    outbox_repo = OutboxRepository(session)
+                    pending = await outbox_repo.get_pending_count()
+                    return events, pending
+
+            events, pending = _run_async(_inspect())
+
+            assert stored is not None
+            assert stored.confidence == pytest.approx(0.4)
+            assert receipt is None
+            assert events == []
+            assert pending == 0
+        finally:
+            provider.shutdown()
+
+
+class TestHermesProviderConflictAtomicity:
+    """Regression coverage for conflict resolution staying in one UoW."""
+
+    def _make_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "lancedb")
+        import memory_server.providers.embedding_provider as embedding_module
+
+        monkeypatch.setattr(
+            embedding_module,
+            "SentenceTransformerEmbeddingProvider",
+            MockEmbeddingProvider,
+        )
+
+        provider = HermesProvider()
+        provider.initialize(
+            session_id="conflict-native",
+            config={
+                "db_url": f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}",
+                "path": str(tmp_path),
+            },
+            hermes_home=str(tmp_path),
+        )
+        return provider
+
+    def test_discard_both_commits_without_nested_session_lock(self, tmp_path, monkeypatch):
+        provider = self._make_provider(tmp_path, monkeypatch)
+        try:
+            belief_a = _run_async(provider._provider.create_belief(
+                Belief(proposition="discard A", confidence=0.8)
+            ))
+            belief_b = _run_async(provider._provider.create_belief(
+                Belief(proposition="discard B", confidence=0.7)
+            ))
+            payload = json.loads(_run_async(provider._handle_resolve_conflict(
+                belief_a_id=belief_a.id,
+                belief_b_id=belief_b.id,
+                resolution="discard_both",
+            )))
+            assert payload["resolution"] == "discard_both"
+            assert len(payload["events"]) == 2
+            assert _run_async(provider._provider.get_receipt(payload["receipt"]["id"])) is not None
+            fresh_a = _run_async(provider._provider.get_belief(belief_a.id))
+            fresh_b = _run_async(provider._provider.get_belief(belief_b.id))
+            assert fresh_a.lifecycle_state == "discarded"
+            assert fresh_b.lifecycle_state == "discarded"
+            assert fresh_a.version == 2
+            assert fresh_b.version == 2
+        finally:
+            provider.shutdown()
+
+    @pytest.mark.parametrize(
+        "resolution,auto_resolve,new_proposition",
+        [
+            ("merge", False, "Merged belief"),
+            ("discard_both", False, ""),
+            ("keep_a", True, ""),
+        ],
+    )
+    def test_second_event_failure_rolls_back_conflict_resolution(
+        self,
+        tmp_path,
+        monkeypatch,
+        resolution,
+        auto_resolve,
+        new_proposition,
+    ):
+        provider = self._make_provider(tmp_path, monkeypatch)
+        calls = {"count": 0}
+
+        original_record_event = LifecycleRepository.record_event
+
+        async def boom(self, *args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise RuntimeError("event flush failed")
+            return await original_record_event(self, *args, **kwargs)
+
+        monkeypatch.setattr(LifecycleRepository, "record_event", boom)
+        try:
+            belief_a = _run_async(
+                provider._provider.create_belief(
+                    Belief(
+                        proposition="Docker is better than Podman",
+                        confidence=0.8,
+                    )
+                )
+            )
+            belief_b = _run_async(
+                provider._provider.create_belief(
+                    Belief(
+                        proposition="Docker is worse than Podman",
+                        confidence=0.6,
+                    )
+                )
+            )
+
+            kwargs = {
+                "belief_a_id": belief_a.id,
+                "belief_b_id": belief_b.id,
+                "resolution": resolution,
+                "auto_resolve": auto_resolve,
+            }
+            if new_proposition:
+                kwargs["new_proposition"] = new_proposition
+
+            with pytest.raises(RuntimeError, match="event flush failed"):
+                _run_async(provider._handle_resolve_conflict(**kwargs))
+
+            fresh_a = _run_async(provider._provider.get_belief(belief_a.id))
+            fresh_b = _run_async(provider._provider.get_belief(belief_b.id))
+            async def _inspect():
+                async with await provider._provider._get_session() as session:
+                    lifecycle_repo = LifecycleRepository(session)
+                    events_a = await lifecycle_repo.get_events(belief_a.id)
+                    events_b = await lifecycle_repo.get_events(belief_b.id)
+                    outbox_repo = OutboxRepository(session)
+                    pending = await outbox_repo.get_pending_count()
+                    return events_a, events_b, pending
+
+            events_a, events_b, pending = _run_async(_inspect())
+
+            assert fresh_a is not None and fresh_a.lifecycle_state == "active"
+            assert fresh_b is not None and fresh_b.lifecycle_state == "active"
+            assert fresh_a.version == 1
+            assert fresh_b.version == 1
+            assert events_a == []
+            assert events_b == []
+            assert pending == 0
+            if resolution == "merge":
+                merged = _run_async(
+                    provider._provider.search_beliefs(
+                        proposition="Merged belief",
+                        lifecycle_state=None,
+                        include_inactive=True,
+                        limit=10,
+                    )
+                )
+                assert merged == []
         finally:
             provider.shutdown()
 

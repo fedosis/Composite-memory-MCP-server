@@ -1594,111 +1594,112 @@ class HermesProvider:
         import json as _json
         from datetime import datetime, timezone
 
+        from storage.outbox import OutboxRepository
+        from storage.repositories import BeliefRepository, EvidenceRepository, ReceiptRepository
+
         from memory_server.models.belief import Belief
         from memory_server.models.evidence import Evidence
         from memory_server.models.receipt import MemoryReceipt
+        from memory_server.services.ingestion_service import reinforce_belief_item
+        from memory_server.services.lifecycle_service import (
+            LifecycleService,
+            LifecycleTransitionRequest,
+        )
 
         parsed_sources = _json.loads(sources) if sources else []
         parsed_tags = _json.loads(tags) if tags else []
-
-        # Check for existing active belief with same proposition
-        existing = await self._provider.search_beliefs(
-            proposition=proposition,
-            lifecycle_state=None,
-            limit=100,
-        )
-
-        # Find exact match
-        match = None
-        norm = proposition.strip().lower()
-        for b in existing:
-            if b.proposition.strip().lower() == norm and b.lifecycle_state == "active":
-                match = b
-                break
-
-        if match:
-            new_confidence = max(0.0, min(1.0, (match.confidence + confidence) / 2))
-            await self._provider.update_belief_confidence(match.id, new_confidence)
-            await self._provider.update_belief_reinforced_at(match.id)
-            receipt = MemoryReceipt(
-                id=match.id,
-                memory_type="belief",
-                source=source,
-                created_by=source,
-                timestamp=datetime.now(timezone.utc),
-                confidence=new_confidence,
-            )
-            serialized = {
-                "belief": match.model_dump(mode="json"),
-                "receipt": receipt.model_dump(mode="json"),
-                "superseded": None,
-                "reinforced": True,
-            }
-            return json.dumps(serialized)
-
-        # Create the belief
-        belief = Belief(
-            proposition=proposition,
-            confidence=confidence,
-            source=source,
-            tags=parsed_tags,
-            creator=source,
-        )
-
-        evidence_list = []
-        for s in parsed_sources:
-            ev = Evidence(
-                belief_id=belief.id,
-                source_type=s.get("source_type", "observation"),
-                source_id=s.get("source_id", ""),
-                weight=s.get("weight", 0.5),
-                contributor=source,
-            )
-            evidence_list.append(ev)
-
         superseded = None
-        if replace_belief_id:
-            old_belief = await self._provider.get_belief(replace_belief_id)
-            if old_belief:
-                superseded = old_belief.model_dump(mode="json")
-                await self._provider.update_belief_lifecycle(replace_belief_id, "superseded")
-                belief.version = old_belief.version + 1
 
-        receipt = MemoryReceipt(
-            id=belief.id,
-            memory_type="belief",
-            source=source,
-            created_by=source,
-            timestamp=datetime.now(timezone.utc),
-            confidence=confidence,
-        )
+        async with await self._provider._get_session() as session:
+            try:
+                reinforced = None
+                if not replace_belief_id:
+                    reinforced = await reinforce_belief_item(
+                        session,
+                        proposition=proposition,
+                        new_confidence=confidence,
+                        source=source,
+                        parsed_sources=parsed_sources,
+                        parsed_tags=parsed_tags,
+                    )
+                if reinforced is not None:
+                    belief, receipt = reinforced
+                    await session.commit()
+                    return json.dumps({
+                        "belief": belief.model_dump(mode="json"),
+                        "receipt": receipt.model_dump(mode="json"),
+                        "superseded": None,
+                        "reinforced": True,
+                    })
 
-        await self._provider.create_in_transaction(
-            belief=belief,
-            evidence_list=evidence_list,
-            receipt=receipt,
-            outbox_entries=[
-                {
-                    "record_type": "belief",
-                    "record_id": belief.id,
-                    "operation": "index_belief",
-                    "payload": {
+                belief_repo = BeliefRepository(session)
+                evidence_repo = EvidenceRepository(session)
+                receipt_repo = ReceiptRepository(session)
+                outbox_repo = OutboxRepository(session)
+                belief = Belief(
+                    proposition=proposition,
+                    confidence=confidence,
+                    source=source,
+                    tags=parsed_tags,
+                    creator=source,
+                )
+                if replace_belief_id:
+                    old_belief = await belief_repo.get_by_id(replace_belief_id)
+                    if old_belief is not None:
+                        superseded = old_belief.model_dump(mode="json")
+                        result = await LifecycleService(self._provider).transition_in_session(
+                            session,
+                            LifecycleTransitionRequest(
+                                memory_id=replace_belief_id,
+                                memory_type="belief",
+                                to_state="superseded",
+                                reason=f"Superseded by {belief.id}",
+                                triggered_by=source,
+                                expected_version=old_belief.version,
+                            ),
+                            graph=None,
+                        )
+                        # Keep the response's snapshot tied to the CAS transition.
+                        superseded = result.memory.model_dump(mode="json")
+                await belief_repo.create(belief)
+                for item in parsed_sources:
+                    await evidence_repo.create(Evidence(
+                        belief_id=belief.id,
+                        source_type=item.get("source_type", "observation"),
+                        source_id=item.get("source_id", ""),
+                        weight=item.get("weight", 0.5),
+                        contributor=source,
+                    ))
+                receipt = MemoryReceipt(
+                    id=belief.id,
+                    memory_type="belief",
+                    source=source,
+                    created_by=source,
+                    timestamp=datetime.now(timezone.utc),
+                    confidence=confidence,
+                )
+                await receipt_repo.create(receipt)
+                await outbox_repo.add_entry(
+                    record_type="belief",
+                    record_id=belief.id,
+                    operation="index_belief",
+                    payload={
                         "proposition": proposition,
                         "tags": parsed_tags,
                         "confidence": confidence,
                         "source": source,
                     },
-                }
-            ],
-        )
+                )
+                await session.commit()
+            except BaseException:
+                await session.rollback()
+                raise
 
-        serialized = {
+        return json.dumps({
             "belief": belief.model_dump(mode="json"),
             "receipt": receipt.model_dump(mode="json"),
             "superseded": superseded,
-        }
-
-        return json.dumps(serialized)
+        })
 
     async def _handle_get_belief(
         self,
@@ -1756,271 +1757,297 @@ class HermesProvider:
         import uuid
         from datetime import datetime, timezone
 
-        from sqlalchemy.ext.asyncio import AsyncSession
-        from storage.repositories import LifecycleRepository
+        from storage.outbox import OutboxRepository
+        from storage.repositories import BeliefRepository, EvidenceRepository, ReceiptRepository
 
+        from memory_server.models.belief import Belief
+        from memory_server.models.evidence import Evidence
         from memory_server.models.receipt import MemoryReceipt
+        from memory_server.services.lifecycle_service import (
+            LifecycleService,
+            LifecycleTransitionRequest,
+        )
 
-        belief_a = await self._provider.get_belief(belief_a_id)
-        belief_b = await self._provider.get_belief(belief_b_id)
-        if belief_a is None or belief_b is None:
-            raise ValueError("Both belief_a and belief_b must exist in the store")
-
-        if auto_resolve:
-            events = []
-            confidence_diff = abs(belief_a.confidence - belief_b.confidence)
-
-            async with AsyncSession(self._provider.engine) as lc_session:
-                lifecycle_repo = LifecycleRepository(lc_session)
-
-                if confidence_diff > 0.5:
-                    if belief_a.confidence < belief_b.confidence:
-                        lower_id, lower_conf = belief_a_id, belief_a.confidence
-                        higher_conf = belief_b.confidence
-                        lower_state = belief_a.lifecycle_state
-                    else:
-                        lower_id, lower_conf = belief_b_id, belief_b.confidence
-                        higher_conf = belief_a.confidence
-                        lower_state = belief_b.lifecycle_state
-
-                    await self._provider.update_belief_lifecycle(lower_id, "superseded")
-                    await lifecycle_repo.record_event(
-                        memory_id=lower_id,
-                        memory_type="belief",
-                        from_state=lower_state,
-                        to_state="superseded",
-                        reason=(f"Auto-resolved — confidence gap "
-                                f"({higher_conf:.2f} vs {lower_conf:.2f})"),
-                        triggered_by="system",
-                    )
-                    events.append({
-                        "belief_id": lower_id,
-                        "from_state": lower_state,
-                        "to_state": "superseded",
-                        "reason": (f"Auto-resolved — confidence gap "
-                                  f"({higher_conf:.2f} vs {lower_conf:.2f})"),
-                    })
-                else:
-                    for bid, bstate in (
-                        (belief_a_id, belief_a.lifecycle_state),
-                        (belief_b_id, belief_b.lifecycle_state),
-                    ):
-                        await self._provider.update_belief_lifecycle(bid, "contradicted")
-                        await lifecycle_repo.record_event(
-                            memory_id=bid,
-                            memory_type="belief",
-                            from_state=bstate,
-                            to_state="contradicted",
-                            reason=("Auto-resolved — needs manual review "
-                                    "(confidences too close or both low)"),
-                            triggered_by="system",
-                        )
-                        events.append({
-                            "belief_id": bid,
-                            "from_state": bstate,
-                            "to_state": "contradicted",
-                            "reason": ("Auto-resolved — needs manual review "
-                                      "(confidences too close or both low)"),
-                        })
-
-                await lc_session.commit()
-
-            receipt = MemoryReceipt(
-                id=str(uuid.uuid4()),
-                memory_type="belief",
-                source="conflict_resolution",
-                created_by="system",
-                timestamp=datetime.now(timezone.utc),
-            )
-
-            return json.dumps({
-                "belief_a": (await self._provider.get_belief(belief_a_id)).model_dump(mode="json"),
-                "belief_b": (await self._provider.get_belief(belief_b_id)).model_dump(mode="json"),
-                "resolution": resolution,
-                "auto_resolved": True,
-                "created": None,
-                "events": events,
-                "receipt": receipt.model_dump(mode="json"),
-            })
-
-        # Manual resolution
-        events = []
+        events: list[dict[str, str]] = []
         merged = None
+        lifecycle_service = LifecycleService(self._provider)
 
-        async with AsyncSession(self._provider.engine) as lc_session:
-            lifecycle_repo = LifecycleRepository(lc_session)
+        async with await self._provider._get_session() as session:
+            belief_repo = BeliefRepository(session)
+            evidence_repo = EvidenceRepository(session)
+            receipt_repo = ReceiptRepository(session)
+            outbox_repo = OutboxRepository(session)
+            try:
+                belief_a = await belief_repo.get_by_id(belief_a_id)
+                belief_b = await belief_repo.get_by_id(belief_b_id)
+                if belief_a is None or belief_b is None:
+                    raise ValueError("Both belief_a and belief_b must exist in the store")
 
-            if resolution == "keep_a":
-                await self._provider.update_belief_lifecycle(belief_b_id, "discarded")
-                await lifecycle_repo.record_event(
-                    memory_id=belief_b_id,
-                    memory_type="belief",
-                    from_state=belief_b.lifecycle_state,
-                    to_state="discarded",
-                    reason=f"Discarded in favor of {belief_a_id} via conflict resolution",
-                    triggered_by="system",
-                )
-                events.append({
-                    "belief_id": belief_b_id,
-                    "from_state": belief_b.lifecycle_state,
-                    "to_state": "discarded",
-                    "reason": f"Discarded in favor of {belief_a_id} via conflict resolution",
-                })
-            elif resolution == "keep_b":
-                await self._provider.update_belief_lifecycle(belief_a_id, "discarded")
-                await lifecycle_repo.record_event(
-                    memory_id=belief_a_id,
-                    memory_type="belief",
-                    from_state=belief_a.lifecycle_state,
-                    to_state="discarded",
-                    reason=f"Discarded in favor of {belief_b_id} via conflict resolution",
-                    triggered_by="system",
-                )
-                events.append({
-                    "belief_id": belief_a_id,
-                    "from_state": belief_a.lifecycle_state,
-                    "to_state": "discarded",
-                    "reason": f"Discarded in favor of {belief_b_id} via conflict resolution",
-                })
-            elif resolution == "merge":
-                if not new_proposition:
-                    raise ValueError("new_proposition is required when resolution='merge'")
-                from memory_server.models.belief import Belief
-                from memory_server.models.evidence import Evidence
+                if auto_resolve:
+                    confidence_diff = abs(belief_a.confidence - belief_b.confidence)
+                    if confidence_diff > 0.5:
+                        if belief_a.confidence < belief_b.confidence:
+                            lower_id = belief_a_id
+                            lower_conf = belief_a.confidence
+                            higher_conf = belief_b.confidence
+                            expected_version = belief_a.version
+                        else:
+                            lower_id = belief_b_id
+                            lower_conf = belief_b.confidence
+                            higher_conf = belief_a.confidence
+                            expected_version = belief_b.version
 
-                merged = Belief(
-                    proposition=new_proposition,
-                    confidence=min(1.0, (belief_a.confidence + belief_b.confidence) / 2),
-                    source="conflict_resolution",
-                    creator="system",
-                    tags=list(set(belief_a.tags + belief_b.tags)),
-                    source_ids=list(set(belief_a.source_ids + belief_b.source_ids)),
-                )
+                        transition_requests = [
+                            LifecycleTransitionRequest(
+                                memory_id=lower_id,
+                                memory_type="belief",
+                                to_state="superseded",
+                                reason=(
+                                    f"Auto-resolved — confidence gap "
+                                    f"({higher_conf:.2f} vs {lower_conf:.2f})"
+                                ),
+                                triggered_by="system",
+                                expected_version=expected_version,
+                            )
+                        ]
+                    else:
+                        transition_requests = [
+                            LifecycleTransitionRequest(
+                                memory_id=belief_a_id,
+                                memory_type="belief",
+                                to_state="contradicted",
+                                reason=(
+                                    "Auto-resolved — needs manual review "
+                                    "(confidences too close or both low)"
+                                ),
+                                triggered_by="system",
+                                expected_version=belief_a.version,
+                            ),
+                            LifecycleTransitionRequest(
+                                memory_id=belief_b_id,
+                                memory_type="belief",
+                                to_state="contradicted",
+                                reason=(
+                                    "Auto-resolved — needs manual review "
+                                    "(confidences too close or both low)"
+                                ),
+                                triggered_by="system",
+                                expected_version=belief_b.version,
+                            ),
+                        ]
 
-                copied_evidence = []
-                try:
-                    from storage.repositories import EvidenceRepository
+                    results = await lifecycle_service.transition_many_in_session(
+                        session,
+                        transition_requests,
+                        graph=None,
+                    )
+                    events = [
+                        {
+                            "belief_id": result.event["memory_id"],
+                            "from_state": result.from_state,
+                            "to_state": result.to_state,
+                            "reason": result.event["reason"],
+                        }
+                        for result in results
+                    ]
 
-                    async with AsyncSession(self._provider.engine) as ev_session:
-                        ev_repo = EvidenceRepository(ev_session)
-                        for orig_id in (belief_a_id, belief_b_id):
-                            ev_rows = await ev_repo.get_by_belief_id(orig_id)
-                            for ev in ev_rows:
-                                new_ev = Evidence(
+                elif resolution == "keep_a":
+                    results = await lifecycle_service.transition_many_in_session(
+                        session,
+                        [
+                            LifecycleTransitionRequest(
+                                memory_id=belief_b_id,
+                                memory_type="belief",
+                                to_state="discarded",
+                                reason=(
+                                    f"Discarded in favor of {belief_a_id} via conflict resolution"
+                                ),
+                                triggered_by="system",
+                                expected_version=belief_b.version,
+                            )
+                        ],
+                        graph=None,
+                    )
+                    events = [
+                        {
+                            "belief_id": result.event["memory_id"],
+                            "from_state": result.from_state,
+                            "to_state": result.to_state,
+                            "reason": result.event["reason"],
+                        }
+                        for result in results
+                    ]
+                elif resolution == "keep_b":
+                    results = await lifecycle_service.transition_many_in_session(
+                        session,
+                        [
+                            LifecycleTransitionRequest(
+                                memory_id=belief_a_id,
+                                memory_type="belief",
+                                to_state="discarded",
+                                reason=(
+                                    f"Discarded in favor of {belief_b_id} via conflict resolution"
+                                ),
+                                triggered_by="system",
+                                expected_version=belief_a.version,
+                            )
+                        ],
+                        graph=None,
+                    )
+                    events = [
+                        {
+                            "belief_id": result.event["memory_id"],
+                            "from_state": result.from_state,
+                            "to_state": result.to_state,
+                            "reason": result.event["reason"],
+                        }
+                        for result in results
+                    ]
+                elif resolution == "merge":
+                    if not new_proposition:
+                        raise ValueError("new_proposition is required when resolution='merge'")
+
+                    merged = Belief(
+                        proposition=new_proposition,
+                        confidence=min(1.0, (belief_a.confidence + belief_b.confidence) / 2),
+                        source="conflict_resolution",
+                        creator="system",
+                        tags=list(set(belief_a.tags + belief_b.tags)),
+                        source_ids=list(set(belief_a.source_ids + belief_b.source_ids)),
+                    )
+
+                    copied_evidence = []
+                    for orig_id in (belief_a_id, belief_b_id):
+                        ev_rows = await evidence_repo.get_by_belief_id(orig_id)
+                        for ev in ev_rows:
+                            copied_evidence.append(
+                                Evidence(
                                     belief_id=merged.id,
                                     source_type=ev.source_type,
                                     source_id=ev.source_id,
                                     weight=ev.weight,
                                     contributor=ev.contributor,
                                 )
-                                copied_evidence.append(new_ev)
-                except Exception:
-                    logger.warning(
-                        "Failed to copy evidence for merged belief %s",
-                        merged.id,
-                        exc_info=True,
-                    )
+                            )
 
-                merged_receipt = MemoryReceipt(
-                    id=merged.id,
-                    memory_type="belief",
-                    source="conflict_resolution",
-                    created_by="system",
-                    timestamp=datetime.now(timezone.utc),
-                    confidence=merged.confidence,
-                )
-                await self._provider.create_in_transaction(
-                    belief=merged,
-                    evidence_list=copied_evidence,
-                    receipt=merged_receipt,
-                    outbox_entries=[{
-                        "record_type": "belief",
-                        "record_id": merged.id,
-                        "operation": "index_belief",
-                        "payload": {
+                    merged = await belief_repo.create(merged)
+                    for ev in copied_evidence:
+                        await evidence_repo.create(ev)
+
+                    merged_receipt = MemoryReceipt(
+                        id=merged.id,
+                        memory_type="belief",
+                        source="conflict_resolution",
+                        created_by="system",
+                        timestamp=datetime.now(timezone.utc),
+                        confidence=merged.confidence,
+                    )
+                    await receipt_repo.create(merged_receipt)
+                    await outbox_repo.add_entry(
+                        record_type="belief",
+                        record_id=merged.id,
+                        operation="index_belief",
+                        payload={
                             "proposition": merged.proposition,
                             "tags": merged.tags,
                             "confidence": merged.confidence,
                             "source": "conflict_resolution",
                         },
-                    }],
-                )
-
-                await self._provider.update_belief_lifecycle(belief_a_id, "superseded")
-                await lifecycle_repo.record_event(
-                    memory_id=belief_a_id,
-                    memory_type="belief",
-                    from_state=belief_a.lifecycle_state,
-                    to_state="superseded",
-                    reason=f"Merged into {merged.id} via conflict resolution",
-                    triggered_by="system",
-                )
-                events.append({
-                    "belief_id": belief_a_id,
-                    "from_state": belief_a.lifecycle_state,
-                    "to_state": "superseded",
-                    "reason": f"Merged into {merged.id} via conflict resolution",
-                })
-
-                await self._provider.update_belief_lifecycle(belief_b_id, "superseded")
-                await lifecycle_repo.record_event(
-                    memory_id=belief_b_id,
-                    memory_type="belief",
-                    from_state=belief_b.lifecycle_state,
-                    to_state="superseded",
-                    reason=f"Merged into {merged.id} via conflict resolution",
-                    triggered_by="system",
-                )
-                events.append({
-                    "belief_id": belief_b_id,
-                    "from_state": belief_b.lifecycle_state,
-                    "to_state": "superseded",
-                    "reason": f"Merged into {merged.id} via conflict resolution",
-                })
-            elif resolution == "discard_both":
-                for bid, bstate in (
-                    (belief_a_id, belief_a.lifecycle_state),
-                    (belief_b_id, belief_b.lifecycle_state),
-                ):
-                    await self._provider.update_belief_lifecycle(bid, "discarded")
-                    await lifecycle_repo.record_event(
-                        memory_id=bid,
-                        memory_type="belief",
-                        from_state=bstate,
-                        to_state="discarded",
-                        reason="Discarded via conflict resolution",
-                        triggered_by="system",
                     )
-                    events.append({
-                        "belief_id": bid,
-                        "from_state": bstate,
-                        "to_state": "discarded",
-                        "reason": "Discarded via conflict resolution",
-                    })
-            else:
-                raise ValueError(
-                    f"Unknown resolution: {resolution}. "
-                    "Must be one of: keep_a, keep_b, merge, discard_both"
+
+                    results = await lifecycle_service.transition_many_in_session(
+                        session,
+                        [
+                            LifecycleTransitionRequest(
+                                memory_id=belief_a_id,
+                                memory_type="belief",
+                                to_state="superseded",
+                                reason=f"Merged into {merged.id} via conflict resolution",
+                                triggered_by="system",
+                                expected_version=belief_a.version,
+                            ),
+                            LifecycleTransitionRequest(
+                                memory_id=belief_b_id,
+                                memory_type="belief",
+                                to_state="superseded",
+                                reason=f"Merged into {merged.id} via conflict resolution",
+                                triggered_by="system",
+                                expected_version=belief_b.version,
+                            ),
+                        ],
+                        graph=None,
+                    )
+                    events = [
+                        {
+                            "belief_id": result.event["memory_id"],
+                            "from_state": result.from_state,
+                            "to_state": result.to_state,
+                            "reason": result.event["reason"],
+                        }
+                        for result in results
+                    ]
+                elif resolution == "discard_both":
+                    results = await lifecycle_service.transition_many_in_session(
+                        session,
+                        [
+                            LifecycleTransitionRequest(
+                                memory_id=belief_a_id,
+                                memory_type="belief",
+                                to_state="discarded",
+                                reason="Discarded via conflict resolution",
+                                triggered_by="system",
+                                expected_version=belief_a.version,
+                            ),
+                            LifecycleTransitionRequest(
+                                memory_id=belief_b_id,
+                                memory_type="belief",
+                                to_state="discarded",
+                                reason="Discarded via conflict resolution",
+                                triggered_by="system",
+                                expected_version=belief_b.version,
+                            ),
+                        ],
+                        graph=None,
+                    )
+                    events = [
+                        {
+                            "belief_id": result.event["memory_id"],
+                            "from_state": result.from_state,
+                            "to_state": result.to_state,
+                            "reason": result.event["reason"],
+                        }
+                        for result in results
+                    ]
+                else:
+                    raise ValueError(
+                        f"Unknown resolution: {resolution}. "
+                        "Must be one of: keep_a, keep_b, merge, discard_both"
+                    )
+
+                receipt = MemoryReceipt(
+                    id=str(uuid.uuid4()),
+                    memory_type="belief",
+                    source="conflict_resolution",
+                    created_by="system",
+                    timestamp=datetime.now(timezone.utc),
                 )
+                await receipt_repo.create(receipt)
+                await session.commit()
+            except BaseException:
+                await session.rollback()
+                raise
 
-            await lc_session.commit()
-
-        receipt = MemoryReceipt(
-            id=str(uuid.uuid4()),
-            memory_type="belief",
-            source="conflict_resolution",
-            created_by="system",
-            timestamp=datetime.now(timezone.utc),
+        return json.dumps(
+            {
+                "belief_a": (await self._provider.get_belief(belief_a_id)).model_dump(mode="json"),
+                "belief_b": (await self._provider.get_belief(belief_b_id)).model_dump(mode="json"),
+                "resolution": resolution,
+                **({"auto_resolved": True} if auto_resolve else {}),
+                "created": merged.model_dump(mode="json") if resolution == "merge" and merged else None,
+                "events": events,
+                "receipt": receipt.model_dump(mode="json"),
+            }
         )
-
-        return json.dumps({
-            "belief_a": (await self._provider.get_belief(belief_a_id)).model_dump(mode="json"),
-            "belief_b": (await self._provider.get_belief(belief_b_id)).model_dump(mode="json"),
-            "resolution": resolution,
-            "created": merged.model_dump(mode="json") if resolution == "merge" and merged else None,
-            "events": events,
-            "receipt": receipt.model_dump(mode="json"),
-        })
 
     async def _handle_reflect(
         self,
