@@ -6,12 +6,14 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy.ext.asyncio import AsyncSession
 from storage.repositories import (
     BeliefRepository,
     FactRepository,
     LifecycleRepository,
     RelationRepository,
 )
+from storage.repositories.lifecycle_repo import LifecycleConflictError, normalize_version
 
 from memory_server.evaluation.validator import (
     is_valid_transition,
@@ -90,30 +92,25 @@ class LifecycleService:
 
     async def transition_in_session(
         self,
-        session,
+        session: AsyncSession,
         request: LifecycleTransitionRequest,
         graph: SimpleGraph | None = None,
     ) -> LifecycleTransitionResult:
-        """Transition a single memory using an existing DB session."""
-        lifecycle_repo = LifecycleRepository(session)
-        fact_repo = FactRepository(session)
-        belief_repo = BeliefRepository(session)
-        return await self._transition_in_session(
-            session=session,
-            lifecycle_repo=lifecycle_repo,
-            fact_repo=fact_repo,
-            belief_repo=belief_repo,
-            request=request,
-            graph=graph,
-        )
+        """Use the caller's UOW; caller must commit or roll back on any error."""
+        results = await self.transition_many_in_session(session, [request], graph=graph)
+        return results[0]
 
     async def transition_many_in_session(
         self,
-        session,
+        session: AsyncSession,
         requests: list[LifecycleTransitionRequest],
         graph: SimpleGraph | None = None,
     ) -> list[LifecycleTransitionResult]:
-        """Transition multiple memories using an existing DB session."""
+        """Stage a batch; caller owns commit/rollback of the entire UOW.
+
+        On any error the caller must roll back, not commit earlier writes.
+        Results are provisional until that commit succeeds.
+        """
         lifecycle_repo = LifecycleRepository(session)
         fact_repo = FactRepository(session)
         belief_repo = BeliefRepository(session)
@@ -138,27 +135,17 @@ class LifecycleService:
     ) -> list[LifecycleTransitionResult]:
         """Transition multiple memories in a single transaction."""
         async with await self._provider._get_session() as session:
-            lifecycle_repo = LifecycleRepository(session)
-            fact_repo = FactRepository(session)
-            belief_repo = BeliefRepository(session)
-            results: list[LifecycleTransitionResult] = []
-            for request in requests:
-                results.append(
-                    await self._transition_in_session(
-                        session=session,
-                        lifecycle_repo=lifecycle_repo,
-                        fact_repo=fact_repo,
-                        belief_repo=belief_repo,
-                        request=request,
-                        graph=graph,
-                    )
-                )
-            await session.commit()
-            return results
+            try:
+                results = await self.transition_many_in_session(session, requests, graph=graph)
+                await session.commit()
+                return results
+            except BaseException:
+                await session.rollback()
+                raise
 
     async def _transition_in_session(
         self,
-        session,
+        session: AsyncSession,
         lifecycle_repo: LifecycleRepository,
         fact_repo: FactRepository,
         belief_repo: BeliefRepository,
@@ -177,34 +164,19 @@ class LifecycleService:
             raise KeyError(f"{memory_type} '{request.memory_id}' not found")
 
         current_state = self._normalize_state(memory.lifecycle_state)
-        self._validate_transition(current_state, target_state)
         self._validate_expected_version(memory.version, request.expected_version, request.memory_id)
+        self._validate_transition(current_state, target_state)
 
-        if memory_type == "fact":
-            updated = await fact_repo.update_lifecycle_state(request.memory_id, target_state)
-            if updated is None:
-                raise KeyError(f"fact '{request.memory_id}' not found")
-            updated = await fact_repo.increment_version(request.memory_id) or updated
-        elif memory_type == "belief":
-            updated = await belief_repo.update_lifecycle_state(request.memory_id, target_state)
-            if updated is None:
-                raise KeyError(f"belief '{request.memory_id}' not found")
-            updated = await belief_repo.increment_version(request.memory_id) or updated
-        else:
-            raise ValueError("memory_type must be one of: fact, belief")
-
-        await lifecycle_repo.set_state(
-            memory_id=request.memory_id,
-            memory_type=memory_type,
-            new_state=target_state,
-            previous_state=current_state,
-            confidence=updated.confidence,
+        expected_version = self._normalize_version(
+            memory.version if request.expected_version is None else request.expected_version
         )
-        await lifecycle_repo.record_event(
+        updated = await lifecycle_repo.transition(
+            repo,
             memory_id=request.memory_id,
             memory_type=memory_type,
             from_state=current_state,
             to_state=target_state,
+            expected_version=expected_version,
             reason=request.reason or "lifecycle transition",
             triggered_by=request.triggered_by,
         )
@@ -239,7 +211,7 @@ class LifecycleService:
 
     async def _propagate_dependents(
         self,
-        session,
+        session: AsyncSession,
         lifecycle_repo: LifecycleRepository,
         fact_repo: FactRepository,
         belief_repo: BeliefRepository,
@@ -293,20 +265,16 @@ class LifecycleService:
                 continue
 
             new_confidence = max(0.1, round(float(dependent.confidence) * 0.8, 6))
-            if dependent_type == "belief":
-                await belief_repo.update_confidence(dependent_id, new_confidence)
-                updated_dependent = await belief_repo.increment_version(dependent_id)
-            else:
-                await fact_repo.update(dependent_id, confidence=new_confidence)
-                updated_dependent = await fact_repo.increment_version(dependent_id)
-
-            await lifecycle_repo.record_event(
+            updated_dependent = await lifecycle_repo.transition(
+                belief_repo if dependent_type == "belief" else fact_repo,
                 memory_id=dependent_id,
                 memory_type=dependent_type,
                 from_state=self._normalize_state(dependent.lifecycle_state),
                 to_state=self._normalize_state(dependent.lifecycle_state),
+                expected_version=self._normalize_version(dependent.version),
                 reason=reason,
                 triggered_by=triggered_by,
+                confidence=new_confidence,
             )
             propagated.append(
                 {
@@ -322,7 +290,7 @@ class LifecycleService:
 
     async def _load_memory(
         self,
-        session,
+        session: AsyncSession,
         fact_repo: FactRepository,
         belief_repo: BeliefRepository,
         memory_id: str,
@@ -338,7 +306,7 @@ class LifecycleService:
 
     async def _load_any_memory(
         self,
-        session,
+        session: AsyncSession,
         fact_repo: FactRepository,
         belief_repo: BeliefRepository,
         memory_id: str,
@@ -360,7 +328,7 @@ class LifecycleService:
         if expected_version is None:
             return
         if self._normalize_version(current_version) != self._normalize_version(expected_version):
-            raise ValueError(
+            raise LifecycleConflictError(
                 f"expected_version mismatch for {memory_id}: "
                 f"expected {expected_version}, got {current_version}"
             )
@@ -381,15 +349,4 @@ class LifecycleService:
 
     @staticmethod
     def _normalize_version(version: Any) -> int:
-        if isinstance(version, int):
-            return max(1, version)
-        if isinstance(version, str):
-            stripped = version.strip()
-            if stripped.isdigit():
-                return max(1, int(stripped))
-            if stripped == "0.1.0":
-                return 1
-        try:
-            return max(1, int(str(version).strip()))
-        except (TypeError, ValueError):
-            return 1
+        return normalize_version(version)

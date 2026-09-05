@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from memory_server.models import Fact
 from storage.dedup import ACTIVE_LIFECYCLE_STATES, normalize_spo_component
 from storage.models.fact import FactORM
+from storage.repositories.lifecycle_repo import _cas_transition
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +235,21 @@ class FactRepository:
         await self._session.flush()
         await self._session.refresh(orm)
         return orm.to_pydantic()
+
+    async def transition_lifecycle_state(
+        self,
+        memory_id: str,
+        new_state: str,
+        expected_state: str,
+        expected_version: int,
+        *,
+        confidence: float | None = None,
+    ) -> Fact:
+        """Session-aware CAS; use LifecycleRepository.transition to add history/event."""
+        return await _cas_transition(
+            self._session, FactORM, memory_id, new_state,
+            expected_state, expected_version, confidence,
+        )
 
     async def update_lifecycle_state(self, fact_id: str, new_state: str) -> Optional[Fact]:
         orm = await self._session.get(FactORM, fact_id)

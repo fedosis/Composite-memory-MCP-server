@@ -12,9 +12,11 @@ from memory_server.evaluation.confidence import LIFECYCLE_MULTIPLIER
 from memory_server.evaluation.decay import PER_TYPE_TTL, DecayEngine
 from memory_server.evaluation.validator import (
     _VALID_TRANSITIONS,
-    Validator as EvValidator,
     is_valid_transition,
     normalize_lifecycle_state,
+)
+from memory_server.evaluation.validator import (
+    Validator as EvValidator,
 )
 from memory_server.models.receipt import LifecycleState
 
@@ -244,3 +246,209 @@ class TestDecayEngineBelief:
             lifecycle_state="active",
         )
         assert engine.get_lifecycle_state("belief-reg-1") == "active"
+
+
+@pytest.fixture(params=["fact", "belief"])
+async def cas_file_store(tmp_path, request):
+    from memory_server.models import Belief, Fact
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'boundary.db'}"
+    writer, observer = SQLiteProvider(url=url), SQLiteProvider(url=url)
+    await writer.initialize()
+    await observer.initialize()
+    kind = request.param
+    if kind == "fact":
+        memory = Fact(id="boundary-fact", subject="CAS", predicate="has", object="one owner")
+        await writer.create_fact(memory)
+    else:
+        memory = Belief(id="boundary-belief", proposition="CAS has one owner")
+        await writer.create_belief(memory)
+    try:
+        yield writer, observer, kind, memory
+    finally:
+        await observer.close()
+        await writer.close()
+
+
+async def _read_cas_memory(provider, kind, memory_id):
+    if kind == "fact":
+        return await provider.get_fact(memory_id)
+    return await provider.get_belief(memory_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["event", "commit"])
+async def test_file_sqlite_real_failure_rolls_back_entire_transition(cas_file_store, failure):
+    from sqlalchemy import event, text
+    from sqlalchemy.exc import IntegrityError
+
+    from memory_server.services.lifecycle_service import LifecycleService
+
+    writer, observer, kind, memory = cas_file_store
+    counts = {"event_insert": 0, "commit": 0}
+
+    def enable_fk(dbapi_connection, connection_record, connection_proxy):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    event.listen(writer.engine.sync_engine, "checkout", enable_fk)
+    async with await writer._get_session() as session:
+        if failure == "event":
+            await session.execute(text(
+                "CREATE TRIGGER reject_event BEFORE INSERT ON lifecycle_events "
+                "BEGIN SELECT RAISE(ABORT, 'event rejected'); END"
+            ))
+        else:
+            await session.execute(text("CREATE TABLE cas_parent (id INTEGER PRIMARY KEY)"))
+            await session.execute(text(
+                "CREATE TABLE cas_deferred (parent_id INTEGER REFERENCES cas_parent(id) "
+                "DEFERRABLE INITIALLY DEFERRED)"
+            ))
+            await session.execute(text(
+                "CREATE TRIGGER reject_commit AFTER INSERT ON lifecycle_events "
+                "BEGIN INSERT INTO cas_deferred VALUES (42); END"
+            ))
+        await session.commit()
+
+    def after_sql(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("INSERT INTO lifecycle_events"):
+            counts["event_insert"] += 1
+
+    def before_commit(conn):
+        counts["commit"] += 1
+
+    event.listen(writer.engine.sync_engine, "after_cursor_execute", after_sql)
+    event.listen(writer.engine.sync_engine, "commit", before_commit)
+    try:
+        with pytest.raises(IntegrityError, match="event rejected|FOREIGN KEY constraint failed"):
+            await LifecycleService(writer).transition(memory.id, kind, "stale", expected_version=1)
+    finally:
+        event.remove(writer.engine.sync_engine, "after_cursor_execute", after_sql)
+        event.remove(writer.engine.sync_engine, "commit", before_commit)
+        event.remove(writer.engine.sync_engine, "checkout", enable_fk)
+    if failure == "commit":
+        assert counts == {"event_insert": 1, "commit": 1}
+    else:
+        assert counts == {"event_insert": 0, "commit": 0}
+    current = await _read_cas_memory(observer, kind, memory.id)
+    assert (current.lifecycle_state, current.version) == ("active", 1)
+    async with await observer._get_session() as session:
+        assert (await session.execute(text("SELECT count(*) FROM lifecycle_events"))).scalar_one() == 0
+        assert (await session.execute(text("SELECT count(*) FROM lifecycle_states"))).scalar_one() == 0
+        if failure == "commit":
+            assert (await session.execute(text("SELECT count(*) FROM cas_deferred"))).scalar_one() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ["commit", "rollback", "batch_conflict"])
+async def test_session_api_leaves_whole_uow_to_caller(cas_file_store, finish):
+    from sqlalchemy import text
+
+    from memory_server.services.lifecycle_service import LifecycleService, LifecycleTransitionRequest
+
+    writer, observer, kind, memory = cas_file_store
+    service = LifecycleService(writer)
+    request = LifecycleTransitionRequest(memory.id, kind, "stale", expected_version=1)
+    async with await writer._get_session() as session:
+        if finish == "batch_conflict":
+            with pytest.raises(ValueError, match="expected_version mismatch"):
+                async with session.begin():
+                    await service.transition_many_in_session(session, [request, request])
+        else:
+            result = await service.transition_in_session(session, request)
+            assert (result.memory.lifecycle_state, result.memory.version) == ("stale", 2)
+            before = await _read_cas_memory(observer, kind, memory.id)
+            assert (before.lifecycle_state, before.version) == ("active", 1)
+            assert session.in_transaction()
+            if finish == "commit":
+                await session.commit()
+            else:
+                await session.rollback()
+    current = await _read_cas_memory(observer, kind, memory.id)
+    expected = ("stale", 2) if finish == "commit" else ("active", 1)
+    assert (current.lifecycle_state, current.version) == expected
+    async with await observer._get_session() as session:
+        expected_count = int(finish == "commit")
+        assert (await session.execute(text("SELECT count(*) FROM lifecycle_events"))).scalar_one() == expected_count
+        assert (await session.execute(text("SELECT count(*) FROM lifecycle_states"))).scalar_one() == expected_count
+
+
+
+@pytest.mark.asyncio
+async def test_cas_zero_affected_rows_is_conflict(cas_file_store):
+    from sqlalchemy import text
+
+    from memory_server.services.lifecycle_service import LifecycleService
+
+    writer, observer, kind, memory = cas_file_store
+    table = "facts" if kind == "fact" else "beliefs"
+    async with await writer._get_session() as session:
+        await session.execute(text(
+            f"CREATE TRIGGER ignore_transition BEFORE UPDATE ON {table} "
+            "BEGIN SELECT RAISE(IGNORE); END"
+        ))
+        await session.commit()
+    with pytest.raises(ValueError, match="expected_version mismatch"):
+        await LifecycleService(writer).transition(memory.id, kind, "stale", expected_version=1)
+    current = await _read_cas_memory(observer, kind, memory.id)
+    assert (current.lifecycle_state, current.version) == ("active", 1)
+    async with await observer._get_session() as session:
+        assert (await session.execute(text("SELECT count(*) FROM lifecycle_events"))).scalar_one() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_version", ["garbage", "1.5", True])
+async def test_unknown_expected_version_is_rejected(cas_file_store, expected_version):
+    from memory_server.services.lifecycle_service import LifecycleService
+
+    writer, observer, kind, memory = cas_file_store
+    with pytest.raises(ValueError, match="Unsupported lifecycle version"):
+        await LifecycleService(writer).transition(memory.id, kind, "stale", expected_version=expected_version)
+    current = await _read_cas_memory(observer, kind, memory.id)
+    assert (current.lifecycle_state, current.version) == ("active", 1)
+
+
+@pytest.mark.asyncio
+async def test_propagation_wins_against_stale_dependent_transition(cas_file_store):
+    import asyncio
+
+    from storage.repositories import LifecycleRepository, RelationRepository
+
+    from memory_server.models import Fact
+    from memory_server.services.lifecycle_service import LifecycleService
+
+    writer, observer, kind, child = cas_file_store
+    parent = Fact(id="cas-parent", subject="Parent", predicate="supports", object="Child")
+    await writer.create_fact(parent)
+    async with await writer._get_session() as session:
+        await RelationRepository(session).create(child.id, parent.id, "derived_from")
+        await session.commit()
+    loaded, release = asyncio.Event(), asyncio.Event()
+
+    class PausedService(LifecycleService):
+        async def _load_memory(self, *args, **kwargs):
+            result = await super()._load_memory(*args, **kwargs)
+            loaded.set()
+            await asyncio.wait_for(release.wait(), timeout=5)
+            return result
+
+    task = asyncio.create_task(PausedService(observer).transition(child.id, kind, "stale", expected_version=1))
+    try:
+        await asyncio.wait_for(loaded.wait(), timeout=5)
+        result = await LifecycleService(writer).transition(parent.id, "fact", "superseded", expected_version=1)
+        assert len(result.propagated) == 1
+        release.set()
+        with pytest.raises(ValueError, match="expected_version mismatch"):
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    current = await _read_cas_memory(observer, kind, child.id)
+    assert (current.lifecycle_state, current.version) == ("active", 2)
+    assert current.confidence == pytest.approx(child.confidence * 0.8)
+    async with await observer._get_session() as session:
+        events = await LifecycleRepository(session).get_events(child.id)
+    assert len(events) == 1
+    assert events[0]["reason"] == "parent_invalidated"

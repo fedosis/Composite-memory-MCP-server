@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import ValidationError
@@ -32,6 +33,7 @@ from sqlalchemy.types import String
 
 from memory_server.models.belief import Belief
 from storage.models.belief import BeliefORM
+from storage.repositories.lifecycle_repo import _cas_transition
 
 logger = logging.getLogger(__name__)
 
@@ -247,11 +249,25 @@ class BeliefRepository:
         if orm is None:
             return None
         orm.confidence = max(0.0, min(1.0, new_confidence))
-        from datetime import datetime, timezone
         orm.updated_at = datetime.now(timezone.utc)
         await self._session.flush()
         await self._session.refresh(orm)
         return orm.to_pydantic()
+
+    async def transition_lifecycle_state(
+        self,
+        memory_id: str,
+        new_state: str,
+        expected_state: str,
+        expected_version: int,
+        *,
+        confidence: float | None = None,
+    ) -> Belief:
+        """Session-aware CAS; use LifecycleRepository.transition to add history/event."""
+        return await _cas_transition(
+            self._session, BeliefORM, memory_id, new_state,
+            expected_state, expected_version, confidence,
+        )
 
     async def update_lifecycle_state(self, belief_id: str, new_state: str) -> Optional[Belief]:
         """Update the lifecycle state of a belief."""
@@ -259,7 +275,6 @@ class BeliefRepository:
         if orm is None:
             return None
         orm.lifecycle_state = new_state
-        from datetime import datetime, timezone
         orm.updated_at = datetime.now(timezone.utc)
         await self._session.flush()
         await self._session.refresh(orm)
@@ -270,7 +285,6 @@ class BeliefRepository:
         orm = await self._session.get(BeliefORM, belief_id)
         if orm is None:
             return None
-        from datetime import datetime, timezone
         orm.last_reinforced_at = datetime.now(timezone.utc)
         orm.updated_at = datetime.now(timezone.utc)
         await self._session.flush()
@@ -283,7 +297,6 @@ class BeliefRepository:
         if orm is None:
             return None
         orm.version = (orm.version or 1) + 1
-        from datetime import datetime, timezone
         orm.updated_at = datetime.now(timezone.utc)
         await self._session.flush()
         await self._session.refresh(orm)

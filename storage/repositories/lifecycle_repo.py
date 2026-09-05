@@ -1,14 +1,71 @@
 """Lifecycle repository — lifecycle state and event tracking."""
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from storage.base import utcnow
 from storage.models.lifecycle import LifecycleEventORM, LifecycleStateORM
+
+
+class LifecycleConflictError(ValueError):
+    """The requested revision/state no longer matches; roll back the whole UOW."""
+
+
+def normalize_version(version: Any) -> int:
+    """Canonical revision; support legacy initial and padded integer versions.
+
+    NULL and 0.1.0 denote revision 1. Non-positive integer revisions also
+    denote 1. Unknown strings are rejected, never interpreted via SQLite CAST.
+    """
+    if version is None or version == "0.1.0":
+        return 1
+    if isinstance(version, int) and not isinstance(version, bool):
+        return max(1, version)
+    if isinstance(version, str):
+        value = version.strip()
+        if value == "0.1.0":
+            return 1
+        if value.isascii() and value.isdecimal():
+            return max(1, int(value))
+    raise ValueError(f"Unsupported lifecycle version: {version!r}")
+
+
+async def _cas_transition(
+    session: AsyncSession,
+    model: Any,
+    memory_id: str,
+    new_state: str,
+    expected_state: str,
+    expected_version: int,
+    confidence: float | None = None,
+) -> Any:
+    """Shared fact/belief CAS primitive; no commit or rollback here."""
+    row = (await session.execute(
+        select(model.version, model.lifecycle_state).where(model.id == memory_id)
+    )).one_or_none()
+    if row is None or normalize_version(row.version) != expected_version or row.lifecycle_state != expected_state:
+        raise LifecycleConflictError(f"expected_version mismatch for {memory_id}: expected {expected_version}")
+    values = {
+        "lifecycle_state": new_state,
+        "version": str(expected_version + 1) if model.__tablename__ == "facts" else expected_version + 1,
+        "updated_at": utcnow(),
+    }
+    if confidence is not None:
+        values["confidence"] = confidence
+    result = await session.execute(
+        update(model)
+        .where(model.id == memory_id, model.version == row.version, model.lifecycle_state == expected_state)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        raise LifecycleConflictError(f"expected_version mismatch for {memory_id}: expected {expected_version}")
+    orm = await session.get(model, memory_id, populate_existing=True)
+    return orm.to_pydantic()
 
 
 class LifecycleRepository:
@@ -16,6 +73,33 @@ class LifecycleRepository:
 
     def __init__(self, session: AsyncSession):
         self._session = session
+
+    async def transition(
+        self,
+        repository: Any,
+        *,
+        memory_id: str,
+        memory_type: str,
+        from_state: str,
+        to_state: str,
+        expected_version: int,
+        reason: str = "",
+        triggered_by: str = "system",
+        confidence: float | None = None,
+    ) -> Any:
+        """CAS + state history + event in this session; the UOW owner commits.
+
+        Any exception must propagate to the UOW owner, who rolls back the whole
+        transaction. Do not catch a conflict and commit earlier batch writes.
+        """
+        if repository._session is not self._session:
+            raise ValueError("Lifecycle repositories must share the UOW session")
+        updated = await repository.transition_lifecycle_state(
+            memory_id, to_state, from_state, expected_version, confidence=confidence
+        )
+        await self.set_state(memory_id, memory_type, to_state, from_state, updated.confidence)
+        await self.record_event(memory_id, memory_type, from_state, to_state, reason, triggered_by)
+        return updated
 
     async def get_state(self, memory_id: str) -> Optional[str]:
         stmt = (

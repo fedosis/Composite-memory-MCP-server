@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
+from sqlalchemy import text
 from storage.repositories import LifecycleRepository
 
 import memory_server.server as server_module
@@ -116,6 +118,92 @@ class TestLifecycleServiceP3:
                 expected_version=99,
             )
 
+    @pytest.mark.parametrize("memory_type", ["fact", "belief"])
+    async def test_event_failure_rolls_back_state_and_version(self, provider, memory_type):
+        if memory_type == "fact":
+            memory = Fact(id="fact-event-rollback", subject="Rollback", predicate="has", object="event")
+            await provider.create_fact(memory)
+        else:
+            memory = Belief(id="belief-event-rollback", proposition="Rollback event")
+            await provider.create_belief(memory)
+        async with await provider._get_session() as session:
+            await session.execute(text(
+                "CREATE TRIGGER reject_lifecycle_event BEFORE INSERT ON lifecycle_events "
+                "BEGIN SELECT RAISE(ABORT, 'event rejected'); END"
+            ))
+            await session.commit()
+
+        with pytest.raises(Exception, match="event rejected"):
+            await LifecycleService(provider).transition(
+                memory.id, memory_type, "stale", expected_version=1
+            )
+
+        current = await provider.get_fact(memory.id) if memory_type == "fact" else await provider.get_belief(memory.id)
+        assert current is not None
+        assert current.lifecycle_state == "active"
+        assert current.version == 1
+        async with await provider._get_session() as session:
+            events = await LifecycleRepository(session).get_events(memory.id)
+        assert events == []
+
+    @pytest.mark.parametrize("memory_type", ["fact", "belief"])
+    async def test_file_sqlite_concurrent_same_version_has_one_winner(self, tmp_path, memory_type):
+        db_url = f"sqlite+aiosqlite:///{tmp_path / 'cas.db'}"
+        first = SQLiteProvider(url=db_url)
+        second = SQLiteProvider(url=db_url)
+        await first.initialize()
+        await second.initialize()
+        try:
+            if memory_type == "fact":
+                memory = Fact(id="cas-fact", subject="CAS", predicate="is", object="atomic")
+                await first.create_fact(memory)
+            else:
+                memory = Belief(id="cas-belief", proposition="CAS is atomic")
+                await first.create_belief(memory)
+
+            barrier = asyncio.Barrier(2)
+            reads = 0
+            connections = []
+
+            class BarrierLifecycleService(LifecycleService):
+                async def _load_memory(self, *args, **kwargs):
+                    nonlocal reads
+                    result = await super()._load_memory(*args, **kwargs)
+                    reads += 1
+                    connection = await args[0].connection()
+                    connections.append(connection.sync_connection.connection.dbapi_connection)
+                    await asyncio.wait_for(barrier.wait(), timeout=5)
+                    return result
+
+            services = [BarrierLifecycleService(first), BarrierLifecycleService(second)]
+
+            async def run(service):
+                return await service.transition(
+                    memory.id, memory_type, "stale", expected_version=1
+                )
+
+            results = await asyncio.wait_for(
+                asyncio.gather(run(services[0]), run(services[1]), return_exceptions=True), timeout=10
+            )
+            assert reads == 2
+            assert connections[0] is not connections[1]
+            assert sum(not isinstance(result, Exception) for result in results) == 1
+            conflicts = [result for result in results if isinstance(result, ValueError)]
+            assert len(conflicts) == 1
+            assert "expected_version mismatch" in str(conflicts[0])
+            current = (
+                await first.get_fact(memory.id) if memory_type == "fact" else await first.get_belief(memory.id)
+            )
+            assert current is not None
+            assert current.version == 2
+            assert current.lifecycle_state == "stale"
+            async with await first._get_session() as session:
+                events = await LifecycleRepository(session).get_events(memory.id)
+            assert len(events) == 1
+        finally:
+            await first.close()
+            await second.close()
+
     async def test_legacy_fact_expected_version_semver_string_is_accepted(self, provider):
         fact = Fact(
             id="fact-legacy",
@@ -136,6 +224,58 @@ class TestLifecycleServiceP3:
         )
 
         assert result.memory.lifecycle_state == "stale"
+        assert result.memory.version == 2
+
+    @pytest.mark.parametrize("memory_type", ["fact", "belief"])
+    async def test_version_changed_after_read_without_state_change_conflicts(self, tmp_path, memory_type):
+        p = SQLiteProvider(url=f"sqlite+aiosqlite:///{tmp_path / 'interleaved.db'}")
+        await p.initialize()
+        try:
+            if memory_type == "fact":
+                memory = Fact(id="version-only-fact", subject="CAS", predicate="guards", object="version-only writer")
+                await p.create_fact(memory)
+            else:
+                memory = Belief(proposition="CAS guards version-only writer")
+                await p.create_belief(memory)
+
+            class InterleavedService(LifecycleService):
+                async def _load_memory(self, *args, **kwargs):
+                    result = await super()._load_memory(*args, **kwargs)
+                    async with await p._get_session() as other:
+                        table = "facts" if memory_type == "fact" else "beliefs"
+                        await other.execute(text(f"UPDATE {table} SET version = 2 WHERE id = :id"), {"id": memory.id})
+                        await other.commit()
+                    return result
+
+            with pytest.raises(ValueError, match="expected_version mismatch"):
+                await InterleavedService(p).transition(memory.id, memory_type, "stale", expected_version=1)
+            current = await p.get_fact(memory.id) if memory_type == "fact" else await p.get_belief(memory.id)
+            assert current is not None
+            assert (current.lifecycle_state, current.version) == ("active", 2)
+            async with await p._get_session() as session:
+                assert await LifecycleRepository(session).get_events(memory.id) == []
+        finally:
+            await p.close()
+
+    @pytest.mark.parametrize("stored_version, expected_version", [("0.1.0", "0.1.0"), (" 1 ", " 1 "), ("0", 0)])
+    async def test_legacy_fact_versions_are_cas_matched_as_raw_sql(self, provider, stored_version, expected_version):
+        fact = Fact(
+            id=f"fact-legacy-{stored_version.strip().replace('.', '-')}",
+            subject="Legacy raw",
+            predicate="has",
+            object=stored_version,
+        )
+        await provider.create_fact(fact)
+        async with await provider._get_session() as session:
+            await session.execute(
+                text("UPDATE facts SET version = :version WHERE id = :id"),
+                {"version": stored_version, "id": fact.id},
+            )
+            await session.commit()
+
+        result = await LifecycleService(provider).transition(
+            fact.id, "fact", "stale", expected_version=expected_version
+        )
         assert result.memory.version == 2
 
     async def test_invalid_memory_type_raises(self, provider):
