@@ -827,12 +827,18 @@ class TestOutboxWorker:
         )
         worker._last_compact_at = 0.0  # force first run
 
-        # Give the background task a chance to run.
-        await asyncio.sleep(0.2)
         await worker._maybe_compact()
-        await asyncio.sleep(0.2)
 
-        assert "kwargs" in captured, "optimize() was never called"
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        timeout = 5.0
+        while not captured and loop.time() - started < timeout:
+            await asyncio.sleep(0.05)
+        elapsed = loop.time() - started
+
+        assert "kwargs" in captured, (
+            f"optimize() was never called after {elapsed:.2f}s"
+        )
         kw = captured["kwargs"]
         assert "cleanup_older_than" in kw, (
             "optimize() must receive an explicit cleanup_older_than"
