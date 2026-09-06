@@ -17,6 +17,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError, OperationalError
 from storage.base import utcnow
+from storage.dedup import fact_dedup_key
 from storage.models.fact import FactORM
 from storage.outbox import OutboxEntryORM, OutboxRepository
 from storage.outbox_worker import OutboxWorker
@@ -93,10 +94,10 @@ async def test_f1_fresh_and_upgraded_schema_have_same_fact_contract(tmp_path):
     assert "lifecycle_state" in fresh_index and "dedup_key" in fresh_index
 
 
-def test_f1_fact_orm_rejects_missing_canonical_key():
+def test_f1_fact_orm_computes_missing_canonical_key():
     fact = Fact(id="missing", subject="s", predicate="p", object="o")
-    with pytest.raises(ValueError, match="dedup_key"):
-        FactORM.from_pydantic(fact)
+    orm = FactORM.from_pydantic(fact)
+    assert orm.dedup_key == fact_dedup_key("s", "p", "o")
 
 
 @pytest.mark.asyncio
@@ -310,8 +311,6 @@ async def test_f3_writer_path_lock_failure_is_bounded(tmp_path):
 
 @pytest.mark.asyncio
 async def test_w7_two_real_sessions_preserve_one_fact_receipt_and_monotonic_reinforcement(tmp_path, monkeypatch):
-    with pytest.raises(ValueError, match="dedup_key"):
-        FactORM.from_pydantic(Fact(id="boundary", subject="s", predicate="p", object="o"))
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'w7.db'}"
     provider_a = SQLiteProvider(url=db_url)
     provider_b = SQLiteProvider(url=db_url)

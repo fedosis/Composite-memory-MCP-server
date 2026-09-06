@@ -1100,7 +1100,7 @@ class TestOutboxWorkerWiring:
                 calls["stale"] = max_age_seconds
                 return 0
 
-            async def get_pending(self, limit=None):
+            async def claim_pending(self, limit=None):
                 calls["pending_limit"] = limit
                 return []
 
@@ -1125,7 +1125,7 @@ class TestOutboxWorkerWiring:
             def __init__(self, session):
                 pass
 
-            async def get_pending(self, limit=None):
+            async def claim_pending(self, limit=None):
                 calls["pending_limit"] = limit
                 return []
 

@@ -7,7 +7,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE_VERSION = "0.11.0b1"
+RELEASE_VERSION = "0.12.0b1"
 
 
 def _read_text(relative: str) -> str:
@@ -142,7 +142,7 @@ def test_ci_python_versions_are_aligned():
 
     assert "python -m build" in ci
     assert "pip install dist/*.whl" in ci
-    assert "python -c \"import memory_server, storage; assert memory_server.__version__ == '0.11.0b1'\"" in ci
+    assert "python -c \"import memory_server, storage; assert memory_server.__version__ == '0.12.0b1'\"" in ci
     assert "memory-server --help" in ci
 
 

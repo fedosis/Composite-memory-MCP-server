@@ -10,8 +10,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-_LIVE_ROOT = Path("/home/shtorm/memory-server").resolve()
-_LIVE_DB = (_LIVE_ROOT / "data" / "memory.db").resolve()
+# Identify the live checkout from its actual repository root, not a fixed
+# developer path. An isolated copy of scripts remains usable for tests.
+_LIVE_DB = (ROOT / "data" / "memory.db").resolve()
+_IS_LIVE_CHECKOUT = (ROOT / ".git").exists()
 
 
 def _sqlite_path(url: str) -> Path | None:
@@ -29,11 +31,11 @@ def get_db_url() -> str:
     configured = os.environ.get("MEMORY_SERVER_DB_URL")
     if configured:
         db_path = _sqlite_path(configured)
-        if db_path == _LIVE_DB:
+        if _IS_LIVE_CHECKOUT and db_path == _LIVE_DB:
             raise RuntimeError(f"refusing live memory-server DB target: {db_path}")
         return configured
     default_url = f"sqlite+aiosqlite:///{ROOT / 'data' / 'memory.db'}"
     db_path = _sqlite_path(default_url)
-    if db_path == _LIVE_DB:
+    if _IS_LIVE_CHECKOUT and db_path == _LIVE_DB:
         raise RuntimeError(f"refusing live memory-server DB target: {db_path}")
     return default_url

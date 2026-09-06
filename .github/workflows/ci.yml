@@ -96,7 +96,7 @@ jobs:
         run: |
           python -m venv /tmp/cmms-wheel-smoke
           /tmp/cmms-wheel-smoke/bin/pip install dist/*.whl
-          /tmp/cmms-wheel-smoke/bin/python -c "import memory_server, storage; assert memory_server.__version__ == '0.11.0b1'"
+          /tmp/cmms-wheel-smoke/bin/python -c "import memory_server, storage; assert memory_server.__version__ == '0.12.0b1'"
           /tmp/cmms-wheel-smoke/bin/memory-server --help
           /tmp/cmms-wheel-smoke/bin/python - <<'PY'
           import asyncio

@@ -38,7 +38,7 @@ def test_explicit_live_sqlite_url_is_rejected(monkeypatch):
     common = _load_common(monkeypatch)
     monkeypatch.setenv(
         "MEMORY_SERVER_DB_URL",
-        "sqlite+aiosqlite:////home/shtorm/memory-server/data/memory.db",
+        f"sqlite+aiosqlite:///{common.ROOT / 'data' / 'memory.db'}",
     )
 
     with pytest.raises(RuntimeError, match="refusing live memory-server DB target"):
