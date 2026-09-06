@@ -812,6 +812,8 @@ class TestOutboxWorker:
         """
         from datetime import timedelta
 
+        import time
+
         from storage.outbox_worker import OutboxWorker
 
         captured = {}
@@ -825,7 +827,9 @@ class TestOutboxWorker:
             db_url=f"sqlite+aiosqlite:///{tmp_path / 'compact-test.db'}",
             qdrant=FakeOptimizeProvider(),
         )
-        worker._last_compact_at = 0.0  # force first run
+        worker._last_compact_at = (
+            time.monotonic() - worker._compact_interval_seconds - 1.0
+        )  # force first run regardless of host uptime (monotonic = uptime)
 
         await worker._maybe_compact()
 
