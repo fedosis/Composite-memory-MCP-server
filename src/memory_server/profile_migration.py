@@ -13,26 +13,57 @@ storage identity, and a durable atomic manifest write (unique no-follow 0600
 temp -> flush -> fsync -> replace -> directory fsync) inside a 0700 run
 directory. Every refusal is fail-closed and leaves the previously materialized
 manifest byte-identical.
+
+Slice S2-02 replaces the planner with a full mutation-free no-follow inventory
+and a raw/effective config report:
+
+* the canonical SQL is selected from the RAW YAML layer (``use_env=False``) —
+  there is no source autodetection ambiguity; the environment is reported
+  SEPARATELY and never re-selects the source;
+* every identity digest (source / config / parent / sidecar) is produced by a
+  streaming, size-bounded, looped fd-relative read that fstat's the SAME
+  descriptor before and after the read. The bounded 64 KiB readers in
+  ``storage_lock`` (``read_file_nofollow`` / ``read_regular_file_nofollow``) are
+  deliberately NOT used for identity: they hash at most the first 64 KiB and
+  tolerate a short read (routing-matrix residual F7);
+* the run-directory path chain, the source, sidecars, config file, parents,
+  targets and legacy candidates are inventoried through pinned no-follow
+  descriptors: intermediate symlinks, hard links and special files are refused
+  and a final symlink is recorded by its exact RAW link string, never followed;
+* sidecars present means NO SQLite open at all; only an all-absent sidecar set
+  allows bounded ``immutable=1&mode=ro`` metadata queries, and the source bytes
+  plus every sidecar entry are re-checked across that optional open;
+* the disk margin (1.25), lock state, collisions and the operation plan are
+  populated instead of guessed; unknown space stays a blocker.
+
+Still planner-only: every mutating entrypoint fails closed.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
 import os
 import re
+import shutil
+import sqlite3
 import stat
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, Mapping, cast, get_args
+from urllib.parse import quote
 from uuid import uuid4
 
+from memory_server import storage_lock
 from memory_server.paths import (
     ArtifactKind,
     StorageLayout,
+    StorageLayoutError,
     StorageResolutionInputs,
-    classify_artifact_nofollow,
+    ValueOrigin,
+    inspect_component_chain_nofollow,
     resolve_storage_layout,
     serialize_layout_redacted,
 )
@@ -55,6 +86,49 @@ RunStatus = Literal["running", "failed", "complete", "rolled_back", "rollback_fa
 
 _SQLITE_PREFIX = "sqlite+aiosqlite:///"
 _SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_SIDECAR_CODES = {
+    "-wal": "E_SQLITE_WAL_ACTIVE",
+    "-shm": "E_SQLITE_SHM_AMBIGUOUS",
+    "-journal": "E_SQLITE_HOT_JOURNAL",
+}
+
+# S2-02 inventory bounds. ``IDENTITY_READ_CHUNK``/``MAX_IDENTITY_BYTES`` bound
+# the streaming identity digest; the loop reads exactly the size observed on the
+# descriptor and refuses anything it cannot prove (short read, growth, identity
+# change), so a truncated digest can never be reported as a whole-file digest.
+IDENTITY_READ_CHUNK = 1 << 20
+MAX_IDENTITY_BYTES = 1 << 36
+MAX_INVENTORY_ENTRIES = 64
+MAX_SQLITE_TABLES = 64
+SQLITE_COUNT_CAP = 100_000
+DISK_MARGIN_RATIO = 1.25
+SQL_ACTION_PRESERVE_IN_PLACE = "preserve_in_place"
+RUN_DIRECTORY_NAME = ".cmms-migrations"
+MANIFEST_FILE_NAME = "manifest.json"
+CONFIG_FILE_NAME = "config.yaml"
+CANONICAL_SQLITE_URL = "sqlite+aiosqlite:///data/memory.db"
+SQLITE_OPEN_POLICY_ABSENT = "sidecars_absent_immutable_ro"
+SQLITE_OPEN_POLICY_PRESENT = "sidecars_present_no_open"
+SQLITE_OPEN_POLICY_NOT_REGULAR = "source_not_regular_no_open"
+_UNKNOWN_OUTBOX_COUNTS: dict[str, str] = {
+    "pending": "unknown",
+    "processing": "unknown",
+    "completed": "unknown",
+    "failed": "unknown",
+}
+_RUNTIME_STOP_INSTRUCTIONS = (
+    "stop every CMMS runtime for this profile and confirm no writer remains",
+    "re-run this dry-run after shutdown; a zero-byte WAL is still an apply blocker",
+)
+_LEGACY_DISPOSITION = "preserve-only; not imported"
+_LAYOUT_ORIGIN_ALIASES = {
+    "sqlite": "db_url",
+    "vector": "vector_backend",
+    "graph": "graph_snapshot_path",
+    "mode": "storage_mode",
+    "root": "data_root",
+}
+_IDENTITY_KEY_FIELDS = ("kind", "device", "inode", "mode", "size", "mtime_ns", "sha256", "raw_link_target")
 
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -134,6 +208,12 @@ class MigrationRequest:
     stop_attestation: str | None = None
     embedding_plan_digest: str | None = None
     allow_network_embedding: bool = False
+    # S2-02: the RAW config block (``memory.providers.memory_server`` as read
+    # from YAML). The planner never reads env, a live config file or Settings to
+    # select the canonical SQL; the caller hands the parsed raw block in and the
+    # raw layer (``use_env=False``) is the only selector.
+    raw_config: Mapping[str, Any] | None = None
+    raw_config_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +246,11 @@ class MigrationPlan:
     warnings: tuple[Diagnostic, ...]
     blockers: tuple[Diagnostic, ...]
     config_digest: str
+    # S2-02 additive fields. ``sql_action`` is the strategy contract for the
+    # source database (DETAIL 4.2) and ``report`` is the stable dry-run report
+    # of DETAIL 8 as a plain, JSON-serializable mapping.
+    sql_action: str = SQL_ACTION_PRESERVE_IN_PLACE
+    report: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -219,28 +304,215 @@ class MigrationManifest:
     failure: Mapping[str, Any] | None = None
 
 
-def _identity(path: Path) -> ArtifactIdentity:
-    """No-follow artifact identity; never opens a symlink or special file."""
-    kind = classify_artifact_nofollow(path)
-    status: os.stat_result | None = None
-    try:
-        status = os.lstat(path)
-    except FileNotFoundError:
-        status = None
-    digest = None
-    if kind == "regular_file":
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    return ArtifactIdentity(
-        str(path),
-        kind,
-        getattr(status, "st_dev", None),
-        getattr(status, "st_ino", None),
-        getattr(status, "st_mode", None),
-        getattr(status, "st_size", None),
-        getattr(status, "st_mtime_ns", None),
-        digest,
-        os.readlink(path) if kind == "symlink" else None,
+def _note(diagnostics: list[Diagnostic], diagnostic: Diagnostic) -> None:
+    """Append a diagnostic once; repeated findings never duplicate a blocker."""
+    if diagnostic not in diagnostics:
+        diagnostics.append(diagnostic)
+
+
+def _path_code(exc: OSError) -> str:
+    if isinstance(exc, PermissionError) or exc.errno in (errno.EACCES, errno.EPERM):
+        return "E_LOCK_PERMISSION"
+    return "E_ARTIFACT_IDENTITY_CHANGED"
+
+
+def _same_inode(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and stat.S_IFMT(first.st_mode) == stat.S_IFMT(second.st_mode)
     )
+
+
+def _identity_key(identity: ArtifactIdentity) -> tuple[Any, ...]:
+    return tuple(getattr(identity, name) for name in _IDENTITY_KEY_FIELDS)
+
+
+def _regular_identity(info: os.stat_result, lexical: str, *, sha256: str | None = None) -> ArtifactIdentity:
+    return ArtifactIdentity(
+        lexical, "regular_file", info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, sha256, None
+    )
+
+
+def _streamed_digest(
+    descriptor: int, opened: os.stat_result, *, artifact: str
+) -> tuple[str | None, Diagnostic | None]:
+    """Digest a regular file through ONE descriptor, fstat'ed before and after.
+
+    The loop reads exactly the size observed on that descriptor in bounded
+    chunks. A short read (EOF before the recorded size), growth beyond it, or
+    any device/inode/size/mtime change is refused instead of being silently
+    digested as the whole file — the failure mode of the bounded 64 KiB reader.
+    """
+    if opened.st_size > MAX_IDENTITY_BYTES:
+        return None, Diagnostic(
+            "E_ARTIFACT_IDENTITY_CHANGED",
+            "error",
+            f"{artifact} exceeds the bounded identity read bound; identity unproven",
+            artifact,
+        )
+    digest = hashlib.sha256()
+    remaining = opened.st_size
+    while remaining > 0:
+        chunk = os.read(descriptor, min(IDENTITY_READ_CHUNK, remaining))
+        if not chunk:
+            return None, Diagnostic(
+                "E_ARTIFACT_IDENTITY_CHANGED",
+                "error",
+                f"{artifact} returned a short read; identity unproven",
+                artifact,
+            )
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        return None, Diagnostic(
+            "E_ARTIFACT_IDENTITY_CHANGED",
+            "error",
+            f"{artifact} grew while it was being read; identity unproven",
+            artifact,
+        )
+    after = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        return None, Diagnostic(
+            "E_ARTIFACT_IDENTITY_CHANGED",
+            "error",
+            f"{artifact} changed while it was being read; identity unproven",
+            artifact,
+        )
+    return digest.hexdigest(), None
+
+
+def _digest_regular_path(
+    path: Path, *, artifact: str, notes: list[Diagnostic], digest: bool
+) -> ArtifactIdentity:
+    """Read a regular file relative to its validated, pinned parent descriptor."""
+    lexical = str(path)
+    parent, name = path.parent, path.name
+    try:
+        with storage_lock.open_directory_nofollow(parent) as parent_fd:
+            try:
+                before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return ArtifactIdentity(lexical, "absent")
+            except OSError as exc:
+                _note(notes, Diagnostic(_path_code(exc), "error", f"{artifact} cannot be inspected", artifact))
+                return ArtifactIdentity(lexical, "regular_file")
+            if not stat.S_ISREG(before.st_mode):
+                _note(
+                    notes,
+                    Diagnostic(
+                        "E_ARTIFACT_IDENTITY_CHANGED",
+                        "error",
+                        f"{artifact} changed kind between inspections",
+                        artifact,
+                    ),
+                )
+                return ArtifactIdentity(lexical, "regular_file")
+            if before.st_nlink != 1:
+                _note(
+                    notes,
+                    Diagnostic(
+                        "E_PATH_HARDLINK_UNSAFE",
+                        "error",
+                        f"{artifact} is a hard-linked regular file",
+                        artifact,
+                    ),
+                )
+                return _regular_identity(before, lexical)
+            try:
+                # O_NONBLOCK is a no-op for regular files and keeps a FIFO swap
+                # between the stat above and this open from blocking forever.
+                descriptor = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent_fd
+                )
+            except OSError as exc:
+                _note(
+                    notes,
+                    Diagnostic(_path_code(exc), "error", f"{artifact} cannot be opened no-follow", artifact),
+                )
+                return _regular_identity(before, lexical)
+            try:
+                opened = os.fstat(descriptor)
+                if not _same_inode(before, opened) or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                    _note(
+                        notes,
+                        Diagnostic(
+                            "E_ARTIFACT_IDENTITY_CHANGED",
+                            "error",
+                            f"{artifact} identity changed between stat and open",
+                            artifact,
+                        ),
+                    )
+                    return _regular_identity(opened, lexical)
+                if not digest:
+                    return _regular_identity(opened, lexical)
+                sha256, refusal = _streamed_digest(descriptor, opened, artifact=artifact)
+                if refusal is not None:
+                    _note(notes, refusal)
+                    return _regular_identity(opened, lexical)
+                return _regular_identity(opened, lexical, sha256=sha256)
+            finally:
+                os.close(descriptor)
+    except storage_lock.StorageLockError as exc:
+        if exc.code == "E_PATH_ABSENT":
+            return ArtifactIdentity(lexical, "absent")
+        _note(
+            notes,
+            Diagnostic(exc.code, "error", f"{artifact} parent chain is not a no-follow real directory", artifact),
+        )
+        return ArtifactIdentity(lexical, "regular_file")
+
+
+def _inventory(
+    path: Path,
+    *,
+    artifact: str,
+    diagnostics: list[Diagnostic] | None = None,
+    digest: bool = True,
+) -> ArtifactIdentity:
+    """Mutation-free no-follow identity of exactly one filesystem entry (S2-02).
+
+    The component chain is inspected through pinned no-follow descriptors: an
+    intermediate symlink or a non-directory intermediate component is fatal
+    there and is reported as a blocker instead of being traversed. A final
+    symlink is inventoried by its exact RAW link string and never resolved.
+    Regular files are digested through ``_digest_regular_path``; hard links and
+    special files are refused.
+    """
+    notes = diagnostics if diagnostics is not None else []
+    lexical = str(path)
+    try:
+        component = inspect_component_chain_nofollow(Path(lexical), anchor=Path("/"))[-1]
+    except StorageLayoutError as exc:
+        _note(
+            notes,
+            Diagnostic(exc.code, "error", f"{artifact} path chain is not a no-follow real path", artifact),
+        )
+        return ArtifactIdentity(lexical, "special")
+    if component.kind != "regular_file":
+        return ArtifactIdentity(
+            lexical,
+            component.kind,
+            component.device,
+            component.inode,
+            component.mode,
+            None,
+            None,
+            None,
+            component.raw_link_target,
+        )
+    if component.nlink != 1:
+        _note(
+            notes,
+            Diagnostic("E_PATH_HARDLINK_UNSAFE", "error", f"{artifact} is a hard-linked regular file", artifact),
+        )
+        return ArtifactIdentity(lexical, "regular_file", component.device, component.inode, component.mode)
+    return _digest_regular_path(Path(lexical), artifact=artifact, notes=notes, digest=digest)
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -562,7 +834,13 @@ def _encode_manifest(manifest: MigrationManifest) -> bytes:
     return _canonical_bytes(asdict(_decode_manifest(asdict(manifest))))
 
 
-def _config_identity(request: MigrationRequest, layout: StorageLayout) -> dict[str, Any]:
+def _config_identity(
+    request: MigrationRequest,
+    layout: StorageLayout,
+    *,
+    source_origin: str = "default",
+    config_view: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """The NONSECRET storage identity hashed into ``config_digest``.
 
     Only canonical storage settings and store locations enter the digest. The
@@ -570,83 +848,573 @@ def _config_identity(request: MigrationRequest, layout: StorageLayout) -> dict[s
     memory content never do: two runs of the same storage layout share one
     digest whatever the operator's secret inputs were.
     """
+    view = config_view or {}
     return {
         "strategy": request.strategy,
         "profile_home": str(request.profile_home),
         "layout": serialize_layout_redacted(layout),
+        "source_sql_origin": source_origin,
+        "raw_config": view.get("raw", {}),
+        "effective_config": view.get("effective", {}),
+        "config_divergence": list(view.get("divergence", ())),
     }
 
 
+def _layout_origins(config_report: Any) -> dict[str, ValueOrigin]:
+    """Origin labels for the frozen layout, taken from the RAW report."""
+    origins = {key: ValueOrigin(kind) for key, kind in config_report.raw_origins.items()}
+    for alias, key in _LAYOUT_ORIGIN_ALIASES.items():
+        origins.setdefault(alias, origins.get(key, ValueOrigin("default")))
+    return origins
+
+
+def _available_bytes(root: Path) -> tuple[int | None, str]:
+    """Free bytes of the filesystem that will own *root*; never a guess.
+
+    The nearest existing ancestor is used because a not-yet-created directory
+    would live on its parent's filesystem. If the kernel refuses to answer, the
+    caller must report ``unknown`` and block instead of inventing a number.
+    """
+    candidate = Path(root)
+    while True:
+        try:
+            return int(shutil.disk_usage(str(candidate)).free), ""
+        except OSError as exc:
+            if candidate == candidate.parent:
+                return None, f"free space could not be proven ({exc.strerror})"
+            candidate = candidate.parent
+
+
+def _bounded_count(connection: sqlite3.Connection, table: str) -> int | str:
+    """Row count of one table, bounded by ``SQLITE_COUNT_CAP``.
+
+    The identifier comes from the database's own schema and is still quoted; a
+    count that reaches the cap is reported as ``"<cap>+"`` instead of a number
+    that pretends to be exact.
+    """
+    quoted = '"' + table.replace('"', '""') + '"'
+    row = connection.execute(
+        f"SELECT COUNT(*) FROM (SELECT 1 FROM {quoted} LIMIT ?)", (SQLITE_COUNT_CAP + 1,)
+    ).fetchone()
+    total = int(row[0]) if row else 0
+    return f"{SQLITE_COUNT_CAP}+" if total > SQLITE_COUNT_CAP else total
+
+
+def _immutable_readonly_probe(source: Path) -> dict[str, Any]:
+    """Bounded metadata queries over an encoded ``immutable=1&mode=ro`` URI.
+
+    Never used while a WAL/SHM/journal exists: ``immutable=1`` is only sound
+    once sidecar absence has established a clean checkpointed image. No
+    SQLiteProvider, SQLAlchemy, aiosqlite, ``PRAGMA wal_checkpoint``, recovery
+    or normal open is involved — one stdlib read-only connection to the source.
+    """
+    uri = "file:" + quote(str(source), safe="/") + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True, timeout=0)
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                " AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?",
+                (MAX_SQLITE_TABLES,),
+            )
+        )
+        counts = {name: _bounded_count(connection, name) for name in tables}
+        integrity_row = connection.execute("PRAGMA integrity_check(1)").fetchone()
+    finally:
+        connection.close()
+    integrity = "ok" if integrity_row and integrity_row[0] == "ok" else "failed"
+    return {"uri": uri, "schema": "known", "integrity": integrity, "tables": tables, "counts": counts}
+
+
+def _sidecar_entries_key(source: Path) -> tuple[Any, ...]:
+    """Identity of the database and all four parent directory entries.
+
+    DETAIL 7.2 requires the database bytes and every sidecar entry to be
+    snapshotted before/after the optional immutable open; the database digest is
+    carried by the surrounding inventory and this key covers the entries.
+    """
+    entries = [source, *(source.with_name(source.name + suffix) for suffix in _SIDECAR_SUFFIXES)]
+    return tuple(
+        _identity_key(_inventory(entry, artifact="sidecar", digest=False)) for entry in entries
+    )
+
+
+def _qualify_sqlite(
+    source: Path, source_identity: ArtifactIdentity, sidecars: Mapping[str, ArtifactIdentity]
+) -> tuple[dict[str, Any], list[Diagnostic]]:
+    """Sidecar-gated SQLite qualification; anything unproven stays ``unknown``."""
+    diagnostics: list[Diagnostic] = []
+    report: dict[str, Any] = {
+        "opened": False,
+        "uri": None,
+        "schema": "unknown",
+        "integrity": "unknown",
+        "tables": (),
+        "counts": {},
+        "outbox_counts": dict(_UNKNOWN_OUTBOX_COUNTS),
+    }
+    if any(item.kind != "absent" for item in sidecars.values()):
+        report["open_policy"] = SQLITE_OPEN_POLICY_PRESENT
+        return report, diagnostics
+    if source_identity.kind != "regular_file" or source_identity.size is None:
+        report["open_policy"] = SQLITE_OPEN_POLICY_NOT_REGULAR
+        return report, diagnostics
+    entries_before = _sidecar_entries_key(source)
+    try:
+        knowledge = _immutable_readonly_probe(source)
+    except sqlite3.Error as exc:
+        report["open_policy"] = SQLITE_OPEN_POLICY_ABSENT
+        diagnostics.append(
+            Diagnostic(
+                "E_SQLITE_INTEGRITY",
+                "error",
+                f"immutable read-only probe could not read the source ({type(exc).__name__})",
+                "sqlite",
+            )
+        )
+        return report, diagnostics
+    report["open_policy"] = SQLITE_OPEN_POLICY_ABSENT
+    report["opened"] = True
+    report.update(knowledge)
+    if entries_before != _sidecar_entries_key(source) or _identity_key(source_identity) != _identity_key(
+        _inventory(source, artifact="source")
+    ):
+        # A difference disables the optimization outright: report unknown.
+        report["schema"] = "unknown"
+        report["integrity"] = "unknown"
+        report["tables"] = ()
+        report["counts"] = {}
+        diagnostics.append(
+            Diagnostic(
+                "E_SQLITE_PROBE_UNSAFE",
+                "error",
+                "source bytes or sidecar entries changed across the immutable probe;"
+                " the read-only optimization is disabled",
+                "sqlite",
+            )
+        )
+        return report, diagnostics
+    if report["integrity"] != "ok":
+        diagnostics.append(
+            Diagnostic("E_SQLITE_INTEGRITY", "error", "PRAGMA integrity_check did not return ok", "sqlite")
+        )
+    return report, diagnostics
+
+
 def plan_profile_migration(request: MigrationRequest) -> MigrationPlan:
-    """Build a strictly read-only migration plan."""
+    """Build a strictly read-only migration plan and dry-run report (S2-02).
+
+    Nothing is created, opened for writing, imported from an embedder or sent
+    over the network. The canonical SQL is selected from the RAW YAML layer
+    (``use_env=False``) and the environment is reported separately, so no
+    autodetection can silently re-select the source. Every identity digest is a
+    streaming size-bounded fd-relative read; the run-directory chain, source,
+    sidecars, config file, parents, targets and legacy candidates are
+    inventoried no-follow, and disk margin, lock state, collisions and the
+    operation plan are populated instead of guessed.
+    """
     if request.mode not in {"dry-run", "apply", "resume", "rollback"}:
         raise ValueError("E_INVALID_MODE")
-    source = Path(request.source_sql or Path(request.profile_home) / "data/memory.db")
-    root = Path(request.target_root or request.profile_home)
+
+    from memory_server.plugins.hermes.config import build_storage_config_report
+
+    config_report = build_storage_config_report(dict(request.raw_config or {}), include_env=True)
+    config_view = config_report.as_dict()
+    raw = config_report.raw
+    diagnostics: list[Diagnostic] = []
+    warnings: list[Diagnostic] = []
+
+    configured_root = (request.configured_data_root or "").strip()
+    data_root: str | Path | None = configured_root or None
+    if data_root is None and request.target_root is not None:
+        data_root = request.target_root
+    if data_root is None:
+        data_root = raw.get("data_root") or "."
+
+    if request.source_sql is not None:
+        source_url = f"{_SQLITE_PREFIX}{Path(request.source_sql)}"
+        source_origin = "request"
+    else:
+        source_url = config_report.canonical_sqlite_url
+        source_origin = (
+            "raw_config"
+            if raw.get("db_url") not in (None, "", CANONICAL_SQLITE_URL)
+            else "default"
+        )
+
     layout = resolve_storage_layout(
         StorageResolutionInputs(
             mode="profile",
             profile_home=request.profile_home,
-            data_root=root,
-            sqlite_url=f"{_SQLITE_PREFIX}{source}",
+            data_root=data_root,
+            sqlite_url=source_url,
+            vector_backend=str(raw.get("vector_backend") or "lancedb"),
+            lancedb_path=str(raw.get("lancedb_path") or "data/lancedb"),
+            graph_snapshot_path=str(raw.get("graph_snapshot_path") or "data/graph.json"),
+            qdrant_location=str(raw.get("qdrant_location") or ":memory:"),
+            vector_collection=str(raw.get("vector_collection") or "memories"),
+            origins=_layout_origins(config_report),
         )
     )
-    sidecars = {
-        suffix: _identity(source.with_name(source.name + suffix))
-        for suffix in _SIDECAR_SUFFIXES
-    }
-    blockers: list[Diagnostic] = []
-    warnings = [
-        Diagnostic(
-            "INFO_LEGACY_PRESERVE", "info", "preserve-only; not imported", "legacy"
+    root = layout.data_root
+
+    if request.source_sql is not None:
+        source = Path(request.source_sql)
+    elif layout.sqlite.local_path is not None:
+        source = layout.sqlite.local_path
+    else:
+        source = Path(request.profile_home) / "data" / "memory.db"
+        source_origin = "unresolved"
+        diagnostics.append(
+            Diagnostic("E_SOURCE_SQL_REQUIRED", "error", "the raw db_url selects no local SQL file", "sqlite")
         )
-    ]
-    if source.exists() and source.is_symlink():
-        blockers.append(
+
+    source_identity = _inventory(source, artifact="source", diagnostics=diagnostics)
+    if source_identity.kind == "absent":
+        diagnostics.append(Diagnostic("E_SOURCE_SQL_REQUIRED", "error", "source SQL is absent", "sqlite"))
+    elif source_identity.kind != "regular_file":
+        diagnostics.append(
+            Diagnostic("E_SOURCE_SQL_NOT_REGULAR", "error", "source SQL is not a regular file", "sqlite")
+        )
+
+    sidecar_paths = {suffix: source.with_name(source.name + suffix) for suffix in _SIDECAR_SUFFIXES}
+    sidecars = {
+        suffix: _inventory(path, artifact=f"sidecar{suffix}", diagnostics=diagnostics)
+        for suffix, path in sidecar_paths.items()
+    }
+    sidecar_matrix = {
+        "wal_present": sidecars["-wal"].kind != "absent",
+        "wal_size": sidecars["-wal"].size,
+        "shm_present": sidecars["-shm"].kind != "absent",
+        "journal_present": sidecars["-journal"].kind != "absent",
+    }
+    for suffix, code in _SIDECAR_CODES.items():
+        identity = sidecars[suffix]
+        if identity.kind == "absent":
+            continue
+        if identity.kind == "symlink":
+            diagnostics.append(
+                Diagnostic("E_PATH_FINAL_SYMLINK_UNSAFE", "error", f"sidecar {suffix} is a symlink", "sqlite")
+            )
+        elif identity.kind != "regular_file":
+            diagnostics.append(
+                Diagnostic("E_PATH_SPECIAL_FILE", "error", f"sidecar {suffix} is not a regular file", "sqlite")
+            )
+        diagnostics.append(
+            Diagnostic(code, "error", f"SQLite sidecar {suffix} is present; dry-run does not open SQLite", "sqlite")
+        )
+    if sidecar_matrix["wal_present"] and not sidecar_matrix["shm_present"]:
+        diagnostics.append(
             Diagnostic(
-                "E_SOURCE_SQL_NOT_REGULAR", "error", "source SQL is not a regular file", "sqlite"
+                "E_SQLITE_SHM_AMBIGUOUS",
+                "error",
+                "WAL is present without an SHM sidecar; writer and cleanup state are ambiguous",
+                "sqlite",
             )
         )
-    for suffix, identity in sidecars.items():
-        if identity.kind != "absent":
-            blockers.append(
+
+    config_path = (
+        Path(request.raw_config_path)
+        if request.raw_config_path is not None
+        else Path(request.profile_home) / CONFIG_FILE_NAME
+    )
+    config_identity = _inventory(config_path, artifact="config", diagnostics=diagnostics)
+
+    target_paths: dict[str, Path] = {
+        "sqlite": source,
+        "graph": layout.graph_snapshot_path,
+        "graph_lock": layout.graph_lock_path,
+        "root_lock": layout.root_lock_path,
+    }
+    if layout.vector.local_path is not None:
+        target_paths["vector"] = layout.vector.local_path
+    targets = {
+        label: _inventory(path, artifact=f"target:{label}", diagnostics=diagnostics)
+        for label, path in target_paths.items()
+    }
+
+    legacy: list[ArtifactIdentity] = []
+    legacy_entries: list[dict[str, Any]] = []
+    legacy_notes: list[Diagnostic] = []
+    candidates: list[tuple[str, Path | None]] = []
+    store_paths = {
+        "sqlite": layout.sqlite.local_path,
+        "vector": layout.vector.local_path,
+        "graph": layout.graph_snapshot_path,
+    }
+    for entry in layout.compatibility:
+        if entry.startswith("legacy-split-layout:"):
+            label = entry.split(":", 1)[1]
+            candidates.append((f"legacy-split-layout:{label}", store_paths.get(label)))
+    profile_local = (
+        ("profile-lancedb", root / "data" / "lancedb"),
+        ("profile-graph", root / "data" / "graph.json"),
+    )
+    for label, path in profile_local:
+        if path not in (layout.vector.local_path, layout.graph_snapshot_path):
+            candidates.append((label, path))
+    seen: set[str] = set()
+    for label, candidate in candidates:
+        if candidate is None or len(legacy) >= MAX_INVENTORY_ENTRIES:
+            continue
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        identity = _inventory(Path(key), artifact=f"legacy:{label}", diagnostics=legacy_notes)
+        if identity.kind == "absent":
+            continue
+        legacy.append(identity)
+        legacy_entries.append(
+            {
+                "artifact": f"legacy:{label}",
+                "path": key,
+                "kind": identity.kind,
+                "raw_link_target": identity.raw_link_target,
+                "sha256": identity.sha256,
+                "disposition": _LEGACY_DISPOSITION,
+            }
+        )
+        if identity.kind == "symlink":
+            warnings.append(
                 Diagnostic(
-                    "E_SQLITE_WAL_ACTIVE" if suffix == "-wal" else "E_SQLITE_SHM_AMBIGUOUS",
-                    "error",
-                    f"SQLite sidecar {suffix} must be absent",
-                    "sqlite",
+                    "W_LEGACY_SPLIT_LAYOUT",
+                    "warning",
+                    f"legacy projection {label} is a symlink; preserve-only, never traversed",
+                    f"legacy:{label}",
                 )
             )
-    targets = {
-        "vector": _identity(layout.vector.local_path or root / "data/lancedb"),
-        "graph": _identity(layout.graph_snapshot_path),
+    for note in legacy_notes:
+        warnings.append(Diagnostic(note.code, "warning", note.message, note.artifact))
+
+    if config_report.divergence:
+        warnings.append(
+            Diagnostic(
+                "INFO_CONFIG_ENV_DIVERGENCE",
+                "info",
+                f"environment would override the raw storage config for {list(config_report.divergence)};"
+                " the canonical SQL is selected from the raw YAML layer",
+                "config",
+            )
+        )
+    warnings.append(
+        Diagnostic(
+            "INFO_CONFIG_SETTINGS_LAYER",
+            "info",
+            "the dry-run report never consults Settings/.env; an effective origin of 'default'"
+            " can still be overridden by that layer at runtime",
+            "config",
+        )
+    )
+
+    required_bytes: int | None = None
+    if source_identity.kind == "regular_file" and source_identity.size is not None:
+        required_bytes = source_identity.size + sum(
+            identity.size
+            for label, identity in targets.items()
+            if label != "sqlite" and identity.kind == "regular_file" and identity.size is not None
+        )
+    else:
+        diagnostics.append(
+            Diagnostic(
+                "E_INSUFFICIENT_SPACE",
+                "error",
+                "required space is unproven: the source size is unknown",
+                "disk",
+            )
+        )
+    available_bytes, disk_error = _available_bytes(root)
+    if available_bytes is None:
+        diagnostics.append(Diagnostic("E_INSUFFICIENT_SPACE", "error", disk_error, "disk"))
+    within_margin: bool | None = None
+    if required_bytes is not None and available_bytes is not None:
+        within_margin = available_bytes >= required_bytes * DISK_MARGIN_RATIO
+        if not within_margin:
+            diagnostics.append(
+                Diagnostic(
+                    "E_INSUFFICIENT_SPACE",
+                    "error",
+                    f"free space {available_bytes} is below required {required_bytes} with margin"
+                    f" {DISK_MARGIN_RATIO}",
+                    "disk",
+                )
+            )
+
+    inspection = storage_lock.inspect_existing_lock_readonly(root)
+    lock_availability = inspection.availability
+    lock_view: dict[str, Any] = {
+        "availability": inspection.availability,
+        "error": inspection.error,
+        "owner": asdict(inspection.owner) if inspection.owner is not None else None,
     }
+    if inspection.availability == "held":
+        diagnostics.append(
+            Diagnostic("E_WRITER_ACTIVE", "error", "an existing storage lock is held by a live writer", "lock")
+        )
+    elif inspection.availability == "unknown":
+        warnings.append(
+            Diagnostic(
+                "E_WRITER_STATE_UNKNOWN",
+                "warning",
+                "runtime writer state is unknown: no conclusive mutation-free lock evidence",
+                "lock",
+            )
+        )
+    if inspection.error:
+        warnings.append(Diagnostic("E_LOCK_ENTRY_UNSAFE", "warning", inspection.error, "lock"))
+
+    sqlite_report, probe_diagnostics = _qualify_sqlite(source, source_identity, sidecars)
+    for diagnostic in probe_diagnostics:
+        _note(diagnostics, diagnostic)
+
+    run_dir = root / RUN_DIRECTORY_NAME / request.run_id
+    manifest_path = run_dir / MANIFEST_FILE_NAME
+    collisions: list[dict[str, Any]] = []
+    for label, path in (("run_directory", run_dir), ("manifest", manifest_path)):
+        identity = _inventory(path, artifact=f"collision:{label}", diagnostics=diagnostics)
+        if identity.kind != "absent":
+            collisions.append({"artifact": label, "path": str(path), "kind": identity.kind})
+    if collisions:
+        diagnostics.append(
+            Diagnostic("E_BACKUP_COLLISION", "error", "a run-owned path for this run id already exists", "run")
+        )
+
+    parents: dict[str, ArtifactIdentity] = {}
+    parent_candidates = [source, *sidecar_paths.values(), config_path, *target_paths.values(), manifest_path]
+    for candidate in parent_candidates:
+        parent = candidate.parent
+        key = str(parent)
+        if key in parents or len(parents) >= MAX_INVENTORY_ENTRIES:
+            continue
+        parents[key] = _inventory(
+            parent, artifact=f"parent:{parent.name or '/'}", diagnostics=diagnostics, digest=False
+        )
+
+    invariance_targets: list[tuple[str, Path, tuple[Any, ...]]] = [
+        ("source", source, _identity_key(source_identity)),
+        ("target:sqlite", source, _identity_key(targets["sqlite"])),
+        *[(f"sidecar{suffix}", path, _identity_key(sidecars[suffix])) for suffix, path in sidecar_paths.items()],
+        *[(f"parent:{key}", Path(key), _identity_key(identity)) for key, identity in parents.items()],
+    ]
+    changed = sorted(
+        {
+            label
+            for label, path, expected in invariance_targets
+            if _identity_key(_inventory(path, artifact=label)) != expected
+        }
+    )
+    if changed:
+        diagnostics.append(
+            Diagnostic(
+                "E_ARTIFACT_IDENTITY_CHANGED",
+                "error",
+                f"artifacts changed across the plan: {changed}; byte/listing invariance failed",
+                "invariance",
+            )
+        )
+
+    operations: list[PlannedOperation] = [PlannedOperation("validate", "sqlite", str(source))]
+    if source_identity.kind == "regular_file":
+        operations.append(PlannedOperation("snapshot", "sqlite", str(source)))
+    for label, identity in sorted(targets.items()):
+        if label == "sqlite" or identity.kind != "regular_file":
+            continue
+        operations.append(PlannedOperation("backup", label, identity.lexical_path))
+    for label in ("vector", "graph"):
+        path = target_paths.get(label)
+        if path is None:
+            continue
+        operations.append(PlannedOperation("rebuild", label, str(path)))
+        operations.append(PlannedOperation("publish", label, str(path)))
+    for identity in legacy:
+        operations.append(PlannedOperation("preserve", "legacy", identity.lexical_path))
+
+    path_checks = [
+        {
+            "artifact": label,
+            "path": identity.lexical_path,
+            "kind": identity.kind,
+            "sha256": identity.sha256,
+            "ok": identity.kind in ("absent", "regular_file", "directory"),
+        }
+        for label, identity in [
+            ("source", source_identity),
+            *[(f"sidecar{suffix}", identity) for suffix, identity in sidecars.items()],
+            ("config", config_identity),
+            *[(f"target:{label}", identity) for label, identity in targets.items()],
+            *[(f"parent:{key}", identity) for key, identity in parents.items()],
+        ]
+    ][:MAX_INVENTORY_ENTRIES]
+
     embedding = EmbeddingPlan(
-        backend="local",
+        backend=str(raw.get("vector_backend") or "lancedb"),
         eligible_records="unknown",
         batches="unknown",
-        digest=_digest([str(source), request.strategy]),
+        digest=_digest([str(source), request.strategy, config_view.get("canonical_sqlite_url")]),
+        network=False,
     )
-    operations = tuple(
-        PlannedOperation("rebuild", kind, str(identity.lexical_path))
-        for kind, identity in targets.items()
-    )
+
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "mode": request.mode,
+        "strategy": request.strategy,
+        "sql_action": SQL_ACTION_PRESERVE_IN_PLACE,
+        "source_sql_origin": source_origin,
+        "source_sql": asdict(source_identity),
+        "source_sidecars": {suffix: asdict(identity) for suffix, identity in sidecars.items()},
+        "sidecars": sidecar_matrix,
+        "config": config_view,
+        "config_file": asdict(config_identity),
+        "target": {
+            "root": str(root),
+            "sqlite": str(source),
+            "vector": str(layout.vector.local_path) if layout.vector.local_path is not None else None,
+            "graph": str(layout.graph_snapshot_path),
+        },
+        "parents": [asdict(identity) for identity in parents.values()],
+        "legacy_projections": legacy_entries,
+        "path_checks": path_checks,
+        "collisions": collisions,
+        "disk": {
+            "required_bytes": required_bytes,
+            "available_bytes": available_bytes,
+            "margin_ratio": DISK_MARGIN_RATIO,
+            "within_margin": within_margin,
+        },
+        "sqlite": sqlite_report,
+        "outbox_counts": dict(_UNKNOWN_OUTBOX_COUNTS),
+        "invariance": {"artifacts": "failed" if changed else "ok", "changed": changed},
+        "lock_availability": lock_availability,
+        "lock": lock_view,
+        "planned_operations": [asdict(operation) for operation in operations],
+        "runtime_stop_instructions": list(_RUNTIME_STOP_INSTRUCTIONS),
+        "proposed_manifest_path": str(manifest_path),
+        "warnings": [asdict(item) for item in warnings],
+        "blockers": [asdict(item) for item in diagnostics],
+    }
+
     return MigrationPlan(
-        1,
-        request,
-        layout,
-        _identity(source),
-        sidecars,
-        (),
-        targets,
-        None,
-        None,
-        "unknown",
-        embedding,
-        operations,
-        tuple(warnings),
-        tuple(blockers),
-        _digest(_config_identity(request, layout)),
+        schema_version=1,
+        request=request,
+        layout=layout,
+        source_sql=source_identity,
+        source_sidecars=sidecars,
+        legacy_projections=tuple(legacy),
+        targets=targets,
+        required_bytes=required_bytes,
+        available_bytes=available_bytes,
+        lock_availability=lock_availability,
+        embedding=embedding,
+        planned_operations=tuple(operations),
+        warnings=tuple(warnings),
+        blockers=tuple(diagnostics),
+        config_digest=_digest(
+            _config_identity(request, layout, source_origin=source_origin, config_view=config_view)
+        ),
+        sql_action=SQL_ACTION_PRESERVE_IN_PLACE,
+        report=report,
     )
 
 

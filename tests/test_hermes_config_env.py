@@ -14,6 +14,7 @@ Env manipulation uses monkeypatch AFTER clearing the vars (teardown restores
 the original environment automatically).
 """
 
+import json
 from types import MappingProxyType
 
 import pytest
@@ -266,3 +267,106 @@ def test_s1_parent_frozen_storage_values_not_replaced_by_supplied_settings(tmp_p
     layout = cfg.resolve_storage_layout(hermes_home=str(tmp_path), settings=synthetic)
     assert layout.vector.local_path == tmp_path / ("env-vectors" if use_env else "data/lancedb")
     assert layout.origins["lancedb_path"].kind == ("env" if use_env else "default")
+
+
+# ---------------------------------------------------------------------------
+# S2-02 -- raw / effective storage configuration report
+#
+# The report is the config half of the S2-02 contract: the RAW YAML layer
+# (``use_env=False``) selects the canonical SQL with ZERO environment reads,
+# the environment is reported SEPARATELY, and the effective value is derived
+# without ever consulting ``Settings``/``.env``.
+# ---------------------------------------------------------------------------
+
+_S202_RAW_BLOCK = {
+    "storage_mode": "profile",
+    "data_root": ".",
+    "db_url": "sqlite+aiosqlite:///data/memory.db",
+    "vector_backend": "lancedb",
+    "lancedb_path": "data/lancedb",
+    "graph_snapshot_path": "data/graph.json",
+}
+
+_S202_REPORT_KEYS = (
+    "db_url",
+    "storage_mode",
+    "data_root",
+    "vector_backend",
+    "lancedb_path",
+    "graph_snapshot_path",
+    "qdrant_location",
+    "vector_collection",
+)
+
+
+def _s202_report_builder():
+    """The config report builder, or a hard failure naming the missing capability."""
+    from memory_server.plugins.hermes import config as config_module
+
+    builder = getattr(config_module, "build_storage_config_report", None)
+    if builder is None:
+        pytest.fail(
+            "S2-02: no raw/effective storage config report exists in "
+            "memory_server.plugins.hermes.config (missing capability on this revision)"
+        )
+    return builder
+
+
+def test_s202_raw_layer_selects_canonical_sql_with_zero_env_reads(clean_env, monkeypatch):
+    """The raw layer is the single canonical-SQL selector and reads no env."""
+    builder = _s202_report_builder()
+    monkeypatch.setenv("MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///env/other.db")
+    monkeypatch.setenv("MEMORY_SERVER_VECTOR_BACKEND", "qdrant")
+
+    raw = builder(_S202_RAW_BLOCK, include_env=False)
+
+    assert raw.canonical_sqlite_url == "sqlite+aiosqlite:///data/memory.db"
+    assert raw.raw["db_url"] == "sqlite+aiosqlite:///data/memory.db"
+    assert raw.raw["vector_backend"] == "lancedb"
+    assert raw.divergence == ()
+    assert raw.settings_consulted is False
+    # With include_env=False no environment key is read at all.
+    assert all(raw.env[key] is None for key in _S202_REPORT_KEYS)
+    assert raw.effective["db_url"] == raw.raw["db_url"]
+
+    effective = builder(_S202_RAW_BLOCK, include_env=True)
+    assert effective.raw == raw.raw
+    assert effective.env["db_url"] == "sqlite+aiosqlite:///env/other.db"
+    assert effective.effective["db_url"] == "sqlite+aiosqlite:///env/other.db"
+    assert effective.effective_origins["db_url"] == "env"
+    assert effective.raw_origins["db_url"] == "yaml"
+    assert effective.divergence == ("db_url", "vector_backend")
+
+
+def test_s202_raw_layer_does_not_touch_environ_or_settings(monkeypatch):
+    """``include_env=False`` must not read os.environ nor construct Settings."""
+    import os as _os
+
+    from memory_server.plugins.hermes import config as config_module
+
+    builder = _s202_report_builder()
+    monkeypatch.setattr(
+        config_module,
+        "get_settings",
+        lambda: (_ for _ in ()).throw(AssertionError("settings read")),
+    )
+    monkeypatch.setattr(config_module.os, "environ", {"MEMORY_SERVER_DB_URL": "sqlite+aiosqlite:///leak.db"})
+
+    raw = builder(_S202_RAW_BLOCK, include_env=False)
+
+    assert raw.raw["db_url"] == "sqlite+aiosqlite:///data/memory.db"
+    assert raw.canonical_sqlite_url == "sqlite+aiosqlite:///data/memory.db"
+    monkeypatch.undo()
+    assert _os.environ is not None
+
+
+def test_s202_raw_report_redacts_sensitive_uri_values(clean_env, monkeypatch):
+    builder = _s202_report_builder()
+    monkeypatch.setenv("MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///env.db?token=SECRETVALUE")
+
+    payload = builder(_S202_RAW_BLOCK, include_env=True).as_dict()
+
+    encoded = json.dumps(payload, sort_keys=True)
+    assert "SECRETVALUE" not in encoded
+    assert payload["canonical_sqlite_url"] == "sqlite+aiosqlite:///data/memory.db"
+    assert "<redacted>" in encoded
