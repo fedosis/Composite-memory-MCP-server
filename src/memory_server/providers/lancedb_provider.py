@@ -19,8 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AbstractSet, Any
 
-import pyarrow as pa
-
 from memory_server.providers.exceptions import (
     ProviderSearchError,
     ProviderWriteError,
@@ -30,6 +28,55 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TABLE = "memories"
 DEFAULT_VECTOR_SIZE = 384
+
+_PAYLOAD_CONTRACT = {
+    "fact": {
+        "subject": str, "predicate": str, "object": str, "source": str,
+        "memory_type": "fact",
+    },
+    "belief": {
+        "proposition": str, "confidence": "number", "tags": "string-list",
+        "source": str, "memory_type": "belief",
+    },
+}
+
+
+def _payload_error(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    memory_type = payload.get("memory_type")
+    contract = _PAYLOAD_CONTRACT.get(memory_type)
+    if contract is None:
+        return "unknown memory_type"
+    expected = set(contract)
+    actual = set(payload)
+    if any(actual == set(other) for name, other in _PAYLOAD_CONTRACT.items() if name != memory_type):
+        return "mismatched memory_type"
+    unknown = sorted(actual - expected)
+    missing = sorted(expected - actual)
+    if unknown:
+        return "unknown payload keys: " + ", ".join(unknown)
+    if missing:
+        return "missing required keys: " + ", ".join(missing)
+    if payload["memory_type"] != memory_type:
+        return "mismatched memory_type"
+    for key, expected_type in contract.items():
+        value = payload[key]
+        if key == "memory_type":
+            valid = value == expected_type
+        elif expected_type == "number":
+            valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+        elif expected_type == "string-list":
+            valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
+        else:
+            valid = isinstance(value, expected_type)
+        if not valid:
+            return f"wrong value type for '{key}'"
+    return None
+
+
+def _has_lancedb_manifest(path: Path) -> bool:
+    return any(path.rglob("*.manifest"))
 
 # Restricted filter contract (CORE-5/6, PROV-4).
 #
@@ -759,7 +806,10 @@ class LanceDBProvider:
         try:
             if not Path(self._db_path).is_dir():
                 raise FileNotFoundError(f"LanceDB store is missing: {self._db_path}")
+            if not _has_lancedb_manifest(Path(self._db_path)):
+                raise ValueError("LanceDB store has no manifest")
             import lancedb
+            import pyarrow as pa
 
             db = await self._run(lancedb.connect, self._db_path)
             table_list = await self._run(db.list_tables)
@@ -789,8 +839,17 @@ class LanceDBProvider:
     ) -> LanceValidation:
         """Validate a real table read-only; missing/corrupt stores are refusals.
 
-        The payload allowlist is exactly ``subject``, ``predicate``, and
-        ``object``, each required and string-typed.  The plain-table metric is
+        Metadata accepts exactly the five-key fact contract (``subject``,
+        ``predicate``, ``object``, ``source`` strings and ``memory_type``
+        ``"fact"``) or the five-key belief contract (``proposition`` and
+        ``source`` strings, numeric ``confidence``, list-of-strings ``tags``,
+        and ``memory_type`` ``"belief"``). Unknown/missing keys, unknown or
+        mismatched discriminators, wrong value types, malformed JSON, and
+        non-object metadata are rejected with cause-specific errors. This
+        allowlist is implemented exactly once here from DETAIL §3.7, as
+        approved by ``map_projection_record``; it is not imported because
+        importing that module would create a dependency cycle.
+        The plain-table metric is
         not persisted by LanceDB 0.34.0, so validation reports the provider's
         normalized metric expectation rather than claiming store proof of it.
         """
@@ -803,7 +862,11 @@ class LanceDBProvider:
             if not Path(self._db_path).is_dir():
                 errors.append("store is missing")
                 return LanceValidation(False, errors=tuple(errors))
+            if not _has_lancedb_manifest(Path(self._db_path)):
+                errors.append("store has no LanceDB manifest")
+                return LanceValidation(False, errors=tuple(errors))
             import lancedb
+            import pyarrow as pa
 
             db = await self._run(lancedb.connect, self._db_path)
             table_list = await self._run(db.list_tables)
@@ -839,10 +902,9 @@ class LanceDBProvider:
                         payload = json.loads(raw)
                         if not isinstance(payload, dict):
                             raise ValueError("payload is not an object")
-                        if set(payload) != {"subject", "predicate", "object"}:
-                            raise ValueError("payload keys are not allowlisted")
-                        if any(not isinstance(payload[key], str) for key in payload):
-                            raise ValueError("payload values must be strings")
+                        payload_error = _payload_error(payload)
+                        if payload_error:
+                            raise ValueError(payload_error)
                     except (TypeError, ValueError, json.JSONDecodeError) as exc:
                         errors.append(f"row {row_number} invalid payload: {exc}")
             return LanceValidation(not errors, duplicate_ids, ids_digest, tuple(errors))
