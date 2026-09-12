@@ -178,4 +178,11 @@ Qdrant + embeddings + semantic router.
 
 Initial MCP API + SQLite provider + `get_context`/`search`/`remember` tools.
 
+### Storage isolation warning
+
+Profile storage now resolves to profile-owned roots. An existing escaping
+vector symlink is deliberately not followed; vector recall is unavailable
+until explicit migration. Non-empty SQLite WAL/SHM blocks migration apply;
+only a clean external runtime shutdown may checkpoint it.
+
 

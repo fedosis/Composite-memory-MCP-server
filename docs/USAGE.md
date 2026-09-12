@@ -411,3 +411,13 @@ archive(fact_id)
 ├── README.md
 └── PLAN.md
 ```
+
+## Storage migration
+
+`memory-server migrate-profile-storage` is a read-only dry-run by default.
+Review its JSON report, then use `--apply --confirm-target <canonical-root>
+--attest-runtimes-stopped <ticket>` only after every CMMS writer is stopped and
+SQLite has no WAL/SHM/journal sidecars. Apply creates a run manifest under
+`.cmms-migrations`; use `--resume` or `--rollback` with the same confirmations.
+Legacy projections are inventory-only (`preserve-only; not imported`).
+

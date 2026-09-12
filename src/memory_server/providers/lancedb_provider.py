@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from memory_server.providers.exceptions import (
@@ -262,6 +263,22 @@ def _normalize_metric(metric: str) -> str:
     }
     return mapping.get(metric.lower(), "cosine")
 
+
+@dataclass(frozen=True)
+class LanceCollectionDescription:
+    table: str
+    vector_size: int
+    row_count: int
+    metric: str
+    ids_digest: str
+
+
+@dataclass(frozen=True)
+class LanceValidation:
+    valid: bool
+    duplicate_ids: tuple[str, ...] = ()
+    ids_digest: str = ""
+    errors: tuple[str, ...] = ()
 
 class LanceDBProvider:
     """Provider wrapping LanceDB for vector storage and search.

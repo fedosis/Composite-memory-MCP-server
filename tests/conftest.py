@@ -28,6 +28,25 @@ def _clear_settings_cache():
 
 
 @pytest.fixture
+def synthetic_storage_env(tmp_path, monkeypatch):
+    """Synthetic-Settings isolation harness (IMPL slice S0, DETAIL 14.1).
+
+    Every provider-touching test in the profile-isolation modules MUST request
+    this fixture *before* constructing a ``HermesProvider``. It scrubs the
+    deployment environment, pins the working directory to ``tmp_path``, injects
+    one synthetic ``Settings`` instance into every module-local
+    ``get_settings`` reference — proving that injection by assertion — and makes
+    every resolved store path fail the test if it lands inside a live CMMS data
+    root. The repository's smoke hook runs pytest where ``memory_server`` may
+    not be importable; the fixture then reports the blocker instead of silently
+    passing.
+    """
+    from tests.synthetic_storage_env import activate_synthetic_storage_env
+
+    return activate_synthetic_storage_env(tmp_path, monkeypatch)
+
+
+@pytest.fixture
 def graph_test_isolation(tmp_path, monkeypatch):
     """Isolate graph tests from the process singleton and live snapshot."""
     from memory_server import server as server_module

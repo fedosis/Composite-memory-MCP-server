@@ -11,11 +11,21 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
+from uuid import uuid4
 
 import typer
 
 from memory_server.paths import cmms_repo_root
+from memory_server.profile_migration import (
+    MigrationPlan,
+    MigrationRequest,
+    MigrationStrategy,
+    apply_profile_migration,
+    plan_profile_migration,
+    resume_profile_migration,
+    rollback_profile_migration,
+)
 
 # Lazy import: server.py imports ``storage`` which may not be installed.
 # Only load it when the ``serve`` subcommand is actually invoked.
@@ -481,9 +491,87 @@ def doctor(
     sys.exit(1 if problems else 0)
 
 
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
+def _migration_dry_run_payload(plan: MigrationPlan, request: MigrationRequest) -> dict:
+    """Stable dry-run report fields (DETAIL 8); nothing is created on disk."""
+    return {
+        "schema_version": 1,
+        "run_id": request.run_id,
+        "mode": "dry-run",
+        "strategy": request.strategy,
+        "source_sql": plan.source_sql.__dict__,
+        "target": {"root": str(plan.layout.data_root)},
+        "lock_availability": plan.lock_availability,
+        "warnings": [warning.__dict__ for warning in plan.warnings],
+        "blockers": [blocker.__dict__ for blocker in plan.blockers],
+        "planned_operations": [
+            operation.__dict__ for operation in plan.planned_operations
+        ],
+        "proposed_manifest_path": str(
+            plan.layout.data_root / ".cmms-migrations" / request.run_id / "manifest.json"
+        ),
+    }
+
+
+@app.command("migrate-profile-storage")
+def migrate_profile_storage(
+    hermes_home: Optional[str] = typer.Option(None, "--hermes-home"),
+    source_sql: Optional[Path] = typer.Option(None, "--source-sql"),
+    target_root: Optional[Path] = typer.Option(None, "--target-root"),
+    strategy: str = typer.Option("rebuild-from-profile-sql", "--strategy"),
+    run_id: Optional[str] = typer.Option(None, "--run-id"),
+    apply: bool = typer.Option(False, "--apply"),
+    confirm_target: Optional[str] = typer.Option(None, "--confirm-target"),
+    attest_runtimes_stopped: Optional[str] = typer.Option(None, "--attest-runtimes-stopped"),
+    confirm_embedding_plan: Optional[str] = typer.Option(None, "--confirm-embedding-plan"),
+    resume: Optional[Path] = typer.Option(None, "--resume"),
+    rollback: Optional[Path] = typer.Option(None, "--rollback"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Plan profile storage migration; mutation requires explicit confirmations."""
+    home = Path(_find_hermes_home(hermes_home))
+    if resume and rollback:
+        raise typer.BadParameter("--resume and --rollback are mutually exclusive")
+    if (resume or rollback) and not apply:
+        raise typer.BadParameter("--apply is required")
+    try:
+        manifest_path = resume or rollback
+        if manifest_path is not None:
+            request = MigrationRequest(
+                home,
+                target_root=target_root,
+                mode="resume" if resume else "rollback",
+                confirm_target=confirm_target,
+                stop_attestation=attest_runtimes_stopped,
+            )
+            if resume:
+                result: dict | object = resume_profile_migration(manifest_path, request)
+            else:
+                result = rollback_profile_migration(manifest_path, request)
+        else:
+            request = MigrationRequest(
+                home,
+                source_sql=source_sql,
+                target_root=target_root,
+                strategy=cast(MigrationStrategy, strategy),
+                run_id=run_id or uuid4().hex,
+                mode="apply" if apply else "dry-run",
+                confirm_target=confirm_target,
+                stop_attestation=attest_runtimes_stopped,
+                embedding_plan_digest=confirm_embedding_plan,
+            )
+            plan = plan_profile_migration(request)
+            if apply:
+                result = apply_profile_migration(plan).__dict__
+            else:
+                result = _migration_dry_run_payload(plan, request)
+        typer.echo(json.dumps(result, default=str, sort_keys=True, indent=2))
+        if not isinstance(result, dict) and getattr(result, "status", "") == "failed":
+            raise typer.Exit(3)
+    except ValueError as exc:
+        typer.echo(json.dumps({"code": str(exc)}))
+        raise typer.Exit(1) from exc
+
+
 
 
 @app.callback(invoke_without_command=True)
