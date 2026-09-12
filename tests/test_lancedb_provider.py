@@ -808,3 +808,97 @@ async def test_s302_real_mapping_fact_and_belief_validates(tmp_path):
         "\n".join(sorted(item["id"] for item in points)).encode("utf-8")
     ).hexdigest()
     assert result.ids_digest == expected_digest
+
+
+# ---------------------------------------------------------------------------
+# S3-05 -- the staged verifier at the REAL LanceDB boundary
+# (DETAIL 10.3; consumer duty R-S302-c: the duplicate-ID diagnostic is consumed)
+# ---------------------------------------------------------------------------
+
+
+def _s305_min_corpus(path: Path) -> str:
+    """A minimal REAL snapshot: one eligible fact, the accepted revision."""
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
+        CREATE TABLE beliefs (id TEXT PRIMARY KEY, proposition TEXT, confidence REAL,
+            source TEXT, tags TEXT, lifecycle_state TEXT);
+        CREATE TABLE decisions (id TEXT PRIMARY KEY, choice TEXT, reason TEXT,
+            context TEXT, lifecycle_state TEXT);
+        CREATE TABLE facts (id TEXT PRIMARY KEY, subject TEXT, predicate TEXT,
+            object TEXT, source TEXT, lifecycle_state TEXT);
+        CREATE TABLE skills (id TEXT PRIMARY KEY, purpose TEXT, steps TEXT,
+            lifecycle_state TEXT);
+        CREATE TABLE outbox_entries (id TEXT PRIMARY KEY, status TEXT, created_at TEXT);
+        INSERT INTO alembic_version VALUES ('0005');
+        INSERT INTO facts VALUES ('f1', 'Widget', 'uses', 'Caddy', 's', 'active');
+        INSERT INTO outbox_entries VALUES ('o1', 'pending', '2026-09-13T00:00:00Z');
+    """)
+    connection.commit()
+    connection.close()
+    return f"sqlite+aiosqlite:///{path}"
+
+
+@pytest.mark.asyncio
+async def test_s305_seam_consumes_the_duplicate_id_diagnostic(tmp_path: Path) -> None:
+    """A store with a duplicated row must be refused, WITH the diagnostic named.
+
+    Two rows carry the SAME id, so the ID *set* is still exactly the expected one
+    and the ID digest matches: only the provider's duplicate-ID diagnostic can
+    catch this, which is why the verifier must consume it (R-S302-c).
+
+    At BASE the unconditional stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    import lancedb
+
+    from memory_server.projection_rebuild import id_digest, verify_staged_projections
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_min_corpus(db_path)
+    vector_path = tmp_path / "staging" / "lancedb"
+    graph_path = tmp_path / "staging" / "graph.json"
+    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "fact:f1"))
+
+    db = lancedb.connect(str(vector_path))
+    payload = json.dumps({
+        "subject": "Widget", "predicate": "uses", "object": "Caddy",
+        "source": "s", "memory_type": "fact",
+    })
+    db.create_table("memories", data=pa.table({
+        "id": pa.array([point_id, point_id], type=pa.utf8()),
+        "vector": pa.array([[0.1, 0.2, 0.3, 0.4], [0.1, 0.2, 0.3, 0.4]], type=pa.list_(pa.float32())),
+        "_metadata": pa.array([payload, payload], type=pa.utf8()),
+    }))
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_path.write_text(json.dumps({
+        "nodes": {
+            "widget": {"id": "widget", "type": "entity", "name": "Widget", "attributes": {}},
+            "caddy": {"id": "caddy", "type": "entity", "name": "Caddy", "attributes": {}},
+        },
+        "edges": [
+            {"source_id": "widget", "target_id": "caddy", "relation": "uses", "attributes": {}}
+        ],
+    }), encoding="utf-8")
+
+    validation = await LanceDBProvider(
+        db_path=str(vector_path), vector_size=4
+    ).validate_collection(expected_ids={point_id}, expected_vector_size=4)
+    assert validation.duplicate_ids == (point_id,)
+    duplicate_digest = hashlib.sha256(f"{point_id}\n{point_id}".encode("utf-8")).hexdigest()
+    assert validation.ids_digest == duplicate_digest, "the digest really covers BOTH rows"
+    assert id_digest({point_id}) != validation.ids_digest, (
+        "the ID SET alone is exactly the expected one: only the duplicate diagnostic can refuse this"
+    )
+
+    verdict = await verify_staged_projections(
+        snapshot_url=url,
+        staging_vector_path=vector_path,
+        staging_graph_path=graph_path,
+        expected_vector_size=4,
+    )
+
+    assert verdict.valid is False, "a duplicated row must refuse the artifact"
+    assert any("duplicate IDs" in error for error in verdict.errors), verdict.errors

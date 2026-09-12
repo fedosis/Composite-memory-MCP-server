@@ -7,10 +7,12 @@ wired into a runtime path yet, and none of these functions touches a store.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AbstractSet, Any, Literal, Mapping, Sequence
 from uuid import NAMESPACE_DNS, uuid5
@@ -62,11 +64,54 @@ class RebuildResult:
 
 @dataclass(frozen=True)
 class ProjectionVerification:
+    """The verdict of ONE staged or published verification.
+
+    The first five fields are the S0 contract and keep their meaning. The S3-05
+    fields are additive and every one of them carries a default, so the S0
+    construction (`ProjectionVerification(True)`) stays valid; the verifier
+    fills them from the ACTUAL reopened artifacts and from the expectation it
+    derives itself from the canonical snapshot.
+    """
+
     valid: bool
     vector_ids_digest: str = ""
     graph_nodes_digest: str = ""
     graph_edges_digest: str = ""
     errors: tuple[str, ...] = ()
+    basis: str = ""
+    artifacts: tuple[str, ...] = ()
+    expected_vector_ids: tuple[str, ...] = ()
+    vector_ids: tuple[str, ...] = ()
+    staging_digest: str = ""
+    vector_table: str = ""
+    vector_dimension: int = 0
+    vector_row_count: int = 0
+    vector_metric: str = ""
+    metric_verifiable: bool = False
+    graph_nodes: tuple[tuple[str, str], ...] = ()
+    graph_edges: tuple[tuple[str, str, str], ...] = ()
+    graph_node_count: int = 0
+    graph_edge_count: int = 0
+    snapshot_integrity: str = ""
+    snapshot_revision: str = ""
+    outbox_counts: Mapping[str, int | str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ExpectedProjection:
+    """The expected projection identity, derived from the canonical corpus only.
+
+    Derived by pure set algebra over the eligible canonical records (addendum
+    A.3.2/A.3.3): nodes by `(id, type)`, edges by `(source_id, target_id,
+    relation)`, vectors by the deterministic point id. It is NOT derived from
+    `RebuildResult`, from a staged store, or from any digest the rebuild
+    computed -- `build_shared_projection_graph` is deliberately not called.
+    """
+
+    eligible_counts: Mapping[str, int]
+    vector_ids: frozenset[str]
+    graph_nodes: frozenset[tuple[str, str]]
+    graph_edges: frozenset[tuple[str, str, str]]
 
 
 def deterministic_vector_id(record_type: str, record_id: str) -> str:
@@ -217,6 +262,471 @@ def graph_id_digests(graph: SimpleGraph) -> tuple[str, str]:
     return id_digest(nodes), id_digest(edges)
 
 
+# ---------------------------------------------------------------------------
+# S3-05 -- independent staged/published verification
+# (DETAIL 10.3, DETAIL.md:637-645 and DETAIL 19.10, DETAIL.md:1077; addendum
+# PART A, sha d3dbdf58f19152d1b6efaffa6eab41954eca95580b78465446a2dbabfb1c5784).
+#
+# This block is the ONE staged/published verification implementation in the
+# project. `profile_migration` (the engine) CALLS it and never re-implements it.
+#
+# The boundaries this block keeps:
+# * The expectation is re-derived HERE from the canonical snapshot the caller
+#   names -- never from `RebuildResult`, from a staged store, or from any digest
+#   the rebuild computed (addendum A.5; matrix S3-05 acceptance 2).
+# * Store-level checks are the S3-02/S3-03 hooks (`describe_collection`,
+#   `validate_collection`, `validate_snapshot`), consumed, not duplicated.
+#   `describe_collection` RAISES while `validate_collection` returns a refusal
+#   object (R-S302-d): both shapes are handled. `_PAYLOAD_CONTRACT` is consumed
+#   as it is -- including its string `source` requirement, so a NULL canonical
+#   `source` refuses the whole artifact (R-S302-g) and the contract is never
+#   weakened here. The duplicate-ID diagnostic is consumed (R-S302-c).
+# * The plain-table metric is NOT artifact evidence on lancedb 0.34.0: the
+#   verdict reports the provider's expectation and marks it unverifiable
+#   (R-S302-a).
+# * `SimpleGraph.load_snapshot` is deliberately NOT used to reopen an artifact:
+#   it would create a `.lock` sibling next to the artifact under verification,
+#   i.e. the verifier would mutate what it verifies. Structural validation stays
+#   with S3-03's read-only no-follow `validate_snapshot`; the exact `(id, type)`
+#   and edge-key sets are read by a bounded no-follow reader here.
+# * A zero-node graph means EMPTY, never complete (R-S303-a), and a NON-EMPTY
+#   canonical corpus can never pass empty digests (acceptance 4).
+# * Every store this module opens is released in a `finally` before the caller
+#   may rename anything (DETAIL 10.3, last bullet). lancedb 0.34.0 exposes no
+#   connection/table `close()` (R-S302-b), so what is released is the provider
+#   or handle THIS module owns -- no more is claimed.
+# ---------------------------------------------------------------------------
+
+_GRAPH_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
+EMPTY_ID_DIGEST = hashlib.sha256(b"").hexdigest()
+
+_OPEN_VERIFICATION_HANDLES: list[str] = []
+
+
+def outstanding_verification_handles() -> tuple[str, ...]:
+    """Stores the verifier opened and has not released yet; empty when released."""
+    return tuple(_OPEN_VERIFICATION_HANDLES)
+
+
+@contextlib.contextmanager
+def _held_verification_handle(label: str):
+    _OPEN_VERIFICATION_HANDLES.append(label)
+    try:
+        yield
+    finally:
+        _OPEN_VERIFICATION_HANDLES.remove(label)
+
+
+_SHARED_NODE_ID_ROUTER = GraphRouter()
+
+
+def _normalized_node_id(value: object) -> str:
+    """The pinned A.3.2 node-id normalization (``GraphRouter._to_node_id``)."""
+    return _SHARED_NODE_ID_ROUTER._to_node_id(str(value))
+
+
+def _prefixed_node_id(prefix: str, value: object) -> str:
+    return _SHARED_NODE_ID_ROUTER._to_node_id(f"{prefix}{value}")
+
+
+def expected_projection(records: Sequence[CanonicalProjectionRecord]) -> ExpectedProjection:
+    """Derive the expected projection identity from the canonical corpus.
+
+    Pure set algebra over the eligible records, in the pinned
+    ``(record_type, record_id)`` order of DETAIL 10.2 and the two-phase
+    construction of addendum A.3.2: phase 1 materialises every implied node with
+    its type, phase 2 creates an edge only between existing nodes and creates no
+    node. ``build_shared_projection_graph`` is NOT called: this derivation must
+    not depend on the rebuild's own output.
+    """
+    ordered = sorted(
+        (record for record in records if is_eligible(record)),
+        key=lambda record: (record.record_type, record.record_id),
+    )
+    counts: dict[str, int] = {}
+    node_types: dict[str, str] = {}
+    vector_ids: set[str] = set()
+    for record in ordered:
+        counts[record.record_type] = counts.get(record.record_type, 0) + 1
+        payload = record.payload
+        if record.record_type == "fact":
+            vector_ids.add(deterministic_vector_id("fact", record.record_id))
+            for name in (payload["subject"], payload["object"]):
+                node_types.setdefault(_normalized_node_id(name), "entity")
+        elif record.record_type == "belief":
+            vector_ids.add(deterministic_vector_id("belief", record.record_id))
+        elif record.record_type == "decision":
+            node_types.setdefault(_prefixed_node_id("decision-", payload["choice"]), "decision")
+        elif record.record_type == "skill":
+            node_types.setdefault(_prefixed_node_id("skill-", payload["purpose"]), "skill")
+    edges: set[tuple[str, str, str]] = set()
+    for record in ordered:
+        payload = record.payload
+        if record.record_type == "fact":
+            edges.add(
+                (
+                    _normalized_node_id(payload["subject"]),
+                    _normalized_node_id(payload["object"]),
+                    str(payload["predicate"]),
+                )
+            )
+        elif record.record_type == "decision":
+            target = _normalized_node_id(payload["context"])
+            if target in node_types:
+                edges.add((_prefixed_node_id("decision-", payload["choice"]), target, "decides"))
+    return ExpectedProjection(
+        eligible_counts=counts,
+        vector_ids=frozenset(vector_ids),
+        graph_nodes=frozenset(node_types.items()),
+        graph_edges=frozenset(edges),
+    )
+
+
+def expected_graph_digests(expected: ExpectedProjection) -> tuple[str, str]:
+    """A.3.3 digest domain: node IDS and edge KEYS, as ``graph_id_digests`` does."""
+    nodes = {node_id for node_id, _ in expected.graph_nodes}
+    edges = {f"{source}|{target}|{relation}" for source, target, relation in expected.graph_edges}
+    return id_digest(nodes), id_digest(edges)
+
+
+@dataclass
+class _ProjectionObservation:
+    """What the verifier ACTUALLY read back out of the artifacts."""
+
+    vector_ids: tuple[str, ...] = ()
+    vector_ids_digest: str = ""
+    vector_table: str = ""
+    vector_dimension: int = 0
+    vector_row_count: int = 0
+    vector_metric: str = ""
+    metric_verifiable: bool = False
+    graph_node_count: int = 0
+    graph_edge_count: int = 0
+    graph_nodes_digest: str = ""
+    graph_edges_digest: str = ""
+    snapshot_integrity: str = ""
+    snapshot_revision: str = ""
+    outbox_counts: Mapping[str, int | str] = field(default_factory=dict)
+
+
+def _add_error(errors: list[str], message: str) -> None:
+    if message not in errors:
+        errors.append(message)
+
+
+def _snapshot_path_from_url(snapshot_url: str) -> Path:
+    """The local file a canonical snapshot URL names, or a refusal."""
+    url = make_url(snapshot_url)
+    database = url.database or ""
+    if database.startswith("file:"):
+        database = database.removeprefix("file:")
+    if url.drivername != "sqlite+aiosqlite" or not database or ":memory:" in database:
+        raise ValueError(f"the snapshot URL is not a local file database: {snapshot_url!r}")
+    if not database.startswith("/"):
+        raise ValueError(f"the snapshot URL is not absolute: {snapshot_url!r}")
+    return Path(database)
+
+
+def _observe_snapshot(
+    snapshot_url: str, observed: _ProjectionObservation, errors: list[str]
+) -> None:
+    """DETAIL 10.3 first bullet: integrity, required tables and the revision.
+
+    The check itself is the engine's ONE snapshot verifier (`verify_snapshot`,
+    S2-03) rather than a second implementation; this module imports it lazily
+    because ``profile_migration`` imports this module at its own import time.
+    """
+    from memory_server import profile_migration
+
+    try:
+        path = _snapshot_path_from_url(snapshot_url)
+    except ValueError as exc:
+        _add_error(errors, str(exc))
+        return
+    verification, diagnostics = profile_migration.verify_snapshot(path)
+    observed.snapshot_integrity = str(verification.get("integrity", "unknown"))
+    observed.snapshot_revision = str(verification.get("alembic_revision") or "")
+    counts = verification.get("outbox_counts")
+    if isinstance(counts, Mapping):
+        observed.outbox_counts = dict(counts)
+    if observed.snapshot_integrity != "ok":
+        _add_error(errors, "the snapshot PRAGMA integrity_check did not return ok")
+    if not verification.get("revision_accepted"):
+        _add_error(errors, "the snapshot Alembic revision is absent, ambiguous or not accepted")
+    for diagnostic in diagnostics:
+        _add_error(errors, f"the snapshot was refused ({diagnostic.code}): {diagnostic.message}")
+
+
+async def _release_provider(provider: Any) -> None:
+    """Release a provider THIS module opened; never claims more (R-S302-b)."""
+    close = getattr(provider, "close", None)
+    if close is None:
+        return
+    result = close()
+    if hasattr(result, "__await__"):
+        await result
+
+
+async def _observe_vector_artifact(
+    expected: ExpectedProjection,
+    artifact_path: Path,
+    observed: _ProjectionObservation,
+    errors: list[str],
+    *,
+    expected_vector_size: int,
+) -> None:
+    """Reopen the vector artifact and compare it with the expectation exactly."""
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    provider = LanceDBProvider(db_path=str(artifact_path), vector_size=expected_vector_size)
+    with _held_verification_handle(f"vector:{artifact_path}"):
+        try:
+            described = False
+            try:
+                description = await provider.describe_collection()
+            except Exception as exc:  # R-S302-d: this hook RAISES on a refusal.
+                _add_error(
+                    errors,
+                    f"vector artifact is unreadable: {type(exc).__name__}: {exc}",
+                )
+            else:
+                described = True
+                observed.vector_table = description.table
+                observed.vector_dimension = description.vector_size
+                observed.vector_row_count = description.row_count
+                observed.vector_metric = description.metric
+                # R-S302-a: an expectation, never store-attested evidence.
+                observed.metric_verifiable = False
+                if description.table != "memories":
+                    _add_error(errors, f"vector table {description.table!r} is not 'memories'")
+                if description.vector_size != expected_vector_size:
+                    _add_error(
+                        errors,
+                        f"vector dimension {description.vector_size} != {expected_vector_size}",
+                    )
+                if description.row_count != len(expected.vector_ids):
+                    _add_error(
+                        errors,
+                        f"vector row count {description.row_count} != {len(expected.vector_ids)}",
+                    )
+            validation = await provider.validate_collection(
+                expected_ids=set(expected.vector_ids), expected_vector_size=expected_vector_size
+            )
+            observed.vector_ids_digest = validation.ids_digest
+            for duplicate in validation.duplicate_ids:
+                _add_error(errors, f"duplicate IDs: {duplicate}")
+            for problem in validation.errors:
+                _add_error(errors, problem)
+            if not validation.errors and not validation.valid:
+                _add_error(errors, "the vector artifact was refused without a cause")
+            if described:
+                actual_ids = await _staged_ids(Path(artifact_path))
+                observed.vector_ids = tuple(sorted(actual_ids))
+                expected_ids = set(expected.vector_ids)
+                if actual_ids != expected_ids:
+                    _add_error(
+                        errors,
+                        "vector ID set mismatch: missing "
+                        f"{sorted(expected_ids - actual_ids)} extra {sorted(actual_ids - expected_ids)}",
+                    )
+                if observed.vector_ids_digest != id_digest(expected_ids):
+                    _add_error(errors, "vector ID digest mismatch")
+        finally:
+            await _release_provider(provider)
+
+
+def _read_graph_snapshot(path: Path) -> Mapping[str, Any]:
+    """Bounded, no-follow, read-only read of a graph snapshot's identity.
+
+    Structural validation is S3-03's ``validate_snapshot`` and is not repeated
+    here; this reader exists because that hook returns counts and
+    attribute-inclusive digests, while the acceptance criteria compare the exact
+    ``(id, type)`` node set and edge-key set. See the block comment for why
+    ``SimpleGraph.load_snapshot`` is not used.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as stream:
+        raw = stream.read(_GRAPH_SNAPSHOT_MAX_BYTES + 1)
+    if len(raw) > _GRAPH_SNAPSHOT_MAX_BYTES:
+        raise ValueError("the graph snapshot exceeds the bounded read size")
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("the graph snapshot is not a JSON object")
+    return data
+
+
+def _observe_graph_artifact(
+    expected: ExpectedProjection, artifact_path: Path, observed: _ProjectionObservation, errors: list[str]
+) -> None:
+    """Validate the graph artifact structurally, then compare its identity."""
+    validation = SimpleGraph.validate_snapshot(Path(artifact_path))
+    if not validation.valid:
+        _add_error(errors, f"graph artifact is invalid: {validation.error}")
+    try:
+        data = _read_graph_snapshot(Path(artifact_path))
+        nodes_raw = data.get("nodes") or {}
+        edges_raw = data.get("edges") or []
+        actual_nodes = {
+            (str(node["id"]), str(node.get("type", "")))
+            for node in (nodes_raw.values() if isinstance(nodes_raw, Mapping) else ())
+            if isinstance(node, Mapping) and "id" in node
+        }
+        edge_keys = [
+            (str(edge.get("source_id")), str(edge.get("target_id")), str(edge.get("relation")))
+            for edge in (edges_raw if isinstance(edges_raw, list) else ())
+            if isinstance(edge, Mapping)
+        ]
+    except Exception as exc:
+        _add_error(errors, f"graph artifact is unreadable: {type(exc).__name__}: {exc}")
+        return
+    node_ids = {node_id for node_id, _ in actual_nodes}
+    observed.graph_node_count = len(actual_nodes)
+    observed.graph_edge_count = len(edge_keys)
+    observed.graph_nodes_digest = id_digest(node_ids)
+    observed.graph_edges_digest = id_digest({f"{s}|{t}|{r}" for s, t, r in edge_keys})
+    if not validation.valid:
+        # The structural refusal already refuses the artifact; its own cause is
+        # in `errors` and the identity above is still reported.
+        return
+    expected_node_ids = {node_id for node_id, _ in expected.graph_nodes}
+    if not actual_nodes and expected_node_ids:
+        _add_error(
+            errors,
+            f"graph artifact is EMPTY (0 nodes) but the canonical corpus implies "
+            f"{len(expected_node_ids)} nodes: zero nodes is never proof of completeness",
+        )
+    if actual_nodes != set(expected.graph_nodes):
+        _add_error(
+            errors,
+            "graph node set mismatch: missing "
+            f"{sorted(set(expected.graph_nodes) - actual_nodes)} "
+            f"extra {sorted(actual_nodes - set(expected.graph_nodes))}",
+        )
+    orphans = sorted(
+        f"{source}|{target}" for source, target, _ in edge_keys if source not in node_ids or target not in node_ids
+    )
+    if orphans:
+        _add_error(errors, "graph artifact has orphan edges: " + ", ".join(orphans))
+    duplicated = sorted(
+        key for key, count in Counter(edge_keys).items() if count > 1
+    )
+    if duplicated:
+        _add_error(
+            errors,
+            "duplicate parallel graph edges (multiplicity > 1): "
+            + ", ".join(f"{source}|{target}|{relation}" for source, target, relation in duplicated),
+        )
+    if set(edge_keys) != set(expected.graph_edges):
+        _add_error(
+            errors,
+            "graph edge set mismatch: missing "
+            f"{sorted(set(expected.graph_edges) - set(edge_keys))} "
+            f"extra {sorted(set(edge_keys) - set(expected.graph_edges))}",
+        )
+    expected_nodes_digest, expected_edges_digest = expected_graph_digests(expected)
+    if observed.graph_nodes_digest != expected_nodes_digest:
+        _add_error(errors, "graph node ID digest mismatch")
+    if observed.graph_edges_digest != expected_edges_digest:
+        _add_error(errors, "graph edge key digest mismatch")
+
+
+def _verification_digest(expected: ExpectedProjection, observed: _ProjectionObservation) -> str:
+    """One deterministic identity over the expectation and what was reopened.
+
+    Deliberately NOT salted with the basis: identical staged and published
+    content must produce an identical digest, which is what lets the engine
+    prove `matches_staged` on a reopened publication.
+    """
+    members = [
+        "counts=" + ",".join(f"{name}:{count}" for name, count in sorted(expected.eligible_counts.items())),
+        "expected_vector_ids=" + id_digest(expected.vector_ids),
+        "expected_nodes=" + expected_graph_digests(expected)[0],
+        "expected_edges=" + expected_graph_digests(expected)[1],
+        "actual_vector_ids=" + observed.vector_ids_digest,
+        "actual_nodes=" + observed.graph_nodes_digest,
+        "actual_edges=" + observed.graph_edges_digest,
+    ]
+    return hashlib.sha256("\n".join(members).encode()).hexdigest()
+
+
+def _empty_verification(basis: str, errors: list[str]) -> ProjectionVerification:
+    return ProjectionVerification(
+        valid=False,
+        graph_nodes_digest=EMPTY_ID_DIGEST,
+        graph_edges_digest=EMPTY_ID_DIGEST,
+        errors=tuple(errors),
+        basis=basis,
+        artifacts=("vector", "graph"),
+        staging_digest=hashlib.sha256("\n".join(sorted(errors)).encode()).hexdigest(),
+    )
+
+
+async def _verify_projection_artifacts(
+    *,
+    basis: str,
+    snapshot_url: str,
+    vector_path: str | Path,
+    graph_path: str | Path,
+    expected_vector_size: int,
+    batch_size: int,
+) -> ProjectionVerification:
+    """The ONE verification body: staged and published differ only by basis."""
+    errors: list[str] = []
+    observed = _ProjectionObservation()
+    try:
+        records = [
+            record async for record in iter_canonical_projection_records(snapshot_url, batch_size=batch_size)
+        ]
+    except Exception as exc:
+        return _empty_verification(
+            basis, [f"the canonical snapshot could not be read: {type(exc).__name__}: {exc}"]
+        )
+    expected = expected_projection(records)
+    if records and not expected.vector_ids and not expected.graph_nodes:
+        _add_error(
+            errors,
+            "the canonical corpus is non-empty but implies no projection at all: "
+            "empty digests must never be accepted as proof",
+        )
+    _observe_snapshot(snapshot_url, observed, errors)
+    await _observe_vector_artifact(
+        expected, Path(vector_path), observed, errors, expected_vector_size=expected_vector_size
+    )
+    _observe_graph_artifact(expected, Path(graph_path), observed, errors)
+    expected_nodes_digest, expected_edges_digest = expected_graph_digests(expected)
+    actual_nodes_digest = observed.graph_nodes_digest or EMPTY_ID_DIGEST
+    actual_edges_digest = observed.graph_edges_digest or EMPTY_ID_DIGEST
+    if observed.graph_nodes_digest != expected_nodes_digest:
+        _add_error(errors, "graph node ID digest does not match the canonical corpus")
+    if observed.graph_edges_digest != expected_edges_digest:
+        _add_error(errors, "graph edge key digest does not match the canonical corpus")
+    return ProjectionVerification(
+        valid=not errors,
+        vector_ids_digest=observed.vector_ids_digest,
+        graph_nodes_digest=actual_nodes_digest,
+        graph_edges_digest=actual_edges_digest,
+        errors=tuple(errors),
+        basis=basis,
+        artifacts=("vector", "graph"),
+        expected_vector_ids=tuple(sorted(expected.vector_ids)),
+        vector_ids=observed.vector_ids,
+        staging_digest=_verification_digest(expected, observed),
+        vector_table=observed.vector_table,
+        vector_dimension=observed.vector_dimension,
+        vector_row_count=observed.vector_row_count,
+        vector_metric=observed.vector_metric,
+        metric_verifiable=observed.metric_verifiable,
+        graph_nodes=tuple(sorted(expected.graph_nodes)),
+        graph_edges=tuple(sorted(expected.graph_edges)),
+        graph_node_count=observed.graph_node_count,
+        graph_edge_count=observed.graph_edge_count,
+        snapshot_integrity=observed.snapshot_integrity,
+        snapshot_revision=observed.snapshot_revision,
+        outbox_counts=observed.outbox_counts,
+    )
+
+
 async def iter_canonical_projection_records(snapshot_url: str, *, batch_size: int):
     """Yield eligible canonical SQL rows ordered by type and id."""
     if batch_size <= 0:
@@ -296,17 +806,32 @@ def _checkpoint_write(path: Path, state: dict[str, Any]) -> None:
 
 
 async def _staged_ids(path: Path) -> set[str]:
+    """The ids currently in a staged/published vector store, handle released.
+
+    S3-04 review residual R-S304-e: this helper used to leave the opened table
+    handle behind. It now releases it in a ``finally`` (lancedb 0.34.0 exposes
+    ``close_lsm_writers()``, not ``close()``) and never creates a directory for a
+    path that does not exist.
+    """
     if not path.exists():
         return set()
+    import asyncio
+
     import lancedb
 
-    db = await __import__("asyncio").to_thread(lancedb.connect, str(path))
-    names = await __import__("asyncio").to_thread(db.table_names)
+    db = await asyncio.to_thread(lancedb.connect, str(path))
+    names = await asyncio.to_thread(db.table_names)
     if "memories" not in names:
         return set()
-    table = await __import__("asyncio").to_thread(db.open_table, "memories")
-    rows = await __import__("asyncio").to_thread(table.to_arrow)
-    return {str(value) for value in rows.column("id").to_pylist()}
+    table = await asyncio.to_thread(db.open_table, "memories")
+    with _held_verification_handle(f"staged_ids:{path}"):
+        try:
+            rows = await asyncio.to_thread(table.to_arrow)
+            return {str(value) for value in rows.column("id").to_pylist()}
+        finally:
+            close = getattr(table, "close_lsm_writers", None)
+            if close is not None:
+                await asyncio.to_thread(close)
 
 
 async def rebuild_projections(
@@ -427,6 +952,64 @@ def embedding_plan_digest_fn(records: Sequence[CanonicalProjectionRecord]) -> st
     return embedding_plan_digest(records)
 
 
-async def verify_staged_projections(*args, **kwargs) -> ProjectionVerification:
-    """Verify staged projections before publication (later slice)."""
-    return ProjectionVerification(True)
+async def verify_staged_projections(
+    *,
+    snapshot_url: str,
+    staging_vector_path: str | Path,
+    staging_graph_path: str | Path,
+    expected_vector_size: int = 384,
+    batch_size: int = 32,
+) -> ProjectionVerification:
+    """Verify the STAGED projections before publication (DETAIL 10.3).
+
+    The canonical snapshot is re-read here to derive the expected identity
+    independently, then the ACTUAL staged artifacts are reopened and compared
+    with it: vector table/schema/dimension/row count/ID set/ID digest/payload
+    contract/duplicate IDs, the graph's structural validity, its exact
+    ``(id, type)`` node set, its exact edge-key set, orphan edges, parallel-edge
+    multiplicity and the ID digests over the A.3.3 domain, plus the snapshot's
+    integrity/table set/Alembic revision. Nothing is inferred from
+    ``RebuildResult`` and no artifact is mutated; every store this call opens is
+    released before it returns, so the caller may rename the staged entries.
+
+    The signature is keyword-only ON PURPOSE. The S2-06 capability gate probes
+    this seam with a single positional argument and treats a qualified refusal as
+    an implemented capability; a keyword-only contract therefore leaves the
+    gate's report exactly as S2-06 wrote it (`implemented=False`), keeps the
+    public `apply`/`resume` refusals unchanged, and leaves opening the gate --
+    and `complete` end-to-end -- to S3-06, which owns that wiring.
+    """
+    return await _verify_projection_artifacts(
+        basis="staged",
+        snapshot_url=snapshot_url,
+        vector_path=staging_vector_path,
+        graph_path=staging_graph_path,
+        expected_vector_size=expected_vector_size,
+        batch_size=batch_size,
+    )
+
+
+async def verify_published_projections(
+    *,
+    snapshot_url: str,
+    published_vector_path: str | Path,
+    published_graph_path: str | Path,
+    expected_vector_size: int = 384,
+    batch_size: int = 32,
+) -> ProjectionVerification:
+    """Reopen the PUBLISHED projections and reverify them before `complete`.
+
+    The same one verification body runs against the published entries, so the
+    reopened publication must reproduce the same expectation (and, through the
+    verdict's identity digest, the same staged identity). A publication that
+    cannot be reopened, or that reopens different, never yields a `verified`
+    checkpoint.
+    """
+    return await _verify_projection_artifacts(
+        basis="published",
+        snapshot_url=snapshot_url,
+        vector_path=published_vector_path,
+        graph_path=published_graph_path,
+        expected_vector_size=expected_vector_size,
+        batch_size=batch_size,
+    )
