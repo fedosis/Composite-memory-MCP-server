@@ -518,3 +518,98 @@ def test_s1_parent_final_link_degraded_startup_preserves_entry(synthetic_storage
     finally:
         provider.shutdown()
     assert before == (link.lstat().st_ino, os.readlink(link), sentinel.read_bytes(), sorted(external.iterdir()))
+
+
+# --------------------------------------------------------------------------- #
+# B02 adversarial guards (holes H-A / H-B from the B01 gate evidence)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def cwd_decoy_live_graph(tmp_path: Path, monkeypatch):
+    """CWD that *looks* like the deployment checkout (``data/graph.json``).
+
+    H-A: ``graph_test_isolation`` used to resolve ``Path("data/graph.json")``
+    relative to the process working directory and ``read_bytes()`` it. When
+    pytest is started from the deployment checkout that path IS the live store.
+    This fixture reproduces the shape with a synthetic decoy and installs a
+    tripwire that fails the test if the decoy is ever read.
+    """
+    decoy_cwd = tmp_path / "deployment-like"
+    decoy_graph = decoy_cwd / "data" / "graph.json"
+    decoy_graph.parent.mkdir(parents=True)
+    decoy_graph.write_bytes(b"decoy-live-graph-not-a-store")
+
+    monkeypatch.chdir(decoy_cwd)
+
+    real_read_bytes = Path.read_bytes
+    decoy_lexical = str(decoy_graph.resolve())
+
+    def guarded_read_bytes(self: Path) -> bytes:
+        if str(self.resolve()) == decoy_lexical:
+            raise AssertionError(
+                "graph fixture read a CWD-relative live-store candidate: "
+                f"{decoy_lexical}"
+            )
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    return decoy_graph
+
+
+def test_graph_test_isolation_never_reads_a_cwd_relative_store(
+    cwd_decoy_live_graph, graph_test_isolation
+) -> None:
+    """B02 / H-A: the graph fixture must be CWD-independent and fail closed."""
+    resolved = Path(str(graph_test_isolation)).resolve()
+    assert resolved.name == "graph.json"
+    assert not str(resolved).startswith(str(cwd_decoy_live_graph.parent.resolve())), (
+        f"snapshot escaped the pytest temporary root: {resolved}"
+    )
+    assert resolved != cwd_decoy_live_graph.resolve()
+
+
+def test_synthetic_harness_pins_home_hermes_home_and_tmpdir(synthetic_storage_env) -> None:
+    """B02 / H-B: HOME, HERMES_HOME and TMPDIR must be pinned synthetically."""
+    from tests.synthetic_storage_env import lexical
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    root = lexical(env.root)
+    pinned = {}
+    for key in ("HOME", "HERMES_HOME", "TMPDIR"):
+        raw = os.environ.get(key)
+        assert raw, f"{key} is not pinned by the synthetic harness"
+        resolved = lexical(raw)
+        assert resolved == root or root in resolved.parents, (
+            f"{key}={resolved} is outside the synthetic root {root}"
+        )
+        pinned[key] = resolved
+    assert lexical("~").resolve() == pinned["HOME"].resolve()
+    assert str(pinned["HOME"]) != "/home/shtorm"
+    assert str(pinned["HERMES_HOME"]) != "/home/shtorm/.hermes"
+
+
+def test_synthetic_harness_child_process_inherits_only_synthetic_home(synthetic_storage_env) -> None:
+    """B02 / H-B: a child process must not see the real HOME/HERMES_HOME/TMPDIR."""
+    import subprocess
+    import sys
+
+    script = (
+        "import os;print('|'.join(str(os.environ.get(k)) for k in "
+        "('HOME', 'HERMES_HOME', 'TMPDIR')))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    home, hermes_home, tmpdir = proc.stdout.strip().split("|")
+    root = str(synthetic_storage_env.root.resolve())
+    for key, value in (("HOME", home), ("HERMES_HOME", hermes_home), ("TMPDIR", tmpdir)):
+        assert value and value != "None", f"{key} missing in the child environment"
+        assert str(Path(value).resolve()).startswith(root), (
+            f"child {key}={value} is outside the synthetic root {root}"
+        )

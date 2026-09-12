@@ -7,8 +7,10 @@ Safety contract (IMPL_RESTART_PLAN slice S0, DETAIL 14.1):
 * the deployment environment keys that can place stores on the live machine are
   removed, and the live extraction/LLM keys are removed with them so a synthetic
   test can never reach a real model endpoint;
-* the working directory is moved into the pytest temporary root, so the
-  standalone/CWD-relative defaults cannot escape it;
+* the working directory is moved into the pytest temporary root, and
+  ``HOME`` / ``HERMES_HOME`` / ``TMPDIR`` are scrubbed and re-pinned inside that
+  root, so the standalone/CWD-relative defaults and the live Hermes config
+  cannot be reached — in this process or in any child it spawns;
 * exactly one synthetic ``Settings`` instance is built and injected into every
   module-local ``get_settings`` reference; the injection is proven by assertion
   before the caller constructs anything;
@@ -62,6 +64,19 @@ LIVE_MODEL_ENV_KEYS: tuple[str, ...] = (
 
 DEPLOYMENT_ENV_KEYS: tuple[str, ...] = STORAGE_ENV_KEYS + LIVE_MODEL_ENV_KEYS
 
+# B02 hole H-B: process-level keys that let code inside a test process (or a
+# child process) resolve a live machine path or live Hermes config. They are
+# scrubbed *before* any memory_server import and re-pinned into the synthetic
+# root, so HOME/HERMES_HOME/TMPDIR are synthetic and provably so.
+PROCESS_ENV_KEYS: tuple[str, ...] = (
+    "HOME",
+    "HERMES_HOME",
+    "TMPDIR",
+)
+
+SCRUBBED_ENV_KEYS: tuple[str, ...] = DEPLOYMENT_ENV_KEYS + PROCESS_ENV_KEYS
+
+
 _SQLITE_PREFIX = "sqlite+aiosqlite:///"
 
 
@@ -114,7 +129,7 @@ def _presence(exclude: Mapping[str, str] | None = None) -> tuple[str, ...]:
     pinned = exclude or {}
     return tuple(
         key
-        for key in DEPLOYMENT_ENV_KEYS
+        for key in SCRUBBED_ENV_KEYS
         if key not in pinned and os.environ.get(key) is not None
     )
 
@@ -131,6 +146,9 @@ class SyntheticStorageEnv:
     present_before_scrub: tuple[str, ...]
     pinned_env: Mapping[str, str] = field(default_factory=dict)
     injected_modules: tuple[Any, ...] = field(default=())
+    home_dir: Path | None = None
+    hermes_home_dir: Path | None = None
+    tmp_dir: Path | None = None
 
     @property
     def injected_module_names(self) -> tuple[str, ...]:
@@ -154,6 +172,25 @@ class SyntheticStorageEnv:
         assert leaked == (), (
             f"deployment environment keys leaked into the synthetic harness: {leaked!r}"
         )
+        # B02 hole H-B: HOME / HERMES_HOME / TMPDIR must be synthetic, inside
+        # the synthetic root, and must drive ``expanduser`` for this process.
+        for key, pinned_path in (
+            ("HOME", self.home_dir),
+            ("HERMES_HOME", self.hermes_home_dir),
+            ("TMPDIR", self.tmp_dir),
+        ):
+            if pinned_path is None:
+                continue
+            assert os.environ.get(key) == str(pinned_path), (
+                f"synthetic harness {key} pin drifted: "
+                f"{os.environ.get(key)!r} != {str(pinned_path)!r}"
+            )
+            _require_contained(pinned_path, self.root, label=f"synthetic {key}")
+        if self.home_dir is not None:
+            assert lexical("~") == lexical(self.home_dir), (
+                "synthetic harness HOME does not drive expanduser: "
+                f"{lexical('~')} != {lexical(self.home_dir)}"
+            )
         assert_not_live(self.root, label="pytest temporary root")
         assert_not_live(self.install_dir, label="synthetic install dir")
         assert_not_live(self.fallback_repo_root, label="synthetic repo-root fallback")
@@ -233,9 +270,9 @@ def provider_store_paths(provider: Any) -> tuple[tuple[str, Path], ...]:
 
 
 def purge_deployment_env(monkeypatch: Any) -> tuple[str, ...]:
-    """Remove every deployment/model env key; return the keys that were present."""
+    """Remove every deployment/model/process env key; return those present."""
     present = _presence()
-    for key in DEPLOYMENT_ENV_KEYS:
+    for key in SCRUBBED_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     return present
 
@@ -255,14 +292,18 @@ def activate_synthetic_storage_env(tmp_path: Path, monkeypatch: Any) -> Syntheti
     """Scrub the deployment environment and inject synthetic Settings.
 
     Returns a guard handle. Call this before constructing any provider; the
-    function itself asserts the injection, the CWD pin and every synthetic root.
+    function itself asserts the injection, the CWD pin, the HOME/HERMES_HOME/
+    TMPDIR pins and every synthetic root.
     """
+    # B02 hole H-B: scrub the deployment/model/process environment *before*
+    # importing any memory_server module, so nothing module-local can capture a
+    # live HOME/HERMES_HOME/TMPDIR, a live store path or a live credential.
+    present_before = purge_deployment_env(monkeypatch)
+
     import memory_server.paths as paths_module
     import memory_server.settings as settings_module
     from memory_server.plugins.hermes import config as config_module
     from memory_server.plugins.hermes import provider as provider_module
-
-    present_before = purge_deployment_env(monkeypatch)
 
     root = lexical(tmp_path)
     install_dir = root / "cmms-install"
@@ -272,10 +313,20 @@ def activate_synthetic_storage_env(tmp_path: Path, monkeypatch: Any) -> Syntheti
     profiles_root = root / "profiles"
     profiles_root.mkdir()
 
+    # B02 hole H-B: synthetic HOME/HERMES_HOME/TMPDIR, inside the synthetic root.
+    # Distinct name from the ``<root>/home`` profile homes the tests build, so
+    # the process HOME never collides with a profile home.
+    home_dir = root / "synthetic-home"
+    hermes_home_dir = home_dir / ".hermes"
+    tmp_dir = root / "tmp"
+    for pinned_path in (home_dir, hermes_home_dir, tmp_dir):
+        pinned_path.mkdir(parents=True, exist_ok=True)
+
     monkeypatch.chdir(root)
 
     settings_module.get_settings.cache_clear()
     settings = settings_module.Settings(
+        _env_file=None,  # B02 H-B: never read a .env from the CWD/deployment
         vector_backend="lancedb",
         lancedb_path=Path("data/lancedb"),
         graph_snapshot_path=Path("data/graph.json"),
@@ -297,6 +348,11 @@ def activate_synthetic_storage_env(tmp_path: Path, monkeypatch: Any) -> Syntheti
         "MEMORY_SERVER_VECTOR_BACKEND": "lancedb",
         "MEMORY_SERVER_LANCEDB_PATH": "data/lancedb",
         "MEMORY_SERVER_GRAPH_SNAPSHOT_PATH": "data/graph.json",
+        # B02 hole H-B: process-level keys, so nothing in-process or in a child
+        # process can resolve a live machine path or live Hermes config.
+        "HOME": str(home_dir),
+        "HERMES_HOME": str(hermes_home_dir),
+        "TMPDIR": str(tmp_dir),
     }
     for key, value in pinned_env.items():
         monkeypatch.setenv(key, value)
@@ -306,10 +362,13 @@ def activate_synthetic_storage_env(tmp_path: Path, monkeypatch: Any) -> Syntheti
         install_dir=install_dir,
         fallback_repo_root=fallback_repo_root,
         settings=settings,
-        scrubbed_keys=DEPLOYMENT_ENV_KEYS,
+        scrubbed_keys=SCRUBBED_ENV_KEYS,
         present_before_scrub=present_before,
         pinned_env=pinned_env,
         injected_modules=injected_modules,
+        home_dir=home_dir,
+        hermes_home_dir=hermes_home_dir,
+        tmp_dir=tmp_dir,
     )
     for module in injected_modules:
         assert getattr(module, "get_settings")() is settings
