@@ -20,6 +20,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, cast
+from urllib.parse import quote
 
 import pytest
 
@@ -1312,3 +1313,531 @@ def test_s202_report_is_json_serializable_and_bounded(tmp_path: Path, synthetic_
     assert _s202_section(plan, "config_file", "kind") == "regular_file"
     assert (home / "config.yaml").stat().st_size > 65536
     assert re.fullmatch(r"[0-9a-f]{64}", str(_s202_section(plan, "config_file", "sha256")))
+
+
+# ---------------------------------------------------------------------------
+# S2-03 -- qualified SQLite transaction probe and run-directory safety snapshot
+#
+# DETAIL 6.3 step 10, 7.3 and 10.1. Every node below addresses a behaviour the
+# pre-fix module does not have: the exact bounded ``BEGIN IMMEDIATE`` /
+# ``ROLLBACK`` write-lock probe (never an ``immutable=1`` read-only URI), its
+# byte/entry/parent invariance proof on a sidecar-free regular source, the
+# competing-writer refusal that proves write-lock exclusion, the
+# ``sqlite3.Connection.backup`` safety snapshot taken from a percent-encoded
+# immutable read-only source URI, and the snapshot's integrity / schema /
+# Alembic revision / ID / outbox verification read back from the RUN DIRECTORY
+# instead of the live source. Accessors are shape-tolerant so that the filed RED
+# on the parent commit is a behavioural assertion failure and never a collection
+# ``ImportError`` or a helper ``KeyError``.
+# ---------------------------------------------------------------------------
+
+S203_HEAD_REVISION = "7a1b2c3d4e5f"
+S203_REQUIRED_CODES = ("E_SQLITE_PROBE_UNSAFE", "E_SQLITE_SCHEMA", "E_BACKUP_COLLISION")
+
+
+def _s203_qualify(source: Path, run_dir: Path, **kwargs: Any) -> tuple[dict[str, Any], list[Any]]:
+    """Call the S2-03 qualifier, or ``({}, [])`` on a module that lacks it."""
+    api = getattr(profile_migration, "qualify_sqlite_source", None)
+    if api is None:
+        return {}, []
+    report, diagnostics = api(source, run_dir=run_dir, **kwargs)
+    return dict(report), list(diagnostics)
+
+
+def _s203_verify(snapshot_path: Path, **kwargs: Any) -> tuple[dict[str, Any], list[Any]]:
+    """Call the S2-03 snapshot verification, or ``({}, [])`` when absent."""
+    api = getattr(profile_migration, "verify_snapshot", None)
+    if api is None:
+        return {}, []
+    report, diagnostics = api(snapshot_path, **kwargs)
+    return dict(report), list(diagnostics)
+
+
+def _s203_section(report: Mapping[str, Any], *path: str) -> Any:
+    """Nested lookup yielding ``{}`` for anything the module does not report."""
+    current: Any = report
+    for key in path:
+        if not isinstance(current, Mapping) or key not in current:
+            return {}
+        current = current[key]
+    return current
+
+
+def _s203_codes(diagnostics: list[Any]) -> list[str]:
+    return [str(getattr(item, "code", "")) for item in diagnostics]
+
+
+def _s203_uri(source: Path, query: str) -> str:
+    return "file:" + quote(str(source), safe="/") + "?" + query
+
+
+def _s203_seed_canonical_db(
+    path: Path, *, journal_mode: str | None = None, revision: str = S203_HEAD_REVISION
+) -> Path:
+    """A synthetic, sidecar-free database carrying the snapshot's target schema."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        if journal_mode is not None:
+            connection.execute(f"PRAGMA journal_mode={journal_mode}")
+        connection.execute("create table alembic_version(version_num text)")
+        connection.execute("insert into alembic_version values(?)", (revision,))
+        connection.execute("create table facts(id text, subject text)")
+        connection.executemany(
+            "insert into facts values(?,?)", [(f"fact-{index}", f"subject-{index}") for index in range(3)]
+        )
+        connection.execute("create table outbox_entries(id text, status text)")
+        connection.executemany(
+            "insert into outbox_entries values(?,?)",
+            [
+                ("outbox-1", "pending"),
+                ("outbox-2", "pending"),
+                ("outbox-3", "completed"),
+                ("outbox-4", "failed"),
+                ("outbox-5", "processing"),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def _s203_header_modes(path: Path) -> tuple[int, int]:
+    header = path.read_bytes()[:20]
+    return header[18], header[19]
+
+
+def _s203_run_dir(tmp_path: Path) -> Path:
+    return tmp_path / "run" / "0123456789abcdef0123456789abcdef"
+
+
+def _s203_sidecar_paths(db_path: Path) -> tuple[Path, ...]:
+    return tuple(db_path.with_name(db_path.name + suffix) for suffix in ("-wal", "-shm", "-journal"))
+
+
+def test_s203_module_under_test_is_the_tree_that_owns_this_test_file() -> None:
+    """The loaded module is the tree under test, never the ambient agent venv."""
+    module_path = Path(profile_migration.__file__).resolve()
+    assert Path(__file__).resolve().parents[1] in module_path.parents
+    digest = hashlib.sha256(module_path.read_bytes()).hexdigest()
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    print(f"module under test: {module_path} sha256={digest}")
+
+
+def test_s203_sidecar_free_rollback_source_probe_is_byte_and_entry_invariant(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    assert _s203_header_modes(db_path) == (1, 1)
+    run_dir = _s203_run_dir(tmp_path)
+    before = _tree_snapshot(home)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    assert diagnostics == []
+    probe = _s203_section(report, "probe")
+    assert probe.get("policy") == "sidecars_absent_writable_probe"
+    assert probe.get("performed") is True
+    assert probe.get("in_transaction") is True
+    assert probe.get("rolled_back") is True
+    assert probe.get("qualified") is True
+    assert probe.get("unsafe") is False
+    assert probe.get("journal_mode_header") == "rollback"
+    assert probe.get("failure") is None
+    assert probe.get("sql") == ["BEGIN IMMEDIATE", "ROLLBACK"]
+    uri = str(probe.get("uri"))
+    assert uri == _s203_uri(db_path, "mode=rw")
+    assert "immutable" not in uri
+    assert _s203_section(report, "probe", "invariance", "artifacts") == "ok"
+    assert _s203_section(report, "probe", "invariance", "parent") == "ok"
+    # ROLLBACK left the database, every sidecar and the parent listing unchanged.
+    assert _tree_snapshot(home) == before
+    assert [path for path in _s203_sidecar_paths(db_path) if path.exists()] == []
+
+
+def test_s203_sidecar_free_wal_source_probe_is_byte_and_entry_invariant(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db", journal_mode="wal")
+    # The image is WAL-mode but sidecar-free: header write/read version 2.
+    assert _s203_header_modes(db_path) == (2, 2)
+    assert [path for path in _s203_sidecar_paths(db_path) if path.exists()] == []
+    run_dir = _s203_run_dir(tmp_path)
+    before = _tree_snapshot(home)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    assert diagnostics == []
+    probe = _s203_section(report, "probe")
+    assert probe.get("journal_mode_header") == "wal"
+    assert probe.get("performed") is True
+    assert probe.get("qualified") is True
+    assert _s203_section(report, "probe", "invariance", "artifacts") == "ok"
+    assert _s203_section(report, "probe", "invariance", "parent") == "ok"
+    # A WAL-mode source is probed without creating a WAL, an SHM or a journal.
+    assert _tree_snapshot(home) == before
+    assert [path for path in _s203_sidecar_paths(db_path) if path.exists()] == []
+
+
+def test_s203_probe_records_the_exact_runtime_triple_and_encoded_uri(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    # A space in the path proves the probe URI is percent-encoded too.
+    db_path = _s203_seed_canonical_db(home / "data" / "my memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+
+    report, _ = _s203_qualify(db_path, run_dir)
+
+    runtime = _s203_section(report, "probe", "runtime")
+    assert runtime.get("sqlite_version") == sqlite3.sqlite_version
+    assert runtime.get("sqlite3_module") == getattr(sqlite3, "version", "unknown")
+    assert runtime.get("python") == ".".join(str(part) for part in sys.version_info[:3])
+    assert runtime.get("platform") == sys.platform
+    assert re.fullmatch(r"[0-9a-f]{64}", str(runtime.get("digest")))
+    uri = str(_s203_section(report, "probe", "uri"))
+    assert uri.startswith("file:")
+    assert "my%20memory.db" in uri
+    assert " " not in uri
+    assert uri.endswith("?mode=rw")
+    assert "immutable" not in uri
+
+
+def test_s203_probe_proves_write_lock_exclusion_against_a_competing_writer(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    before = _tree_snapshot(home)
+    observed: dict[str, Any] = {}
+
+    def _competing_writer() -> None:
+        """An independent connection is refused while the probe holds the lock."""
+        try:
+            connection = sqlite3.connect(
+                _s203_uri(db_path, "mode=rw"), uri=True, timeout=0, isolation_level=None
+            )
+        except sqlite3.Error as exc:  # pragma: no cover - open refusal is also a refusal
+            observed["open"] = f"{type(exc).__name__}: {exc}"
+            return
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            observed["begin_immediate"] = "acquired"
+            connection.execute("ROLLBACK")
+        except sqlite3.Error as exc:
+            observed["begin_immediate"] = f"{type(exc).__name__}: {exc}"
+            observed["sqlite_errorname"] = getattr(exc, "sqlite_errorname", None)
+        finally:
+            connection.close()
+
+    report, diagnostics = _s203_qualify(db_path, run_dir, while_locked=_competing_writer)
+
+    assert diagnostics == []
+    assert observed.get("begin_immediate", "") != "acquired"
+    assert "database is locked" in str(observed.get("begin_immediate", ""))
+    assert observed.get("sqlite_errorname") == "SQLITE_BUSY"
+    recorded = _s203_section(report, "probe", "competing_writer")
+    assert recorded.get("attempted") is True
+    assert recorded.get("refused") is True
+    assert recorded.get("sqlite_errorname") == "SQLITE_BUSY"
+    assert _s203_section(report, "probe", "qualified") is True
+    # The observation hook and the refusal left the source untouched.
+    assert _tree_snapshot(home) == before
+    assert [path for path in _s203_sidecar_paths(db_path) if path.exists()] == []
+
+
+def test_s203_probe_refuses_when_a_live_writer_holds_the_database(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    holder = sqlite3.connect(_s203_uri(db_path, "mode=rw"), uri=True, timeout=0, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        report, diagnostics = _s203_qualify(db_path, run_dir)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    assert "E_SQLITE_PROBE_UNSAFE" in _s203_codes(diagnostics)
+    probe = _s203_section(report, "probe")
+    assert probe.get("qualified") is False
+    assert probe.get("unsafe") is True
+    assert probe.get("rolled_back") in (False, None)
+    assert _s203_section(report, "probe", "failure", "sqlite_errorname") == "SQLITE_BUSY"
+    # The exact attempted URI is recorded even when the probe could not take the
+    # lock, and it is never the immutable read-only one.
+    attempted = str(probe.get("uri"))
+    assert attempted.endswith("?mode=rw")
+    assert "immutable" not in attempted
+    # No snapshot may be created from an unqualified source.
+    assert _s203_section(report, "snapshot") is None
+    assert not (run_dir / "snapshot").exists()
+
+
+def test_s203_probe_reports_unsafe_when_a_parent_entry_appears_mid_probe(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    planted = db_path.with_name(db_path.name + "-journal")
+
+    def _plant_entry() -> None:
+        planted.write_bytes(b"")
+
+    report, diagnostics = _s203_qualify(db_path, run_dir, while_locked=_plant_entry)
+
+    assert "E_SQLITE_PROBE_UNSAFE" in _s203_codes(diagnostics)
+    assert _s203_section(report, "probe", "invariance", "artifacts") == "failed"
+    assert _s203_section(report, "probe", "unsafe") is True
+    assert _s203_section(report, "probe", "qualified") is False
+    assert _s203_section(report, "snapshot") is None
+    assert not (run_dir / "snapshot").exists()
+
+
+def test_s203_sidecar_present_source_is_never_probed_or_snapshotted(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db", journal_mode="wal")
+    wal = db_path.with_name(db_path.name + "-wal")
+    shm = db_path.with_name(db_path.name + "-shm")
+    wal.write_bytes(b"")
+    shm.write_bytes(b"")
+    run_dir = _s203_run_dir(tmp_path)
+    before = _tree_snapshot(home)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    codes = _s203_codes(diagnostics)
+    assert "E_SQLITE_WAL_ACTIVE" in codes
+    assert "E_SQLITE_SHM_AMBIGUOUS" in codes
+    probe = _s203_section(report, "probe")
+    assert probe.get("policy") == "sidecars_present_no_probe"
+    assert probe.get("performed") is False
+    assert probe.get("uri") is None
+    assert _s203_section(report, "snapshot") is None
+    assert not (run_dir / "snapshot").exists()
+    # No recovery, no checkpoint: the planted sidecars are byte-identical.
+    assert _tree_snapshot(home) == before
+    assert wal.read_bytes() == b""
+    assert shm.read_bytes() == b""
+
+
+def test_s203_snapshot_uses_the_backup_api_from_an_immutable_readonly_uri(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "my memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    before = _tree_snapshot(home)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    assert "E_SQLITE_PROBE_UNSAFE" not in _s203_codes(diagnostics)
+    snapshot = _s203_section(report, "snapshot")
+    snapshot_path = Path(str(snapshot.get("path")))
+    assert run_dir in snapshot_path.parents
+    assert snapshot_path.is_file()
+    assert snapshot.get("created") is True
+    assert snapshot.get("api") == "sqlite3.Connection.backup"
+    source_uri = str(snapshot.get("source_uri"))
+    assert source_uri == _s203_uri(db_path, "mode=ro&immutable=1")
+    assert "my%20memory.db" in source_uri
+    assert " " not in source_uri
+    assert re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get("snapshot_sha256")))
+    assert snapshot.get("size") == snapshot_path.stat().st_size
+    # No WAL/SHM copied, no checkpoint, no recovery: the source tree is identical.
+    assert _tree_snapshot(home) == before
+    assert sorted(path.name for path in snapshot_path.parent.iterdir()) == [snapshot_path.name]
+    assert not (home / "data" / "my memory.db-wal").exists()
+    assert not (home / "data" / "my memory.db-shm").exists()
+
+
+def test_s203_snapshot_verification_reports_schema_revision_ids_and_outbox(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+
+    report, _ = _s203_qualify(db_path, run_dir)
+
+    verification = _s203_section(report, "snapshot", "verification")
+    assert verification.get("integrity") == "ok"
+    assert verification.get("schema") == "known"
+    tables = set(verification.get("tables", ()))
+    assert {"alembic_version", "facts", "outbox_entries"} <= tables
+    assert verification.get("alembic_revision") == S203_HEAD_REVISION
+    assert verification.get("revision_accepted") is True
+    facts = _s203_section(verification, "ids", "facts")
+    assert facts.get("count") == 3
+    assert re.fullmatch(r"[0-9a-f]{64}", str(facts.get("digest")))
+    assert re.fullmatch(r"[0-9a-f]{64}", str(verification.get("ids_digest")))
+    assert verification.get("outbox_counts") == {
+        "pending": 2,
+        "processing": 1,
+        "completed": 1,
+        "failed": 1,
+    }
+    assert tuple(verification.get("unexpected_outbox_statuses", ())) == ()
+
+
+def test_s203_snapshot_verification_reads_the_run_dir_copy_not_the_live_source(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    report, _ = _s203_qualify(db_path, run_dir)
+    snapshot_path = Path(str(_s203_section(report, "snapshot", "path")))
+    assert snapshot_path.is_file()
+
+    live = sqlite3.connect(db_path)
+    try:
+        live.execute("insert into facts values('post-snapshot','x')")
+        live.execute("insert into outbox_entries values('outbox-6','pending')")
+        live.commit()
+    finally:
+        live.close()
+
+    verified, diagnostics = _s203_verify(snapshot_path)
+
+    assert diagnostics == []
+    assert _s203_section(verified, "ids", "facts", "count") == 3
+    assert _s203_section(verified, "outbox_counts", "pending") == 2
+    after = sqlite3.connect(db_path)
+    try:
+        assert after.execute("select count(*) from facts").fetchone()[0] == 4
+        assert after.execute("select count(*) from outbox_entries").fetchone()[0] == 6
+    finally:
+        after.close()
+
+
+def test_s203_snapshot_with_an_unaccepted_revision_blocks_with_a_stable_code(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db", revision="deadbeef0000")
+    run_dir = _s203_run_dir(tmp_path)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    assert "E_SQLITE_SCHEMA" in _s203_codes(diagnostics)
+    verification = _s203_section(report, "snapshot", "verification")
+    assert verification.get("alembic_revision") == "deadbeef0000"
+    assert verification.get("revision_accepted") is False
+    assert _s203_section(report, "probe", "qualified") is True
+
+
+def test_s203_snapshot_never_overwrites_an_existing_run_artifact(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    existing = run_dir / "snapshot" / "memory.db"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"PRE-EXISTING-RUN-ARTIFACT")
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    assert "E_BACKUP_COLLISION" in _s203_codes(diagnostics)
+    assert _s203_section(report, "snapshot", "created") is False
+    assert existing.read_bytes() == b"PRE-EXISTING-RUN-ARTIFACT"
+
+
+def test_s203_snapshot_refuses_a_symlinked_run_artifact_directory(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run_dir.mkdir(parents=True)
+    (run_dir / "snapshot").symlink_to(outside, target_is_directory=True)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    assert "E_PATH_FINAL_SYMLINK_UNSAFE" in _s203_codes(diagnostics)
+    assert _s203_section(report, "snapshot", "created") is False
+    assert list(outside.iterdir()) == []
+
+
+def test_s203_snapshot_refuses_a_special_file_at_the_run_artifact_path(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    fifo_dir = run_dir / "snapshot"
+    fifo_dir.mkdir(parents=True)
+    os.mkfifo(fifo_dir / "memory.db")
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    assert "E_PATH_SPECIAL_FILE" in _s203_codes(diagnostics)
+    assert _s203_section(report, "snapshot", "created") is False
