@@ -10,12 +10,16 @@ EmbeddingProvider abstraction.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import AbstractSet, Any
+
+import pyarrow as pa
 
 from memory_server.providers.exceptions import (
     ProviderSearchError,
@@ -741,6 +745,116 @@ class LanceDBProvider:
         except Exception as exc:
             logger.warning("Failed to delete point %s: %s", point_id, exc)
             raise ProviderWriteError(f"lancedb delete failed: {exc}") from exc
+
+    async def describe_collection(self, collection: str | None = None) -> LanceCollectionDescription:
+        """Describe an existing table without creating or mutating storage.
+
+        LanceDB 0.34.0 does not persist a metric for an unindexed plain table.
+        Consequently ``metric`` is this provider's normalized expectation, not
+        store-attested metadata; an index's distance type is not inferred here.
+        """
+        table_name = collection or self._table_name
+        db = None
+        table = None
+        try:
+            if not Path(self._db_path).is_dir():
+                raise FileNotFoundError(f"LanceDB store is missing: {self._db_path}")
+            import lancedb
+
+            db = await self._run(lancedb.connect, self._db_path)
+            table_list = await self._run(db.list_tables)
+            table_names = getattr(table_list, "tables", table_list)
+            if table_name not in table_names:
+                raise ValueError(f"table '{table_name}' is missing")
+            table = await self._run(db.open_table, table_name)
+            schema = table.schema
+            vector_field = schema.field("vector")
+            if not pa.types.is_fixed_size_list(vector_field.type):
+                raise ValueError("vector field is not fixed-size")
+            arrow = await self._run(table.to_arrow)
+            ids = [str(value) for value in arrow.column("id").to_pylist()]
+            return LanceCollectionDescription(
+                table=table_name,
+                vector_size=vector_field.type.list_size,
+                row_count=arrow.num_rows,
+                metric=self._metric,
+                ids_digest=self._ids_digest(ids),
+            )
+        finally:
+            if table is not None:
+                table.close_lsm_writers()
+
+    async def validate_collection(
+        self, *, expected_ids: AbstractSet[str], expected_vector_size: int
+    ) -> LanceValidation:
+        """Validate a real table read-only; missing/corrupt stores are refusals.
+
+        The payload allowlist is exactly ``subject``, ``predicate``, and
+        ``object``, each required and string-typed.  The plain-table metric is
+        not persisted by LanceDB 0.34.0, so validation reports the provider's
+        normalized metric expectation rather than claiming store proof of it.
+        """
+        table = None
+        errors: list[str] = []
+        duplicate_ids: tuple[str, ...] = ()
+        ids_digest = ""
+        table_name = self._table_name
+        try:
+            if not Path(self._db_path).is_dir():
+                errors.append("store is missing")
+                return LanceValidation(False, errors=tuple(errors))
+            import lancedb
+
+            db = await self._run(lancedb.connect, self._db_path)
+            table_list = await self._run(db.list_tables)
+            table_names = getattr(table_list, "tables", table_list)
+            if table_name not in table_names:
+                errors.append(f"table '{table_name}' is missing")
+                return LanceValidation(False, errors=tuple(errors))
+            table = await self._run(db.open_table, table_name)
+            schema = table.schema
+            names = set(schema.names)
+            if not {"id", "vector", "_metadata"}.issubset(names):
+                errors.append("schema is missing required fields")
+            vector_field = schema.field("vector") if "vector" in names else None
+            if vector_field is None or not pa.types.is_fixed_size_list(vector_field.type):
+                errors.append("vector field is not fixed-size")
+            elif vector_field.type.list_size != expected_vector_size:
+                errors.append(f"vector dimension {vector_field.type.list_size} != {expected_vector_size}")
+            arrow = await self._run(table.to_arrow)
+            ids = [str(value) for value in arrow.column("id").to_pylist()] if "id" in names else []
+            ids_digest = self._ids_digest(ids)
+            counts = {value: ids.count(value) for value in set(ids)}
+            duplicate_ids = tuple(sorted(value for value, count in counts.items() if count > 1))
+            if duplicate_ids:
+                errors.append("duplicate IDs: " + ", ".join(duplicate_ids))
+            actual = set(ids)
+            if actual != set(expected_ids):
+                errors.append("ID set mismatch")
+            if ids_digest != self._ids_digest(expected_ids):
+                errors.append("ID digest mismatch")
+            if "_metadata" in names:
+                for row_number, raw in enumerate(arrow.column("_metadata").to_pylist()):
+                    try:
+                        payload = json.loads(raw)
+                        if not isinstance(payload, dict):
+                            raise ValueError("payload is not an object")
+                        if set(payload) != {"subject", "predicate", "object"}:
+                            raise ValueError("payload keys are not allowlisted")
+                        if any(not isinstance(payload[key], str) for key in payload):
+                            raise ValueError("payload values must be strings")
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        errors.append(f"row {row_number} invalid payload: {exc}")
+            return LanceValidation(not errors, duplicate_ids, ids_digest, tuple(errors))
+        except Exception as exc:
+            return LanceValidation(False, duplicate_ids, ids_digest, (f"unreadable store: {exc}",))
+        finally:
+            if table is not None:
+                table.close_lsm_writers()
+
+    @staticmethod
+    def _ids_digest(ids) -> str:
+        return hashlib.sha256("\n".join(sorted(str(value) for value in ids)).encode("utf-8")).hexdigest()
 
     async def optimize(
         self,

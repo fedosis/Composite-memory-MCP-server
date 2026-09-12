@@ -1,9 +1,14 @@
 """Tests for LanceDB provider (Card 001 — v0.10)."""
 
+import hashlib
+import json
+import shutil
 import tempfile
 import uuid
 from datetime import timedelta
+from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from memory_server.providers.lancedb_provider import LanceDBProvider
@@ -608,3 +613,134 @@ class TestLanceDBSafeContract:
         assert [r["id"] for r in results] == ["far"]
         # Orthogonal cosine distance = 1 -> similarity 1 - 1/2 = 0.5 exactly.
         assert abs(results[0]["score"] - 0.5) < 1e-6
+
+
+# S3-02 real-store validation coverage.
+def _validation_rows(ids, dimension=3, payload=None):
+    payload = {"subject": "s", "predicate": "p", "object": "o"} if payload is None else payload
+    return [
+        {"id": value, "vector": [float(i) for i in range(dimension)], "_metadata": json.dumps(payload)} for value in ids
+    ]
+
+
+def _make_validation_store(path: Path, rows, dimension=3, table="memories"):
+    import lancedb
+
+    db = lancedb.connect(str(path))
+    schema = pa.schema(
+        [
+            pa.field("id", pa.utf8()),
+            pa.field("vector", pa.list_(pa.float32(), dimension)),
+            pa.field("_metadata", pa.utf8()),
+        ]
+    )
+    table_obj = db.create_table(table, schema=schema)
+    table_obj.add(rows)
+    return table_obj
+
+
+@pytest.mark.asyncio
+async def test_s302_missing_store_refuses_without_creation(tmp_path):
+    path = tmp_path / "missing"
+    before = sorted(path.parent.iterdir())
+    result = await LanceDBProvider(db_path=str(path), table="memories").validate_collection(
+        expected_ids=set(), expected_vector_size=3
+    )
+    assert not result.valid and result.errors
+    assert not path.exists()
+    assert sorted(path.parent.iterdir()) == before
+
+
+@pytest.mark.asyncio
+async def test_s302_missing_table_refuses_without_creation(tmp_path):
+    path = tmp_path / "db"
+    import lancedb
+
+    db = lancedb.connect(str(path))
+    db.create_table(
+        "other",
+        schema=pa.schema(
+            [pa.field("id", pa.utf8()), pa.field("vector", pa.list_(pa.float32(), 3)), pa.field("_metadata", pa.utf8())]
+        ),
+    )
+    result = await LanceDBProvider(db_path=str(path), table="memories").validate_collection(
+        expected_ids=set(), expected_vector_size=3
+    )
+    assert not result.valid and any("table" in error.lower() for error in result.errors)
+    assert "memories" not in db.list_tables()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    ["corrupt", "dimension", "duplicate", "extra", "missing", "malformed", "nonobject", "missingkey", "wrongtype"],
+)
+async def test_s302_real_store_validation_cases(tmp_path, case):
+    path = tmp_path / case
+    rows = _validation_rows(["a", "b"])
+    expected = {"a", "b"}
+    if case == "dimension":
+        rows = _validation_rows(["a", "b"], dimension=2)
+    elif case == "duplicate":
+        rows.append(rows[0].copy())
+    elif case == "extra":
+        rows.append(_validation_rows(["c"])[0])
+    elif case == "missing":
+        rows = rows[:1]
+    elif case == "malformed":
+        rows[0]["_metadata"] = "{bad"
+    elif case == "nonobject":
+        rows[0]["_metadata"] = "[]"
+    elif case == "missingkey":
+        rows[0]["_metadata"] = json.dumps({"subject": "s"})
+    elif case == "wrongtype":
+        rows[0]["_metadata"] = json.dumps({"subject": 3, "predicate": "p", "object": "o"})
+    if case == "corrupt":
+        _make_validation_store(path, rows)
+        lance_dir = next(path.rglob("*.lance"))
+        shutil.rmtree(lance_dir)
+    else:
+        _make_validation_store(path, rows, dimension=2 if case == "dimension" else 3)
+    result = await LanceDBProvider(db_path=str(path), table="memories").validate_collection(
+        expected_ids=expected, expected_vector_size=3
+    )
+    assert not result.valid
+    assert result.errors
+
+
+@pytest.mark.asyncio
+async def test_s302_happy_path_digest_is_independent_literal(tmp_path):
+    path = tmp_path / "good"
+    _make_validation_store(path, _validation_rows(["b", "a"]))
+    result = await LanceDBProvider(db_path=str(path), table="memories", metric="euclidean").validate_collection(
+        expected_ids={"a", "b"}, expected_vector_size=3
+    )
+    expected_digest = hashlib.sha256("a\nb".encode("utf-8")).hexdigest()
+    assert result.valid and result.ids_digest == expected_digest
+    description = await LanceDBProvider(db_path=str(path), table="memories", metric="euclidean").describe_collection()
+    assert (
+        description.table,
+        description.vector_size,
+        description.row_count,
+        description.metric,
+        description.ids_digest,
+    ) == ("memories", 3, 2, "l2", expected_digest)
+
+
+@pytest.mark.asyncio
+async def test_s302_readonly_and_reopen_inventory_unchanged(tmp_path):
+    path = tmp_path / "readonly"
+    _make_validation_store(path, _validation_rows(["a", "b"]))
+
+    def inventory():
+        return sorted((str(p.relative_to(path)), p.stat().st_mtime_ns, p.stat().st_size) for p in path.rglob("*"))
+
+    before = inventory()
+    provider = LanceDBProvider(db_path=str(path), table="memories")
+    await provider.describe_collection()
+    await provider.validate_collection(expected_ids={"a", "b"}, expected_vector_size=3)
+    assert inventory() == before
+    reopened = LanceDBProvider(db_path=str(path), table="memories")
+    await reopened.describe_collection()
+    await reopened.validate_collection(expected_ids={"a", "b"}, expected_vector_size=3)
+    assert inventory() == before
