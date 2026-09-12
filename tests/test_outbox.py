@@ -14,6 +14,7 @@ import os
 import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from sqlalchemy.ext.asyncio import (
@@ -39,9 +40,11 @@ from memory_server.router.graph_router import GraphRouter
 # =============================================================================
 
 
-def _make_engine_and_factory():
+def _make_engine_and_factory(root: Path | None = None):
     """Create a unique file-based SQLite engine + session factory."""
-    db_path = f"/tmp/test_outbox_{uuid.uuid4().hex[:16]}.db"
+    root = root or Path(os.environ.get("GATE_TMP", ".pytest-tmp"))
+    root.mkdir(parents=True, exist_ok=True)
+    db_path = root / f"test_outbox_{uuid.uuid4().hex[:16]}.db"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     return engine, factory, db_path
@@ -810,9 +813,8 @@ class TestOutboxWorker:
         hundreds of GB. The worker must schedule compaction with an explicit
         sub-week cleanup_older_than and run it as a background task.
         """
-        from datetime import timedelta
-
         import time
+        from datetime import timedelta
 
         from storage.outbox_worker import OutboxWorker
 
@@ -1220,11 +1222,13 @@ class TestServerOutboxIntegration:
             assert result.status == "pending"
             assert result.retry_count == 0
 
-    async def test_migration_creates_outbox_table(self):
+    async def test_migration_creates_outbox_table(self, tmp_path: Path):
         """Verify an online Alembic upgrade creates outbox_entries."""
         project_dir = os.path.join(os.path.dirname(__file__), "..")
-        db_path = os.path.join(project_dir, "tests", f"tmp_outbox_migration_{uuid.uuid4().hex}.db")
-        ini_path = os.path.join(project_dir, f"tmp_outbox_migration_{uuid.uuid4().hex}.ini")
+        gate_tmp = Path(os.environ.get("GATE_TMP", str(tmp_path)))
+        gate_tmp.mkdir(parents=True, exist_ok=True)
+        db_path = gate_tmp / f"tmp_outbox_migration_{uuid.uuid4().hex}.db"
+        ini_path = gate_tmp / f"tmp_outbox_migration_{uuid.uuid4().hex}.ini"
         with open(os.path.join(project_dir, "alembic.ini"), encoding="utf-8") as stream:
             ini_text = stream.read().replace("sqlite:///memory.db", f"sqlite:///{db_path}")
         with open(ini_path, "w", encoding="utf-8") as stream:

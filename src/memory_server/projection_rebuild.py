@@ -69,7 +69,9 @@ def _nonblank(value: object) -> bool:
 
 
 def _valid_steps(value: object) -> bool:
-    return isinstance(value, list) and all(isinstance(step, str) and step.strip() for step in value)
+    return isinstance(value, list) and bool(value) and all(
+        isinstance(step, str) and step.strip() for step in value
+    )
 
 
 def is_eligible(record: CanonicalProjectionRecord) -> bool:
@@ -203,6 +205,9 @@ async def iter_canonical_projection_records(snapshot_url: str, *, batch_size: in
         "fact": ("facts", "index_fact"),
         "skill": ("skills", "index_skill"),
     }
+    if snapshot_url.startswith("sqlite+aiosqlite:///") and ":memory:" not in snapshot_url:
+        database = snapshot_url.removeprefix("sqlite+aiosqlite:///")
+        snapshot_url = f"sqlite+aiosqlite:///file:{database}?mode=ro&immutable=1&uri=true"
     engine = create_async_engine(snapshot_url)
     rows: list[CanonicalProjectionRecord] = []
     try:

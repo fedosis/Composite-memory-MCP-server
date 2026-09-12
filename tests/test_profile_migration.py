@@ -111,9 +111,97 @@ def test_s301_mapping_is_order_independent_for_ids_types_and_edge_digest() -> No
 def test_s301_exact_vector_mapping() -> None:
     mapped = projection_rebuild.map_projection_record(_s301_records()[-1])
     assert mapped.vector_text == "Widget uses Caddy"
+    assert mapped.point_id == projection_rebuild.deterministic_vector_id("fact", "f1")
     assert mapped.payload == {
         "subject": "Widget", "predicate": "uses", "object": "Caddy",
         "source": "s", "memory_type": "fact",
+    }
+
+
+def test_s301_belief_mapping_has_vector_payload_and_no_graph_projection() -> None:
+    record = CanonicalProjectionRecord("belief", "b1", "index_belief", {
+        "proposition": "Sky is blue", "confidence": 0.8, "tags": ["color"],
+        "source": "observation", "lifecycle_state": "active",
+    })
+    mapped = projection_rebuild.map_projection_record(record)
+    assert mapped.vector_text == "Sky is blue"
+    assert mapped.point_id == projection_rebuild.deterministic_vector_id("belief", "b1")
+    assert set(mapped.payload) == {"proposition", "confidence", "tags", "source", "memory_type"}
+    graph = projection_rebuild.build_shared_projection_graph([record])
+    assert all(node.type != "belief" for node in graph.get_all_nodes())
+
+
+def test_s301_skill_eligibility_requires_nonempty_string_steps() -> None:
+    def skill(steps):
+        return CanonicalProjectionRecord("skill", "s1", "index_skill", {
+            "purpose": "Use the tool", "steps": steps, "lifecycle_state": "active",
+        })
+    assert not projection_rebuild.is_eligible(skill([]))
+    assert not projection_rebuild.is_eligible(skill([" "]))
+    assert not projection_rebuild.is_eligible(skill(["ok", 1]))
+    assert projection_rebuild.is_eligible(skill(["ok"]))
+
+
+def _seed_s301_snapshot(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        CREATE TABLE beliefs (id TEXT PRIMARY KEY, proposition TEXT, confidence REAL,
+            source TEXT, tags TEXT, lifecycle_state TEXT);
+        CREATE TABLE decisions (id TEXT PRIMARY KEY, choice TEXT, reason TEXT,
+            context TEXT, lifecycle_state TEXT);
+        CREATE TABLE facts (id TEXT PRIMARY KEY, subject TEXT, predicate TEXT,
+            object TEXT, source TEXT, lifecycle_state TEXT);
+        CREATE TABLE skills (id TEXT PRIMARY KEY, purpose TEXT, steps TEXT,
+            lifecycle_state TEXT);
+        INSERT INTO beliefs VALUES ('b0', 'candidate belief', 0.5, 's', '[]', 'candidate');
+        INSERT INTO beliefs VALUES ('b1', 'active belief', 0.8, 's', '["tag"]', 'active');
+        INSERT INTO decisions VALUES ('d0', 'ignored', 'why', 'ctx', 'archived');
+        INSERT INTO decisions VALUES ('d1', 'choose', 'why', 'ctx', 'active');
+        INSERT INTO facts VALUES ('f0', 'A', 'is', 'B', 's', 'archived');
+        INSERT INTO facts VALUES ('f1', 'A', 'is', 'B', 's', 'candidate');
+        INSERT INTO skills VALUES ('s0', 'empty', '[]', 'active');
+        INSERT INTO skills VALUES ('s1', 'usable', '["step"]', 'validated');
+    """)
+    connection.commit()
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_s301_iterator_is_ordered_bounded_and_read_only(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+    url = f"sqlite+aiosqlite:///{db_path}"
+    records = [record async for record in projection_rebuild.iter_canonical_projection_records(url, batch_size=2)]
+    assert [(record.record_type, record.record_id) for record in records] == [
+        ("belief", "b1"), ("decision", "d1"), ("fact", "f1"), ("skill", "s1")
+    ]
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute("CREATE TABLE forbidden (id TEXT)")
+    finally:
+        connection.close()
+    with pytest.raises(ValueError, match="batch_size must be positive"):
+        async for _ in projection_rebuild.iter_canonical_projection_records(url, batch_size=0):
+            pass
+
+
+def test_s301_rebuild_matches_real_graph_router_fact_path() -> None:
+    record = _s301_records()[-1]
+    rebuilt = projection_rebuild.build_shared_projection_graph([record])
+    runtime_router = projection_rebuild.GraphRouter(graph=projection_rebuild.SimpleGraph())
+    subject = cast(str, record.payload["subject"])
+    predicate = cast(str, record.payload["predicate"])
+    object_name = cast(str, record.payload["object"])
+    runtime_router.sync_fact(subject, predicate, object_name)
+    runtime = runtime_router.graph
+    assert {(node.id, node.type) for node in rebuilt.get_all_nodes()} == {
+        (node.id, node.type) for node in runtime.get_all_nodes()
+    }
+    assert {(edge.source_id, edge.target_id, edge.relation)
+            for targets in rebuilt._edges.values() for group in targets.values() for edge in group} == {
+        (edge.source_id, edge.target_id, edge.relation)
+        for targets in runtime._edges.values() for group in targets.values() for edge in group
     }
 
 
