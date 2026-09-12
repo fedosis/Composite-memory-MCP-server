@@ -2387,3 +2387,129 @@ def test_s204_the_implementation_never_signals_a_process() -> None:
         source = Path(path).read_text()
         for forbidden in ("os.kill", "import signal", "signal.SIG", "send_signal", "subprocess"):
             assert forbidden not in source, f"{path} references {forbidden}"
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 1 (cross-provider review R1 / finding F2). The freshness gate of
+# `validate_mutation_preconditions` and the lock stage of this same card could
+# not be composed: `_plan_identity_digest` digested `plan.targets`, which
+# includes the two coordination entries `acquire_maintenance_locks` CREATES
+# (`root_lock`, `graph_lock`) and by design never unlinks, so after one lock
+# cycle any caller-supplied plan was `E_PLAN_STALE` and the cause-specific
+# fail-closed code (`E_OLD_WRITER_ACTIVE` / `E_WRITER_ACTIVE`) was masked.
+# `_plan_identity_digest` now excludes exactly those two coordination labels
+# while `plan.targets`, the writer inventory and the lock stage stay unchanged.
+# These three nodes are BEHAVIOURAL at the fixed base 44bde33: the first fails
+# with `E_PLAN_STALE` where it requires a valid result, and the second and third
+# receive `E_PLAN_STALE` where they require the cause-specific refusal code.
+# ---------------------------------------------------------------------------
+
+
+def _s204_fix1_lock_cycle(plan: Any) -> None:
+    """One real lock cycle: take every maintenance lock, then release it."""
+    locks = profile_migration.acquire_maintenance_locks(plan, timeout=2)
+    locks.release()
+
+
+def _s204_fix1_live_upgraded_runtime(root: str, ready, release) -> None:
+    """A real upgraded runtime: the shared runtime lock held on its data root."""
+    import memory_server.storage_lock as storage_lock
+
+    lock = storage_lock.RuntimeStorageLock.acquire(Path(root), timeout=3)
+    ready.put(os.getpid())
+    release.wait(10)
+    lock.release()
+
+
+def test_s204_fix1_a_lock_cycle_leaves_a_planned_plan_fresh(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path)
+    root_lock = Path(plan.layout.root_lock_path)
+    graph_lock = Path(plan.layout.graph_lock_path)
+    assert not root_lock.exists()
+    assert not graph_lock.exists()
+    _s204_fix1_lock_cycle(plan)
+    assert root_lock.exists()
+    assert graph_lock.exists()
+    # Lock-then-validate: the caller's plan was built BEFORE the lock cycle, and
+    # taking the locks must not have invalidated it.
+    preconditions = profile_migration.validate_mutation_preconditions(request, plan=plan)
+    assert preconditions.plan_digest == preconditions.replan_digest
+
+
+def test_s204_fix1_the_first_validation_after_a_lock_cycle_names_the_live_old_writer(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    import multiprocessing
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path)
+    _s204_fix1_lock_cycle(plan)
+    ready: multiprocessing.Queue[int] = multiprocessing.Queue()
+    release = multiprocessing.Event()
+    proc = multiprocessing.Process(target=_s204_old_writer, args=(str(db_path), ready, release))
+    proc.start()
+    try:
+        child = ready.get(timeout=8)
+        assert child != os.getpid()
+        # FIRST validation, plan built before the lock cycle: it must name the
+        # live writer, not the lock stage's own coordination growth.
+        with pytest.raises(ValueError, match="E_OLD_WRITER_ACTIVE"):
+            apply_profile_migration(plan)
+        assert proc.is_alive()
+    finally:
+        release.set()
+        proc.join(10)
+        if proc.is_alive():
+            proc.terminate()
+    assert proc.exitcode == 0
+
+
+def test_s204_fix1_a_live_upgraded_runtime_is_still_detected_after_a_lock_cycle(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    import multiprocessing
+
+    import memory_server.storage_lock as storage_lock
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path)
+    _s204_fix1_lock_cycle(plan)
+    ready: multiprocessing.Queue[int] = multiprocessing.Queue()
+    release = multiprocessing.Event()
+    proc = multiprocessing.Process(
+        target=_s204_fix1_live_upgraded_runtime, args=(str(plan.layout.data_root), ready, release)
+    )
+    proc.start()
+    try:
+        child = ready.get(timeout=8)
+        assert child != os.getpid()
+        preconditions = profile_migration.validate_mutation_preconditions(request, plan=plan)
+        holders = preconditions.writer_state["upgraded_holders"]
+        assert [record["pid"] for record in holders] == [child]
+        assert holders[0]["label_key"] == "root_lock"
+        assert holders[0]["raw_label"] == str(Path(plan.layout.root_lock_path))
+        assert holders[0]["classification"] == "upgraded_lock_holder"
+        # Second, independent detection channel: the lock stage itself must still
+        # refuse to hand over the entry the live runtime holds.
+        with pytest.raises(storage_lock.StorageLockError) as timeout:
+            profile_migration.acquire_maintenance_locks(plan, timeout=0.3)
+        assert timeout.value.code == "E_LOCK_TIMEOUT"
+        assert proc.is_alive()
+    finally:
+        release.set()
+        proc.join(10)
+        if proc.is_alive():
+            proc.terminate()
+    assert proc.exitcode == 0
