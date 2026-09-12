@@ -1,7 +1,5 @@
 """Shared pytest fixtures."""
 
-from pathlib import Path
-
 import pytest
 
 
@@ -48,13 +46,22 @@ def synthetic_storage_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def graph_test_isolation(tmp_path, monkeypatch):
-    """Isolate graph tests from the process singleton and live snapshot."""
+    """Isolate graph tests from the process singleton and live snapshot.
+
+    B02 hole H-A: the snapshot target is derived from ``tmp_path`` only and
+    asserted to be outside every live CMMS data root *before* anything can open
+    it. The fixture never resolves a CWD-relative path and never reads a live
+    store, so its behaviour does not depend on where pytest was started from
+    (previously ``Path("data/graph.json")`` resolved to the live store whenever
+    pytest ran from the deployment checkout, and the comparison happened only
+    after the read).
+    """
     from memory_server import server as server_module
     from memory_server.settings import get_settings
+    from tests.synthetic_storage_env import assert_not_live, lexical
 
-    live_snapshot = Path("data/graph.json").resolve()
-    live_before = live_snapshot.read_bytes() if live_snapshot.exists() else None
-    snapshot = tmp_path / "graph.json"
+    snapshot = lexical(tmp_path / "graph.json")
+    assert_not_live(snapshot, label="graph_test_isolation snapshot")
     monkeypatch.setenv("MEMORY_SERVER_GRAPH_SNAPSHOT_PATH", str(snapshot))
     get_settings.cache_clear()
     server_module._graph = None
@@ -65,5 +72,4 @@ def graph_test_isolation(tmp_path, monkeypatch):
         server_module._graph = None
         server_module._graph_router = None
         get_settings.cache_clear()
-        live_after = live_snapshot.read_bytes() if live_snapshot.exists() else None
-        assert live_after == live_before
+        assert_not_live(snapshot, label="graph_test_isolation snapshot")
