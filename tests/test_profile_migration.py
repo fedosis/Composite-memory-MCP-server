@@ -2251,7 +2251,12 @@ def test_s204_every_entrypoint_replans_independently_without_inherited_state(
     manifest_path = home / ".cmms-migrations" / request.run_id / "manifest.json"
     with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
         apply_profile_migration(plan)
-    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+    # S2-07 moved this boundary and this leg is updated for it, not weakened:
+    # `resume` now repeats the preconditions and reads the run's own manifest, so
+    # with no manifest at all it is refused with its own stable code. The property
+    # this node exists for -- that resume replans for ITSELF, on its own mode, and
+    # inherits nothing from the caller -- is asserted by `calls` below.
+    with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
         resume_profile_migration(manifest_path, replace(request, mode="resume"))
     with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
         rollback_profile_migration(manifest_path, replace(request, mode="rollback"))
@@ -3592,12 +3597,20 @@ def test_s206_the_public_entrypoints_stay_fail_closed_while_the_seam_is_a_stub(
 
     entrypoints = (
         ("apply_profile_migration", (plan,)),
-        ("resume_profile_migration", (live, request)),
         ("rollback_profile_migration", (live, request)),
     )
     for name, args in entrypoints:
         with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
             getattr(profile_migration, name)(*args)
+
+    # S2-07 moved ONE leg of this boundary and this node is updated for it, not
+    # weakened: `resume` now repeats the preconditions and reads the run's own
+    # manifest, so an absent manifest is refused with its own stable code instead
+    # of the slice-level "not implemented". What this node exists to pin is
+    # unchanged and still asserted below -- resume is non-success and touches
+    # nothing -- and it still classifies nothing it cannot read.
+    with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
+        profile_migration.resume_profile_migration(live, request)
 
     monkeypatch.setattr(projection_rebuild, "STAGED_VERIFICATION_IMPLEMENTED", True, raising=False)
     with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
@@ -4214,3 +4227,632 @@ def test_s206_the_link_entry_backup_fsyncs_the_created_backup_directory(
     assert backup_dir in fsynced, (
         "the `backup` directory entry created for the link entry was never fsynced"
     )
+
+
+# ---------------------------------------------------------------------------
+# S2-07 -- the deterministic resume classifier for the checkpoint and the
+# target/staging/quarantine triads (DETAIL 9.3, 10.5), plus the two S2-06
+# review carry-ins this card owns: R3 (the crash states the classifier must
+# classify, and what it may honestly claim about them) and R7/F-1 (the durable
+# record could name an UNQUALIFIED evidence object).
+# ---------------------------------------------------------------------------
+
+S207_STAGING_DIRECTORY_NAME = "staging"
+S207_SEQUENCE_QUARANTINED: tuple[str, ...] = (
+    "prestate_revalidated",
+    "prestate_quarantined",
+    "staging_published",
+    "parent_fsynced",
+)
+S207_SEQUENCE_ABSENT: tuple[str, ...] = (
+    "prestate_revalidated",
+    "prestate_absent",
+    "staging_published",
+    "parent_fsynced",
+)
+# Crash boundaries of ONE artifact's DETAIL 9.3 event sequence. Each entry says
+# which artifact crashed, what the run's OWN chain recorded by then, the REAL
+# on-disk triad that boundary leaves, and the single event the classifier must
+# derive as the next operation.
+S207_CRASH_BOUNDARIES: dict[str, dict[str, Any]] = {
+    "prestate_revalidated": {
+        "artifact": "vector",
+        "prestate_absent": False,
+        "recorded": ("prestate_revalidated",),
+        "state": "prestate_intact",
+        "quarantine_present": False,
+        "staging_present": True,
+        "next_event": "prestate_quarantined",
+    },
+    "prestate_quarantined": {
+        "artifact": "vector",
+        "prestate_absent": False,
+        "recorded": ("prestate_revalidated", "prestate_quarantined"),
+        "state": "prestate_quarantined",
+        "quarantine_present": True,
+        "staging_present": True,
+        "next_event": "staging_published",
+    },
+    "prestate_absent": {
+        "artifact": "graph",
+        "prestate_absent": True,
+        "recorded": ("prestate_revalidated", "prestate_absent"),
+        "state": "prestate_absent",
+        "quarantine_present": False,
+        "staging_present": True,
+        "next_event": "staging_published",
+    },
+    "staging_published": {
+        "artifact": "vector",
+        "prestate_absent": False,
+        "recorded": ("prestate_revalidated", "prestate_quarantined", "staging_published"),
+        "state": "staging_published",
+        "quarantine_present": True,
+        "staging_present": False,
+        "next_event": "parent_fsynced",
+    },
+    "parent_fsynced": {
+        "artifact": "vector",
+        "prestate_absent": False,
+        "recorded": S207_SEQUENCE_QUARANTINED,
+        "state": "complete",
+        "quarantine_present": True,
+        "staging_present": False,
+        "next_event": None,
+    },
+}
+
+
+def _s207_api(name: str) -> Any:
+    """The S2-07 callable, or None -- MISSING CAPABILITY, never behavioural proof."""
+    return getattr(profile_migration, name, None)
+
+
+def _s207_manifest(
+    plan: Any, checkpoint: str = "publishing", **overrides: Any
+) -> MigrationManifest:
+    """A manifest bound to a REAL plan: run id, source identity and digest agree."""
+    values: dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": plan.request.run_id,
+        "strategy": plan.request.strategy,
+        "checkpoint": checkpoint,
+        "status": "running",
+        "source_identity": plan.source_sql,
+        "target_identities_before": {
+            label: plan.targets[label] for label in ("vector", "graph") if label in plan.targets
+        },
+        "config_digest": plan.config_digest,
+        "runtime_stop_attestation": {"value": "maintenance-ticket"},
+        "artifacts": {},
+        "completed_steps": [
+            "planned",
+            "locked",
+            "backed_up",
+            "sqlite_snapshotted",
+            "projections_built",
+        ],
+        "events": [],
+        "embedding": {},
+        "failure": None,
+    }
+    values.update(overrides)
+    return MigrationManifest(**values)
+
+
+def _s207_write_manifest(
+    plan: Any,
+    run_dir: Path,
+    *,
+    checkpoint: str = "publishing",
+    name: str = "manifest.json",
+    **overrides: Any,
+) -> Path:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    live = run_dir / name
+    profile_migration._write_manifest(live, _s207_manifest(plan, checkpoint, **overrides))
+    return live
+
+
+def _s207_stage(run_dir: Path, artifact: str, payload: bytes = b"S207-STAGED") -> Path:
+    """A REAL prepared staging entry: a directory for vector, a file for graph."""
+    staging = run_dir / S207_STAGING_DIRECTORY_NAME
+    staging.mkdir(parents=True, exist_ok=True)
+    entry = staging / S206_STAGING_NAMES[artifact]
+    if artifact == "vector":
+        (entry / "nested").mkdir(parents=True, exist_ok=True)
+        (entry / "part.bin").write_bytes(payload)
+        (entry / "nested" / "deep.bin").write_bytes(b"deep-" + payload[:8])
+    else:
+        entry.write_bytes(payload)
+    return entry
+
+
+def _s207_quarantine_entry(run_dir: Path, artifact: str, run_id: str) -> Path:
+    """The run-owned quarantine entry of one artifact, by the module's own naming."""
+    return (
+        run_dir
+        / profile_migration.QUARANTINE_DIRECTORY_NAME
+        / profile_migration.QUARANTINE_PREPUBLISH_NAME
+        / profile_migration._quarantine_entry_name(artifact, run_id)
+    )
+
+
+def _s207_operations(manifest_path: Path) -> list[str]:
+    """The run's own recorded event names, in order, as a plain list."""
+    return [event.operation for event in load_manifest(manifest_path).events]
+
+
+def _s207_fail_nth_rename(monkeypatch: pytest.MonkeyPatch, nth: int) -> None:
+    """Fail the nth REAL ``os.rename``: the publication stops exactly there."""
+    real = os.rename
+    seen: list[int] = []
+
+    def _rename(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        seen.append(1)
+        if len(seen) == nth:
+            raise OSError(errno.EIO, "injected rename failure")
+        return real(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", _rename)
+
+
+def _s207_fail_nth_manifest_write(monkeypatch: pytest.MonkeyPatch, nth: int) -> None:
+    """Fail the nth durable manifest write: the chain stops one event short."""
+    real = profile_migration._write_manifest
+    seen: list[int] = []
+
+    def _write(target: Path, manifest: Any) -> Any:
+        seen.append(1)
+        if len(seen) >= nth:
+            raise ValueError("E_MANIFEST_WRITE_INJECTED")
+        return real(target, manifest)
+
+    monkeypatch.setattr(profile_migration, "_write_manifest", _write)
+
+
+def _s207_publish(plan: Any, artifact: str, staged: Path, run_dir: Path, live: Path) -> Any:
+    return profile_migration.publish_artifact(
+        plan, artifact, staged_identity=_s206_identity(staged), run_dir=run_dir, manifest_path=live
+    )
+
+
+def _s207_crash_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> dict[str, Any]:
+    """Drive the REAL publication primitive to one crash boundary.
+
+    Every input is real: a real backup report from the shipped backup stage, a
+    real prepared staging entry for BOTH artifacts, and a crash produced by
+    injecting the real ``os.rename`` / the real durable manifest write. Nothing
+    about the resulting target/staging/quarantine triad is synthesised.
+    """
+    if boundary == "unrecorded_swap":
+        spec = dict(S207_CRASH_BOUNDARIES["prestate_quarantined"])
+        spec["recorded"] = ("prestate_revalidated", "prestate_quarantined")
+        # The rename LANDED, so the staged entry is no longer under `staging/`:
+        # it is the entry now sitting at the target name.
+        spec["staging_present"] = False
+        spec["state"] = "ambiguous"
+    else:
+        spec = S207_CRASH_BOUNDARIES[boundary]
+    artifact = str(spec["artifact"])
+    home, db_path = _s205_home(tmp_path)
+    target = home / "data" / S206_STAGING_NAMES[artifact]
+    if spec["prestate_absent"]:
+        target.unlink()
+    request, plan = _s205_legacy_plan(home, db_path)
+    assert (plan.targets[artifact].kind == "absent") is bool(spec["prestate_absent"])
+    run_dir = _s206_run_dir(home, plan)
+    report = profile_migration.create_run_backup(plan)
+    assert report is not None, "no backup stage exists at this commit"
+    live = _s207_write_manifest(plan, run_dir)
+    staged = {label: _s207_stage(run_dir, label) for label in ("vector", "graph")}
+
+    if boundary == "parent_fsynced":
+        assert _s207_publish(plan, artifact, staged[artifact], run_dir, live) is not None
+    elif boundary == "unrecorded_swap":
+        # The publish rename LANDS but its own event never reaches the manifest:
+        # the real "failure between rename and manifest update" window.
+        _s207_fail_nth_manifest_write(monkeypatch, 3)
+        with pytest.raises(ValueError, match="E_MANIFEST_WRITE_INJECTED"):
+            _s207_publish(plan, artifact, staged[artifact], run_dir, live)
+    elif boundary == "staging_published":
+        _s207_fail_nth_manifest_write(monkeypatch, 4)
+        with pytest.raises(ValueError, match="E_MANIFEST_WRITE_INJECTED"):
+            _s207_publish(plan, artifact, staged[artifact], run_dir, live)
+    else:
+        _s207_fail_nth_rename(monkeypatch, 2 if boundary == "prestate_quarantined" else 1)
+        with pytest.raises(ValueError, match="E_PUBLICATION_RENAME_FAILED"):
+            _s207_publish(plan, artifact, staged[artifact], run_dir, live)
+
+    assert _s207_operations(live) == [f"{artifact}.{name}" for name in spec["recorded"]]
+    quarantine = _s207_quarantine_entry(run_dir, artifact, plan.request.run_id)
+    assert quarantine.exists() is bool(spec["quarantine_present"])
+    assert staged[artifact].exists() is bool(spec["staging_present"])
+    return {
+        "home": home,
+        "db_path": db_path,
+        "request": request,
+        "plan": plan,
+        "artifact": artifact,
+        "run_dir": run_dir,
+        "live": live,
+        "target": target,
+        "quarantine": quarantine,
+        "staged": staged,
+        "spec": spec,
+    }
+
+
+def _s207_classify(manifest: Any, plan: Any, run_dir: Path) -> Any:
+    api = _s207_api("classify_publication_triads")
+    return None if api is None else api(manifest, plan, run_dir=run_dir)
+
+
+def _s207_triad(triads: Any, label: str) -> Any:
+    return next(item for item in triads if item.artifact == label)
+
+
+def _s207_backup_copy(run_dir: Path) -> Path:
+    """A REAL backed-up regular file, located from the run's own report."""
+    report = json.loads((run_dir / profile_migration.BACKUP_REPORT_NAME).read_text(encoding="utf-8"))
+    for entry in report["entries"]:
+        if entry["present"] and entry["kind"] == "regular_file":
+            return run_dir / entry["run_relative_path"]
+    raise AssertionError("the backup report records no regular-file entry to check")
+
+
+@pytest.mark.parametrize("boundary", sorted(S207_CRASH_BOUNDARIES))
+def test_s207_every_publication_event_crash_boundary_is_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env, boundary: str
+) -> None:
+    """MISSING-CAPABILITY at BASE: no deterministic triad classifier exists.
+
+    The crash state itself is behavioural evidence on BOTH sides -- the run's own
+    chain and the real triad are produced by the shipped publication primitive.
+    Behavioural successor of this contract: the classifier is driven from the
+    entrypoint in `test_s207_resume_names_the_single_unambiguous_next_operation`
+    and `test_s207_a_completed_run_has_nothing_to_repeat_and_resume_is_byte_stable`,
+    which are behavioural on both sides; wiring the classifier into `apply` is
+    S3-06 (routing-matrix S2-06 split_further).
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s207_crash_state(tmp_path, monkeypatch, boundary)
+    spec = state["spec"]
+
+    triads = _s207_classify(load_manifest(state["live"]), state["plan"], state["run_dir"])
+    assert triads is not None, "no deterministic target/staging/quarantine classifier exists"
+
+    triad = _s207_triad(triads, state["artifact"])
+    assert triad.recorded_events == spec["recorded"]
+    assert triad.state == spec["state"]
+    assert triad.next_event == spec["next_event"]
+    assert triad.quarantine_present is spec["quarantine_present"]
+    assert triad.staging_present is spec["staging_present"]
+
+    other = _s207_triad(triads, "graph" if state["artifact"] == "vector" else "vector")
+    assert other.recorded_events == ()
+    assert other.next_event == "prestate_revalidated"
+
+
+def test_s207_resume_refuses_with_the_gate_of_the_single_unambiguous_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL at BASE: `resume` refuses with E_MIGRATION_NOT_IMPLEMENTED.
+
+    At HEAD it repeats every precondition, classifies a real mid-publication crash
+    and refuses with the CAUSE of the ONE operation it found: exactly one next
+    operation exists, and its gate -- the verification seam that is still the S0
+    stub -- is what keeps resume from executing it (acceptance 3 / R1 / R4).
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s207_crash_state(tmp_path, monkeypatch, "prestate_quarantined")
+    manifest_bytes = state["live"].read_bytes()
+
+    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+        profile_migration.resume_profile_migration(state["live"], state["request"])
+
+    assert state["live"].read_bytes() == manifest_bytes
+    assert state["quarantine"].exists(), "the retained prestate copy was touched"
+
+
+def test_s207_the_classifier_reports_the_phase_and_the_single_next_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE: `classify_resume` does not exist yet.
+
+    Behavioural successor of the SAME contract: the entrypoint node
+    `test_s207_resume_refuses_with_the_gate_of_the_single_unambiguous_operation`
+    and the parametrized triad node above are behavioural on both sides; what this
+    node adds is the classification itself, which is what an operator reads when
+    the entrypoint refuses. At HEAD it is the real thing: the phase, the single
+    next operation per artifact, the gate and the tolerations this run is expected
+    to produce.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s207_crash_state(tmp_path, monkeypatch, "prestate_quarantined")
+
+    api = _s207_api("classify_resume")
+    assert api is not None, "no deterministic resume classifier exists at this commit"
+    outcome = api(state["live"], state["request"])
+
+    assert outcome.phase == "publishing"
+    assert outcome.checkpoint == "publishing"
+    assert outcome.next_checkpoint == "published"
+    assert outcome.next_operations == (
+        "vector.staging_published",
+        "graph.prestate_revalidated",
+    )
+    assert outcome.blocked_by == "E_STAGED_VERIFICATION_CAPABILITY_MISSING"
+    assert outcome.backup_state == "verified"
+    assert "E_BACKUP_COLLISION:run" in outcome.tolerated_blockers
+    vector = _s207_triad(outcome.triads, "vector")
+    assert vector.state == "prestate_quarantined"
+    assert vector.next_event == "staging_published"
+    assert vector.detail["pin_source"] == "record"
+
+    # Before `publishing` the triads are not consulted at all, and the ONE next
+    # checkpoint is the capability-gated verifier: batch/embedding state is S3's.
+    home, db_path = _s205_home(tmp_path / "batch")
+    batch_request, batch_plan = _s205_legacy_plan(home, db_path)
+    assert profile_migration.create_run_backup(batch_plan) is not None
+    batch_live = _s207_write_manifest(
+        batch_plan, _s206_run_dir(home, batch_plan), checkpoint="projections_built"
+    )
+    batch = api(batch_live, batch_request)
+    assert batch.phase == "prepublication"
+    assert batch.checkpoint == "projections_built"
+    assert batch.triads == ()
+    assert batch.next_operations == ()
+    assert batch.next_checkpoint == "staged_verified"
+    assert batch.blocked_by == "E_STAGED_VERIFICATION_CAPABILITY_MISSING"
+    assert batch.backup_state == "verified"
+
+
+def test_s207_a_completed_run_has_nothing_to_repeat_and_resume_is_byte_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL at BASE; acceptance 4 -- a repeated resume repeats no swap.
+
+    Both artifacts are published by the REAL primitive, so the run's own events
+    (not a claim) say the sequence is complete. Two resumes then execute nothing,
+    the manifest is byte-identical, and the stale quarantine, the source and the
+    backup are all retained; the only thing left is the gated next checkpoint,
+    which is what both calls refuse on.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s207_crash_state(tmp_path, monkeypatch, "parent_fsynced")
+    assert _s207_publish(
+        state["plan"], "graph", state["staged"]["graph"], state["run_dir"], state["live"]
+    ) is not None
+
+    live = state["live"]
+    run_dir = state["run_dir"]
+    manifest_bytes = live.read_bytes()
+    source_bytes = state["db_path"].read_bytes()
+    report_bytes = (run_dir / profile_migration.BACKUP_REPORT_NAME).read_bytes()
+    quarantined_before = sorted(path.name for path in state["quarantine"].parent.iterdir())
+    tree_before = _tree_snapshot(tmp_path)
+
+    for _attempt in range(2):
+        with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+            profile_migration.resume_profile_migration(live, state["request"])
+
+    assert live.read_bytes() == manifest_bytes, "a repeated resume rewrote the manifest"
+    assert _tree_snapshot(tmp_path) == tree_before, "a repeated resume mutated the filesystem"
+    assert state["db_path"].read_bytes() == source_bytes, "resume touched the source"
+    assert (run_dir / profile_migration.BACKUP_REPORT_NAME).read_bytes() == report_bytes
+    assert sorted(path.name for path in state["quarantine"].parent.iterdir()) == quarantined_before
+    assert not state["staged"]["vector"].exists()
+    assert not state["staged"]["graph"].exists()
+
+
+def test_s207_an_event_that_contradicts_the_disk_is_refused_as_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL at BASE; DETAIL 10.5's ambiguous refusal.
+
+    The run's chain says the prestate was quarantined, but the target name is NOT
+    vacant: the rename landed and its event never did. Two candidate readings
+    exist, so resume must return E_PUBLICATION_AMBIGUOUS and require manual
+    escalation -- never guess, and never "repair" the chain.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s207_crash_state(tmp_path, monkeypatch, "unrecorded_swap")
+    assert state["target"].exists(), "the swap must have landed for this fixture to mean anything"
+    assert not state["staged"]["vector"].exists()
+    manifest_bytes = state["live"].read_bytes()
+
+    with pytest.raises(ValueError, match="E_PUBLICATION_AMBIGUOUS"):
+        profile_migration.resume_profile_migration(state["live"], state["request"])
+
+    assert state["live"].read_bytes() == manifest_bytes, (
+        "an ambiguous refusal must not rewrite the run's own record"
+    )
+
+
+def test_s207_a_duplicated_publication_sequence_is_refused_and_stays_unrecoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL at BASE; the S2-06 review's R3 fail-closed case.
+
+    When one artifact's events appear TWICE in a manifest, the shipped predicate
+    `_published_sequence_is_complete` returns False forever (len != 4). Resume
+    must classify that honestly as unrecoverable instead of treating the
+    duplicate as progress.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s207_crash_state(tmp_path, monkeypatch, "parent_fsynced")
+    profile_migration.append_manifest_event(
+        state["live"],
+        {
+            "checkpoint": "publishing",
+            "operation": "vector.prestate_revalidated",
+            "payload": {"duplicate": True},
+        },
+    )
+    recorded = profile_migration.publication_events_from_manifest(load_manifest(state["live"]))
+    assert len(recorded["vector"]) == 5
+    assert profile_migration._published_sequence_is_complete(recorded["vector"]) is False
+
+    with pytest.raises(ValueError, match="E_PUBLICATION_AMBIGUOUS"):
+        profile_migration.resume_profile_migration(state["live"], state["request"])
+
+
+def test_s207_a_missing_required_triad_entry_is_refused_and_nothing_is_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL at BASE; the card's "missing required triad entry" Stop.
+
+    Two real missing-entry cases, both refused: the staged entry the next
+    operation would publish is gone, and the quarantine entry the run's own event
+    claims is gone. Neither the retained quarantine nor the stale staging is ever
+    deleted by resume.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s207_crash_state(tmp_path, monkeypatch, "prestate_quarantined")
+
+    retained = state["quarantine"].parent.parent / "retained-old-entry"
+    os.rename(state["quarantine"], retained)
+    with pytest.raises(ValueError, match="E_RESUME_TRIAD_INCOMPLETE"):
+        profile_migration.resume_profile_migration(state["live"], state["request"])
+    assert retained.exists(), "resume must never delete a retained prestate copy"
+    os.rename(retained, state["quarantine"])
+
+    import shutil as _shutil
+
+    _shutil.rmtree(state["staged"]["vector"])
+    with pytest.raises(ValueError, match="E_RESUME_TRIAD_INCOMPLETE"):
+        profile_migration.resume_profile_migration(state["live"], state["request"])
+    assert state["quarantine"].exists()
+
+
+def test_s207_before_publishing_resume_continues_only_through_verified_steps(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL at BASE; acceptance 2.
+
+    Before `publishing` the triads are never consulted: the next step stays shut
+    by CAUSE -- the capability-gated verifier while the seam is the S0 stub, and an
+    engine stage this slice has not wired for the checkpoints before it. Batch and
+    embedding state is S3's, and nothing on disk moves.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = _s206_run_dir(home, plan)
+    assert profile_migration.create_run_backup(plan) is not None
+    batch_live = _s207_write_manifest(plan, run_dir, checkpoint="projections_built")
+    early_live = _s207_write_manifest(
+        plan, run_dir, checkpoint="backed_up", name="manifest-early.json"
+    )
+    tree_before = _tree_snapshot(tmp_path)
+
+    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+        profile_migration.resume_profile_migration(batch_live, request)
+    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+        profile_migration.resume_profile_migration(early_live, request)
+
+    assert _tree_snapshot(tmp_path) == tree_before, "a pre-publication resume touched the tree"
+
+
+def test_s207_resume_refuses_a_changed_source_a_changed_config_or_a_changed_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL at BASE; acceptance 1 and the card's Stop list.
+
+    Every identity a resume must repeat is really re-checked against the run's own
+    durable records: the source's no-follow identity, the config digest and every
+    backed-up entry's size and digest.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s207_crash_state(tmp_path, monkeypatch, "prestate_revalidated")
+
+    connection = sqlite3.connect(state["db_path"])
+    connection.execute("insert into facts(id) values ('after-the-crash')")
+    connection.commit()
+    connection.close()
+    with pytest.raises(ValueError, match="E_RESUME_SOURCE_CHANGED"):
+        profile_migration.resume_profile_migration(state["live"], state["request"])
+
+    config_state = _s207_crash_state(tmp_path / "config", monkeypatch, "prestate_revalidated")
+    tampered = _s207_write_manifest(
+        config_state["plan"], config_state["run_dir"], config_digest="cd" * 32
+    )
+    with pytest.raises(ValueError, match="E_RESUME_CONFIG_CHANGED"):
+        profile_migration.resume_profile_migration(tampered, config_state["request"])
+
+    backup_state = _s207_crash_state(tmp_path / "backup", monkeypatch, "prestate_revalidated")
+    copy = _s207_backup_copy(backup_state["run_dir"])
+    copy.write_bytes(copy.read_bytes() + b"corrupted")
+    with pytest.raises(ValueError, match="E_RESUME_BACKUP_CHANGED"):
+        profile_migration.resume_profile_migration(backup_state["live"], backup_state["request"])
+
+
+def test_s207_resume_refuses_a_missing_a_broken_and_a_foreign_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL at BASE; resume must not inherit a claim it cannot read.
+
+    A missing manifest, a manifest whose bytes are truncated (the broken
+    chain/digest Stop) and a manifest that belongs to a DIFFERENT run id are all
+    refused after the preconditions repeat, never before.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s207_crash_state(tmp_path, monkeypatch, "prestate_revalidated")
+
+    with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
+        profile_migration.resume_profile_migration(tmp_path / "absent" / "manifest.json", state["request"])
+
+    truncated = state["run_dir"] / "manifest-truncated.json"
+    truncated.write_bytes(state["live"].read_bytes()[:64])
+    with pytest.raises(ValueError, match="E_MANIFEST_SCHEMA"):
+        profile_migration.resume_profile_migration(truncated, state["request"])
+
+    foreign = _s207_write_manifest(
+        state["plan"],
+        state["home"] / ".cmms-migrations" / ("e" * 32),
+        run_id="e" * 32,
+    )
+    with pytest.raises(ValueError, match="E_RESUME_RUN_MISMATCH"):
+        profile_migration.resume_profile_migration(foreign, state["request"])
+
+
+def test_s207_the_durable_record_names_the_qualified_evidence_object(tmp_path: Path) -> None:
+    """BEHAVIOURAL pre-fix RED for R7 (the S2-06 review's F-1, reproduced).
+
+    `advance_manifest_checkpoint` recorded the first evidence object matching the
+    CHECKPOINT, while the transition itself qualifies on checkpoint AND code, so a
+    decoy object for the same checkpoint could be written into the append-only
+    record as the justification. The event must name the qualified object.
+    """
+    run_dir = _s2_run_dir(tmp_path)
+    live = run_dir / "manifest.json"
+    profile_migration._write_manifest(live, _s2_manifest(checkpoint="planned"))
+
+    factory = profile_migration.CheckpointEvidence
+    decoy = factory(
+        checkpoint="locked", code="plan_digest", digest="cc" * 32, detail=_s206_detail("planned")
+    )
+    qualified = factory(
+        checkpoint="locked", code="lock_ownership", digest="ab" * 32, detail=_s206_detail("locked")
+    )
+    advanced = profile_migration.advance_manifest_checkpoint(live, "locked", evidence=[decoy, qualified])
+    assert advanced.checkpoint == "locked"
+
+    event = load_manifest(live).events[-1]
+    assert event.payload["evidence"] == "lock_ownership", (
+        "the durable record names an evidence object that the transition never qualified"
+    )
+    assert event.payload["digest"] == "ab" * 32

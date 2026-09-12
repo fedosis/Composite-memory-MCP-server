@@ -4049,10 +4049,46 @@ def append_manifest_event(
 
 def resume_profile_migration(
     manifest_path: Path, request: MigrationRequest
-) -> MigrationManifest:
-    """Reject resume until continuation is implemented, after its own checks."""
-    validate_mutation_preconditions(request)
-    raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
+) -> ResumeOutcome:
+    """Classify a stopped run, then CONTINUE it or refuse by cause.
+
+    S2-07 (DETAIL 9.3, 10.5). Resume is an ACTION entrypoint, so it stays
+    fail-closed exactly like `apply`: it repeats every precondition the apply path
+    repeats -- replan, no-follow identities, config digest, writer inventory, quiet
+    interval and the bounded SQLite probe -- then re-confirms the RUN's own durable
+    records against the filesystem, classifies the run through the deterministic
+    `classify_resume` primitive, and then either continues or REFUSES WITH THE
+    CAUSE:
+
+    1. a manifest that cannot be read is refused before anything else
+       (``E_MANIFEST_ABSENT``; a broken chain/digest stays fatal in
+       ``load_manifest``), and so is a manifest belonging to another run id
+       (``E_RESUME_RUN_MISMATCH``);
+    2. the source's no-follow identity and the config digest must still be the
+       ones the run recorded (``E_RESUME_SOURCE_CHANGED``,
+       ``E_RESUME_CONFIG_CHANGED``), and every entry the run's OWN backup report
+       records must still verify (``E_RESUME_BACKUP_CHANGED``,
+       ``E_RESUME_BACKUP_MISSING``);
+    3. at or after ``publishing`` each artifact's target/staging/quarantine triad
+       is classified against the run's OWN event history. A contradiction between
+       that chain and the disk, a duplicated sequence, or a missing required entry
+       is ``E_PUBLICATION_AMBIGUOUS`` / ``E_RESUME_TRIAD_INCOMPLETE`` -- never a
+       guess, never a repair;
+    4. when EXACTLY ONE next operation remains, the refusal is that operation's own
+       gate: ``E_STAGED_VERIFICATION_CAPABILITY_MISSING`` while the verification
+       seam reports no implemented capability, and ``E_MIGRATION_NOT_IMPLEMENTED``
+       for an engine stage this slice has not wired. The entrypoint CONTINUES
+       (returns the classification) only when nothing remains at all.
+
+    No mutation happens on any path -- no swap, no repair, no deletion -- so a
+    repeated resume repeats nothing. Executing `next_operations` is S3-06's wiring:
+    publication requires evidence that `staged_verified` was reached and
+    `verify_staged_projections` is still the S0 stub (S2-06 review R1/R4).
+    """
+    outcome = classify_resume(manifest_path, request)
+    if outcome.blocked_by:
+        raise ValueError(outcome.blocked_by)
+    return outcome
 
 
 def rollback_profile_migration(
@@ -4523,7 +4559,17 @@ def advance_manifest_checkpoint(
         manifest.checkpoint, target, evidence, capability=capability, manifest=manifest
     )
     supplied = [item for item in (evidence or ()) if isinstance(item, CheckpointEvidence)]
-    matching = next(item for item in supplied if item.checkpoint == checkpoint)
+    # R7 (S2-06 review F-1, reproduced by its own probe): the recorded evidence
+    # object must be the one the transition QUALIFIED. Filtering by checkpoint
+    # alone let a decoy object for the same checkpoint be written into the
+    # append-only record as the justification, so the two-key filter of
+    # `validate_forward_transition` is reused here verbatim. The object is
+    # guaranteed to exist: the transition above already refused without it.
+    matching = next(
+        item
+        for item in supplied
+        if item.checkpoint == checkpoint and item.code == CHECKPOINT_EVIDENCE_CODES[checkpoint]
+    )
     updated = _append_event_to_manifest(
         manifest,
         checkpoint,
@@ -4902,3 +4948,579 @@ def reopen_published_artifact(
         "digest": observed.sha256 or "",
         "matches_staged": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# S2-07 -- the deterministic resume classifier
+# (DETAIL 9.3's forward checkpoints and per-artifact publication events,
+# DETAIL 10.5's resume rules) and the two carry-ins the S2-06 review assigned to
+# this card: R3 (the crash states the classifier must classify, and what it may
+# honestly claim about them) and R7/F-1 (the durable record could name an
+# UNQUALIFIED evidence object -- fixed at `advance_manifest_checkpoint`).
+#
+# Three promises, and every fail-closed branch below exists to keep one of them:
+#
+# 1. REPEAT, THEN DECIDE. Nothing is inherited from the caller. `resume` repeats
+#    the whole DETAIL 6.3 precondition set and re-confirms the RUN's own durable
+#    records -- run id, source identity, config digest, backup entries -- against
+#    the live filesystem before a single decision is made.
+# 2. ONE OPERATION, OR NONE. Each artifact's target/staging/quarantine triad is
+#    classified against the run's OWN event history: the recorded events must be a
+#    PREFIX of that artifact's DETAIL 9.3 sequence and the disk must agree with
+#    that prefix, and then the next event is the single unambiguous next
+#    operation. A contradiction between the chain and the disk, a duplicated
+#    sequence, or a missing required entry is refused with a stable code, never
+#    guessed and never repaired.
+# 3. IT NAMES, IT DOES NOT EXECUTE. The classifier reports what the run is
+#    licensed to continue with; `blocked_by` names the gate that keeps that
+#    operation from being executed HERE. Executing it is S3-06's wiring, because
+#    publication requires evidence that `staged_verified` was reached and
+#    `verify_staged_projections` is still the S0 stub (S2-06 review R1/R4).
+#    Because this path performs no mutation at all -- no swap, no repair, no
+#    deletion -- a repeated resume repeats no verified swap.
+#
+# Honest limits of this slice (disclosed, not worked around):
+# * `resume` does NOT execute `next_operations`, so it cannot by itself finish a
+#   half-published run; it reports the exact operation that would, and the cause
+#   that keeps it shut.
+# * A manifest at or after `publishing` is currently only reachable from a
+#   test or a future (S3) run, because `staged_verified` is capability-gated and
+#   the seam is a stub. The classifier is therefore exercised on REAL crash
+#   states produced by the shipped publication primitive.
+# * `manifest.target_identities_before` is the durable home of the pinned
+#   prestate. Nothing in this project populates it yet, so the classifier falls
+#   back to the live plan while the run's own record has not decided the
+#   sequence, and says which source it used (`pin_source`).
+# ---------------------------------------------------------------------------
+
+RESUME_PHASE_PREPUBLICATION = "prepublication"
+RESUME_PHASE_PUBLISHING = "publishing"
+RESUME_PHASE_POSTPUBLICATION = "postpublication"
+
+RESUME_TRIAD_PRESTATE_INTACT = "prestate_intact"
+RESUME_TRIAD_PRESTATE_QUARANTINED = "prestate_quarantined"
+RESUME_TRIAD_PRESTATE_ABSENT = "prestate_absent"
+RESUME_TRIAD_STAGING_PUBLISHED = "staging_published"
+RESUME_TRIAD_COMPLETE = "complete"
+
+RESUME_BACKUP_VERIFIED = "verified"
+RESUME_BACKUP_ABSENT = "absent"
+RESUME_BACKUP_NOT_REQUIRED = "not_required"
+
+RESUME_PIN_SOURCE_RECORD = "record"
+RESUME_PIN_SOURCE_PLAN = "plan"
+
+RESUME_TOLERATED_RUN_PATH_COLLISION = "E_BACKUP_COLLISION"
+_PUBLICATION_SEQUENCE_QUARANTINED: tuple[str, ...] = (
+    PUBLICATION_EVENT_REVALIDATED,
+    PUBLICATION_EVENT_QUARANTINED,
+    PUBLICATION_EVENT_STAGING_PUBLISHED,
+    PUBLICATION_EVENT_PARENT_FSYNCED,
+)
+_PUBLICATION_SEQUENCE_ABSENT: tuple[str, ...] = (
+    PUBLICATION_EVENT_REVALIDATED,
+    PUBLICATION_EVENT_ABSENT,
+    PUBLICATION_EVENT_STAGING_PUBLISHED,
+    PUBLICATION_EVENT_PARENT_FSYNCED,
+)
+_PUBLISHING_CHECKPOINT_INDEX = FORWARD_CHECKPOINTS.index(PUBLICATION_EVENT_CHECKPOINT)
+
+
+@dataclass(frozen=True)
+class ArtifactTriad:
+    """One artifact's target/staging/quarantine triad, classified.
+
+    ``recorded_events`` is what the RUN ITSELF recorded for this artifact, in
+    order; ``state`` is the DETAIL 9.3 position that both the record and the disk
+    agree on; ``next_event`` is the single next publication event, or None when
+    this artifact's sequence is already complete. ``detail`` carries the facts the
+    decision was made from (kinds, which source pinned the prestate kind, and
+    whether the published entry could be bound to the recorded staged identity).
+    """
+
+    artifact: str
+    recorded_events: tuple[str, ...]
+    state: str
+    next_event: str | None
+    target_kind: str
+    quarantine_present: bool
+    staging_present: bool
+    detail: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ResumeOutcome:
+    """What a resume DECIDED. Never a claim that the migration finished.
+
+    ``blocked_by`` is the stable code that keeps ``next_operations`` from being
+    executed by this slice (empty only when nothing remains at all);
+    ``tolerated_blockers`` names the replan diagnostics a resumed run is EXPECTED
+    to produce, so the tolerance is auditable instead of silent.
+    """
+
+    phase: str
+    checkpoint: str
+    next_checkpoint: str | None
+    triads: tuple[ArtifactTriad, ...]
+    next_operations: tuple[str, ...]
+    blocked_by: str
+    backup_state: str
+    tolerated_blockers: tuple[str, ...]
+    manifest: MigrationManifest
+
+
+def _load_resume_manifest(manifest_path: Path) -> MigrationManifest:
+    """The manifest a resume may act on, or a stable refusal.
+
+    A missing manifest is ``E_MANIFEST_ABSENT``; every malformed, unbounded,
+    escaping, tampered or chain-broken document keeps the fatal code
+    ``load_manifest`` already raises.
+    """
+    try:
+        return load_manifest(Path(manifest_path))
+    except FileNotFoundError as exc:
+        raise ValueError("E_MANIFEST_ABSENT") from exc
+
+
+def _require_resume_source_identity(plan: MigrationPlan, manifest: MigrationManifest) -> None:
+    """The source must still be the identity the run recorded (DETAIL 10.5)."""
+    if _identity_key(plan.source_sql) != _identity_key(manifest.source_identity):
+        raise ValueError("E_RESUME_SOURCE_CHANGED")
+
+
+def _require_resume_config_digest(plan: MigrationPlan, manifest: MigrationManifest) -> None:
+    """The config digest must still be the one the run recorded (DETAIL 10.5)."""
+    if plan.config_digest != manifest.config_digest:
+        raise ValueError("E_RESUME_CONFIG_CHANGED")
+
+
+def _require_resume_plan(plan: MigrationPlan) -> tuple[str, ...]:
+    """A replan of a RESUMED run is expected to collide with its own run path.
+
+    ``E_BACKUP_COLLISION`` -- "a run-owned path for this run id already exists" --
+    is the definition of a resumed run, so it is tolerated and REPORTED; every
+    other blocker still refuses the resume with its own stable code.
+    """
+    tolerated = tuple(
+        sorted(
+            f"{item.code}:{item.artifact}"
+            for item in plan.blockers
+            if item.code == RESUME_TOLERATED_RUN_PATH_COLLISION
+        )
+    )
+    blocking = [
+        item.code for item in plan.blockers if item.code != RESUME_TOLERATED_RUN_PATH_COLLISION
+    ]
+    if blocking:
+        raise ValueError(blocking[0])
+    return tolerated
+
+
+def _resume_backup_state(run_dir: Path, manifest: MigrationManifest) -> str:
+    """Confirm the run's OWN backup report and every entry it records.
+
+    DETAIL 10.5 repeats "backup hashes" on resume. The report is the run's own
+    durable record of what was copied, so it is re-read and its recorded digest,
+    run id and per-entry size/digest are re-checked against the run directory. A
+    rotted or replaced backup copy is ``E_RESUME_BACKUP_CHANGED``; a run that has
+    passed ``backed_up`` with no report at all is ``E_RESUME_BACKUP_MISSING``.
+    """
+    required = forward_checkpoint_index(manifest.checkpoint) >= FORWARD_CHECKPOINTS.index(
+        "backed_up"
+    )
+    report_path = Path(run_dir) / BACKUP_REPORT_NAME
+    if not os.path.lexists(report_path):
+        if required:
+            raise ValueError("E_RESUME_BACKUP_MISSING")
+        return RESUME_BACKUP_NOT_REQUIRED
+    try:
+        payload = json.loads(_read_bounded_manifest_bytes(report_path).decode("utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("E_RESUME_BACKUP_CHANGED")
+        recorded_digest = payload.get("digest")
+        body = {key: value for key, value in payload.items() if key != "digest"}
+        if not _is_bounded_digest(recorded_digest) or _digest(body) != recorded_digest:
+            raise ValueError("E_RESUME_BACKUP_CHANGED")
+        if payload.get("run_id") != manifest.run_id:
+            raise ValueError("E_RESUME_BACKUP_CHANGED")
+        entries = payload.get("entries")
+        if not isinstance(entries, (list, tuple)) or len(entries) > MAX_BACKUP_ENTRIES:
+            raise ValueError("E_RESUME_BACKUP_CHANGED")
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise ValueError("E_RESUME_BACKUP_CHANGED")
+            if entry.get("present") is not True:
+                continue
+            relative = _validate_run_relative_path(
+                entry.get("run_relative_path"), field_name="backup entry.run_relative_path"
+            )
+            destination = Path(run_dir) / relative
+            kind = entry.get("kind")
+            if kind == "regular_file":
+                # The shared, no-follow, fstat-before-and-after streaming reader is
+                # the ONE copy verifier in this project; it never raises, it
+                # degrades to a sha256-less identity, and that is a refusal here.
+                identity = _digest_regular_path(
+                    destination, artifact=f"backup:{destination.name}", notes=[], digest=True
+                )
+                if (
+                    identity.kind != "regular_file"
+                    or identity.size != entry.get("size")
+                    or identity.sha256 != entry.get("sha256")
+                ):
+                    raise ValueError("E_RESUME_BACKUP_CHANGED")
+            elif kind == "directory":
+                if not stat.S_ISDIR(os.lstat(destination).st_mode):
+                    raise ValueError("E_RESUME_BACKUP_CHANGED")
+            elif kind == "symlink":
+                if os.readlink(destination) != entry.get("raw_link_target"):
+                    raise ValueError("E_RESUME_BACKUP_CHANGED")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc) == "E_RESUME_BACKUP_CHANGED":
+            raise
+        raise ValueError("E_RESUME_BACKUP_CHANGED") from exc
+    return RESUME_BACKUP_VERIFIED
+
+
+def _resume_entry_identity(parent: Path, name: str, *, artifact: str) -> ArtifactIdentity:
+    """The no-follow identity of one triad entry; ``absent`` when it is not there.
+
+    A missing parent chain is NOT an error here: it is exactly how an unstarted
+    artifact looks, and the classifier decides what that means.
+    """
+    try:
+        with storage_lock.open_directory_nofollow(parent) as parent_fd:
+            return _observed_entry_identity(parent_fd, name, artifact=artifact)
+    except storage_lock.StorageLockError as exc:
+        if exc.code == "E_PATH_ABSENT":
+            return ArtifactIdentity(str(name), "absent")
+        raise _publication_failure(
+            exc.code, f"{artifact} path chain is not a no-follow real path"
+        ) from exc
+
+
+def _publication_records(
+    manifest: MigrationManifest, label: str
+) -> tuple[tuple[str, ...], tuple[Mapping[str, Any], ...]]:
+    """One artifact's recorded publication events: names AND payloads, in order."""
+    prefix = label + PUBLICATION_EVENT_OPERATION_SEPARATOR
+    names: list[str] = []
+    payloads: list[Mapping[str, Any]] = []
+    for event in manifest.events:
+        if event.operation.startswith(prefix):
+            names.append(event.operation[len(prefix) :])
+            payloads.append(event.payload)
+    return tuple(names), tuple(payloads)
+
+
+def _classify_artifact(
+    manifest: MigrationManifest,
+    plan: MigrationPlan,
+    run_dir: Path,
+    label: str,
+    names: tuple[str, ...],
+    payloads: tuple[Mapping[str, Any], ...],
+) -> ArtifactTriad:
+    """Classify ONE artifact's triad against the run's own event history."""
+    quarantined_recorded = PUBLICATION_EVENT_QUARANTINED in names
+    absent_recorded = PUBLICATION_EVENT_ABSENT in names
+    pinned = plan.targets.get(label)
+    if pinned is None:
+        raise _publication_failure("E_PUBLICATION_TARGET_MISSING", f"the plan records no {label} target")
+    if quarantined_recorded:
+        sequence = _PUBLICATION_SEQUENCE_QUARANTINED
+        pin_source = RESUME_PIN_SOURCE_RECORD
+    elif absent_recorded:
+        sequence = _PUBLICATION_SEQUENCE_ABSENT
+        pin_source = RESUME_PIN_SOURCE_RECORD
+    else:
+        # No sequence decision is recorded yet, so the live pin is still the
+        # prestate and it decides which sequence this artifact is on.
+        sequence = (
+            _PUBLICATION_SEQUENCE_ABSENT
+            if pinned.kind == "absent"
+            else _PUBLICATION_SEQUENCE_QUARANTINED
+        )
+        pin_source = RESUME_PIN_SOURCE_PLAN
+
+    if len(names) > len(sequence) or names != sequence[: len(names)]:
+        raise _publication_failure(
+            "E_PUBLICATION_AMBIGUOUS",
+            f"{label} recorded {list(names)} for its own {list(sequence)} sequence; "
+            "the events cannot be ordered into exactly one next operation",
+        )
+
+    position = len(names)
+    next_event = sequence[position] if position < len(sequence) else None
+    target = Path(pinned.lexical_path)
+    observed_target = _resume_entry_identity(target.parent, target.name, artifact=label)
+    staging_entry = Path(run_dir) / BACKUP_STAGING_NAME / ARTIFACT_STAGING_NAMES[label]
+    observed_staging = _resume_entry_identity(
+        staging_entry.parent, staging_entry.name, artifact=label
+    )
+    quarantine_entry = (
+        Path(run_dir)
+        / QUARANTINE_DIRECTORY_NAME
+        / QUARANTINE_PREPUBLISH_NAME
+        / _quarantine_entry_name(label, manifest.run_id)
+    )
+    observed_quarantine = _resume_entry_identity(
+        quarantine_entry.parent, quarantine_entry.name, artifact=label
+    )
+    quarantine_present = observed_quarantine.kind != "absent"
+    staging_present = observed_staging.kind != "absent"
+    detail: dict[str, Any] = {
+        "sequence_position": position,
+        "pin_source": pin_source,
+        "target_kind": observed_target.kind,
+        "staging_kind": observed_staging.kind,
+        "quarantine_kind": observed_quarantine.kind,
+        "next_event": next_event,
+    }
+
+    if position <= 1:
+        if not staging_present:
+            raise _manifest_failure(
+                "E_RESUME_TRIAD_INCOMPLETE",
+                f"{label} has no staged entry to publish, which its own record requires",
+            )
+        if quarantine_present:
+            raise _publication_failure(
+                "E_PUBLICATION_AMBIGUOUS",
+                f"{label} already owns a quarantine entry while its own record records no "
+                "quarantine step",
+            )
+        if position == 1:
+            recorded_pinned_kind = payloads[0].get("pinned_kind")
+            if recorded_pinned_kind != observed_target.kind:
+                raise _publication_failure(
+                    "E_PUBLICATION_AMBIGUOUS",
+                    f"{label} was revalidated as {recorded_pinned_kind!r} but the target is "
+                    f"{observed_target.kind!r}",
+                )
+        state = RESUME_TRIAD_PRESTATE_INTACT
+
+    elif position == 2:
+        if observed_target.kind != "absent":
+            raise _publication_failure(
+                "E_PUBLICATION_AMBIGUOUS",
+                f"{label}'s own record says its prestate was quarantined but the target name is "
+                f"not vacant (it holds {observed_target.kind!r}); two candidates are possible",
+            )
+        if not staging_present:
+            raise _manifest_failure(
+                "E_RESUME_TRIAD_INCOMPLETE",
+                f"{label} has no staged entry to publish, which its own record requires",
+            )
+        if quarantined_recorded:
+            if not quarantine_present:
+                raise _manifest_failure(
+                    "E_RESUME_TRIAD_INCOMPLETE",
+                    f"{label}'s own record says its prestate was quarantined but the quarantine "
+                    "entry is missing",
+                )
+            pinned_digest = payloads[0].get("pinned_digest")
+            quarantined_digest = payloads[1].get("identity")
+            if (
+                _is_bounded_digest(pinned_digest)
+                and _is_bounded_digest(quarantined_digest)
+                and pinned_digest != quarantined_digest
+            ):
+                raise _publication_failure(
+                    "E_PUBLICATION_AMBIGUOUS",
+                    f"{label}'s own record pins one prestate and quarantines another",
+                )
+            detail["digest_bound"] = _is_bounded_digest(quarantined_digest)
+            state = RESUME_TRIAD_PRESTATE_QUARANTINED
+        else:
+            if quarantine_present:
+                raise _publication_failure(
+                    "E_PUBLICATION_AMBIGUOUS",
+                    f"{label} owns a quarantine entry although its own record records an absent "
+                    "prestate",
+                )
+            state = RESUME_TRIAD_PRESTATE_ABSENT
+
+    else:
+        if observed_target.kind == "absent":
+            raise _publication_failure(
+                "E_PUBLICATION_AMBIGUOUS",
+                f"{label}'s own record says the staged entry was published but the target name "
+                "is vacant",
+            )
+        if staging_present:
+            raise _publication_failure(
+                "E_PUBLICATION_AMBIGUOUS",
+                f"{label} still has a staged entry AND an entry at the target name; two "
+                "candidates are possible",
+            )
+        if quarantined_recorded:
+            if not quarantine_present:
+                raise _manifest_failure(
+                    "E_RESUME_TRIAD_INCOMPLETE",
+                    f"{label}'s retained prestate copy is missing from the quarantine area",
+                )
+            if _identity_key(observed_target) == _identity_key(observed_quarantine):
+                raise _publication_failure(
+                    "E_PUBLICATION_AMBIGUOUS",
+                    f"{label}'s quarantined prestate is sitting at the target name",
+                )
+        elif quarantine_present:
+            raise _publication_failure(
+                "E_PUBLICATION_AMBIGUOUS",
+                f"{label} owns a quarantine entry although its own record records an absent "
+                "prestate",
+            )
+        recorded_staged_digest = payloads[0].get("staged_digest")
+        published_digest = payloads[position - 1].get("identity")
+        if (
+            _is_bounded_digest(recorded_staged_digest)
+            and _is_bounded_digest(published_digest)
+        ):
+            detail["staged_record_consistent"] = recorded_staged_digest == published_digest
+        # The run's own record digests the identity object ITS CALLER passed to
+        # `publish_artifact`, while an observed identity carries the entry's own
+        # basename. Where the two agree the binding is exact; where they do not,
+        # that is REPORTED instead of being mistaken for a refusal.
+        detail["digest_bound"] = _digest(asdict(observed_target)) == published_digest
+        if position == len(sequence):
+            state = RESUME_TRIAD_COMPLETE
+            if not _published_sequence_is_complete(names):
+                raise _publication_failure(
+                    "E_PUBLICATION_AMBIGUOUS",
+                    f"{label}'s recorded sequence is not complete by the state machine's own "
+                    "predicate",
+                )
+        else:
+            state = RESUME_TRIAD_STAGING_PUBLISHED
+
+    return ArtifactTriad(
+        artifact=label,
+        recorded_events=names,
+        state=state,
+        next_event=next_event,
+        target_kind=observed_target.kind,
+        quarantine_present=quarantine_present,
+        staging_present=staging_present,
+        detail=detail,
+    )
+
+
+def classify_publication_triads(
+    manifest: MigrationManifest, plan: MigrationPlan, *, run_dir: Path
+) -> tuple[ArtifactTriad, ...]:
+    """Classify EVERY publication artifact's target/staging/quarantine triad.
+
+    Deterministic and read-only: the same manifest, plan and run directory always
+    yield the same classification, and nothing on disk is modified or deleted.
+    Each artifact's recorded events are read through the shipped
+    ``publication_events_from_manifest`` view and independently re-derived from
+    the same chain, so the two can never disagree silently. A refusal is a stable
+    ``E_PUBLICATION_AMBIGUOUS`` (not single-valued) or ``E_RESUME_TRIAD_INCOMPLETE``
+    (a required entry is missing) -- there is no "best guess" branch.
+    """
+    recorded: dict[str, tuple[str, ...]] = {}
+    payloads: dict[str, tuple[Mapping[str, Any], ...]] = {}
+    claimed = publication_events_from_manifest(manifest)
+    for label in PUBLICATION_ARTIFACTS:
+        names, item_payloads = _publication_records(manifest, label)
+        if names != claimed[label]:
+            raise _publication_failure(
+                "E_PUBLICATION_AMBIGUOUS", f"the run's own views of {label}'s events disagree"
+            )
+        recorded[label] = names
+        payloads[label] = item_payloads
+    return tuple(
+        _classify_artifact(
+            manifest, plan, Path(run_dir), label, recorded[label], payloads[label]
+        )
+        for label in PUBLICATION_ARTIFACTS
+    )
+
+
+def _resume_blocked_by(next_checkpoint: str | None, next_operations: tuple[str, ...]) -> str:
+    """The stable code that keeps the ONE next operation from being executed here.
+
+    Empty only when nothing remains. A capability-gated checkpoint and any
+    publication operation both need the verification seam to REPORT an
+    implemented capability; while it does not, the gate stays shut and says so.
+    Anything else that remains is an engine stage this slice has not wired
+    (S3-06), which is reported with the project's existing code for that.
+    """
+    if next_checkpoint is None and not next_operations:
+        return ""
+    gated = next_checkpoint is not None and next_checkpoint in CAPABILITY_GATED_CHECKPOINTS
+    if (gated or next_operations) and not staged_verification_capability().implemented:
+        return "E_STAGED_VERIFICATION_CAPABILITY_MISSING"
+    return "E_MIGRATION_NOT_IMPLEMENTED"
+
+
+def classify_resume(manifest_path: Path, request: MigrationRequest) -> ResumeOutcome:
+    """Repeat every precondition, confirm every durable identity, then classify.
+
+    This is the DETERMINISTIC CLASSIFIER itself, and it is public so the decision
+    can be inspected without an action entrypoint's refusal in the way: it repeats
+    the whole DETAIL 6.3 precondition set, re-confirms the run's own durable
+    records, and returns what a resume would DECIDE. It mutates nothing, and it
+    refuses ambiguity rather than resolving it:
+
+    * ``E_MANIFEST_ABSENT`` / ``E_RESUME_RUN_MISMATCH`` -- no manifest for this run;
+    * ``E_RESUME_SOURCE_CHANGED`` / ``E_RESUME_CONFIG_CHANGED`` /
+      ``E_RESUME_BACKUP_CHANGED`` / ``E_RESUME_BACKUP_MISSING`` -- a duplicated
+      precondition moved under the run;
+    * ``E_PUBLICATION_AMBIGUOUS`` / ``E_RESUME_TRIAD_INCOMPLETE`` -- the triad is
+      not single-valued, or an entry the run's own record requires is missing.
+
+    ``blocked_by`` is the stable code that keeps ``next_operations`` from being
+    executed by this slice; it is empty only when nothing remains at all.
+    """
+    validate_mutation_preconditions(request)
+    manifest = _load_resume_manifest(manifest_path)
+    if manifest.run_id != request.run_id:
+        raise ValueError("E_RESUME_RUN_MISMATCH")
+    plan = plan_profile_migration(request)
+    _require_resume_source_identity(plan, manifest)
+    _require_resume_config_digest(plan, manifest)
+    tolerated = _require_resume_plan(plan)
+    run_dir = _backup_run_directory(plan)
+    backup_state = _resume_backup_state(run_dir, manifest)
+
+    index = forward_checkpoint_index(manifest.checkpoint)
+    if index < _PUBLISHING_CHECKPOINT_INDEX:
+        next_checkpoint = FORWARD_CHECKPOINTS[index + 1]
+        return ResumeOutcome(
+            phase=RESUME_PHASE_PREPUBLICATION,
+            checkpoint=manifest.checkpoint,
+            next_checkpoint=next_checkpoint,
+            triads=(),
+            next_operations=(),
+            blocked_by=_resume_blocked_by(next_checkpoint, ()),
+            backup_state=backup_state,
+            tolerated_blockers=tolerated,
+            manifest=manifest,
+        )
+
+    triads = classify_publication_triads(manifest, plan, run_dir=run_dir)
+    next_operations = tuple(
+        f"{triad.artifact}{PUBLICATION_EVENT_OPERATION_SEPARATOR}{triad.next_event}"
+        for triad in triads
+        if triad.next_event is not None
+    )
+    next_checkpoint = (
+        FORWARD_CHECKPOINTS[index + 1] if index + 1 < len(FORWARD_CHECKPOINTS) else None
+    )
+    return ResumeOutcome(
+        phase=(
+            RESUME_PHASE_PUBLISHING
+            if index == _PUBLISHING_CHECKPOINT_INDEX
+            else RESUME_PHASE_POSTPUBLICATION
+        ),
+        checkpoint=manifest.checkpoint,
+        next_checkpoint=next_checkpoint,
+        triads=triads,
+        next_operations=next_operations,
+        blocked_by=_resume_blocked_by(next_checkpoint, next_operations),
+        backup_state=backup_state,
+        tolerated_blockers=tolerated,
+        manifest=manifest,
+    )
