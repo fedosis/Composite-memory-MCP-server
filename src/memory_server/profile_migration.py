@@ -168,10 +168,26 @@ MAX_DISTINCT_OUTBOX_STATUSES = 16
 # queue whose status counts are recorded. Requiring the accepted head revision
 # below transitively implies the rest of the canonical schema.
 REQUIRED_SNAPSHOT_TABLES = ("alembic_version", "facts", OUTBOX_TABLE_NAME)
-# Migration head of this tree: migrations/versions/7a1b2c3d4e5f_*.py, reached
-# through 70e6afc8d15d -> 5d4e3c2b1a0f -> 6a7b8c9d0e1f. An intermediate or
-# unknown revision is a blocker, never silently accepted for a rebuild source.
-ACCEPTED_SQLITE_SCHEMA_REVISIONS = frozenset({"7a1b2c3d4e5f"})
+# Migration head of THIS tree, derived from BOTH ``version_locations`` that
+# alembic.ini configures: ``%(here)s/alembic/versions`` AND
+# ``%(here)s/migrations/versions``. Those ten revision files form ONE merged DAG
+# whose single head is the mergepoint ``0005``, whose ``down_revision`` is the
+# pair ("b2f3a4c5d6e7", "7a1b2c3d4e5f"). ``7a1b2c3d4e5f`` is therefore an
+# INTERIOR node of the merged DAG (it is consumed as a parent by ``0005``), NOT
+# a head; reading only one version location is what made S2-03 accept it. An
+# intermediate or unknown revision is a blocker, never silently accepted for a
+# rebuild source.
+#
+# The set is explicit on purpose. A runtime derivation was rejected: alembic is
+# a dev-only extra (pyproject ``[project.optional-dependencies].dev``), not a
+# runtime dependency, and the migration tree lives at the repository root rather
+# than inside the installed ``memory_server`` package, so neither an ``alembic``
+# import nor a version-location walk is available to the deployed module. The
+# drift is instead pinned by
+# ``tests/test_profile_migration.py::test_s203_accepted_revisions_are_the_tree_head_from_both_version_locations``,
+# which recomputes the head from both configured locations (stdlib only) and
+# fails when it changes.
+ACCEPTED_SQLITE_SCHEMA_REVISIONS = frozenset({"0005"})
 _RUNTIME_STOP_INSTRUCTIONS = (
     "stop every CMMS runtime for this profile and confirm no writer remains",
     "re-run this dry-run after shutdown; a zero-byte WAL is still an apply blocker",
@@ -1179,9 +1195,7 @@ def _competing_writer_refusal(uri: str) -> dict[str, Any]:
     return outcome
 
 
-def _transaction_probe(
-    source: Path, *, competing_writer: bool = True, while_locked: Callable[[], Any] | None = None
-) -> dict[str, Any]:
+def _transaction_probe(source: Path, *, while_locked: Callable[[], Any] | None = None) -> dict[str, Any]:
     """The exact bounded ``BEGIN IMMEDIATE`` / ``ROLLBACK`` no-logical-write probe.
 
     DETAIL 6.3 step 10 and 7.3: the probe is NEVER attempted through an
@@ -1191,6 +1205,10 @@ def _transaction_probe(
     transaction of its own; ``timeout=0`` bounds the lock wait so a live writer
     is reported instead of waited out; ``ROLLBACK`` is issued before the handle
     is closed so the qualified sequence is the recorded one.
+
+    The competing-writer refusal is ALWAYS taken: the probe has no way to skip
+    the exclusion proof (review F3 removed the ``competing_writer`` bypass, which
+    let a caller obtain ``qualified=True`` with no exclusion proof at all).
 
     ``while_locked`` is an optional observation hook invoked while the
     transaction is held, which is how the qualification tests observe the
@@ -1215,8 +1233,7 @@ def _transaction_probe(
         connection.execute(PROBE_BEGIN_SQL)
         report["performed"] = True
         report["in_transaction"] = bool(connection.in_transaction)
-        if competing_writer:
-            report["competing_writer"] = _competing_writer_refusal(uri)
+        report["competing_writer"] = _competing_writer_refusal(uri)
         if while_locked is not None:
             while_locked()
         connection.execute(PROBE_ROLLBACK_SQL)
@@ -1231,7 +1248,6 @@ def _qualify_transaction_probe(
     *,
     source_identity: ArtifactIdentity,
     sidecars: Mapping[str, ArtifactIdentity],
-    competing_writer: bool = True,
     while_locked: Callable[[], Any] | None = None,
 ) -> tuple[dict[str, Any], list[Diagnostic]]:
     """Qualify the exact transaction probe on a sidecar-free regular source only.
@@ -1292,7 +1308,7 @@ def _qualify_transaction_probe(
     report["journal_mode_header"] = _journal_mode_hint(source)
     before_artifacts, before_parent = _probe_invariance_key(source)
     try:
-        probe = _transaction_probe(source, competing_writer=competing_writer, while_locked=while_locked)
+        probe = _transaction_probe(source, while_locked=while_locked)
     except sqlite3.Error as exc:
         # The probe could not take the write lock at all (a live writer, an
         # unwritable source or another open refusal). No transaction was held, so
@@ -1341,7 +1357,7 @@ def _qualify_transaction_probe(
             )
         )
         return report, diagnostics
-    if competing_writer and not report["competing_writer"]["refused"]:
+    if not report["competing_writer"]["refused"]:
         report["unsafe"] = True
         diagnostics.append(
             Diagnostic(
@@ -1718,7 +1734,6 @@ def qualify_sqlite_source(
     source: Path,
     *,
     run_dir: Path,
-    competing_writer: bool = True,
     while_locked: Callable[[], Any] | None = None,
     accepted_revisions: frozenset[str] = ACCEPTED_SQLITE_SCHEMA_REVISIONS,
 ) -> tuple[dict[str, Any], list[Diagnostic]]:
@@ -1754,7 +1769,6 @@ def qualify_sqlite_source(
         source,
         source_identity=source_identity,
         sidecars=sidecars,
-        competing_writer=competing_writer,
         while_locked=while_locked,
     )
     diagnostics.extend(probe_diagnostics)

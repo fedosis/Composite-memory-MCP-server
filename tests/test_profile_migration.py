@@ -8,8 +8,10 @@ root.
 """
 from __future__ import annotations
 
+import ast
 import errno
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -1326,17 +1328,248 @@ def test_s202_report_is_json_serializable_and_bounded(tmp_path: Path, synthetic_
 # ``sqlite3.Connection.backup`` safety snapshot taken from a percent-encoded
 # immutable read-only source URI, and the snapshot's integrity / schema /
 # Alembic revision / ID / outbox verification read back from the RUN DIRECTORY
-# instead of the live source. Accessors are shape-tolerant so that the filed RED
-# on the parent commit is a behavioural assertion failure and never a collection
-# ``ImportError`` or a helper ``KeyError``.
+# instead of the live source.
+#
+# CLASSIFICATION OF THE FILED PRE-FIX RED (S2-03 fix round, review F2): those
+# accessors are shape-tolerant, so on a module that lacks the S2-03 API they
+# return ``({}, [])`` and the filed RED failures are SENTINEL comparisons against
+# that missing-capability result (``assert None == 'sidecars_absent_...'``,
+# ``assert {} is True``) -- a missing-capability RED, which routing-matrix line 63
+# says is NEVER a behavioural safety proof. It is labelled as such in
+# S2-03_EVIDENCE/S2-03_FIX1_RED_RELABEL.md; the behavioural RED is the separate
+# F1 capture S2-03_FIX1_BEHAVIOURAL_RED.log, where the API exists and a real
+# database at the tree's real head is refused.
 # ---------------------------------------------------------------------------
 
-S203_HEAD_REVISION = "7a1b2c3d4e5f"
+def _s203_tree_head_revisions() -> frozenset[str]:
+    """The tree's real Alembic head(s), derived from its OWN configuration.
+
+    F1: both ``version_locations`` configured in the repository's ``alembic.ini``
+    are read (``alembic/versions`` AND ``migrations/versions``), every revision
+    file in each is parsed, and a revision that no other revision names as a
+    ``down_revision`` is a head. The derivation imports nothing (no alembic, no
+    SQLAlchemy -- alembic is a dev-only extra and must not become a runtime
+    dependency) and is deliberately independent of the production constant, so a
+    wrong constant cannot mirror itself into these tests the way it did in S2-03.
+    """
+    tree_root = Path(profile_migration.__file__).resolve().parents[2]
+    ini_path = tree_root / "alembic.ini"
+    match = re.search(
+        r"^version_locations\s*=\s*(.+)$", ini_path.read_text(encoding="utf-8"), re.MULTILINE
+    )
+    assert match is not None, f"no version_locations entry in {ini_path}"
+    locations = [
+        part.replace("%(here)s", str(tree_root)) for part in match.group(1).strip().split(os.pathsep)
+    ]
+    assert len(locations) == 2, locations
+    revisions: dict[str, Any] = {}
+    for location in locations:
+        for revision_file in sorted(Path(location).glob("*.py")):
+            assignments: dict[str, Any] = {}
+            for node in ast.parse(revision_file.read_text(encoding="utf-8")).body:
+                names: list[tuple[str, Any]] = []
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            names.append((target.id, node.value))
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    names.append((node.target.id, node.value))
+                for name, value in names:
+                    if name in {"revision", "down_revision"} and value is not None:
+                        assignments[name] = ast.literal_eval(value)
+            assert isinstance(assignments.get("revision"), str), revision_file
+            revisions[assignments["revision"]] = assignments.get("down_revision")
+    parents: set[str] = set()
+    for down in revisions.values():
+        if isinstance(down, str):
+            parents.add(down)
+        elif isinstance(down, (tuple, list)):
+            parents.update(item for item in down if isinstance(item, str))
+    return frozenset(set(revisions) - parents)
+
+
+_S203_TREE_HEADS = _s203_tree_head_revisions()
+# The tree's real head, DERIVED from both configured version locations rather
+# than mirrored from the production constant -- the mirrored literal is exactly
+# how the F1 defect (an interior node 7a1b2c3d4e5f accepted as "the head") hid.
+S203_HEAD_REVISION = next(iter(_S203_TREE_HEADS))
 S203_REQUIRED_CODES = ("E_SQLITE_PROBE_UNSAFE", "E_SQLITE_SCHEMA", "E_BACKUP_COLLISION")
 
 
+def test_s203_accepted_revisions_are_the_tree_head_from_both_version_locations() -> None:
+    """The accepted set is this tree's real head, from BOTH version locations.
+
+    F1: the accepted-revision gate must move with the tree. This node recomputes
+    the head from ``alembic.ini``'s two ``version_locations`` and compares it to
+    the production constant, so adding, removing or merging a revision fails
+    here instead of silently refusing every genuinely current database. The
+    anchored literal below is the pin the reviewer asked for: it and
+    ``ACCEPTED_SQLITE_SCHEMA_REVISIONS`` must be updated together.
+    """
+    heads = _s203_tree_head_revisions()
+    assert heads == frozenset({"0005"}), heads
+    assert frozenset(profile_migration.ACCEPTED_SQLITE_SCHEMA_REVISIONS) == heads
+    # 7a1b2c3d4e5f is consumed as a parent by the merge revision 0005, so it is
+    # an interior node of the merged DAG and never a head.
+    assert "7a1b2c3d4e5f" not in heads
+    assert len(heads) == 1
+
+
+def test_s203_source_at_the_tree_head_revision_is_accepted(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """A real database stamped at the tree's ACTUAL head is accepted.
+
+    F1 behavioural proof: the S2-03 gate accepted only the interior node
+    7a1b2c3d4e5f and REFUSED a database stamped at the real head (0005) with
+    E_SQLITE_SCHEMA, so it refused every genuinely up-to-date database. A real
+    (synthetic, sidecar-free) database stamped at the head must qualify with no
+    diagnostics at all.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db", revision=S203_HEAD_REVISION)
+    run_dir = _s203_run_dir(tmp_path)
+    before = _tree_snapshot(home)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    verification = _s203_section(report, "snapshot", "verification")
+    assert verification.get("alembic_revision") == S203_HEAD_REVISION
+    assert verification.get("revision_accepted") is True
+    assert _s203_section(report, "probe", "qualified") is True
+    assert _s203_section(report, "snapshot", "created") is True
+    codes = _s203_codes(diagnostics)
+    assert "E_SQLITE_SCHEMA" not in codes, codes
+    assert diagnostics == []
+    assert _tree_snapshot(home) == before
+
+
+def test_s203_qualifier_has_no_public_writer_refusal_bypass(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """The public API cannot skip the write-lock exclusion proof.
+
+    F3: ``qualify_sqlite_source`` exposed an undeclared keyword-only
+    ``competing_writer=False`` that skipped the competitor-refusal enforcement
+    entirely, so a caller could get ``qualified=True`` with no exclusion proof
+    at all. After the fix the knob is gone from the public surface: the
+    signature carries no such parameter and passing it is a TypeError, so
+    production behaviour cannot lose the proof.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+
+    signature = inspect.signature(profile_migration.qualify_sqlite_source)
+    assert "competing_writer" not in signature.parameters
+    with pytest.raises(TypeError):
+        profile_migration.qualify_sqlite_source(db_path, run_dir=run_dir, competing_writer=False)
+
+
+def test_s203_probe_reports_unsafe_when_the_competing_writer_is_not_refused(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A competing writer that is NOT refused is E_SQLITE_PROBE_UNSAFE.
+
+    Reviewer mutation M2 deleted this enforcement (profile_migration.py:1344) and
+    the whole suite still passed: the branch was untested. The refusal outcome is
+    replaced at its private seam so the enforcement branch is exercised
+    deterministically on a real synthetic database -- no exclusion proof, no
+    qualification, no snapshot. Deleting the enforcement makes this node fail.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    before = _tree_snapshot(home)
+
+    def _not_refused(uri: str) -> dict[str, Any]:
+        return {
+            "attempted": True,
+            "refused": False,
+            "sqlite_errorname": None,
+            "detail": "injected: the competing writer acquired the write lock",
+        }
+
+    monkeypatch.setattr(profile_migration, "_competing_writer_refusal", _not_refused)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    assert "E_SQLITE_PROBE_UNSAFE" in _s203_codes(diagnostics)
+    probe = _s203_section(report, "probe")
+    assert probe.get("in_transaction") is True
+    assert probe.get("rolled_back") is True
+    assert _s203_section(report, "probe", "competing_writer", "refused") is False
+    assert probe.get("unsafe") is True
+    assert probe.get("qualified") is False
+    assert _s203_section(report, "snapshot") is None
+    assert not (run_dir / "snapshot").exists()
+    # The refusal is recorded, not executed: the source is still untouched.
+    assert _tree_snapshot(home) == before
+
+
+def test_s203_probe_reports_unsafe_when_the_bounded_transaction_is_not_held(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe that did not hold and roll back one transaction is UNSAFE.
+
+    Reviewer mutation M4 deleted the in_transaction/rolled_back enforcement
+    (profile_migration.py:1333) and the whole suite still passed. The real probe
+    runs here and its transaction flags are then falsified at the private seam,
+    so the enforcement branch is exercised for real. Deleting the enforcement
+    makes this node fail.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    run_dir = _s203_run_dir(tmp_path)
+    before = _tree_snapshot(home)
+
+    original_probe = profile_migration._transaction_probe
+
+    def _no_transaction(source: Path, **kwargs: Any) -> dict[str, Any]:
+        report = original_probe(source, **kwargs)
+        report["in_transaction"] = False
+        return report
+
+    monkeypatch.setattr(profile_migration, "_transaction_probe", _no_transaction)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+
+    assert "E_SQLITE_PROBE_UNSAFE" in _s203_codes(diagnostics)
+    probe = _s203_section(report, "probe")
+    # The competing writer WAS refused, so this is the transaction branch only.
+    assert _s203_section(report, "probe", "competing_writer", "refused") is True
+    assert probe.get("in_transaction") is False
+    assert probe.get("unsafe") is True
+    assert probe.get("qualified") is False
+    assert _s203_section(report, "snapshot") is None
+    assert not (run_dir / "snapshot").exists()
+    assert _tree_snapshot(home) == before
+
+
 def _s203_qualify(source: Path, run_dir: Path, **kwargs: Any) -> tuple[dict[str, Any], list[Any]]:
-    """Call the S2-03 qualifier, or ``({}, [])`` on a module that lacks it."""
+    """Call the S2-03 qualifier, or ``({}, [])`` when the API is absent.
+
+    The ``({}, [])`` fallback is what makes the filed pre-fix RED a SENTINEL
+    missing-capability result rather than a collection ``ImportError``; that is
+    its honest classification (see the block comment above), not a claim of
+    behavioural proof.
+    """
     api = getattr(profile_migration, "qualify_sqlite_source", None)
     if api is None:
         return {}, []
@@ -1345,7 +1578,11 @@ def _s203_qualify(source: Path, run_dir: Path, **kwargs: Any) -> tuple[dict[str,
 
 
 def _s203_verify(snapshot_path: Path, **kwargs: Any) -> tuple[dict[str, Any], list[Any]]:
-    """Call the S2-03 snapshot verification, or ``({}, [])`` when absent."""
+    """Call the S2-03 snapshot verification, or ``({}, [])`` when it is absent.
+
+    A sentinel fallback, exactly as ``_s203_qualify`` above -- missing capability,
+    never behavioural evidence.
+    """
     api = getattr(profile_migration, "verify_snapshot", None)
     if api is None:
         return {}, []
