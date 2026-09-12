@@ -4512,7 +4512,7 @@ def test_s207_every_publication_event_crash_boundary_is_classified(
     The crash state itself is behavioural evidence on BOTH sides -- the run's own
     chain and the real triad are produced by the shipped publication primitive.
     Behavioural successor of this contract: the classifier is driven from the
-    entrypoint in `test_s207_resume_names_the_single_unambiguous_next_operation`
+    entrypoint in `test_s207_resume_refuses_with_the_gate_of_the_single_unambiguous_operation`
     and `test_s207_a_completed_run_has_nothing_to_repeat_and_resume_is_byte_stable`,
     which are behavioural on both sides; wiring the classifier into `apply` is
     S3-06 (routing-matrix S2-06 split_further).
@@ -4856,3 +4856,104 @@ def test_s207_the_durable_record_names_the_qualified_evidence_object(tmp_path: P
         "the durable record names an evidence object that the transition never qualified"
     )
     assert event.payload["digest"] == "ab" * 32
+
+
+def _s207_staged_key(entry: Path) -> Any:
+    """The module's OWN identity key of a staged entry, observed through its parent.
+
+    Built from the shipped observer (`_observed_entry_identity`) and the shipped
+    field set (`_identity_key`), so a mutation assertion is measured in exactly the
+    units the production comparison uses -- and it is available on BOTH sides of
+    the fix, so it cannot make this node's failure vacuous at BASE.
+    """
+    with profile_migration.storage_lock.open_directory_nofollow(entry.parent) as parent_fd:
+        observed = profile_migration._observed_entry_identity(
+            parent_fd, entry.name, artifact="s207-staged-probe"
+        )
+    return profile_migration._identity_key(observed)
+
+
+def test_s207_resume_refuses_a_staged_entry_that_is_not_the_identity_the_run_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL at BASE; acceptance 1 / DETAIL 10.5 -- the STAGED identity class.
+
+    BEHAVIOURAL at BASE, and it must be read that way: at BASE this node FAILS on
+    the refusal CAUSE, not on a missing symbol. The BASE entrypoint refuses a
+    changed staged entry with ``E_STAGED_VERIFICATION_CAPABILITY_MISSING`` -- the
+    identical code it returns for an INTACT staged entry -- so the assertion that
+    fails at BASE is the one demanding ``E_RESUME_STAGING_CHANGED``. Nothing here
+    depends on a symbol, helper or signature that BASE does not already have.
+
+    Two REAL crash states, both driven through the shipped publication primitive
+    (`_s207_crash_state`), cover both arms where the run's own record is at or
+    after `prestate_revalidated` and the staged entry is present and required:
+
+    * position 1 (`prestate_revalidated`, vector -- a staged DIRECTORY): the entry
+      is replaced by a REGULAR FILE carrying different real bytes, so the
+      position-independent field set (kind/device/inode/mode/size/mtime_ns/sha256/
+      raw_link_target) differs in kind, size and digest;
+    * position 2 (`prestate_absent`, graph -- a staged REGULAR FILE): its real
+      bytes AND size change after the crash (11 B -> 4000 B).
+
+    The intact CONTROL is asserted first in each arm: the same state with the
+    staged entry untouched must NOT raise the new code -- it refuses on the
+    capability gate -- so the refusal below is caused by the mutation and not by
+    the fixture. Each mutation is additionally asserted to change the module's OWN
+    observed identity key (`_s207_staged_key`), which is measured with the shipped
+    observer on BOTH sides of the fix.
+
+    The honest limit of the comparison is disclosed in the SUMMARY: a DIRECTORY's
+    identity key carries dev/ino/mode and no size and no digest, so a like-for-like
+    directory swap is detected only when its inode or its mode changes -- while
+    this node was written, `rmtree` + `mkdir` REUSED the inode, which is exactly
+    why this leg swaps the KIND instead of pretending a directory digest exists.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+
+    # --- position 1: vector's staged entry is a DIRECTORY ------------------------
+    state = _s207_crash_state(tmp_path, monkeypatch, "prestate_revalidated")
+    staged = state["staged"]["vector"]
+    key_before = _s207_staged_key(staged)
+    manifest_bytes = state["live"].read_bytes()
+
+    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+        profile_migration.resume_profile_migration(state["live"], state["request"])
+
+    import shutil as _shutil
+
+    # A LIKE-FOR-LIKE directory swap is NOT a reliable mutation here: `rmtree` +
+    # `mkdir` reuses the inode on this filesystem (observed while writing this
+    # node), and a directory's identity key carries dev/ino/mode only. The mutation
+    # therefore replaces the staged DIRECTORY with a REGULAR FILE of real bytes:
+    # kind, size and digest all change, deterministically.
+    _shutil.rmtree(staged)
+    staged.write_bytes(b"SWAPPED-STAGED-ENTRY-BYTES" * 250)
+    assert _s207_staged_key(staged) != key_before, "the fixture did not change the observed identity"
+
+    with pytest.raises(ValueError, match="E_RESUME_STAGING_CHANGED"):
+        profile_migration.resume_profile_migration(state["live"], state["request"])
+
+    assert state["live"].read_bytes() == manifest_bytes, "a refusal rewrote the run's own record"
+    assert staged.exists(), "a refusal must not delete the entry it refused to publish"
+
+    # --- position 2: graph's staged entry is a REGULAR FILE, real bytes + size ---
+    file_state = _s207_crash_state(tmp_path / "file", monkeypatch, "prestate_absent")
+    staged_file = file_state["staged"]["graph"]
+    file_key_before = _s207_staged_key(staged_file)
+    size_before = os.lstat(staged_file).st_size
+    file_manifest_bytes = file_state["live"].read_bytes()
+
+    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+        profile_migration.resume_profile_migration(file_state["live"], file_state["request"])
+
+    staged_file.write_bytes(b"S207-SWAPPED-STAGED-BYTES" * 200)
+    assert os.lstat(staged_file).st_size != size_before, "the fixture did not change the entry's size"
+    assert _s207_staged_key(staged_file) != file_key_before, "the fixture did not change the identity"
+
+    with pytest.raises(ValueError, match="E_RESUME_STAGING_CHANGED"):
+        profile_migration.resume_profile_migration(file_state["live"], file_state["request"])
+
+    assert file_state["live"].read_bytes() == file_manifest_bytes
+    assert staged_file.exists(), "a refusal must not delete the entry it refused to publish"
