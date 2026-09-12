@@ -31,6 +31,11 @@ from memory_server.evaluation.decay import DecayEngine
 from memory_server.evaluation.metrics import get_collector
 from memory_server.evaluation.validator import Validator
 from memory_server.models import Belief
+from memory_server.paths import (
+    StorageLayout,
+    StorageResolutionInputs,
+    resolve_storage_layout,
+)
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.graph_router import GraphRouter
@@ -40,6 +45,7 @@ from memory_server.services.lifecycle_service import (
     LifecycleTransitionRequest,
 )
 from memory_server.settings import get_openai_api_key, get_settings
+from memory_server.storage_lock import RuntimeStorageLock
 
 if TYPE_CHECKING:
     from memory_server.providers.embedding_provider import EmbeddingProvider
@@ -63,15 +69,35 @@ _validator_store: Validator | None = None
 _confidence_engine: ConfidenceEngine | None = None
 _decay_engine: DecayEngine | None = None
 _outbox_worker: OutboxWorker | None = None
+_root_lock: RuntimeStorageLock | None = None
+_storage_layout: StorageLayout | None = None
 _outbox_task: asyncio.Task | None = None
+
+
+def _get_storage_layout() -> StorageLayout:
+    global _storage_layout
+    if _storage_layout is None:
+        settings = get_settings()
+        import os
+        explicit = os.environ.get("MEMORY_SERVER_DATA_ROOT")
+        _storage_layout = resolve_storage_layout(StorageResolutionInputs(
+            mode="standalone", data_root=explicit, sqlite_url=settings.db_url,
+            vector_backend=settings.vector_backend, lancedb_path=settings.lancedb_path,
+            graph_snapshot_path=settings.graph_snapshot_path, qdrant_location=settings.qdrant_location,
+            vector_collection=settings.vector_collection,
+        ))
+    return _storage_layout
+
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     """FastMCP lifespan: start providers + outbox worker on boot, stop gracefully on shutdown."""
-    global _outbox_task, _outbox_worker, _provider
+    global _outbox_task, _outbox_worker, _provider, _root_lock
     # --- Startup ---
     logger.info("Starting Composite Memory MCP Server...")
+    layout = _get_storage_layout()
+    _root_lock = RuntimeStorageLock.acquire(layout.data_root, timeout=5.0)
     provider = await _get_provider()
     worker = await _get_outbox_worker()
 
@@ -102,6 +128,9 @@ async def lifespan(server: FastMCP):
     if _provider:
         await _provider.close()
         logger.info("SQLite provider connection closed")
+    if _root_lock:
+        _root_lock.release()
+        _root_lock = None
 
 
 mcp = FastMCP("CompositeMemoryServer", lifespan=lifespan)
@@ -121,20 +150,12 @@ async def _get_provider() -> SQLiteProvider:
 
 def _get_sqlite_db_url() -> str:
     """Return the server SQLite URL and ensure file-backed parent dirs exist."""
-    db_url = get_settings().db_url
-    prefix = "sqlite+aiosqlite:///"
-    if db_url.startswith(prefix):
-        db_path = db_url.removeprefix(prefix)
-        if db_path and db_path != ":memory:":
-            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    return db_url
+    return _get_storage_layout().sqlite.effective_url
 
 
 def _get_graph_snapshot_path() -> Path:
     """Return the snapshot file path for the graph store."""
-    snapshot_path = get_settings().graph_snapshot_path
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    return snapshot_path
+    return _get_storage_layout().graph_snapshot_path
 
 
 async def _get_lancedb_provider() -> LanceDBProvider:
@@ -145,7 +166,7 @@ async def _get_lancedb_provider() -> LanceDBProvider:
 
         settings = get_settings()
         _lancedb = LanceDBProvider(
-            db_path=str(settings.lancedb_path),
+            db_path=str(_get_storage_layout().vector.local_path),
             table=settings.vector_collection,
             metric=settings.vector_metric,
             vector_size=settings.vector_size,

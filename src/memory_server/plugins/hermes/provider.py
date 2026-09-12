@@ -16,13 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from memory_server.paths import cmms_repo_root
+from memory_server.paths import StorageLayout, StorageLayoutError
 from memory_server.plugins.hermes.config import HermesPluginConfig
 from memory_server.plugins.hermes.llm_factory import (
     LLMExtractorFn,
@@ -34,6 +33,7 @@ from memory_server.plugins.hermes.resolver import (
 )
 from memory_server.plugins.hermes.writer import WriterQueue
 from memory_server.settings import get_openai_api_key, get_settings
+from memory_server.storage_lock import RuntimeStorageLock
 
 logger = logging.getLogger(__name__)
 
@@ -101,30 +101,23 @@ def _resolve_cmms_data_path(
     *,
     env_var: str | None = None,
 ) -> Path:
-    """Resolve CMMS data paths relative to config/env/repo root."""
-    raw_path = os.environ.get(env_var, relative_path) if env_var else relative_path
-    path = Path(raw_path)
-
-    if not path.is_absolute():
-        base_root = None
-        if provider._config and provider._config.cmms_path:
-            base_root = Path(provider._config.cmms_path)
-        elif provider._hermes_home:
-            candidate = Path(provider._hermes_home)
-            if (candidate / "data").exists():
-                base_root = candidate
-        if base_root is None:
-            base_root = cmms_repo_root()
-        path = (base_root / path).resolve()
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    if provider._storage_layout is None:
+        raise RuntimeError("storage layout is not initialized")
+    if relative_path == str(get_settings().graph_snapshot_path):
+        return provider._storage_layout.graph_snapshot_path
+    if relative_path == str(get_settings().lancedb_path):
+        return provider._storage_layout.vector.local_path
+    return provider._storage_layout.data_root / relative_path
 
 
 async def _get_graph(provider: "HermesProvider"):
     """Return a snapshot-backed graph instance for Hermes audit/tools."""
     from memory_server.providers.graph_provider import SimpleGraph
 
+    if provider._storage_layout is None:
+        raise RuntimeError("storage layout is not initialized")
+    if "graph" in provider._storage_layout.unavailable_projections:
+        raise RuntimeError("E_PROJECTION_UNAVAILABLE: graph requires migration")
     if provider._graph is None:
         snapshot_path = _resolve_cmms_data_path(
             provider,
@@ -137,7 +130,11 @@ async def _get_graph(provider: "HermesProvider"):
 
 async def _get_vector_provider(provider: "HermesProvider"):
     """Resolve the active vector backend for Hermes audit/tools."""
-    backend = get_settings().vector_backend
+    if provider._storage_layout is None:
+        raise RuntimeError("storage layout is not initialized")
+    if "vector" in provider._storage_layout.unavailable_projections:
+        raise RuntimeError("E_PROJECTION_UNAVAILABLE: vector requires migration")
+    backend = provider._storage_layout.vector.backend
 
     if backend == "qdrant":
         if provider._qdrant is None:
@@ -161,7 +158,9 @@ async def _get_vector_provider(provider: "HermesProvider"):
         from memory_server.providers.lancedb_provider import LanceDBProvider
 
         settings = get_settings()
-        db_path = _resolve_cmms_data_path(provider, str(settings.lancedb_path))
+        db_path = provider._storage_layout.vector.local_path
+        if db_path is None:
+            raise RuntimeError("E_PROJECTION_UNAVAILABLE: local vector path missing")
         provider._lancedb = LanceDBProvider(
             db_path=str(db_path),
             table=settings.vector_collection,
@@ -272,6 +271,9 @@ class HermesProvider:
         self._outbox_worker: Any | None = None
         self._outbox_task: asyncio.Task | None = None
         self._config: HermesPluginConfig | None = None
+        self._storage_layout: StorageLayout | None = None
+        self._root_lock: RuntimeStorageLock | None = None
+        self._projection_degraded_reason: str | None = None
         # B3b: cached extraction state — THE one Settings instance (step 2),
         # the frozen resolver result (step 4), and the cached callable or None
         # (step 5; None = regex mode — a VALUE, never substituted). Invariant:
@@ -361,17 +363,28 @@ class HermesProvider:
             config_data = kwargs.get("config", {}) or {}
             self._config = HermesPluginConfig.from_dict(config_data)
 
-            # STEP 2 — THE one Settings instance (provider-module alias,
-            # settings.py:361-364 @lru_cache). Only Settings object used for
-            # extraction resolution anywhere in the provider.
             self._settings = get_settings()
 
-            # STEP 3 — resolve db_url.
-            db_url = (
-                self._config.resolve_db_url(self._hermes_home)
-                if self._hermes_home
-                else self._config.db_url
+            # Freeze one coherent layout before opening or creating any store.
+            if self._config.storage_mode == "profile" and not self._hermes_home.strip():
+                if self._config.db_url.strip().lower() in {"sqlite+aiosqlite://", "sqlite+aiosqlite:///:memory:"}:
+                    self._config.storage_mode = "standalone"
+                else:
+                    raise StorageLayoutError("E_HERMES_HOME_REQUIRED", "hermes_home is required in profile mode")
+            # Preserve the compatibility hook and its side-effect-free contract.
+            configured_db_url = self._config.resolve_db_url(self._hermes_home)
+            self._config.db_url = configured_db_url
+            self._storage_layout = self._config.resolve_storage_layout(
+                hermes_home=self._hermes_home, settings=self._settings
             )
+            self._projection_degraded_reason = "; ".join(self._storage_layout.compatibility) or None
+            self._root_lock = RuntimeStorageLock.acquire(self._storage_layout.data_root, timeout=5.0)
+            self._storage_layout.data_root.mkdir(parents=True, exist_ok=True)
+            if self._storage_layout.sqlite.local_path is not None:
+                self._storage_layout.sqlite.local_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # SQLiteProvider(busy_timeout_ms=60000) BEFORE await initialize().
+            db_url = self._storage_layout.sqlite.effective_url
 
             # STEP 4 — resolver EXACTLY once; frozen result cached.
             self._extractor_runtime = resolve_extractor_settings(
@@ -396,7 +409,7 @@ class HermesProvider:
             )
             # Start the writer's background task on the shared loop
             _run_async(self._writer.start())
-            if _supports_background_outbox(db_url):
+            if not self._storage_layout.unavailable_projections and _supports_background_outbox(db_url):
                 _run_async(self._start_outbox_worker(), timeout=60.0)
 
             # STEP 8 — only now signal ready.
@@ -604,6 +617,10 @@ class HermesProvider:
         #    (T16). A run where any close failed keeps ``_cleanup_failed`` set
         #    so the retained handles are retried by the next teardown.
         if not run_failed:
+            if self._root_lock is not None:
+                self._root_lock.release()
+                self._root_lock = None
+            self._storage_layout = None
             self._cleanup_failed = False
             self._outbox_stop_failed = False
 

@@ -338,3 +338,14 @@ python -c "import memory_server; print(memory_server.__version__)"
 # Verify SQLite provider can initialize (DB path issue)
 python -c "from memory_server.providers.sqlite_provider import SQLiteProvider; print('OK')"
 ```
+
+## Profile-owned storage
+
+Native Hermes providers default to `storage_mode: profile` and resolve SQLite,
+LanceDB, graph snapshots, and locks below the active profile home. The
+installation `path` is import-only. Intentional sharing requires both
+`storage_mode: shared` and an absolute `data_root`; standalone MCP keeps its
+working-directory defaults unless `MEMORY_SERVER_DATA_ROOT` is supplied.
+Existing escaping projection symlinks are never followed: startup is
+degraded-safe and vector/graph recall remains unavailable until migration.
+

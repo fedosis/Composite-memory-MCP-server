@@ -812,3 +812,9 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 ## Authors
 
 See [AUTHORS.md](AUTHORS.md) for contributor and attribution information.
+
+## Storage isolation
+
+Native Hermes profiles own their SQLite, vector, graph, and lock paths below
+`HERMES_HOME` by default. See [the integration guide](docs/INTEGRATION.md) and
+[usage migration procedure](docs/USAGE.md).

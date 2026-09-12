@@ -869,3 +869,12 @@ Composite Memory MCP Server must be:
 -   extensible;
 -   auditable;
 -   capable of knowledge evolution.
+
+# ADR-014: Profile-owned coherent CMMS storage roots
+
+Status: Accepted. SQLite remains authoritative; vector and graph stores are
+rebuildable projections. Native profile mode resolves all local stores under
+one profile root and never uses the installation checkout for data placement.
+Sharing is explicit and requires a shared mode plus absolute root. Migration
+rebuilds from profile SQL, never imports mixed legacy projections, and is
+backup-backed, dry-run-first, resumable, and rollback-capable.

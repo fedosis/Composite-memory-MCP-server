@@ -14,10 +14,20 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from memory_server.paths import cmms_repo_root
+from memory_server.paths import (
+    StorageLayout,
+    StorageLayoutError,
+    StorageResolutionInputs,
+    ValueOrigin,
+    cmms_repo_root,
+    resolve_storage_layout,
+)
 from memory_server.settings import get_settings
+
+if TYPE_CHECKING:
+    from memory_server.settings import Settings
 
 # Env vars that this config block resolves itself. Extraction/LLM tuning
 # values (MEMORY_SERVER_LLM_MODEL etc.) are deliberately NOT part of the
@@ -30,6 +40,13 @@ _ENV_MAX_FACTS = "MEMORY_SERVER_MAX_FACTS"
 _ENV_WRITER_FLUSH_INTERVAL = "MEMORY_SERVER_WRITER_FLUSH_INTERVAL"
 _ENV_WRITER_MAX_BATCH = "MEMORY_SERVER_WRITER_MAX_BATCH"
 _ENV_LLM_BASE_URL = "MEMORY_SERVER_LLM_BASE_URL"
+_ENV_STORAGE_MODE = "MEMORY_SERVER_STORAGE_MODE"
+_ENV_DATA_ROOT = "MEMORY_SERVER_DATA_ROOT"
+_ENV_VECTOR_BACKEND = "MEMORY_SERVER_VECTOR_BACKEND"
+_ENV_LANCEDB_PATH = "MEMORY_SERVER_LANCEDB_PATH"
+_ENV_GRAPH_PATH = "MEMORY_SERVER_GRAPH_SNAPSHOT_PATH"
+_ENV_QDRANT = "MEMORY_SERVER_QDRANT_LOCATION"
+_ENV_COLLECTION = "MEMORY_SERVER_VECTOR_COLLECTION"
 
 
 def _env_str(name: str) -> str | None:
@@ -83,6 +100,9 @@ def _env_overrides(use_env: bool) -> dict[str, Any]:
             "writer_flush_interval": None,
             "writer_max_batch": None,
             "llm_base_url": None,
+            "storage_mode": None, "data_root": None, "vector_backend": None,
+            "lancedb_path": None, "graph_snapshot_path": None,
+            "qdrant_location": None, "vector_collection": None,
         }
     return {
         "path": _env_str(_ENV_PATH),
@@ -91,6 +111,12 @@ def _env_overrides(use_env: bool) -> dict[str, Any]:
         "writer_flush_interval": _env_float(_ENV_WRITER_FLUSH_INTERVAL),
         "writer_max_batch": _env_int(_ENV_WRITER_MAX_BATCH),
         "llm_base_url": _env_str(_ENV_LLM_BASE_URL),
+        "storage_mode": _env_str(_ENV_STORAGE_MODE), "data_root": _env_str(_ENV_DATA_ROOT),
+        "vector_backend": _env_str(_ENV_VECTOR_BACKEND) or _env_str("MEMORY_VECTOR_BACKEND"),
+        "lancedb_path": _env_str(_ENV_LANCEDB_PATH),
+        "graph_snapshot_path": _env_str(_ENV_GRAPH_PATH) or _env_str("MEMORY_GRAPH_SNAPSHOT_PATH"),
+        "qdrant_location": _env_str(_ENV_QDRANT) or _env_str("MEMORY_QDRANT_URL"),
+        "vector_collection": _env_str(_ENV_COLLECTION),
     }
 
 
@@ -156,6 +182,9 @@ class HermesPluginConfig:
     # ``memory.providers.memory_server`` config block). API keys stay in the
     # environment; enables self-hosted OpenAI-compatible endpoints.
     llm_base_url: str | None = None
+    storage_mode: str = "profile"
+    data_root: str = "."
+    storage_origins: dict[str, ValueOrigin] = field(default_factory=dict)
 
     @classmethod
     def from_dict(
@@ -208,6 +237,18 @@ class HermesPluginConfig:
             llm_base_url=(
                 env["llm_base_url"] or data.get("llm_base_url")
             ),
+            storage_mode=env["storage_mode"] or data.get("storage_mode") or "profile",
+            data_root=env["data_root"] or data.get("data_root") or ".",
+            storage_origins={
+                "mode": ValueOrigin(
+                    "env" if env["storage_mode"] else "yaml" if "storage_mode" in data else "default",
+                    _ENV_STORAGE_MODE if env["storage_mode"] else None,
+                ),
+                "root": ValueOrigin(
+                    "env" if env["data_root"] else "yaml" if "data_root" in data else "default",
+                    _ENV_DATA_ROOT if env["data_root"] else None,
+                ),
+            },
         )
 
     @classmethod
@@ -238,6 +279,8 @@ class HermesPluginConfig:
                 env["max_facts"] if env["max_facts"] is not None else 5
             ),
             llm_base_url=env["llm_base_url"],
+            storage_mode=env["storage_mode"] or "profile",
+            data_root=env["data_root"] or ".",
         )
 
     def validate_shared_root(self, expected: str | None = None) -> None:
@@ -258,17 +301,55 @@ class HermesPluginConfig:
                 "Per-profile data dirs fragment the LanceDB index and graph."
             )
 
-    def resolve_db_url(self, hermes_home: str) -> str:
-        """Resolve the database URL, expanding paths relative to hermes_home.
+    def validate_installation_path(self, expected: str | None = None) -> None:
+        """Validate installation/import path only; it is not a data root."""
+        if expected is not None and Path(self.cmms_path).absolute() != Path(expected).absolute():
+            raise ValueError(f"installation path mismatch: {self.cmms_path}")
 
-        If db_url is a relative path like 'sqlite+aiosqlite:///data/memory.db',
-        make it relative to hermes_home for profile isolation.
+    def resolve_storage_layout(
+        self, *, hermes_home: str, settings: "Settings", native: bool = True
+    ) -> StorageLayout:
+        """Freeze the storage layout once; pure, performs no I/O.
+
+        ``profile`` (native default) requires a non-blank ``hermes_home`` and
+        keeps every local store below it. ``shared`` requires an absolute
+        ``data_root`` and is only ever selected explicitly. ``standalone`` is
+        the legacy native-provider configuration (``hermes_home`` absent and an
+        in-memory ``db_url``; see ``HermesProvider.initialize``) and the MCP
+        server mode: it claims no profile identity and keeps the
+        working-directory-relative defaults unless ``data_root`` is set.
         """
+        mode = self.storage_mode
+        if mode not in ("profile", "shared", "standalone"):
+            raise StorageLayoutError(
+                "E_STORAGE_MODE_INVALID", f"invalid storage mode: {mode!r}"
+            )
+        profile_home: str | None = None
+        if mode == "profile":
+            if not native or not (hermes_home or "").strip():
+                raise StorageLayoutError(
+                    "E_HERMES_HOME_REQUIRED", "profile mode requires hermes_home"
+                )
+            profile_home = hermes_home
+        return resolve_storage_layout(StorageResolutionInputs(
+            mode=mode,
+            profile_home=profile_home,
+            data_root=self.data_root,
+            sqlite_url=self.db_url,
+            vector_backend=getattr(settings, "vector_backend", "lancedb"),
+            lancedb_path=getattr(settings, "lancedb_path", "data/lancedb"),
+            graph_snapshot_path=getattr(settings, "graph_snapshot_path", "data/graph.json"),
+            qdrant_location=getattr(settings, "qdrant_location", ":memory:"),
+            vector_collection=getattr(settings, "vector_collection", "memories"),
+            origins=self.storage_origins,
+        ))
+
+    def resolve_db_url(self, hermes_home: str) -> str:
+        """Resolve the database URL without filesystem side effects."""
         if self.db_url.startswith("sqlite+aiosqlite:///"):
             path_part = self.db_url[len("sqlite+aiosqlite:///"):]
             if not path_part.startswith("/"):
                 # Relative path — resolve against hermes_home
                 resolved = Path(hermes_home) / path_part
-                resolved.parent.mkdir(parents=True, exist_ok=True)
                 return f"sqlite+aiosqlite:///{resolved}"
         return self.db_url
