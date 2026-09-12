@@ -5460,15 +5460,19 @@ def test_s208_a_failed_restore_verification_retains_every_copy_without_an_automa
                 handle.write(b"CORRUPTED-AFTER-THE-RESTORE-RENAME")
         return outcome
 
+    # S2-08 fix round 1 (review F3.ii / R3.2): the shipped constant is now the
+    # DETAIL-registered name `E_ROLLBACK_VERIFY` (DETAIL.md:807), so this node's
+    # expectation was renamed with it. At BASE 54bb05c9 the delta still raises
+    # `E_ROLLBACK_VERIFY_FAILED`, so the rename itself is a behavioural difference at BASE.
     monkeypatch.setattr(os, "rename", _corrupt_after_the_restore_rename)
-    with pytest.raises(ValueError, match="E_ROLLBACK_VERIFY_FAILED"):
+    with pytest.raises(ValueError, match="E_ROLLBACK_VERIFY:"):
         rollback_profile_migration(state["manifest_path"], state["request"])
     monkeypatch.setattr(os, "rename", real_rename)
 
     assert restore_renames == [1], "the rollback retried the destructive swap"
     recorded = load_manifest(state["manifest_path"])
     assert recorded.status == "rollback_failed"
-    assert (recorded.failure or {}).get("code") == "E_ROLLBACK_VERIFY_FAILED"
+    assert (recorded.failure or {}).get("code") == "E_ROLLBACK_VERIFY"
     assert target.read_bytes() != (state["prestates"]["graph"][0][3] or b"")
     assert b"CORRUPTED-AFTER" in target.read_bytes()
     assert (run_dir / "backup" / "graph.json").read_bytes() == (state["prestates"]["graph"][0][3] or b"")
@@ -5542,3 +5546,299 @@ def test_s208_the_rollback_entrypoint_repeats_the_apply_guards(
         rollback_profile_migration(state["manifest_path"], replace(state["request"], mode="dry-run"))
 
     assert _s208_tree(state["home"]) == tree_before, "a refused rollback mutated the tree"
+
+
+# ---------------------------------------------------------------------------
+# S2-08 FIX ROUND 1 (attempt 1/2) -- the four nodes that answer the cross-provider
+# review's F1 (BLOCKING, the directory restore leg), F2 (the retry disposition, PINNED
+# here, not changed), F4 (the pre-move refusal of an added unrecorded backup entry) and
+# F5 (the failure record's exception class). Every node drives the REAL
+# `rollback_profile_migration` entrypoint; no node fabricates a result.
+# ---------------------------------------------------------------------------
+def _s208_fix1_content_map(
+    tree: tuple[tuple[str, str, int, bytes | None], ...],
+) -> dict[str, tuple[str, int | None, str | None]]:
+    """`_s208_tree` capture -> {relpath: (kind, size, sha256)}, path by path.
+
+    Only a regular entry carries bytes in the capture, so kind/size/sha256 are the
+    fields this fix round's byte-exactness claim is asserted on -- no recursive
+    directory digest is invented anywhere, exactly as the identity model requires.
+    """
+    return {
+        relative: (
+            kind,
+            None if payload is None else len(payload),
+            None if payload is None else hashlib.sha256(payload).hexdigest(),
+        )
+        for relative, kind, _mode, payload in tree
+    }
+
+
+def test_s208_fix1_a_directory_prestate_with_a_subdirectory_is_restored_byte_exactly(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """R1/F1: a pre-state DIRECTORY holding a SUBDIRECTORY is restored byte-exactly.
+
+    BEHAVIOURAL at BASE 54bb05c9, and the failure the RED capture must show is THE TREE
+    ASSERTION BELOW -- not a collection ImportError, not a helper TypeError, not a bare
+    bare failure. At BASE the rollback quarantines the published entry and then dies
+    inside `_stage_restored_tree`: `_run_directory_chain(staged_root_fd, parts[:-1])`
+    creates only the leaf's ANCESTORS and the shipped code then `os.chmod`s the LEAF
+    `nested`, so the leaf does not exist yet -- `FileNotFoundError: [Errno 2] 'nested'`,
+    re-wrapped during unwinding by `open_directory_nofollow` into
+    `StorageLockError('storage lock failure')`. THE TARGET IS LEFT ABSENT, so
+    `_s208_tree(target)` is `(("", "absent", 0, None),)` while the recorded pre-state is
+    the fixture's real `data/lancedb/` tree, and the comparison fails on exactly that.
+    The raised exception is captured (never swallowed) and asserted AFTER the tree, so
+    the node keeps its own claim: this passes only when the pre-state is really back.
+
+    What is asserted, in order: kind/size/sha256 path-by-path AND the whole no-follow
+    tree (modes included) equal the recorded pre-state; the rollback did not raise; the
+    run-created entry is retained byte-for-byte in the unique diagnostic quarantine; the
+    retained backup still holds the pre-state; `restore/` is empty; the recorded event
+    chain is the shipped rollback chain.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=False, publish=("vector",))
+    target = state["targets"]["vector"]
+    run_dir = state["run_dir"]
+    prestate = state["prestates"]["vector"]
+    assert (target / "nested").is_dir(), "the fixture no longer carries a nested directory"
+    backup_before = _s208_tree(run_dir / "backup")
+
+    outcome: Any = None
+    try:
+        outcome = rollback_profile_migration(state["manifest_path"], state["request"])
+    except BaseException as exc:  # noqa: BLE001 - the BASE directory-leg failure is CAPTURED
+        outcome = exc
+
+    # THE claim of this node. At BASE the target is absent and THIS is what fails.
+    assert _s208_tree(target) == prestate, (
+        "the directory pre-state (with its subdirectory) was not restored byte-exactly; "
+        f"rollback outcome = {outcome!r}"
+    )
+    assert _s208_fix1_content_map(_s208_tree(target)) == _s208_fix1_content_map(prestate), (
+        "the restored tree does not match the pre-state path-by-path on kind/size/sha256"
+    )
+    assert not isinstance(outcome, BaseException), f"the rollback raised: {outcome!r}"
+    assert outcome.status == "rolled_back"
+    assert outcome.checkpoint == "publishing"
+    failed = _s208_failed_current(run_dir)
+    assert len(failed) == 1, "the run-created entry was not quarantined exactly once"
+    assert _s208_tree(failed[0]) == state["published"]["vector"], "the quarantine copy was not retained"
+    assert re.fullmatch(r"vector-[0-9a-f]{32}", failed[0].name), "the quarantine name is not unique"
+    assert _s208_tree(run_dir / "backup") == backup_before, "the retained backup was changed"
+    staging_area = run_dir / S208_RESTORE_NAME
+    assert [path.name for path in staging_area.iterdir()] == [], "the staging entry was left behind"
+    assert _s207_operations(state["manifest_path"]) == [
+        *(f"vector.{name}" for name in S206_PUBLISHED_SEQUENCE),
+        *S208_ROLLBACK_CHAIN,
+    ]
+
+
+def test_s208_fix1_an_injected_directory_restore_failure_is_recorded_cause_specifically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """R1.2/R1.3: a failed DIRECTORY restore is refused cause-specifically, all copies kept.
+
+    BEHAVIOURAL at BASE 54bb05c9: the injected `OSError` escapes the
+    `open_directory_nofollow` body, whose unwinding re-wraps it into
+    `StorageLockError('storage lock failure')`, so at BASE the durable record stores
+    `code='storage lock failure'` -- neither a stable code nor the real cause -- and a
+    half-built `restore/<name>-<hex>/stage-*` entry is left behind. So at BASE the first
+    failing assertion is the one that requires the refusal to be a `ValueError` carrying
+    `E_ROLLBACK_RESTORE_FAILED`; at BASE it is a `StorageLockError`.
+
+    The invocation is monkeypatched (the ONLY way to make the real staging walk fail
+    deterministically on this host); the quarantine, the restore area and the backup are
+    all the REAL ones the shipped entrypoint works on.
+
+    Asserted: the refusal is this card's `ValueError` family and names
+    `E_ROLLBACK_RESTORE_FAILED` AND the underlying cause class; the durable record carries
+    that exact code, the `rollback.prestate_restored` step and the root-cause exception
+    class; the diagnostic quarantine keeps the published entry; the target was left
+    vacant; the backup report and the whole backup tree are byte-identical; `restore/` is
+    EMPTY (no half-built staging entry); the chain is `rollback.locked`,
+    `rollback.current_quarantined`, `rollback.failed` with no retry event.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=False, publish=("vector",))
+    target = state["targets"]["vector"]
+    run_dir = state["run_dir"]
+    published = _s208_tree(target)
+    backup_before = _s208_tree(run_dir / "backup")
+    report_before = (run_dir / profile_migration.BACKUP_REPORT_NAME).read_bytes()
+
+    def _fail_the_directory_staging(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError(errno.EIO, "fix1-injected directory restore failure")
+
+    monkeypatch.setattr(profile_migration, "_stage_restored_tree", _fail_the_directory_staging)
+    outcome: Any = None
+    try:
+        rollback_profile_migration(state["manifest_path"], state["request"])
+    except BaseException as exc:  # noqa: BLE001 - the refusal IS the object under test
+        outcome = exc
+
+    assert outcome is not None, "the injected directory-restore failure was not refused"
+    assert isinstance(outcome, ValueError), (
+        "the restore failure was not mapped out of the storage layer into this card's "
+        f"fail-closed refusal family: {outcome!r}"
+    )
+    assert "E_ROLLBACK_RESTORE_FAILED" in str(outcome), f"the refusal is not cause-specific: {outcome!r}"
+    assert "OSError" in str(outcome), f"the refusal does not name the underlying cause class: {outcome!r}"
+
+    recorded = load_manifest(state["manifest_path"])
+    assert recorded.status == "rollback_failed"
+    failure = recorded.failure or {}
+    assert failure.get("code") == "E_ROLLBACK_RESTORE_FAILED", f"the durable code is not the cause: {failure!r}"
+    assert failure.get("step") == "rollback.prestate_restored", f"the recorded step is wrong: {failure!r}"
+    assert failure.get("exception") == "OSError", f"the failure record omits the exception class: {failure!r}"
+
+    failed = _s208_failed_current(run_dir)
+    assert len(failed) == 1 and _s208_tree(failed[0]) == published, "the quarantined copy was not retained"
+    assert not os.path.lexists(target), "the failed restore left something at the target"
+    assert _s208_tree(run_dir / "backup") == backup_before, "the retained backup was changed"
+    assert (run_dir / profile_migration.BACKUP_REPORT_NAME).read_bytes() == report_before
+    staging_area = run_dir / S208_RESTORE_NAME
+    assert [path.name for path in staging_area.iterdir()] == [], "a half-built staging entry was left behind"
+    assert _s207_operations(state["manifest_path"]) == [
+        *(f"vector.{name}" for name in S206_PUBLISHED_SEQUENCE),
+        "rollback.locked",
+        "rollback.current_quarantined",
+        S208_FAILED_EVENT,
+    ]
+
+
+def test_s208_fix1_a_clean_retry_after_a_partial_rollback_refuses_with_a_stated_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """R2/F2 disposition PIN -- PASSES at BASE by design; this node is NOT a RED node.
+
+    Two published artifacts with the FOURTH real `os.rename` (the `graph` restore)
+    injected to fail is exactly the interrupted state review F2 reproduced: `vector` is
+    already restored to its recorded pre-state and `graph` is left vacant. A CLEAN retry
+    then refuses `E_ROLLBACK_TARGET_DRIFT` -- "vector is at its recorded pre-state
+    although the run's own record records that it published this artifact" -- because a
+    restored copy can never match the recorded pre-publish identity and that Stop fires
+    before `restore_only` can repair the artifact that is actually vacant.
+
+    THAT IS THE SHIPPED BEHAVIOUR OF THIS ROUND. The retry disposition the review
+    preferred was NOT implemented: accepting a restored-but-unrecorded pre-state as
+    already done means neutering one arm of the `E_ROLLBACK_TARGET_DRIFT` Stop, and
+    making per-artifact restore progress durable means changing the rollback event-chain
+    semantics (its event set/order) -- both are outside this round's hard scope limits
+    ("do not weaken or alter the four Stop conditions", "do not alter the rollback event
+    chain semantics"). The limitation is stated in the fix-round SUMMARY and in the
+    corrected comment of `_decide_rollback_artifact`, the residual is owned by S3-06, and
+    THIS node pins what ships: a cause-specific refusal, nothing deleted, every copy
+    retained, and no automatic retry.
+
+    Asserted: attempt 1 refuses `E_PUBLICATION_RENAME_FAILED` after exactly four renames;
+    the retry refuses `E_ROLLBACK_TARGET_DRIFT` WITHOUT rewriting the run's record (the
+    refusal is read-only); the `vector` pre-state is back (its symlink raw target); the
+    `graph` target is vacant; both published entries are retained in the diagnostic
+    quarantine; the retained backup is byte-identical; the chain's tail is
+    `rollback.locked, rollback.current_quarantined, rollback.failed`.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=True, publish=("vector", "graph"))
+    run_dir = state["run_dir"]
+    vector_target = state["targets"]["vector"]
+    graph_target = state["targets"]["graph"]
+    backup_before = _s208_tree(run_dir / "backup")
+    real_rename = os.rename
+    seen: list[int] = []
+
+    def _fail_the_fourth(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        seen.append(1)
+        if len(seen) == 4:
+            raise OSError(errno.EIO, "fix1-injected graph restore rename failure")
+        return real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", _fail_the_fourth)
+    first: Any = None
+    try:
+        rollback_profile_migration(state["manifest_path"], state["request"])
+    except BaseException as exc:  # noqa: BLE001 - attempt 1's refusal is asserted below
+        first = exc
+    monkeypatch.setattr(os, "rename", real_rename)
+
+    assert len(seen) == 4, f"attempt 1 performed {len(seen)} renames, not the four of this state"
+    assert isinstance(first, ValueError) and "E_PUBLICATION_RENAME_FAILED" in str(first), (
+        f"attempt 1 did not refuse as the interrupted publication: {first!r}"
+    )
+    assert load_manifest(state["manifest_path"]).status == "rollback_failed"
+    manifest_before_retry = state["manifest_path"].read_bytes()
+
+    with pytest.raises(ValueError, match="E_ROLLBACK_TARGET_DRIFT"):
+        rollback_profile_migration(state["manifest_path"], state["request"])
+
+    assert state["manifest_path"].read_bytes() == manifest_before_retry, (
+        "the refused retry rewrote the run's own record instead of refusing read-only"
+    )
+    # The partial attempt's OWN record is what stands: the retry refused before the chain.
+    recorded = load_manifest(state["manifest_path"])
+    assert recorded.status == "rollback_failed"
+    assert (recorded.failure or {}).get("code") == "E_PUBLICATION_RENAME_FAILED"
+    # Every copy is retained and nothing was deleted by either attempt.
+    assert _s208_tree(vector_target) == state["prestates"]["vector"], "the restored pre-state was disturbed"
+    assert not os.path.lexists(graph_target), "the vacant artifact is not vacant"
+    failed = _s208_failed_current(run_dir)
+    assert len(failed) == 2, "the two published entries were not both retained in the quarantine"
+    assert _s208_tree(run_dir / "backup") == backup_before, "the retained backup was changed"
+    assert _s207_operations(state["manifest_path"])[-3:] == [
+        "rollback.locked",
+        "rollback.current_quarantined",
+        S208_FAILED_EVENT,
+    ]
+
+
+def test_s208_fix1_an_unrecorded_file_added_to_the_backup_is_refused_before_anything_moves(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """R4/F4: an ADDED unrecorded entry in the backup is refused BEFORE the quarantine.
+
+    BEHAVIOURAL at BASE 54bb05c9: there the added file is noticed only inside
+    `_stage_restored_tree`, i.e. AFTER the run-created entry has already been quarantined
+    (and the internal refusal is masked into `StorageLockError('storage lock failure')`),
+    so at BASE the FIRST failing assertion is the whole-home fingerprint below -- the
+    target has been moved away and a half-built `restore/` entry has appeared. The refusal
+    must instead happen in the READ-ONLY decision phase (reusing the retained-backup
+    verification path, not a second one), where nothing has moved yet.
+
+    Asserted: the refusal is this card's `ValueError` family and names
+    `E_ROLLBACK_IDENTITY_MISSING`; the whole home tree fingerprint AND the manifest bytes
+    are identical before/after; no diagnostic quarantine entry appears; the published
+    entry is untouched.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=False, publish=("vector",))
+    run_dir = state["run_dir"]
+    target = state["targets"]["vector"]
+    entries = _s208_backup_entries(run_dir)
+    backup_root = run_dir / entries["target:vector"]["run_relative_path"]
+    (backup_root / "RV-UNRECORDED-EXTRA.bin").write_bytes(b"RV-UNRECORDED-EXTRA")
+    home_before = _s208_tree(state["home"])
+    manifest_before = state["manifest_path"].read_bytes()
+
+    outcome: Any = None
+    try:
+        rollback_profile_migration(state["manifest_path"], state["request"])
+    except BaseException as exc:  # noqa: BLE001 - the refusal IS the object under test
+        outcome = exc
+
+    # THE claim of this node. At BASE the quarantine already moved the published entry.
+    assert _s208_tree(state["home"]) == home_before, (
+        f"a refused rollback mutated the home tree; rollback outcome = {outcome!r}"
+    )
+    assert state["manifest_path"].read_bytes() == manifest_before, "a refusal rewrote the run's record"
+    assert isinstance(outcome, ValueError), (
+        f"the added unrecorded entry was not refused cause-specifically: {outcome!r}"
+    )
+    assert "E_ROLLBACK_IDENTITY_MISSING" in str(outcome), f"the refusal is not cause-specific: {outcome!r}"
+    assert _s208_failed_current(run_dir) == [], "the refusal happened AFTER something moved"
+    assert _s208_tree(target) == state["published"]["vector"], "the published entry was disturbed"
