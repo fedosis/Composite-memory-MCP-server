@@ -102,9 +102,39 @@ the final legacy link entries (DETAIL 9.1, 10.1):
   recorded with the (device, inode) of the descriptor the lock stage actually
   owns, so post-unlock cleanup can remove exactly what this run created and
   never a foreign or replaced entry.
+
+Slice S2-06 adds the forward state machine and the per-artifact publication
+(DETAIL 9.2, 9.3, 10.3, 10.4; routing-matrix residual F1):
+
+* the ten forward checkpoints advance one step at a time and only with the
+  checkpoint's OWN qualified prerequisite evidence, and the same rule is
+  enforced where a checkpoint becomes state -- a gated checkpoint cannot even be
+  RECORDED in the manifest without it;
+* `staged_verified`, `published`, `verified` and `complete` are reachable only
+  when the verification seam REPORTS an implemented capability (its explicit
+  flag, or a negative probe it refuses) and never because of the seam's return
+  value; the S0 stub in ``projection_rebuild`` answers ``True`` to a staged entry
+  that does not exist, so while it is in place those checkpoints are unreachable
+  and the public entrypoints stay fail-closed;
+* publication is per artifact and never an atomic claim: revalidate the pinned
+  prestate, quarantine the old entry (or record its absence), rename the verified
+  staged entry into the vacant target, fsync both parents, and emit
+  ``prestate_revalidated``, ``prestate_quarantined|absent``,
+  ``staging_published``, ``parent_fsynced``; `published` additionally requires
+  the run's OWN recorded events for BOTH artifacts, so a half-published run can
+  never be reported as published;
+* ``verified`` needs a reopen of the published entry that still matches the
+  pinned staged identity exactly, and ``complete`` needs the durable manifest
+  update to have been re-read from disk; a graph lock this run CREATED is carried
+  into the manifest for post-unlock cleanup (DETAIL 10.1).
+
+Wiring the stage into ``apply``/``resume``/``rollback`` is NOT part of this
+slice: those entrypoints keep raising ``E_MIGRATION_NOT_IMPLEMENTED`` until
+S3-06, and the ordering must not be bypassed.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import errno
 import hashlib
@@ -116,6 +146,7 @@ import shutil
 import sqlite3
 import stat
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -124,7 +155,7 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, cast, ge
 from urllib.parse import quote
 from uuid import uuid4
 
-from memory_server import storage_lock
+from memory_server import projection_rebuild, storage_lock
 from memory_server.paths import (
     ArtifactKind,
     StorageLayout,
@@ -308,7 +339,7 @@ _CHECKPOINTS = frozenset(get_args(Checkpoint))
 _RUN_STATUSES = frozenset(get_args(RunStatus))
 _ARTIFACT_KINDS = frozenset(get_args(ArtifactKind))
 
-_MANIFEST_OPTIONAL_FIELDS = frozenset({"completed_steps", "events", "embedding", "failure"})
+_MANIFEST_OPTIONAL_FIELDS = frozenset({"completed_steps", "events", "embedding", "failure", "graph_lock"})
 _MANIFEST_FIELDS = frozenset(
     {
         "schema_version", "run_id", "strategy", "checkpoint", "status", "source_identity",
@@ -460,6 +491,12 @@ class MigrationManifest:
     events: list[ManifestEvent] = field(default_factory=list)
     embedding: Mapping[str, Any] = field(default_factory=dict)
     failure: Mapping[str, Any] | None = None
+    # S2-06 (DETAIL 10.1): if this migration CREATED an absent graph lock, the
+    # manifest records that fact -- path plus the exact (device, inode) the lock
+    # stage owns -- so post-unlock rollback cleanup removes exactly what this run
+    # created and never a foreign or replaced entry. Optional and additive: an
+    # older manifest without the field decodes to None and schema_version stays 1.
+    graph_lock: Mapping[str, Any] | None = None
 
 
 def _note(diagnostics: list[Diagnostic], diagnostic: Diagnostic) -> None:
@@ -959,6 +996,10 @@ def _decode_manifest(payload: Any) -> MigrationManifest:
     if failure is not None:
         failure = _bounded_mapping(failure, field_name="manifest.failure")
 
+    graph_lock = payload.get("graph_lock")
+    if graph_lock is not None:
+        graph_lock = _bounded_mapping(graph_lock, field_name="manifest.graph_lock")
+
     return MigrationManifest(
         schema_version=schema_version,
         run_id=run_id,
@@ -980,6 +1021,7 @@ def _decode_manifest(payload: Any) -> MigrationManifest:
         events=events,
         embedding=_bounded_mapping(payload.get("embedding", {}), field_name="manifest.embedding"),
         failure=failure,
+        graph_lock=graph_lock,
     )
 
 
@@ -3281,14 +3323,28 @@ def _stage_tree(
 ) -> tuple[tuple[str, os.stat_result], ...]:
     """Stage one directory subtree and return its bounded child listing.
 
-    The walk never follows a link and never crosses a device: each child is
-    inspected through the pinned descriptor of its parent, and a refusal is
-    raised BEFORE anything is published, so the published backup area is
-    untouched by a refused tree (no partial mirror, no target swap). The listing
-    is re-read after the walk and must be identical, so a directory that changed
-    underneath the walk is ``E_ARTIFACT_IDENTITY_CHANGED`` instead of a copy
-    that silently mixes two states.
-    """
+    The walk never follows a link: each child is inspected through the pinned
+    descriptor of its parent, and a refusal is raised BEFORE anything is
+    published, so the published backup area is untouched by a refused tree (no
+    partial mirror, no target swap). The listing is re-read after the walk and
+    must be identical, so a directory that changed underneath the walk is
+    ``E_ARTIFACT_IDENTITY_CHANGED`` instead of a copy that silently mixes two
+    states.
+
+    What this walk does NOT re-check per child is the DEVICE: the equality of the
+    run directory's filesystem with the artifact's own is enforced once, for the
+    top-level artifact (``_require_same_device`` at the regular-file, tree and
+    link branches). A mount point INSIDE a tree is therefore copied across, which
+    is harmless here -- the copy is a pinned fd-to-fd read into the run
+    directory's staging area, never a rename of the source -- and no rename of a
+    source entry is ever attempted. The cross-filesystem STOP of this engine is
+    enforced where it can actually lose data: the publication renames
+    (``_rename_entry``) refuse ``EXDEV`` on real devices. (S2-06 resolved the
+    S2-05 review's F5 by making this docstring state exactly what is enforced
+    instead of claiming a per-child check that the code does not perform; a
+    per-child device refusal would add a fail-closed branch that cannot be
+    exercised on this host without an unprivileged mount.)"""
+
     if depth > MAX_BACKUP_DEPTH:
         raise _backup_failure("E_BACKUP_VERIFY", f"{label} exceeds the backup depth bound")
     listing = _bounded_child_listing(source_fd, artifact=label)
@@ -3529,6 +3585,11 @@ def _backup_link_entry(
                 raise _backup_failure(
                     "E_BACKUP_VERIFY", f"{label} link entry does not carry the exact raw link string"
                 )
+        # S2-06 (S2-05 review F6): the `backup` directory entry this call just
+        # created must be durable too, or a crash can persist the symlink while
+        # losing `link-entries` entirely. The tree path already double-fsyncs its
+        # directories (deeper first, then the root); this is the same order.
+        os.fsync(backup_fd)
     return (
         BackupEntry(
             artifact=label,
@@ -3907,12 +3968,50 @@ def load_manifest(path: Path) -> MigrationManifest:
     return _decode_manifest(payload)
 
 
-def append_manifest_event(path: Path, event: Mapping[str, Any]) -> MigrationManifest:
+def _append_event_to_manifest(
+    manifest: MigrationManifest,
+    checkpoint: Checkpoint,
+    operation: str,
+    payload: Mapping[str, Any],
+) -> MigrationManifest:
+    """Append one event to the hash chain in memory; the caller persists it.
+
+    Sequence number, UTC timestamp, previous-event SHA-256 and the canonical body
+    digest are derived here, so two callers (the public append and the forward
+    state machine) can never disagree about the chain's shape, and no event is
+    ever rewritten in place.
+    """
+    sequence = len(manifest.events) + 1
+    if sequence > MAX_MANIFEST_EVENTS:
+        raise _manifest_failure("E_MANIFEST_SCHEMA", f"manifest exceeds {MAX_MANIFEST_EVENTS} events")
+    previous_sha256 = manifest.events[-1].digest if manifest.events else _EVENT_GENESIS
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    body = _event_body(sequence, timestamp, previous_sha256, checkpoint, operation, payload)
+    appended = ManifestEvent(
+        sequence, timestamp, previous_sha256, _digest(body), checkpoint, operation, payload
+    )
+    return replace(manifest, events=[*manifest.events, appended])
+
+
+def append_manifest_event(
+    path: Path,
+    event: Mapping[str, Any],
+    *,
+    evidence: Iterable[CheckpointEvidence] | None = None,
+    capability: StagedVerificationCapability | None = None,
+) -> MigrationManifest:
     """Append one event to the append-only hash chain, then persist atomically.
 
     The new event's sequence, UTC timestamp, previous-event SHA-256 and
     canonical body digest are derived here; the caller supplies only the
     checkpoint, operation and payload. Existing events are never rewritten.
+
+    S2-06: a checkpoint that DETAIL 9.3 gates may not be RECORDED without the
+    real prerequisite evidence that justifies it, so the guarantee holds at the
+    manifest boundary as well -- the place where a checkpoint actually becomes
+    state. A gated append is validated exactly like a forward transition (order,
+    evidence, and, for `published`, the run's own recorded publication events),
+    and a refusal leaves the materialized manifest byte-identical.
     """
     manifest = load_manifest(path)
     if not isinstance(event, Mapping):
@@ -3929,18 +4028,23 @@ def append_manifest_event(path: Path, event: Mapping[str, Any]) -> MigrationMani
     if checkpoint not in _CHECKPOINTS:
         raise _manifest_failure("E_MANIFEST_SCHEMA", "event.checkpoint is not a checkpoint")
     payload = _bounded_mapping(event.get("payload", {}), field_name="event.payload")
-    sequence = len(manifest.events) + 1
-    if sequence > MAX_MANIFEST_EVENTS:
-        raise _manifest_failure("E_MANIFEST_SCHEMA", f"manifest exceeds {MAX_MANIFEST_EVENTS} events")
-    previous_sha256 = manifest.events[-1].digest if manifest.events else _EVENT_GENESIS
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    body = _event_body(sequence, timestamp, previous_sha256, checkpoint, operation, payload)
-    appended = ManifestEvent(
-        sequence, timestamp, previous_sha256, _digest(body), cast(Checkpoint, checkpoint), operation, payload
+
+    if checkpoint in CAPABILITY_GATED_CHECKPOINTS:
+        supplied = [item for item in (evidence or ()) if isinstance(item, CheckpointEvidence)]
+        if not supplied:
+            raise _manifest_failure(
+                "E_CHECKPOINT_PREREQUISITE_MISSING",
+                f"{checkpoint} may not be recorded without its {CHECKPOINT_EVIDENCE_CODES[checkpoint]} evidence",
+            )
+        validate_forward_transition(
+            manifest.checkpoint, checkpoint, supplied, capability=capability, manifest=manifest
+        )
+
+    updated = _append_event_to_manifest(
+        manifest, cast(Checkpoint, checkpoint), operation, payload
     )
-    updated = replace(manifest, events=[*manifest.events, appended])
     _write_manifest(path, updated)
-    return updated
+    return load_manifest(path)
 
 
 def resume_profile_migration(
@@ -3957,3 +4061,844 @@ def rollback_profile_migration(
     """Reject rollback until restore/quarantine is implemented, after its own checks."""
     validate_mutation_preconditions(request)
     raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
+
+
+# ---------------------------------------------------------------------------
+# S2-06 -- the forward state machine and the per-artifact publication
+# (DETAIL 9.2, 9.3, 10.3, 10.4; routing-matrix residual F1, which is this
+# card's entry condition AND its Stop).
+#
+# Three promises, and every fail-closed branch below exists to keep one of them:
+#
+# 1. A CHECKPOINT IS EARNED, NOT ANNOUNCED. The ten forward checkpoints of
+#    DETAIL 9.3 advance one step at a time, and each step needs its OWN real
+#    prerequisite evidence -- a structured object whose detail is qualified
+#    before the step is accepted -- so `backed_up` cannot be claimed without a
+#    backup report, `sqlite_snapshotted` without an accepted integrity/revision
+#    observation, and so on. The manifest is where a checkpoint becomes state, so
+#    the same rule is enforced at the manifest boundary: `append_manifest_event`
+#    refuses to RECORD a gated checkpoint without its evidence and leaves the
+#    materialized manifest byte-identical.
+#
+# 2. NO FALSE END-TO-END SUCCESS. `staged_verified`, `published`, `verified` and
+#    `complete` may be entered ONLY when the verification seam REPORTS an
+#    implemented capability (an explicit flag, or a negative probe the seam
+#    refuses) and NEVER because of the seam's return value: the S0 stub answers
+#    `ProjectionVerification(True)` to a staged input that does not exist, which
+#    is exactly why its return value must not be read. The card names the last
+#    three checkpoints; `staged_verified` is gated here as well because DETAIL
+#    10.3 IS the seam's contract and recording a stub verdict as a completed
+#    checkpoint would be the false success this card forbids. There is exactly
+#    ONE verification implementation in this project
+#    (`memory_server.projection_rebuild`); this module only ASKS it.
+#
+# 3. PER ARTIFACT, NEVER ATOMIC. Publication is per artifact: revalidate the
+#    pinned prestate, quarantine the old entry (or record its absence), rename
+#    the verified staged entry into the vacant target, fsync BOTH parents, and
+#    record `prestate_revalidated`, `prestate_quarantined|absent`,
+#    `staging_published`, `parent_fsynced`. `published` additionally requires the
+#    run's OWN recorded publication events for both artifacts, so a half-published
+#    or crash-interrupted run can never be reported as published, and no claim of
+#    a multi-artifact atomic transaction is made anywhere.
+#
+# While `verify_staged_projections` is the S0 stub the public `apply`/`resume`/
+# `rollback` stay fail-closed (they still raise `E_MIGRATION_NOT_IMPLEMENTED`):
+# wiring the stage into them is S3-06's deliverable, and this card must not
+# bypass that ordering (routing-matrix S2-06 `split_further`).
+# ---------------------------------------------------------------------------
+
+FORWARD_CHECKPOINTS: tuple[Checkpoint, ...] = (
+    "planned",
+    "locked",
+    "backed_up",
+    "sqlite_snapshotted",
+    "projections_built",
+    "staged_verified",
+    "publishing",
+    "published",
+    "verified",
+    "complete",
+)
+
+CHECKPOINT_EVIDENCE_CODES: Mapping[Checkpoint, str] = {
+    "planned": "plan_digest",
+    "locked": "lock_ownership",
+    "backed_up": "backup_report",
+    "sqlite_snapshotted": "snapshot_verification",
+    "projections_built": "rebuild_result",
+    "staged_verified": "staged_verification",
+    "publishing": "publication_plan",
+    "published": "publication_events",
+    "verified": "reopen_verification",
+    "complete": "manifest_update",
+}
+
+CAPABILITY_GATED_CHECKPOINTS: frozenset[Checkpoint] = frozenset(
+    {"staged_verified", "published", "verified", "complete"}
+)
+
+STAGED_VERIFICATION_CAPABILITY_FLAG = "STAGED_VERIFICATION_IMPLEMENTED"
+CAPABILITY_BASIS_EXPLICIT_FLAG = "explicit_flag"
+CAPABILITY_BASIS_NEGATIVE_PROBE = "negative_probe"
+CAPABILITY_BASIS_UNIMPLEMENTED = "unimplemented"
+# The negative probe's input: a staged entry that cannot exist. It is only ever
+# passed to the seam as an argument -- never created, opened or enumerated.
+STAGED_VERIFICATION_PROBE_NAME = "s2-06-unverifiable-staged-entry"
+
+PUBLICATION_ARTIFACTS: tuple[str, ...] = ("vector", "graph")
+PUBLICATION_EVENT_REVALIDATED = "prestate_revalidated"
+PUBLICATION_EVENT_QUARANTINED = "prestate_quarantined"
+PUBLICATION_EVENT_ABSENT = "prestate_absent"
+PUBLICATION_EVENT_STAGING_PUBLISHED = "staging_published"
+PUBLICATION_EVENT_PARENT_FSYNCED = "parent_fsynced"
+PUBLICATION_PUBLISHED_EVENTS: tuple[str, ...] = (
+    PUBLICATION_EVENT_REVALIDATED,
+    PUBLICATION_EVENT_QUARANTINED,
+    PUBLICATION_EVENT_STAGING_PUBLISHED,
+    PUBLICATION_EVENT_PARENT_FSYNCED,
+)
+PUBLICATION_EVENT_CHECKPOINT: Checkpoint = "publishing"
+PUBLICATION_EVENT_OPERATION_SEPARATOR = "."
+ARTIFACT_STAGING_NAMES: Mapping[str, str] = {"vector": "lancedb", "graph": "graph.json"}
+QUARANTINE_DIRECTORY_NAME = "quarantine"
+QUARANTINE_PREPUBLISH_NAME = "prepublish"
+GRAPH_LOCK_MANIFEST_FIELD = "graph_lock"
+
+
+@dataclass(frozen=True)
+class CheckpointEvidence:
+    """One checkpoint's real prerequisite evidence, bounded before it is read."""
+
+    checkpoint: Checkpoint
+    code: str
+    digest: str
+    detail: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class StagedVerificationCapability:
+    """What the verification seam REPORTS about itself (never what it returned).
+
+    ``basis`` is the channel the report came through: ``explicit_flag`` (the
+    seam's own implemented-capability flag) or ``negative_probe`` (the seam
+    refused an input a real verifier cannot accept). ``implemented`` False means
+    the gated checkpoints stay unreachable, whatever the seam's last return value
+    happened to be.
+    """
+
+    implemented: bool
+    basis: str
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class PublicationEvent:
+    """One DETAIL 9.3 publishing event of one artifact."""
+
+    artifact: str
+    event: str
+    detail: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PublicationResult:
+    """The outcome of ONE artifact's publication: never an atomic claim."""
+
+    artifact: str
+    prestate: str
+    quarantine_relative_path: str | None
+    published_path: str
+    staged_identity: ArtifactIdentity
+    published_identity: ArtifactIdentity
+    events: tuple[PublicationEvent, ...]
+    parents_fsynced: tuple[str, ...]
+
+
+def forward_checkpoint_index(checkpoint: str) -> int:
+    """The position of a forward checkpoint, or ``E_CHECKPOINT_UNKNOWN``."""
+    if checkpoint not in FORWARD_CHECKPOINTS:
+        raise _manifest_failure("E_CHECKPOINT_UNKNOWN", f"{checkpoint} is not a forward checkpoint")
+    return FORWARD_CHECKPOINTS.index(checkpoint)
+
+
+def _published_sequence_is_complete(events: tuple[str, ...]) -> bool:
+    """DETAIL 9.3's per-artifact sequence, with either quarantine or absence."""
+    if len(events) != len(PUBLICATION_PUBLISHED_EVENTS):
+        return False
+    return (
+        events[0] == PUBLICATION_EVENT_REVALIDATED
+        and events[1] in (PUBLICATION_EVENT_QUARANTINED, PUBLICATION_EVENT_ABSENT)
+        and events[2] == PUBLICATION_EVENT_STAGING_PUBLISHED
+        and events[3] == PUBLICATION_EVENT_PARENT_FSYNCED
+    )
+
+
+def publication_events_from_manifest(manifest: MigrationManifest) -> dict[str, tuple[str, ...]]:
+    """The publication events the RUN ITSELF recorded, per artifact.
+
+    This is the evidence a state machine must read: the caller's claim about a
+    publication is not, because the manifest's chain is the run's own record of
+    what actually happened, in order.
+    """
+    collected: dict[str, list[str]] = {label: [] for label in PUBLICATION_ARTIFACTS}
+    for event in manifest.events:
+        for label in PUBLICATION_ARTIFACTS:
+            prefix = label + PUBLICATION_EVENT_OPERATION_SEPARATOR
+            if event.operation.startswith(prefix):
+                collected[label].append(event.operation[len(prefix) :])
+    return {label: tuple(names) for label, names in collected.items()}
+
+
+def _run_verification_probe(probe: Any, argument: Any) -> Any:
+    """Run the seam's coroutine from this synchronous engine, bounded and closed.
+
+    A running loop (an async caller) is honoured by running the probe on its own
+    short-lived daemon thread, so the seam's contract does not depend on who
+    calls the engine.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(probe(argument))
+    results: list[Any] = []
+    failures: list[BaseException] = []
+
+    def _runner() -> None:
+        try:
+            results.append(asyncio.run(probe(argument)))
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            failures.append(exc)
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if failures:
+        raise failures[0]
+    return results[0]
+
+
+def staged_verification_capability(seam: Any = None) -> StagedVerificationCapability:
+    """Report whether the verification seam IMPLEMENTS staged verification.
+
+    DETAIL 10.3 is the seam's contract and the card's F1 clause makes this report
+    -- never the seam's return value -- the thing the gate reads. The report has
+    two independent channels:
+
+    * the seam's own explicit capability flag, and
+    * a negative probe: a real verifier must REFUSE a staged entry that does not
+      exist (with the module's fail-closed ``ValueError``, or by reporting
+      ``valid=False``). The S0 stub returns ``ProjectionVerification(True)``
+      instead, which is precisely why its answer may not be trusted.
+
+    A probe that raises anything else (including a ``TypeError`` from an
+    unimplemented call contract) reports NO capability: the gate stays shut
+    rather than opening on an answer nobody can qualify.
+    """
+    module = projection_rebuild if seam is None else seam
+    if getattr(module, STAGED_VERIFICATION_CAPABILITY_FLAG, None) is True:
+        return StagedVerificationCapability(True, CAPABILITY_BASIS_EXPLICIT_FLAG)
+    probe = getattr(module, "verify_staged_projections", None)
+    if probe is None:
+        return StagedVerificationCapability(
+            False, CAPABILITY_BASIS_UNIMPLEMENTED, "the seam exposes no staged verifier at all"
+        )
+    argument = Path(os.sep) / STAGED_VERIFICATION_PROBE_NAME
+    try:
+        verdict = _run_verification_probe(probe, argument)
+    except ValueError as exc:
+        return StagedVerificationCapability(
+            True, CAPABILITY_BASIS_NEGATIVE_PROBE, f"the seam refused the probe: {exc}"[:MAX_MANIFEST_STRING_BYTES]
+        )
+    except BaseException as exc:  # noqa: BLE001 - an unqualifiable answer is not a capability
+        return StagedVerificationCapability(
+            False,
+            CAPABILITY_BASIS_UNIMPLEMENTED,
+            f"the probe could not be qualified: {type(exc).__name__}",
+        )
+    if getattr(verdict, "valid", None) is False:
+        return StagedVerificationCapability(
+            True, CAPABILITY_BASIS_NEGATIVE_PROBE, "the seam reported the negative probe invalid"
+        )
+    return StagedVerificationCapability(
+        False,
+        CAPABILITY_BASIS_UNIMPLEMENTED,
+        "the seam accepted a staged entry that does not exist",
+    )
+
+
+_EVIDENCE_REQUIRED_DETAIL: Mapping[str, tuple[str, ...]] = {
+    "plan_digest": ("plan_digest", "config_digest"),
+    "lock_ownership": ("held", "roots", "identities"),
+    "backup_report": ("report_digest", "entries"),
+    "snapshot_verification": ("integrity", "revision", "snapshot_device"),
+    "rebuild_result": ("completed_batches", "vector_ids_digest", "graph_nodes_digest", "graph_edges_digest"),
+    "staged_verification": ("basis", "staging_digest", "artifacts"),
+    "publication_plan": ("targets", "pinned"),
+    "publication_events": ("artifacts",),
+    "reopen_verification": ("artifacts",),
+    "manifest_update": ("manifest_digest", "manifest_bytes", "checkpoint"),
+}
+_EVIDENCE_DIGEST_DETAIL: Mapping[str, tuple[str, ...]] = {
+    "plan_digest": ("plan_digest", "config_digest"),
+    "backup_report": ("report_digest",),
+    "rebuild_result": ("vector_ids_digest", "graph_nodes_digest", "graph_edges_digest"),
+    "staged_verification": ("staging_digest",),
+    "manifest_update": ("manifest_digest",),
+}
+
+
+def _is_bounded_digest(value: Any) -> bool:
+    return isinstance(value, str) and _DIGEST_PATTERN.match(value) is not None
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _evidence_problem(evidence: CheckpointEvidence, target: Checkpoint) -> str:
+    """Qualify one evidence object against the checkpoint it claims to justify.
+
+    An empty string means the evidence is usable. Every other return value is a
+    reason the transition is refused, and the caller reports it as
+    ``E_CHECKPOINT_EVIDENCE_INVALID`` so a caller can never reach a checkpoint
+    with a placeholder, a wrong-checkpoint object, or a digest that is not the
+    bounded SHA-256 the manifest format uses.
+    """
+    expected = CHECKPOINT_EVIDENCE_CODES[target]
+    if evidence.checkpoint != target:
+        return f"{evidence.checkpoint} evidence cannot justify {target}"
+    if evidence.code != expected:
+        return f"{target} needs {expected} evidence, not {evidence.code}"
+    if not _is_bounded_digest(evidence.digest):
+        return "the evidence digest is not a bounded SHA-256"
+    if not isinstance(evidence.detail, Mapping):
+        return "the evidence detail must be a mapping"
+    detail = evidence.detail
+    for key in _EVIDENCE_REQUIRED_DETAIL[expected]:
+        if key not in detail:
+            return f"{expected} evidence is missing {key}"
+    for key in _EVIDENCE_DIGEST_DETAIL.get(expected, ()):
+        if not _is_bounded_digest(detail[key]):
+            return f"{expected}.{key} is not a bounded SHA-256"
+    if expected == "lock_ownership":
+        if detail["held"] is not True:
+            return "lock ownership must report a HELD lock"
+        roots = detail["roots"]
+        if not isinstance(roots, (list, tuple)) or not roots or len(roots) > MAX_MAINTENANCE_ROOTS:
+            return "lock ownership must name a bounded set of roots"
+        identities = detail["identities"]
+        if not isinstance(identities, Mapping) or not identities:
+            return "lock ownership must carry the held identities"
+    if expected == "snapshot_verification":
+        if detail["integrity"] != "ok":
+            return "the snapshot integrity_check is not ok"
+        if detail["revision"] not in ACCEPTED_SQLITE_SCHEMA_REVISIONS:
+            return "the snapshot revision is not accepted"
+        if not _is_int(detail["snapshot_device"]):
+            return "the snapshot device is not an integer"
+    if expected == "backup_report":
+        entries = detail["entries"]
+        if not _is_int(entries) or entries < 1:
+            return "the backup report records no backed-up entries"
+    if expected == "rebuild_result":
+        if not _is_int(detail["completed_batches"]) or detail["completed_batches"] < 0:
+            return "the rebuild result carries no completed-batch count"
+    if expected == "staged_verification":
+        if not isinstance(detail["basis"], str) or not detail["basis"]:
+            return "the staged verification records no capability basis"
+        artifacts = detail["artifacts"]
+        if not isinstance(artifacts, (list, tuple)) or tuple(artifacts) != PUBLICATION_ARTIFACTS:
+            return "the staged verification does not cover both publication artifacts"
+    if expected == "publication_plan":
+        if not isinstance(detail["targets"], (list, tuple)) or tuple(detail["targets"]) != PUBLICATION_ARTIFACTS:
+            return "the publication plan does not cover both publication artifacts"
+        pinned = detail["pinned"]
+        if not isinstance(pinned, Mapping) or set(pinned) != set(PUBLICATION_ARTIFACTS):
+            return "the publication plan does not pin both prestate identities"
+    if expected in ("publication_events", "reopen_verification"):
+        artifacts = detail["artifacts"]
+        if not isinstance(artifacts, Mapping) or set(artifacts) != set(PUBLICATION_ARTIFACTS):
+            return f"{expected} must cover both publication artifacts"
+        for label in PUBLICATION_ARTIFACTS:
+            entry = artifacts[label]
+            if expected == "publication_events":
+                if not isinstance(entry, (list, tuple)) or not _published_sequence_is_complete(tuple(entry)):
+                    return f"{label} has no complete per-artifact publication sequence"
+            elif not isinstance(entry, Mapping) or entry.get("matches_staged") is not True:
+                return f"{label} was not reopened exactly"
+    if expected == "manifest_update":
+        if detail["checkpoint"] != target:
+            return "the manifest update does not record the checkpoint it justifies"
+        if not _is_int(detail["manifest_bytes"]) or detail["manifest_bytes"] < 1:
+            return "the manifest update records no durable manifest bytes"
+    return ""
+
+
+def validate_forward_transition(
+    current: str,
+    target: str,
+    evidence: Iterable[CheckpointEvidence] | None = None,
+    *,
+    capability: StagedVerificationCapability | None = None,
+    manifest: MigrationManifest | None = None,
+) -> Checkpoint:
+    """Validate exactly one forward checkpoint step, or refuse it by cause.
+
+    Refusal codes, in the order they are decided, are stable:
+    ``E_CHECKPOINT_UNKNOWN`` (not a checkpoint), ``E_CHECKPOINT_OUT_OF_ORDER``
+    (a step is skipped), ``E_STAGED_VERIFICATION_CAPABILITY_MISSING`` (a gated
+    checkpoint while the seam reports no implemented capability),
+    ``E_CHECKPOINT_PREREQUISITE_MISSING`` (no evidence at all for this
+    checkpoint), ``E_CHECKPOINT_EVIDENCE_INVALID`` (evidence that cannot justify
+    it) and ``E_PUBLICATION_INCOMPLETE`` (the run's OWN recorded publication
+    events do not yet cover both artifacts).
+    """
+    index = forward_checkpoint_index(target)
+    checkpoint = cast(Checkpoint, target)
+    if forward_checkpoint_index(current) + 1 != index:
+        raise _manifest_failure(
+            "E_CHECKPOINT_OUT_OF_ORDER", f"{current} cannot advance directly to {target}"
+        )
+    if checkpoint in CAPABILITY_GATED_CHECKPOINTS:
+        report = capability if capability is not None else staged_verification_capability()
+        if not getattr(report, "implemented", False):
+            raise _manifest_failure(
+                "E_STAGED_VERIFICATION_CAPABILITY_MISSING",
+                f"the verification seam reports no implemented capability for {target}",
+            )
+    supplied = [item for item in (evidence or ()) if isinstance(item, CheckpointEvidence)]
+    matching = [
+        item
+        for item in supplied
+        if item.checkpoint == checkpoint and item.code == CHECKPOINT_EVIDENCE_CODES[checkpoint]
+    ]
+    if not matching:
+        if supplied:
+            raise _manifest_failure(
+                "E_CHECKPOINT_EVIDENCE_INVALID",
+                f"none of the supplied evidence justifies {target}",
+            )
+        raise _manifest_failure(
+            "E_CHECKPOINT_PREREQUISITE_MISSING",
+            f"{target} has no {CHECKPOINT_EVIDENCE_CODES[checkpoint]} evidence",
+        )
+    problem = _evidence_problem(matching[0], checkpoint)
+    if problem:
+        raise _manifest_failure("E_CHECKPOINT_EVIDENCE_INVALID", problem)
+    if manifest is not None and checkpoint == "published":
+        recorded = publication_events_from_manifest(manifest)
+        incomplete = [
+            label
+            for label in PUBLICATION_ARTIFACTS
+            if not _published_sequence_is_complete(recorded.get(label, ()))
+        ]
+        if incomplete:
+            raise _manifest_failure(
+                "E_PUBLICATION_INCOMPLETE",
+                "published needs both artifacts' own complete publication events; missing: "
+                + ", ".join(incomplete),
+            )
+    return checkpoint
+
+
+def advance_manifest_checkpoint(
+    manifest_path: Path,
+    target: str,
+    *,
+    evidence: Iterable[CheckpointEvidence] | None = None,
+    capability: StagedVerificationCapability | None = None,
+    graph_lock: Mapping[str, Any] | None = None,
+) -> MigrationManifest:
+    """Advance the durable manifest by exactly one validated checkpoint.
+
+    The transition is validated against the MANIFEST's own checkpoint and its own
+    recorded publication events, the appended event and the optional graph-lock
+    creation record are written in ONE atomic manifest update, and the manifest is
+    then RE-READ from disk before anything is returned: a claim about a
+    checkpoint is a claim about the file, not about an in-memory object.
+    """
+    path = Path(manifest_path)
+    manifest = load_manifest(path)
+    checkpoint = validate_forward_transition(
+        manifest.checkpoint, target, evidence, capability=capability, manifest=manifest
+    )
+    supplied = [item for item in (evidence or ()) if isinstance(item, CheckpointEvidence)]
+    matching = next(item for item in supplied if item.checkpoint == checkpoint)
+    updated = _append_event_to_manifest(
+        manifest,
+        checkpoint,
+        f"advance{_checkpoint_operation_separator()}{checkpoint}",
+        {"evidence": matching.code, "digest": matching.digest},
+    )
+    updated = replace(
+        updated,
+        checkpoint=checkpoint,
+        completed_steps=[*manifest.completed_steps, checkpoint][:MAX_MANIFEST_ENTRIES],
+    )
+    if graph_lock is not None:
+        updated = replace(
+            updated,
+            graph_lock=_bounded_mapping(dict(graph_lock), field_name="manifest.graph_lock"),
+        )
+    _write_manifest(path, updated)
+    reopened = load_manifest(path)
+    if reopened.checkpoint != checkpoint:
+        raise _manifest_failure(
+            "E_MANIFEST_UPDATE_UNPROVEN", f"the durable manifest does not record {checkpoint}"
+        )
+    return reopened
+
+
+def _checkpoint_operation_separator() -> str:
+    """The one separator used by both checkpoint and publication event names."""
+    return PUBLICATION_EVENT_OPERATION_SEPARATOR
+
+
+def record_graph_lock_creation(manifest_path: Path, record: Mapping[str, Any]) -> MigrationManifest:
+    """Durably record a graph lock this run CREATED (DETAIL 10.1).
+
+    The record is the lock OWNER's own identity (``device``/``inode`` of the
+    descriptor the lock stage holds), so post-unlock cleanup removes exactly what
+    this run created. Written through the same atomic single-update path as a
+    checkpoint and re-read from disk afterwards.
+    """
+    path = Path(manifest_path)
+    manifest = load_manifest(path)
+    bounded = _bounded_mapping(dict(record), field_name="manifest.graph_lock")
+    if not bounded.get("path") or not isinstance(bounded.get("created"), bool):
+        raise _manifest_failure(
+            "E_MANIFEST_GRAPH_LOCK_INVALID",
+            "the graph-lock record must carry a path and a boolean created flag",
+        )
+    updated = replace(manifest, graph_lock=bounded)
+    _write_manifest(path, updated)
+    reopened = load_manifest(path)
+    if reopened.graph_lock != bounded:
+        raise _manifest_failure(
+            "E_MANIFEST_UPDATE_UNPROVEN", "the durable manifest does not carry the graph-lock record"
+        )
+    return reopened
+
+
+def _publication_failure(code: str, detail: str = "") -> ValueError:
+    return _manifest_failure(code, detail)
+
+
+def _observed_entry_identity(parent_fd: int, name: str, *, artifact: str) -> ArtifactIdentity:
+    """The no-follow identity of one entry through its PINNED parent descriptor.
+
+    A regular file is digested through a pinned ``O_NOFOLLOW`` descriptor with the
+    S2-02 streaming reader (fstat before and after on the SAME descriptor); a
+    directory, a symlink and a special file are recorded by their own metadata,
+    and a symlink is recorded by its exact RAW link string. Nothing here follows a
+    link, and an entry that is not there is ``absent`` rather than an error the
+    caller has to interpret.
+    """
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return ArtifactIdentity(str(name), "absent")
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            raw = os.readlink(name, dir_fd=parent_fd)
+        except OSError as exc:
+            raise _publication_failure(_path_code(exc), f"{artifact} raw link string cannot be read") from exc
+        return ArtifactIdentity(
+            str(name), "symlink", info.st_dev, info.st_ino, info.st_mode, None, None, None, raw
+        )
+    if stat.S_ISDIR(info.st_mode):
+        return ArtifactIdentity(str(name), "directory", info.st_dev, info.st_ino, info.st_mode)
+    if stat.S_ISREG(info.st_mode):
+        if info.st_nlink != 1:
+            raise _publication_failure("E_PATH_HARDLINK_UNSAFE", f"{artifact} is a hard-linked regular file")
+        try:
+            descriptor = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent_fd
+            )
+        except OSError as exc:
+            raise _publication_failure(_path_code(exc), f"{artifact} cannot be opened no-follow") from exc
+        try:
+            opened = os.fstat(descriptor)
+            digest, refusal = _streamed_digest(descriptor, opened, artifact=artifact)
+        finally:
+            os.close(descriptor)
+        if refusal is not None:
+            raise _publication_failure(refusal.code, refusal.message)
+        return ArtifactIdentity(
+            str(name),
+            "regular_file",
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_size,
+            opened.st_mtime_ns,
+            digest,
+        )
+    return ArtifactIdentity(str(name), "special", info.st_dev, info.st_ino, info.st_mode)
+
+
+def _require_prestate_unchanged(pinned: ArtifactIdentity, observed: ArtifactIdentity, *, artifact: str) -> None:
+    """DETAIL 10.4 step 1: the exact prestate must still be the pinned one."""
+    if pinned.kind != observed.kind:
+        raise _publication_failure(
+            "E_PUBLICATION_PRESTATE_CHANGED",
+            f"{artifact} was pinned as {pinned.kind} but is now {observed.kind}",
+        )
+    if pinned.kind == "symlink" and pinned.raw_link_target != observed.raw_link_target:
+        raise _publication_failure(
+            "E_PUBLICATION_PRESTATE_CHANGED", f"{artifact} raw link string changed since it was pinned"
+        )
+    if _identity_key(pinned) != _identity_key(observed):
+        raise _publication_failure(
+            "E_PUBLICATION_PRESTATE_CHANGED", f"{artifact} identity changed since it was pinned"
+        )
+
+
+def _rename_entry(
+    source_fd: int, source_name: str, destination_fd: int, destination_name: str, *, artifact: str
+) -> None:
+    """One atomic same-filesystem rename through PINNED descriptors.
+
+    ``EXDEV`` is the cross-filesystem STOP of this card: it is refused with its
+    own stable code BEFORE anything is unlinked, and it is produced by the kernel
+    on real devices rather than predicted from metadata. Any other failure is
+    ``E_PUBLICATION_RENAME_FAILED``, and the entry stays where it was.
+    """
+    try:
+        os.rename(source_name, destination_name, src_dir_fd=source_fd, dst_dir_fd=destination_fd)
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            raise _publication_failure(
+                "E_CROSS_FILESYSTEM_PUBLICATION",
+                f"{artifact} cannot be renamed across filesystems (EXDEV)",
+            ) from exc
+        raise _publication_failure(
+            "E_PUBLICATION_RENAME_FAILED", f"{artifact} rename failed: {exc.strerror}"
+        ) from exc
+
+
+def _open_quarantine_directory(run_fd: int) -> int:
+    """Open (creating at 0700) the run-owned ``quarantine/prepublish`` directory."""
+    with _run_child_directory(run_fd, QUARANTINE_DIRECTORY_NAME) as quarantine_fd:
+        with _run_child_directory(quarantine_fd, QUARANTINE_PREPUBLISH_NAME) as prepublish_fd:
+            return os.dup(prepublish_fd)
+
+
+def _quarantine_entry_name(artifact: str, run_id: str) -> str:
+    """A bounded, run-owned quarantine entry name that cannot collide silently."""
+    return _backup_entry_name(f"{artifact}-{_validate_run_id(run_id)}")
+
+
+def _record_publication_event(
+    manifest_path: Path | None, artifact: str, event: str, detail: Mapping[str, Any]
+) -> None:
+    """Append one publishing event to the run's own durable event chain."""
+    if manifest_path is None:
+        return
+    append_manifest_event(
+        Path(manifest_path),
+        {
+            "checkpoint": PUBLICATION_EVENT_CHECKPOINT,
+            "operation": f"{artifact}{PUBLICATION_EVENT_OPERATION_SEPARATOR}{event}",
+            "payload": dict(detail),
+        },
+    )
+
+
+def publish_artifact(
+    plan: MigrationPlan,
+    artifact: str,
+    *,
+    staged_identity: ArtifactIdentity,
+    run_dir: Path | None = None,
+    manifest_path: Path | None = None,
+) -> PublicationResult:
+    """Publish ONE verified staged artifact into its vacant target (DETAIL 10.4).
+
+    Steps, in order, with the event each one records:
+
+    1. revalidate the target parent and the EXACT pinned prestate no-follow
+       (``prestate_revalidated``) -- a stale or replaced prestate is refused here,
+       before anything moves;
+    2. an absent prestate is recorded explicitly (``prestate_absent``); otherwise
+       the entry -- a regular file, a directory, or the final symlink itself, which
+       is NEVER followed -- is renamed into the run-owned
+       ``quarantine/prepublish`` area (``prestate_quarantined``) and BOTH parents
+       are fsynced;
+    3. the verified staged entry is revalidated against the caller's pinned
+       ``staged_identity`` and renamed into the now-vacant final name
+       (``staging_published``) with the same-filesystem only ``os.rename``;
+    4. both parents are fsynced again and the sequence closes with
+       ``parent_fsynced``.
+
+    Nothing is copied, no path is traversed and no event is recorded that the run
+    did not actually perform: the result carries THIS artifact's own identity
+    proof, and no multi-artifact atomicity is claimed anywhere.
+    """
+    label = _bounded_str(artifact, field_name="publication.artifact", max_bytes=32)
+    if label not in PUBLICATION_ARTIFACTS:
+        raise _publication_failure("E_PUBLICATION_ARTIFACT_UNKNOWN", f"{label} is not a publication artifact")
+    pinned = plan.targets.get(label)
+    if pinned is None:
+        raise _publication_failure("E_PUBLICATION_TARGET_MISSING", f"the plan records no {label} target")
+    run = _backup_run_directory(plan) if run_dir is None else Path(run_dir)
+    _prepare_run_directory(run, plan.request.run_id)
+    target = Path(pinned.lexical_path)
+    quarantine_parent = run / QUARANTINE_DIRECTORY_NAME / QUARANTINE_PREPUBLISH_NAME
+    events: list[PublicationEvent] = []
+    quarantined_relative: str | None = None
+    prestate = "absent"
+    parents_fsynced: tuple[str, ...] = (str(target.parent),)
+
+    with storage_lock.open_directory_nofollow(run) as run_fd:
+        with storage_lock.open_directory_nofollow(target.parent) as target_parent_fd:
+            observed = _observed_entry_identity(target_parent_fd, target.name, artifact=label)
+            _require_prestate_unchanged(pinned, observed, artifact=label)
+            revalidated = {
+                "pinned_kind": pinned.kind,
+                "observed_kind": observed.kind,
+                "pinned_digest": _digest(asdict(pinned)),
+                "staged_digest": _digest(asdict(staged_identity)),
+            }
+            events.append(PublicationEvent(label, PUBLICATION_EVENT_REVALIDATED, revalidated))
+            _record_publication_event(manifest_path, label, PUBLICATION_EVENT_REVALIDATED, revalidated)
+
+            quarantine_fd: int | None = None
+            try:
+                if pinned.kind == "absent":
+                    absent_detail = {"prestate": "absent"}
+                    events.append(PublicationEvent(label, PUBLICATION_EVENT_ABSENT, absent_detail))
+                    _record_publication_event(
+                        manifest_path, label, PUBLICATION_EVENT_ABSENT, absent_detail
+                    )
+                else:
+                    quarantine_fd = _open_quarantine_directory(run_fd)
+                    entry_name = _quarantine_entry_name(label, plan.request.run_id)
+                    try:
+                        os.stat(entry_name, dir_fd=quarantine_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise _publication_failure(
+                            "E_PUBLICATION_COLLISION",
+                            f"{label} already owns a quarantine entry and it is never overwritten",
+                        )
+                    _rename_entry(
+                        target_parent_fd, target.name, quarantine_fd, entry_name, artifact=label
+                    )
+                    _fsync_pair(target_parent_fd, quarantine_fd)
+                    prestate = "quarantined"
+                    quarantined_relative = (
+                        f"{QUARANTINE_DIRECTORY_NAME}/{QUARANTINE_PREPUBLISH_NAME}/{entry_name}"
+                    )
+                    quarantined_detail = {
+                        "quarantine": quarantined_relative,
+                        "kind": pinned.kind,
+                        "identity": _digest(asdict(pinned)),
+                    }
+                    events.append(
+                        PublicationEvent(label, PUBLICATION_EVENT_QUARANTINED, quarantined_detail)
+                    )
+                    _record_publication_event(
+                        manifest_path, label, PUBLICATION_EVENT_QUARANTINED, quarantined_detail
+                    )
+                    parents_fsynced = (str(target.parent), str(quarantine_parent))
+
+                vacant = _observed_entry_identity(target_parent_fd, target.name, artifact=label)
+                if vacant.kind != "absent":
+                    raise _publication_failure(
+                        "E_PUBLICATION_PRESTATE_CHANGED",
+                        f"{label} target name is not vacant after the quarantine step",
+                    )
+
+                with _run_child_directory(run_fd, BACKUP_STAGING_NAME) as staging_fd:
+                    staged_name = ARTIFACT_STAGING_NAMES[label]
+                    staged = _observed_entry_identity(staging_fd, staged_name, artifact=label)
+                    if staged.kind == "absent":
+                        raise _publication_failure(
+                            "E_STAGING_ENTRY_ABSENT", f"{label} has no staged entry to publish"
+                        )
+                    if _identity_key(staged) != _identity_key(staged_identity):
+                        raise _publication_failure(
+                            "E_STAGING_IDENTITY_CHANGED",
+                            f"{label} staged entry is not the identity that was verified",
+                        )
+                    _rename_entry(staging_fd, staged_name, target_parent_fd, target.name, artifact=label)
+                    os.fsync(target_parent_fd)
+                published_detail = {
+                    "identity": _digest(asdict(staged_identity)),
+                    "path_present": True,
+                }
+                events.append(
+                    PublicationEvent(label, PUBLICATION_EVENT_STAGING_PUBLISHED, published_detail)
+                )
+                _record_publication_event(
+                    manifest_path, label, PUBLICATION_EVENT_STAGING_PUBLISHED, published_detail
+                )
+                if quarantine_fd is not None:
+                    _fsync_pair(target_parent_fd, quarantine_fd)
+                synced_detail = {"parents": list(parents_fsynced)}
+                events.append(PublicationEvent(label, PUBLICATION_EVENT_PARENT_FSYNCED, synced_detail))
+                _record_publication_event(
+                    manifest_path, label, PUBLICATION_EVENT_PARENT_FSYNCED, synced_detail
+                )
+            finally:
+                if quarantine_fd is not None:
+                    os.close(quarantine_fd)
+
+            published_identity = _observed_entry_identity(
+                target_parent_fd, target.name, artifact=label
+            )
+
+    return PublicationResult(
+        artifact=label,
+        prestate=prestate,
+        quarantine_relative_path=quarantined_relative,
+        published_path=str(target),
+        staged_identity=staged_identity,
+        published_identity=published_identity,
+        events=tuple(events),
+        parents_fsynced=parents_fsynced,
+    )
+
+
+def _fsync_pair(first_fd: int, second_fd: int) -> None:
+    """Fsync both parents of a rename (DETAIL 10.4 step 5), source first."""
+    os.fsync(first_fd)
+    os.fsync(second_fd)
+
+
+def reopen_published_artifact(
+    plan: MigrationPlan, artifact: str, result: PublicationResult
+) -> dict[str, Any]:
+    """Reopen the published entry and compare it with the pinned staged identity.
+
+    DETAIL 9.3: `published` may only be followed by `verified` after both
+    artifacts are "present and reopenable". The comparison is exact and
+    no-follow: the publication was a RENAME, so the entry at the final name must
+    be the very inode that was staged, with the staged mode, size, mtime and --
+    for a regular file -- the same streamed SHA-256. A replacement planted after
+    the swap therefore cannot be recorded as verified.
+    """
+    label = _bounded_str(artifact, field_name="publication.artifact", max_bytes=32)
+    if label not in PUBLICATION_ARTIFACTS:
+        raise _publication_failure("E_PUBLICATION_ARTIFACT_UNKNOWN", f"{label} is not a publication artifact")
+    target = Path(plan.targets[label].lexical_path)
+    with storage_lock.open_directory_nofollow(target.parent) as parent_fd:
+        observed = _observed_entry_identity(parent_fd, target.name, artifact=label)
+    if _identity_key(result.staged_identity) != _identity_key(observed):
+        raise _publication_failure(
+            "E_PUBLICATION_REOPEN_MISMATCH",
+            f"{label} at the final name is not the staged entry that was published",
+        )
+    return {
+        "artifact": label,
+        "kind": observed.kind,
+        "device": observed.device,
+        "inode": observed.inode,
+        "mode": observed.mode,
+        "size": observed.size,
+        "mtime_ns": observed.mtime_ns,
+        "digest": observed.sha256 or "",
+        "matches_staged": True,
+    }

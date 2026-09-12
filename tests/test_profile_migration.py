@@ -3216,3 +3216,1001 @@ def test_s205_staging_and_publication_share_one_filesystem(
     assert all(run == source for run, source, _ in calls)
     assert all(call_run == run_device for call_run, _, _ in calls)
     assert _s205_field(result, "run_dir") == str(run_dir)
+
+
+# ---------------------------------------------------------------------------
+# S2-06 -- the forward state machine, the per-artifact publication and the
+# CAPABILITY-GATED transition (DETAIL 9.3, 10.3, 10.4; routing-matrix
+# residual F1, which is this card's entry condition AND its Stop).
+#
+# The card's contract in one paragraph: the ten forward checkpoints are
+# reachable ONLY after real prerequisite evidence; the per-artifact publication
+# emits exactly `prestate_revalidated`, `prestate_quarantined|absent`,
+# `staging_published`, `parent_fsynced` and renames the quarantined prestate out
+# of the way before renaming the staged entry into the vacant target, fsyncing
+# BOTH parents; `published`/`verified`/`complete` may be entered ONLY when the
+# verification seam REPORTS an implemented capability -- never because of what
+# the seam RETURNED -- and the public `apply`/`resume`/`rollback` stay
+# fail-closed while `verify_staged_projections` is the S0 stub
+# (`projection_rebuild.py:68-70`), so no false end-to-end success is claimable.
+#
+# Evidence classification used by every node below, honestly:
+#  * BEHAVIOURAL  -- the node drives an EXISTING public code path at BASE and
+#    observes the wrong outcome (`Failed: DID NOT RAISE ...` or a real
+#    assertion on a real result). Three nodes are behavioural: the manifest
+#    accepting a gated checkpoint with no prerequisite evidence, the manifest
+#    refusing the graph-lock creation record, and the link-entry path not
+#    fsyncing the `backup` directory it created.
+#  * MISSING-CAPABILITY -- the capability does not exist at BASE at all (there
+#    is no forward state machine, no publication primitive, no capability
+#    report). Those nodes fail on an explicit `... is not None` assertion, never
+#    on an AttributeError/ImportError/TypeError from a helper, and never on
+#    `pytest.fail`. Each one names the behavioural node that will carry the same
+#    contract once the stage is wired (S3-06).
+#  * CONTROL -- passes on BOTH sides and pins a boundary that must not move
+#    (the entrypoints stay fail-closed; the primitives stay unwired).
+# ---------------------------------------------------------------------------
+
+S206_DIGEST = "ab" * 32
+S206_RUN_DIRECTORY_NAME = ".cmms-migrations"
+S206_STAGING_DIRECTORY_NAME = "staging"
+S206_QUARANTINE_RELATIVE = ("quarantine", "prepublish")
+S206_FORWARD_CHECKPOINTS: tuple[str, ...] = (
+    "planned",
+    "locked",
+    "backed_up",
+    "sqlite_snapshotted",
+    "projections_built",
+    "staged_verified",
+    "publishing",
+    "published",
+    "verified",
+    "complete",
+)
+S206_EVIDENCE_CODES: dict[str, str] = {
+    "planned": "plan_digest",
+    "locked": "lock_ownership",
+    "backed_up": "backup_report",
+    "sqlite_snapshotted": "snapshot_verification",
+    "projections_built": "rebuild_result",
+    "staged_verified": "staged_verification",
+    "publishing": "publication_plan",
+    "published": "publication_events",
+    "verified": "reopen_verification",
+    "complete": "manifest_update",
+}
+# The three the card names, plus `staged_verified`: DETAIL 10.3 IS the seam's
+# contract, so recording a stub verdict as a completed checkpoint would be the
+# false success this card exists to forbid. Disclosed in the summary.
+S206_GATED_CHECKPOINTS: tuple[str, ...] = ("staged_verified", "published", "verified", "complete")
+S206_PUBLICATION_EVENTS: tuple[str, ...] = (
+    "prestate_revalidated",
+    "prestate_quarantined",
+    "prestate_absent",
+    "staging_published",
+    "parent_fsynced",
+)
+S206_PUBLISHED_SEQUENCE: tuple[str, ...] = (
+    "prestate_revalidated",
+    "prestate_quarantined",
+    "staging_published",
+    "parent_fsynced",
+)
+S206_STAGING_NAMES: dict[str, str] = {"vector": "lancedb", "graph": "graph.json"}
+
+
+def _s206_api(name: str) -> Any:
+    """The S2-06 callable, or None -- MISSING CAPABILITY, never behavioural proof."""
+    return getattr(profile_migration, name, None)
+
+
+def _s206_detail(checkpoint: str) -> dict[str, Any]:
+    """A FRESH structurally valid evidence detail for one checkpoint."""
+    code = S206_EVIDENCE_CODES[checkpoint]
+    reopened = {"matches_staged": True, "device": 1, "inode": 2, "digest": S206_DIGEST}
+    details: dict[str, dict[str, Any]] = {
+        "plan_digest": {"plan_digest": S206_DIGEST, "config_digest": S206_DIGEST},
+        "lock_ownership": {
+            "held": True,
+            "roots": ("/synthetic/root",),
+            "identities": {"root_lock": (1, 2), "graph_lock": (1, 3)},
+        },
+        "backup_report": {"report_digest": S206_DIGEST, "entries": 3},
+        "snapshot_verification": {
+            "integrity": "ok",
+            "revision": sorted(profile_migration.ACCEPTED_SQLITE_SCHEMA_REVISIONS)[0],
+            "snapshot_device": 1,
+        },
+        "rebuild_result": {
+            "completed_batches": 2,
+            "vector_ids_digest": S206_DIGEST,
+            "graph_nodes_digest": S206_DIGEST,
+            "graph_edges_digest": S206_DIGEST,
+        },
+        "staged_verification": {
+            "basis": "explicit_flag",
+            "staging_digest": S206_DIGEST,
+            "artifacts": ("vector", "graph"),
+        },
+        "publication_plan": {
+            "targets": ("vector", "graph"),
+            "pinned": {"vector": S206_DIGEST, "graph": S206_DIGEST},
+        },
+        "publication_events": {
+            "artifacts": {
+                "vector": list(S206_PUBLISHED_SEQUENCE),
+                "graph": list(S206_PUBLISHED_SEQUENCE),
+            }
+        },
+        "reopen_verification": {"artifacts": {"vector": dict(reopened), "graph": dict(reopened)}},
+        "manifest_update": {
+            "manifest_digest": S206_DIGEST,
+            "manifest_bytes": 1024,
+            "checkpoint": checkpoint,
+        },
+    }
+    return details[code]
+
+
+def _s206_evidence(checkpoint: str, **overrides: Any) -> Any:
+    """A real-shaped CheckpointEvidence for one checkpoint, or None without the API."""
+    factory = _s206_api("CheckpointEvidence")
+    if factory is None:
+        return None
+    detail = _s206_detail(checkpoint)
+    detail.update(overrides)
+    return factory(
+        checkpoint=checkpoint,
+        code=S206_EVIDENCE_CODES[checkpoint],
+        digest=S206_DIGEST,
+        detail=detail,
+    )
+
+
+def _s206_capability(implemented: bool = True, basis: str = "explicit_flag") -> Any:
+    factory = _s206_api("StagedVerificationCapability")
+    if factory is None:
+        return None
+    return factory(implemented=implemented, basis=basis)
+
+
+def _s206_validate(current: str, target: str, evidence: Any, capability: Any = None) -> Any:
+    api = _s206_api("validate_forward_transition")
+    if api is None:
+        return None
+    return api(current, target, evidence, capability=capability)
+
+
+def _s206_advance(path: Path, target: str, evidence: Any = None, capability: Any = None) -> Any:
+    api = _s206_api("advance_manifest_checkpoint")
+    if api is None:
+        return None
+    return api(path, target, evidence=evidence, capability=capability)
+
+
+def _s206_identity(path: Path) -> Any:
+    """The no-follow identity of a REAL entry, exactly as the planner records it.
+
+    ``mode`` is the FULL ``st_mode`` (the planner stores ``component.mode``), and
+    a directory carries no size/mtime digest, which is why those stay None.
+    """
+    info = os.lstat(path)
+    if stat.S_ISDIR(info.st_mode):
+        return ArtifactIdentity(str(path), "directory", info.st_dev, info.st_ino, info.st_mode)
+    return ArtifactIdentity(
+        str(path),
+        "regular_file",
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+
+
+def _s206_run_dir(home: Path, plan: Any) -> Path:
+    return home / S206_RUN_DIRECTORY_NAME / plan.request.run_id
+
+
+def test_s206_a_gated_checkpoint_event_is_refused_without_real_prerequisite_evidence(
+    tmp_path: Path,
+) -> None:
+    """BEHAVIOURAL pre-fix RED: at BASE the manifest records `published` freely.
+
+    DETAIL 9.3 makes `published` reachable only after both artifacts are present
+    and reopenable, and acceptance 5 makes the transition capability-gated. The
+    manifest is where a checkpoint is recorded, so at BASE this node drives the
+    REAL `append_manifest_event` with a gated checkpoint and NO prerequisite
+    evidence: it returns happily instead of refusing, which is the false success
+    the card forbids. The refusal must also be fail-closed (byte-identical
+    manifest) and must not disturb a NON-gated checkpoint (the control that keeps
+    this node honest on both sides).
+    """
+    live, _before = _s2_pair(tmp_path)
+    append = profile_migration.append_manifest_event
+
+    appended = append(live, {"operation": "advance:locked", "checkpoint": "locked"})
+    assert len(appended.events) == 1
+    after_control = live.read_bytes()
+
+    with pytest.raises(ValueError, match="E_CHECKPOINT_PREREQUISITE_MISSING"):
+        append(live, {"operation": "publish:vector", "checkpoint": "published"})
+    assert live.read_bytes() == after_control
+
+
+def test_s206_the_s0_stub_seam_reports_no_capability_and_the_gate_stays_shut(
+    tmp_path: Path,
+) -> None:
+    """MISSING-CAPABILITY at BASE: there is no capability report at all.
+
+    Behavioural successor (S3-06): the node drives the public entrypoints once
+    the stage is wired, so the same contract gets a behavioural RED then.
+
+    At HEAD this is the card's central safety proof: the shared seam is still the
+    S0 stub, its own answer to the negative-probe input is a VALID-looking
+    verdict, and the gate nevertheless stays shut -- which is exactly the
+    "never because of the seam's RETURN VALUE" clause of acceptance 5.
+    """
+    import asyncio
+
+    import memory_server.projection_rebuild as projection_rebuild
+
+    report = _s206_api("staged_verification_capability")
+    assert report is not None, "no capability report for the verification seam exists"
+
+    capability = report()
+    assert capability.implemented is False
+    assert capability.basis
+    assert "implemented" not in capability.basis.replace("unimplemented", "")
+
+    # The seam's own verdict on an unverifiable staged input is valid=True: this
+    # line is the reason the gate may not read the return value.
+    probe = tmp_path / "absent-staged-entry"
+    seam_verdict = asyncio.run(projection_rebuild.verify_staged_projections(probe))
+    assert getattr(seam_verdict, "valid", None) is True
+
+    for target, current in (
+        ("staged_verified", "projections_built"),
+        ("published", "publishing"),
+        ("verified", "published"),
+        ("complete", "verified"),
+    ):
+        with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+            _s206_validate(current, target, [_s206_evidence(target)], capability)
+
+
+def test_s206_only_the_seams_own_capability_report_opens_the_gated_transitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MISSING-CAPABILITY at BASE: the gate itself does not exist.
+
+    The gate is opened by the SEAM'S report and by nothing else: the explicit
+    capability flag is the seam's own channel (DETAIL 10.3 implementation), and
+    once the seam reports it, the gated checkpoints become reachable. Nothing in
+    this node lets a caller assert `valid=True` and walk in.
+    """
+    import memory_server.projection_rebuild as projection_rebuild
+
+    report = _s206_api("staged_verification_capability")
+    assert report is not None, "no capability report for the verification seam exists"
+
+    stub = report()
+    assert stub.implemented is False
+    for target, current in (
+        ("staged_verified", "projections_built"),
+        ("published", "publishing"),
+        ("complete", "verified"),
+    ):
+        with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+            _s206_validate(current, target, [_s206_evidence(target)], stub)
+
+    monkeypatch.setattr(projection_rebuild, "STAGED_VERIFICATION_IMPLEMENTED", True, raising=False)
+    opened = report()
+    assert opened.implemented is True
+    assert opened.basis == "explicit_flag"
+    for target, current in (
+        ("staged_verified", "projections_built"),
+        ("published", "publishing"),
+        ("verified", "published"),
+        ("complete", "verified"),
+    ):
+        assert _s206_validate(current, target, [_s206_evidence(target)], opened) == target
+
+
+def test_s206_the_ten_forward_checkpoints_advance_only_with_their_own_evidence(
+    tmp_path: Path,
+) -> None:
+    """MISSING-CAPABILITY at BASE: there is no forward state machine.
+
+    DETAIL 9.3's chain is walked with the capability the seam REPORTS (the real
+    S3 verifier is that card's deliverable): every step needs ITS OWN real
+    prerequisite evidence, a missing evidence object is refused, an evidence
+    object belonging to another checkpoint is refused, a skipped step is refused
+    as out of order, and the gated steps refuse a seam that reports no
+    capability. The last three steps are reached for real -- with both artifacts
+    actually published and reopenable -- by the per-artifact node below; this node
+    pins that `published` cannot be announced without the run's OWN recorded
+    publication events even when the capability IS there.
+    """
+    run_dir = _s2_run_dir(tmp_path)
+    live = run_dir / "manifest.json"
+    profile_migration._write_manifest(live, _s2_manifest(checkpoint="planned", completed_steps=[]))
+
+    assert _s206_api("advance_manifest_checkpoint") is not None, "no forward state machine exists"
+    capable = _s206_capability(implemented=True, basis="explicit_flag")
+
+    current = "planned"
+    for target in S206_FORWARD_CHECKPOINTS[1:7]:
+        with pytest.raises(ValueError, match="E_CHECKPOINT_PREREQUISITE_MISSING"):
+            _s206_advance(live, target, evidence=None, capability=capable)
+        with pytest.raises(ValueError, match="E_CHECKPOINT_EVIDENCE_INVALID"):
+            _s206_advance(live, target, evidence=[_s206_evidence("planned")], capability=capable)
+        manifest = _s206_advance(live, target, evidence=[_s206_evidence(target)], capability=capable)
+        assert manifest is not None, "no forward state machine exists"
+        assert manifest.checkpoint == target
+        current = target
+
+    assert current == "publishing"
+    reloaded = profile_migration.load_manifest(live)
+    assert [event.checkpoint for event in reloaded.events] == list(S206_FORWARD_CHECKPOINTS[1:7])
+    assert reloaded.completed_steps[-1] == "publishing"
+
+    with pytest.raises(ValueError, match="E_CHECKPOINT_OUT_OF_ORDER"):
+        _s206_advance(live, "verified", evidence=[_s206_evidence("verified")])
+    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+        _s206_advance(
+            live,
+            "published",
+            evidence=[_s206_evidence("published")],
+            capability=_s206_capability(implemented=False, basis="unimplemented"),
+        )
+    with pytest.raises(ValueError, match="E_PUBLICATION_INCOMPLETE"):
+        _s206_advance(live, "published", evidence=[_s206_evidence("published")], capability=capable)
+    assert profile_migration.load_manifest(live).checkpoint == "publishing"
+
+
+def test_s206_the_public_entrypoints_stay_fail_closed_while_the_seam_is_a_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """CONTROL (passes on BOTH sides): no false end-to-end success is claimable.
+
+    acceptance 1 and 5: `apply`/`resume`/`rollback` stay non-success while the
+    verification seam is the S0 stub, they touch nothing, and they do not start
+    to proceed even when the seam DOES report an implemented capability -- the
+    general `apply` stays closed until S3-06 and this card must not bypass that
+    ordering (routing-matrix S2-06 split_further / the card's ordering note).
+    """
+    import memory_server.projection_rebuild as projection_rebuild
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    live = tmp_path / "run" / plan.request.run_id / "manifest.json"
+    before = _tree_snapshot(tmp_path)
+
+    entrypoints = (
+        ("apply_profile_migration", (plan,)),
+        ("resume_profile_migration", (live, request)),
+        ("rollback_profile_migration", (live, request)),
+    )
+    for name, args in entrypoints:
+        with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+            getattr(profile_migration, name)(*args)
+
+    monkeypatch.setattr(projection_rebuild, "STAGED_VERIFICATION_IMPLEMENTED", True, raising=False)
+    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+        profile_migration.apply_profile_migration(plan)
+
+    assert _tree_snapshot(tmp_path) == before
+
+
+def test_s206_the_engine_primitives_are_not_wired_into_the_public_entrypoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """CONTROL (passes on BOTH sides) + the F7 status of the S2-05 stage.
+
+    F7 of the S2-05 review asks for the ten missing-capability nodes to be
+    re-anchored on the entrypoints "once the stage is wired into apply/resume/
+    rollback". This card's ordering forbids that wiring: the entrypoints stay
+    fail-closed until S3-06. The node therefore PINS the boundary as a control --
+    the backup stage and the publication primitive are never reached from a
+    public entrypoint and no run directory is created -- and states the residual
+    honestly instead of letting a reader assume the wiring happened.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+
+    reached: list[str] = []
+
+    def _record(name: str) -> Any:
+        def _spy(*args: Any, **kwargs: Any) -> Any:
+            reached.append(name)
+            return None
+
+        return _spy
+
+    for name in ("create_run_backup", "publish_artifact", "advance_manifest_checkpoint"):
+        monkeypatch.setattr(profile_migration, name, _record(name), raising=False)
+
+    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+        profile_migration.apply_profile_migration(plan)
+    assert reached == []
+    assert not _s206_run_dir(home, plan).exists()
+
+
+# ---------------------------------------------------------------------------
+# S2-06 -- the per-artifact publication itself (DETAIL 10.4) and the two
+# carry-ins of the S2-05 review that live on this card's paths (F6, F9).
+# ---------------------------------------------------------------------------
+
+
+def _s206_prepare_staging(run_dir: Path, artifact: str, payload: bytes) -> Path:
+    """A REAL prepared staging entry under ``<run>/staging/`` (DETAIL 9.1).
+
+    ``staging/lancedb`` is a directory and ``staging/graph.json`` a regular file,
+    so both the directory and the file branch of the swap are exercised on a real
+    filesystem; nothing here is a mock and nothing is written outside the run
+    directory (or /dev/shm for the cross-filesystem node).
+    """
+    staging = run_dir / S206_STAGING_DIRECTORY_NAME
+    staging.mkdir(parents=True, exist_ok=True)
+    entry = staging / S206_STAGING_NAMES[artifact]
+    if artifact == "vector":
+        (entry / "nested").mkdir(parents=True, exist_ok=True)
+        (entry / "part.bin").write_bytes(payload)
+        (entry / "nested" / "more.bin").write_bytes(b"nested-" + payload[:16])
+    else:
+        entry.write_bytes(payload)
+    return entry
+
+
+def _s206_publish(
+    plan: Any, artifact: str, staged_identity: Any, run_dir: Path, manifest_path: Path | None = None
+) -> Any:
+    """publish_artifact(...), or None when the capability does not exist (BASE)."""
+    api = _s206_api("publish_artifact")
+    if api is None:
+        return None
+    return api(plan, artifact, staged_identity=staged_identity, run_dir=run_dir, manifest_path=manifest_path)
+
+
+def _s206_fsync_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the real path behind every ``os.fsync`` descriptor, then fsync."""
+    fsynced: list[str] = []
+    real_fsync = os.fsync
+
+    def _spy(descriptor: int) -> None:
+        try:
+            fsynced.append(os.path.realpath(f"/proc/self/fd/{descriptor}"))
+        except OSError:
+            fsynced.append("")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", _spy)
+    return fsynced
+
+
+def _s206_quarantine_parent(run_dir: Path) -> Path:
+    return run_dir.joinpath(*S206_QUARANTINE_RELATIVE)
+
+
+def _s206_publishing_manifest(plan: Any, run_dir: Path, name: str = "manifest.json") -> Path:
+    """A real, durable manifest at the `publishing` checkpoint of this run."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    live = run_dir / name
+    profile_migration._write_manifest(live, _s2_manifest(run_id=plan.request.run_id, checkpoint="publishing"))
+    return live
+
+
+def test_s206_publication_quarantines_the_pinned_prestate_then_renames_staging_into_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE: no per-artifact publication primitive exists.
+
+    Behavioural successor (S3-06): the same node drives the entrypoint once the
+    stage is wired into `apply`, so the swap contract gets a behavioural RED
+    then. At HEAD this node is the real thing on a real filesystem: the pinned
+    prestate is quarantined (retained byte for byte), the staged directory is
+    renamed into the now-vacant target (same inode -- a rename, not a copy), both
+    parents are fsynced, and the four DETAIL 9.3 publishing events are emitted in
+    order for THIS artifact only.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = _s206_run_dir(home, plan)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    target = Path(plan.targets["vector"].lexical_path)
+    old_bytes = (target / "a.bin").read_bytes()
+    old_inode = plan.targets["vector"].inode
+
+    payload = b"STAGED-VECTOR-PAYLOAD" * 8
+    staged = _s206_prepare_staging(run_dir, "vector", payload)
+    staged_identity = _s206_identity(staged)
+    fsynced = _s206_fsync_spy(monkeypatch)
+
+    result = _s206_publish(plan, "vector", staged_identity, run_dir)
+    assert result is not None, "no per-artifact publication primitive exists at this commit"
+
+    assert [event.event for event in result.events] == list(S206_PUBLISHED_SEQUENCE)
+    assert {event.artifact for event in result.events} == {"vector"}
+    assert result.prestate == "quarantined"
+
+    quarantine_parent = _s206_quarantine_parent(run_dir)
+    quarantined = run_dir / result.quarantine_relative_path
+    assert quarantined.parent == quarantine_parent
+    assert quarantined.is_dir()
+    assert (quarantined / "a.bin").read_bytes() == old_bytes
+    assert quarantined.stat().st_ino == old_inode
+
+    assert not staged.exists()
+    assert (target / "part.bin").read_bytes() == payload
+    assert (target / "nested" / "more.bin").read_bytes() == b"nested-" + payload[:16]
+    assert target.stat().st_ino == staged_identity.inode
+
+    parents = {os.path.realpath(item) for item in result.parents_fsynced}
+    assert parents == {
+        os.path.realpath(str(target.parent)),
+        os.path.realpath(str(quarantine_parent)),
+    }
+    assert parents <= set(fsynced)
+
+
+def test_s206_an_absent_prestate_is_recorded_as_absence_and_never_quarantined(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE (same behavioural successor as the node above).
+
+    DETAIL 10.4 step 2: an absent prestate is an explicit ABSENCE event, not a
+    silent skip and not a quarantine entry; the staged entry still lands in the
+    vacant target name.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    target = home / "data" / "graph.json"
+    target.unlink()
+    request, plan = _s205_legacy_plan(home, db_path)
+    assert plan.targets["graph"].kind == "absent"
+    run_dir = _s206_run_dir(home, plan)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = b'{"staged": true}\n'
+    staged = _s206_prepare_staging(run_dir, "graph", payload)
+    staged_identity = _s206_identity(staged)
+
+    result = _s206_publish(plan, "graph", staged_identity, run_dir)
+    assert result is not None, "no per-artifact publication primitive exists at this commit"
+    assert [event.event for event in result.events] == [
+        "prestate_revalidated",
+        "prestate_absent",
+        "staging_published",
+        "parent_fsynced",
+    ]
+    assert result.prestate == "absent"
+    assert not result.quarantine_relative_path
+    assert not _s206_quarantine_parent(run_dir).exists()
+    assert target.read_bytes() == payload
+    assert not staged.exists()
+
+
+def test_s206_a_stale_or_replaced_pinned_prestate_is_refused_before_anything_is_swapped(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE; the stop condition is "stale prestate".
+
+    DETAIL 10.4 step 1 revalidates the pinned prestate BEFORE any rename. The
+    replacement here is a real one: a different inode already allocated under a
+    temporary name and renamed over the target, so the filesystem cannot hand the
+    freed inode back and the premise of the node cannot silently invert.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = _s206_run_dir(home, plan)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    target = Path(plan.targets["graph"].lexical_path)
+    staged = _s206_prepare_staging(run_dir, "graph", b"staged-graph\n")
+    staged_identity = _s206_identity(staged)
+
+    api = _s206_api("publish_artifact")
+    assert api is not None, "no per-artifact publication primitive exists at this commit"
+
+    replacement = home / "replacement-graph.json"
+    replacement.write_bytes(b'{"replaced": true}\n')
+    os.replace(replacement, target)
+    assert os.lstat(target).st_ino != plan.targets["graph"].inode
+
+    with pytest.raises(ValueError, match="E_PUBLICATION_PRESTATE_CHANGED"):
+        api(plan, "graph", staged_identity=staged_identity, run_dir=run_dir)
+    assert target.read_bytes() == b'{"replaced": true}\n'
+    assert staged.exists()
+    assert not _s206_quarantine_parent(run_dir).exists()
+
+
+def test_s206_injected_failures_before_and_after_each_operation_retain_the_prestate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE; the injected failures are REAL.
+
+    The card's clearance evidence demands failures injected before AND after each
+    operation. Three are exercised here on real filesystems, each with the
+    manifest's own event chain inspected afterwards:
+
+    * the quarantine rename fails  -> nothing moved, no quarantine entry, and the
+      event chain stops at `prestate_revalidated`;
+    * the publish rename fails     -> the OLD entry is retained in the run
+      quarantine (no data loss), the target is vacant, the staged entry still
+      exists, and `staging_published` was never recorded;
+    * the failure is the REAL `os.rename`, not a helper of this test.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = _s206_run_dir(home, plan)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    live = _s206_publishing_manifest(plan, run_dir)
+    target = Path(plan.targets["vector"].lexical_path)
+    old_bytes = (target / "a.bin").read_bytes()
+    quarantine_parent = _s206_quarantine_parent(run_dir)
+
+    api = _s206_api("publish_artifact")
+    assert api is not None, "no per-artifact publication primitive exists at this commit"
+    staged = _s206_prepare_staging(run_dir, "vector", b"first-attempt")
+    staged_identity = _s206_identity(staged)
+
+    real_rename = os.rename
+
+    def _always_fail(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        raise OSError(errno.EIO, "injected rename failure")
+
+    monkeypatch.setattr(os, "rename", _always_fail)
+    with pytest.raises(ValueError, match="E_PUBLICATION_RENAME_FAILED"):
+        api(plan, "vector", staged_identity=staged_identity, run_dir=run_dir, manifest_path=live)
+    monkeypatch.setattr(os, "rename", real_rename)
+
+    assert (target / "a.bin").read_bytes() == old_bytes
+    assert staged.is_dir()
+    # Nothing was quarantined: the run-owned quarantine DIRECTORY may have been
+    # created by the attempted step, but no entry ever landed in it.
+    if quarantine_parent.exists():
+        assert list(quarantine_parent.iterdir()) == []
+    assert [event.operation for event in profile_migration.load_manifest(live).events] == [
+        "vector.prestate_revalidated"
+    ]
+
+    seen: list[int] = []
+
+    def _fail_second(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        seen.append(1)
+        if len(seen) == 2:
+            raise OSError(errno.EIO, "injected rename failure")
+        return real_rename(source, destination, *args, **kwargs)
+
+    # A second, fresh run manifest so the chain inspected below belongs to this
+    # attempt only (the first attempt already recorded its revalidation).
+    second = _s206_publishing_manifest(plan, run_dir, name="manifest-phase2.json")
+    monkeypatch.setattr(os, "rename", _fail_second)
+    with pytest.raises(ValueError, match="E_PUBLICATION_RENAME_FAILED"):
+        api(plan, "vector", staged_identity=staged_identity, run_dir=run_dir, manifest_path=second)
+    monkeypatch.setattr(os, "rename", real_rename)
+
+    quarantined = sorted(quarantine_parent.iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "a.bin").read_bytes() == old_bytes
+    assert not target.exists()
+    assert staged.is_dir()
+    operations = [event.operation for event in profile_migration.load_manifest(second).events]
+    assert operations == ["vector.prestate_revalidated", "vector.prestate_quarantined"]
+
+
+def test_s206_a_real_second_filesystem_refuses_publication_and_same_device_publishes(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE; the STOP condition is exercised on REAL devices.
+
+    `/dev/shm` is device 28 and the run directory here is device 66306, so the
+    refusal is produced by the kernel on a genuine cross-device rename of a REAL
+    prepared staging entry -- no mocking of `st_dev` anywhere. The same-device
+    control then publishes the same staged layout, which also proves the refused
+    attempt left no stale prestate behind. (S2-05's fix round established that
+    the certified runner grants /dev/shm; the docstring that claimed otherwise
+    inside the frozen S2-05 node is recorded as residual N-1 there.)
+    """
+    import shutil as _shutil
+    import tempfile
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    target = Path(plan.targets["graph"].lexical_path)
+    api = _s206_api("publish_artifact")
+    assert api is not None, "no per-artifact publication primitive exists at this commit"
+    prestate = target.read_bytes()
+
+    foreign_root = Path(tempfile.mkdtemp(dir="/dev/shm", prefix="s206-device-"))
+    foreign_run = foreign_root / plan.request.run_id
+    try:
+        assert os.stat(foreign_root).st_dev != os.stat(home).st_dev
+        foreign_run.mkdir()
+        staged = _s206_prepare_staging(foreign_run, "graph", b'{"cross-device": true}\n')
+        with pytest.raises(ValueError, match="E_CROSS_FILESYSTEM_PUBLICATION"):
+            api(plan, "graph", staged_identity=_s206_identity(staged), run_dir=foreign_run)
+        assert target.read_bytes() == prestate
+        assert staged.exists()
+        foreign_quarantine = _s206_quarantine_parent(foreign_run)
+        if foreign_quarantine.exists():
+            assert list(foreign_quarantine.iterdir()) == []
+    finally:
+        _shutil.rmtree(foreign_root, ignore_errors=True)
+
+    same_run = _s206_run_dir(home, plan)
+    same_run.mkdir(parents=True, exist_ok=True)
+    staged_same = _s206_prepare_staging(same_run, "graph", b'{"same-device": true}\n')
+    result = api(plan, "graph", staged_identity=_s206_identity(staged_same), run_dir=same_run)
+    assert result is not None
+    assert result.prestate == "quarantined"
+    assert target.read_bytes() == b'{"same-device": true}\n'
+
+
+def test_s206_a_failure_between_the_rename_and_the_manifest_update_is_not_a_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE; the stop condition is "failure between rename
+    and manifest update" and it is the card's most dangerous window.
+
+    The manifest write of `staging_published` is injected to fail AFTER the
+    rename has already landed: the target holds the new bytes, the old entry is
+    retained in the run quarantine, the event chain stops at
+    `prestate_quarantined` -- and `published` remains UNREACHABLE even with the
+    seam reporting an implemented capability, because the state machine reads the
+    manifest's OWN recorded events, not the caller's claim.
+    """
+    import memory_server.projection_rebuild as projection_rebuild
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = _s206_run_dir(home, plan)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    live = _s206_publishing_manifest(plan, run_dir)
+    target = Path(plan.targets["graph"].lexical_path)
+    old_bytes = target.read_bytes()
+
+    api = _s206_api("publish_artifact")
+    assert api is not None, "no per-artifact publication primitive exists at this commit"
+    staged = _s206_prepare_staging(run_dir, "graph", b'{"half-published": true}\n')
+    staged_identity = _s206_identity(staged)
+
+    real_write = profile_migration._write_manifest
+    calls: list[int] = []
+
+    def _fail_after_the_rename(manifest_target: Path, manifest: Any) -> Any:
+        calls.append(1)
+        if len(calls) >= 3:
+            raise ValueError("E_MANIFEST_WRITE_INJECTED")
+        return real_write(manifest_target, manifest)
+
+    monkeypatch.setattr(profile_migration, "_write_manifest", _fail_after_the_rename)
+    with pytest.raises(ValueError, match="E_MANIFEST_WRITE_INJECTED"):
+        api(plan, "graph", staged_identity=staged_identity, run_dir=run_dir, manifest_path=live)
+    monkeypatch.setattr(profile_migration, "_write_manifest", real_write)
+
+    assert target.read_bytes() == b'{"half-published": true}\n'
+    quarantined = sorted(_s206_quarantine_parent(run_dir).iterdir())
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == old_bytes
+    operations = [event.operation for event in profile_migration.load_manifest(live).events]
+    assert operations == ["graph.prestate_revalidated", "graph.prestate_quarantined"]
+
+    monkeypatch.setattr(projection_rebuild, "STAGED_VERIFICATION_IMPLEMENTED", True, raising=False)
+    with pytest.raises(ValueError, match="E_PUBLICATION_INCOMPLETE"):
+        _s206_advance(live, "published", evidence=[_s206_evidence("published")])
+
+
+def test_s206_publishing_is_per_artifact_and_never_a_multi_artifact_atomic_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE; DETAIL 9.3 + acceptance 4.
+
+    The two artifacts really are published one after the other. After the vector
+    swap only, `published` is refused as incomplete -- even with the seam
+    reporting an implemented capability; after the graph swap both artifacts are
+    reopenable and only then does the chain reach `published`, then `verified`
+    (reopen exact) and `complete` (durable manifest update). The per-artifact
+    results carry their OWN events, which is the explicit refusal of a
+    multi-artifact atomic claim.
+    """
+    import memory_server.projection_rebuild as projection_rebuild
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = _s206_run_dir(home, plan)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    live = _s206_publishing_manifest(plan, run_dir)
+
+    publish = _s206_api("publish_artifact")
+    reopen = _s206_api("reopen_published_artifact")
+    assert publish is not None, "no per-artifact publication primitive exists at this commit"
+    assert reopen is not None, "no reopen verification of a published entry exists"
+    monkeypatch.setattr(projection_rebuild, "STAGED_VERIFICATION_IMPLEMENTED", True, raising=False)
+
+    published: dict[str, Any] = {}
+    for artifact in ("vector", "graph"):
+        staged = _s206_prepare_staging(run_dir, artifact, f"staged-{artifact}".encode() * 4)
+        published[artifact] = publish(
+            plan, artifact, staged_identity=_s206_identity(staged), run_dir=run_dir, manifest_path=live
+        )
+        assert published[artifact] is not None
+        assert {event.artifact for event in published[artifact].events} == {artifact}
+        if artifact == "vector":
+            with pytest.raises(ValueError, match="E_PUBLICATION_INCOMPLETE"):
+                _s206_advance(live, "published", evidence=[_s206_evidence("published")])
+
+    assert _s206_advance(live, "published", evidence=[_s206_evidence("published")]) is not None
+
+    reopened = {label: reopen(plan, label, published[label]) for label in ("vector", "graph")}
+    assert all(report["matches_staged"] is True for report in reopened.values())
+    assert _s206_advance(live, "verified", evidence=[_s206_evidence("verified", artifacts=reopened)]) is not None
+    manifest_update = {
+        "manifest_digest": hashlib.sha256(live.read_bytes()).hexdigest(),
+        "manifest_bytes": live.stat().st_size,
+    }
+    final = _s206_advance(live, "complete", evidence=[_s206_evidence("complete", **manifest_update)])
+    assert final is not None
+    assert final.checkpoint == "complete"
+    assert profile_migration.load_manifest(live).checkpoint == "complete"
+
+
+def test_s206_the_published_entry_is_reopened_exact_and_a_post_swap_replacement_is_refused(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE; acceptance 4 ("reopen exact verification").
+
+    The reopen compares what is AT the final name now with the pinned staged
+    identity: the rename preserves the inode, so the device/inode must be the
+    staged entry's own, and a regular file must still digest to the staged bytes.
+    A replacement planted after the swap therefore cannot be recorded as
+    `verified`.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = _s206_run_dir(home, plan)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    target = Path(plan.targets["graph"].lexical_path)
+
+    payload = b'{"reopen": "exact"}\n'
+    staged = _s206_prepare_staging(run_dir, "graph", payload)
+    staged_identity = _s206_identity(staged)
+    result = _s206_publish(plan, "graph", staged_identity, run_dir)
+    assert result is not None, "no per-artifact publication primitive exists at this commit"
+
+    reopen = _s206_api("reopen_published_artifact")
+    assert reopen is not None, "no reopen verification of a published entry exists"
+    report = reopen(plan, "graph", result)
+    assert report["matches_staged"] is True
+    assert report["device"] == staged_identity.device
+    assert report["inode"] == staged_identity.inode
+    assert report["digest"] == staged_identity.sha256
+
+    replacement = home / "replacement-after-swap.json"
+    replacement.write_bytes(b'{"swapped": true}\n')
+    os.replace(replacement, target)
+    with pytest.raises(ValueError, match="E_PUBLICATION_REOPEN_MISMATCH"):
+        reopen(plan, "graph", result)
+
+
+def test_s206_the_manifest_carries_and_round_trips_the_graph_lock_creation_record(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL pre-fix RED (S2-05 review F9, DETAIL 10.1).
+
+    DETAIL 10.1: "If migration created an absent graph lock, manifest records
+    that fact for post-unlock rollback cleanup." At BASE the manifest schema has
+    no such field and the REAL strict deserializer refuses a manifest that
+    carries it (`E_MANIFEST_SCHEMA`), so the DETAIL sentence was unimplementable;
+    at HEAD the record round-trips as durable typed state. The record itself is
+    produced by the real S2-05 lock path, not hand-written.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = home / S206_RUN_DIRECTORY_NAME / plan.request.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    live = run_dir / "manifest.json"
+
+    locks = profile_migration.acquire_maintenance_locks(plan, timeout=2)
+    try:
+        record = dict(profile_migration.graph_lock_creation_record(plan, locks))
+    finally:
+        locks.release()
+    assert record["created"] is True
+    assert record["held"] is True
+
+    payload = asdict(_s2_manifest(run_id=plan.request.run_id))
+    payload["graph_lock"] = record
+    _s2_write_json(live, payload)
+
+    loaded = profile_migration.load_manifest(live)
+    assert dict(loaded.graph_lock) == record
+
+
+def test_s206_a_durable_manifest_update_records_the_graph_lock_and_is_reopened(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """MISSING-CAPABILITY at BASE: nothing writes the record into the manifest.
+
+    The durable update goes through the real atomic manifest writer and is then
+    RE-READ from disk, so the claim is about the file, not about a Python object
+    that happens to be in memory.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = home / S206_RUN_DIRECTORY_NAME / plan.request.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    live = run_dir / "manifest.json"
+    profile_migration._write_manifest(live, _s2_manifest(run_id=plan.request.run_id))
+
+    api = _s206_api("record_graph_lock_creation")
+    assert api is not None, "no manifest record of the created graph lock exists"
+
+    locks = profile_migration.acquire_maintenance_locks(plan, timeout=2)
+    try:
+        record = dict(profile_migration.graph_lock_creation_record(plan, locks))
+    finally:
+        locks.release()
+
+    updated = api(live, record)
+    assert dict(updated.graph_lock) == record
+    on_disk = profile_migration.load_manifest(live)
+    assert dict(on_disk.graph_lock) == record
+    assert str(record["path"]) in live.read_text(encoding="utf-8")
+
+
+def test_s206_the_link_entry_backup_fsyncs_the_created_backup_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """BEHAVIOURAL pre-fix RED (S2-05 review F6).
+
+    In the link-entry branch only the inner `link-entries` descriptor is fsynced
+    at BASE, so the `backup` directory entry the same call just created can be
+    lost by a crash while the symlink survives. The node observes the REAL
+    `os.fsync` calls of the real backup path -- no assertion is made about a
+    mock -- and only the link path is run, so the regular-file path's fsync of
+    the same directory cannot mask the gap.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path, _external = _s205_legacy_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    vector = home / "data" / "lancedb"
+    assert vector.is_symlink()
+    run_dir = _s205_run_dir(home, plan)
+    fsynced = _s206_fsync_spy(monkeypatch)
+
+    entries = _s205_backup_artifact(plan, "legacy:0", vector)
+    assert entries is not None, "no backup stage exists at this commit"
+    assert [entry.kind for entry in entries] == ["symlink"]
+
+    backup_dir = os.path.realpath(str(run_dir / "backup"))
+    link_entries = os.path.realpath(str(run_dir / "backup" / "link-entries"))
+    assert link_entries in fsynced
+    assert backup_dir in fsynced, (
+        "the `backup` directory entry created for the link entry was never fsynced"
+    )
