@@ -37,6 +37,16 @@ class EmbeddingPlan:
     batches: int
     digest: str
     network: bool = False
+    estimated_cost: int = 0
+    estimator: str = "vector-records"
+
+
+@dataclass(frozen=True)
+class EmbeddingProgress:
+    """Optional typed resume marker; checkpoint_path remains the durable store."""
+
+    completed_batches: int = 0
+    staged_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -310,7 +320,7 @@ async def rebuild_projections(
     vector_size: int = 384,
     batch_size: int = 32,
     checkpoint_path: str | Path | None = None,
-    resume: bool = False,
+    resume: EmbeddingProgress | None = None,
     embedding_plan_digest: str | None = None,
     dry_run: bool = False,
 ) -> RebuildResult:
@@ -320,8 +330,14 @@ async def rebuild_projections(
     if backend == "remote" and not allow_network:
         raise PermissionError("remote embedding requires explicit allow-network")
     records = [record async for record in iter_canonical_projection_records(snapshot_url, batch_size=batch_size)]
-    plan = EmbeddingPlan(backend, len(records), (len(records) + batch_size - 1) // batch_size,
-                         embedding_plan_digest_fn(records), backend == "remote")
+    vector_records = [record for record in records if record.record_type in {"fact", "belief"}]
+    vector_batches = sum(
+        bool(records[offset : offset + batch_size])
+        and any(record.record_type in {"fact", "belief"} for record in records[offset : offset + batch_size])
+        for offset in range(0, len(records), batch_size)
+    )
+    plan = EmbeddingPlan(backend, len(vector_records), vector_batches,
+                         embedding_plan_digest_fn(records), backend == "remote", len(vector_records))
     if dry_run:
         return RebuildResult({}, "", "", "", 0, plan, ())
     if embedder is None or not callable(getattr(embedder, "embed_batch", None)):
@@ -333,7 +349,7 @@ async def rebuild_projections(
     checkpoint = Path(checkpoint_path) if checkpoint_path else None
     completed_ids: list[str] = []
     completed_batches = 0
-    if resume and checkpoint and checkpoint.exists():
+    if bool(resume) and checkpoint and checkpoint.exists():
         state = json.loads(checkpoint.read_text(encoding="utf-8"))
         completed_ids = [str(value) for value in state.get("staged_ids", [])]
         if state.get("plan_digest") != plan.digest:
@@ -359,20 +375,24 @@ async def rebuild_projections(
         for offset in range(len(completed_ids), len(records), batch_size):
             batch = records[offset : offset + batch_size]
             try:
-                vectors = embedder.embed_batch([vector_text(record) for record in batch])
-                if len(vectors) != len(batch) or any(len(vector) != vector_size for vector in vectors):
-                    raise ValueError("E_EMBEDDING_DIMENSION")
-                points = [
-                    {"id": map_projection_record(record).point_id, "vector": vector,
-                     "payload": map_projection_record(record).payload}
-                    for record, vector in zip(batch, vectors)
-                    if record.record_type in {"fact", "belief"}
-                ]
+                vector_batch = [record for record in batch if record.record_type in {"fact", "belief"}]
+                points: list[dict[str, Any]] = []
+                if vector_batch:
+                    vectors = embedder.embed_batch([vector_text(record) for record in vector_batch])
+                    if len(vectors) != len(vector_batch) or any(len(vector) != vector_size for vector in vectors):
+                        raise ValueError("E_EMBEDDING_DIMENSION")
+                    points = [
+                        {"id": map_projection_record(record).point_id, "vector": vector,
+                         "payload": map_projection_record(record).payload}
+                        for record, vector in zip(vector_batch, vectors)
+                    ]
                 if points:
                     await provider.upsert_batch(points)
             except Exception:
                 if checkpoint:
                     _checkpoint_write(checkpoint, {"status": "resumable", "plan_digest": plan.digest,
+                        "last_completed_key": [records[len(completed_ids) - 1].record_type,
+                                               records[len(completed_ids) - 1].record_id] if completed_ids else None,
                         "staged_ids": completed_ids, "id_digest": id_digest(set(completed_ids)),
                         "count": len(completed_ids), "completed_batches": completed_batches})
                 raise
