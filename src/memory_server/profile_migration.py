@@ -2241,12 +2241,37 @@ _MAINTENANCE_PROCESS_CLASSES = (
 )
 
 
+# The maintenance coordination entries: the root lock and the applicable graph
+# lock. They are not payload artifacts. Their entire purpose is to be CREATED by
+# the lock stage (``acquire_maintenance_locks`` -> ``MaintenanceStorageLocks``)
+# and, by design, never unlinked, so a lock cycle legitimately turns them from
+# ``absent`` into ``regular_file``.
+#
+# They are therefore deliberately excluded from the freshness digest below while
+# remaining in ``plan.targets``, in the writer inventory and in the disk
+# requirement. Digesting them made the freshness gate and the lock stage of this
+# same card non-composable: after one lock cycle every caller-supplied plan was
+# ``E_PLAN_STALE``, which masked the cause-specific fail-closed codes
+# (``E_OLD_WRITER_ACTIVE`` / ``E_WRITER_ACTIVE``) that acceptance 4 requires a
+# live-activity scenario to report first. A live upgraded runtime is still
+# detected -- by the writer inventory (``upgraded_holders`` -> a matching
+# resource fd becomes ``upgraded_writers``) and by ``E_LOCK_TIMEOUT`` when the
+# held entry is reacquired exclusively -- and an unsafe replacement of either
+# entry is still refused by ``open``-time verification (``E_LOCK_ENTRY_UNSAFE`` /
+# ``E_ARTIFACT_IDENTITY_CHANGED``), so nothing is weakened.
+_COORDINATION_TARGET_LABELS = ("root_lock", "graph_lock")
+
+
 def _plan_identity_digest(plan: MigrationPlan) -> str:
     """Canonical identity digest of one plan's source, sidecars and targets.
 
     Two plans of the same unchanged artifacts share this digest whatever their
     request fields were; any identity, size, mtime or content change moves it,
     which is exactly the staleness test of DETAIL 6.3 step 4.
+
+    The coordination entries listed in ``_COORDINATION_TARGET_LABELS`` are
+    excluded: the lock stage of this card creates them and never unlinks them,
+    so they are not part of the payload identity the caller planned against.
     """
     return _digest(
         {
@@ -2254,7 +2279,11 @@ def _plan_identity_digest(plan: MigrationPlan) -> str:
             "sidecars": {
                 suffix: asdict(identity) for suffix, identity in plan.source_sidecars.items()
             },
-            "targets": {label: asdict(identity) for label, identity in plan.targets.items()},
+            "targets": {
+                label: asdict(identity)
+                for label, identity in plan.targets.items()
+                if label not in _COORDINATION_TARGET_LABELS
+            },
             "config_digest": plan.config_digest,
         }
     )
@@ -2383,7 +2412,7 @@ def _writer_labels(plan: MigrationPlan) -> tuple[dict[str, str], tuple[str, ...]
         labels[f"legacy_link{index}"] = identity.lexical_path
         if identity.raw_link_target:
             labels[f"legacy_referent{index}"] = identity.raw_link_target
-    return labels, ("root_lock", "graph_lock")
+    return labels, _COORDINATION_TARGET_LABELS
 
 
 def _writer_inventory(
