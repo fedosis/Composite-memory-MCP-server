@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import shutil
 import tempfile
 import uuid
 from datetime import timedelta
@@ -11,6 +10,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+from memory_server.projection_rebuild import CanonicalProjectionRecord, map_projection_record
 from memory_server.providers.lancedb_provider import LanceDBProvider
 
 
@@ -617,7 +617,13 @@ class TestLanceDBSafeContract:
 
 # S3-02 real-store validation coverage.
 def _validation_rows(ids, dimension=3, payload=None):
-    payload = {"subject": "s", "predicate": "p", "object": "o"} if payload is None else payload
+    payload = {
+        "subject": "s",
+        "predicate": "p",
+        "object": "o",
+        "source": "test",
+        "memory_type": "fact",
+    } if payload is None else payload
     return [
         {"id": value, "vector": [float(i) for i in range(dimension)], "_metadata": json.dumps(payload)} for value in ids
     ]
@@ -635,7 +641,8 @@ def _make_validation_store(path: Path, rows, dimension=3, table="memories"):
         ]
     )
     table_obj = db.create_table(table, schema=schema)
-    table_obj.add(rows)
+    if rows:
+        table_obj.add(rows)
     return table_obj
 
 
@@ -671,6 +678,21 @@ async def test_s302_missing_table_refuses_without_creation(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_s302_existing_empty_store_refuses_without_mutation(tmp_path):
+    path = tmp_path / "empty"
+    path.mkdir()
+
+    def inventory():
+        return sorted((str(p.relative_to(path)), p.stat().st_mtime_ns, p.stat().st_size) for p in path.rglob("*"))
+
+    before = inventory()
+    result = await LanceDBProvider(db_path=str(path), table="memories").validate_collection(
+        expected_ids=set(), expected_vector_size=3
+    )
+    assert not result.valid
+    assert any("manifest" in error.lower() for error in result.errors)
+    assert inventory() == before
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
     ["corrupt", "dimension", "duplicate", "extra", "missing", "malformed", "nonobject", "missingkey", "wrongtype"],
@@ -692,13 +714,17 @@ async def test_s302_real_store_validation_cases(tmp_path, case):
     elif case == "nonobject":
         rows[0]["_metadata"] = "[]"
     elif case == "missingkey":
-        rows[0]["_metadata"] = json.dumps({"subject": "s"})
+        rows[0]["_metadata"] = json.dumps({
+            "subject": "s", "predicate": "p", "object": "o", "memory_type": "fact"
+        })
     elif case == "wrongtype":
-        rows[0]["_metadata"] = json.dumps({"subject": 3, "predicate": "p", "object": "o"})
+        rows[0]["_metadata"] = json.dumps({
+            "subject": 3, "predicate": "p", "object": "o", "source": "test", "memory_type": "fact"
+        })
     if case == "corrupt":
         _make_validation_store(path, rows)
-        lance_dir = next(path.rglob("*.lance"))
-        shutil.rmtree(lance_dir)
+        for manifest in (path / "memories.lance" / "_versions").glob("*.manifest"):
+            manifest.unlink()
     else:
         _make_validation_store(path, rows, dimension=2 if case == "dimension" else 3)
     result = await LanceDBProvider(db_path=str(path), table="memories").validate_collection(
@@ -706,6 +732,15 @@ async def test_s302_real_store_validation_cases(tmp_path, case):
     )
     assert not result.valid
     assert result.errors
+    if case == "corrupt":
+        assert any("unreadable store:" in error for error in result.errors)
+    elif case == "duplicate":
+        assert result.duplicate_ids == ("a",)
+        assert any("duplicate IDs: a" in error for error in result.errors)
+    elif case == "missingkey":
+        assert any("missing required keys" in error for error in result.errors)
+    elif case == "wrongtype":
+        assert any("wrong value type" in error for error in result.errors)
 
 
 @pytest.mark.asyncio
@@ -744,3 +779,32 @@ async def test_s302_readonly_and_reopen_inventory_unchanged(tmp_path):
     await reopened.describe_collection()
     await reopened.validate_collection(expected_ids={"a", "b"}, expected_vector_size=3)
     assert inventory() == before
+
+
+@pytest.mark.asyncio
+async def test_s302_real_mapping_fact_and_belief_validates(tmp_path):
+    path = tmp_path / "mapped"
+    records = [
+        CanonicalProjectionRecord(
+            "fact", "f1", "index_fact",
+            {"subject": "alice", "predicate": "likes", "object": "tea", "source": "test"},
+        ),
+        CanonicalProjectionRecord(
+            "belief", "b1", "index_belief",
+            {"proposition": "sky is blue", "confidence": 0.8, "tags": ["weather"], "source": "test"},
+        ),
+    ]
+    mapped = [map_projection_record(record) for record in records]
+    points = [{"id": item.point_id, "vector": [1.0, 0.0, 0.0], "payload": dict(item.payload)} for item in mapped]
+    provider = LanceDBProvider(db_path=str(path), table="memories")
+    _make_validation_store(path, [])
+    for point in points:
+        assert await provider.upsert(point_id=point["id"], vector=point["vector"], payload=point["payload"])
+    result = await provider.validate_collection(
+        expected_ids={item["id"] for item in points}, expected_vector_size=3
+    )
+    assert result.valid
+    expected_digest = hashlib.sha256(
+        "\n".join(sorted(item["id"] for item in points)).encode("utf-8")
+    ).hexdigest()
+    assert result.ids_digest == expected_digest
