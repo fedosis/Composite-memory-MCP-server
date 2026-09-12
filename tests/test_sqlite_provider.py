@@ -1,5 +1,9 @@
 """Tests for SQLite provider (Card 003)."""
 
+import sqlite3
+from collections.abc import Mapping
+from pathlib import Path
+
 import pytest
 from sqlalchemy import event
 from storage.adapters.legacy_provider import LegacySQLiteProviderAdapter
@@ -7,6 +11,7 @@ from storage.dedup import fact_dedup_key
 from storage.outbox_worker import OutboxWorker
 
 import memory_server.providers.sqlite_provider as sqlite_provider_module
+from memory_server import profile_migration
 from memory_server.models import Fact as DomainFact
 from memory_server.models import MemoryReceipt, VerificationStatus
 from memory_server.providers.sqlite_provider import SQLiteProvider
@@ -355,3 +360,132 @@ class TestReceiptCRUD:
         results = await provider.search_receipts(memory_type="fact")
         assert len(results) == 1
         assert results[0].id == "r5"
+
+
+# ---------------------------------------------------------------------------
+# S2-03 -- the qualified source inspection never goes through SQLiteProvider
+#
+# DETAIL 7.3: ``SQLiteProvider``'s normal ``initialize`` is NOT usable for
+# source inspection; the source is inspected through the exact bounded
+# write-lock probe plus the immutable read-only snapshot path only. These nodes
+# run against a provider-WRITTEN, cleanly closed database (a real
+# runtime-shaped source: WAL-mode header with the sidecars removed by the last
+# clean close) and against a synthetic sidecar-free source. Accessors are
+# shape-tolerant so that the filed RED on the parent commit is a behavioural
+# assertion failure.
+# ---------------------------------------------------------------------------
+
+S203_HEAD_REVISION = "7a1b2c3d4e5f"
+
+
+def _s203_get(report, *path):
+    """Nested lookup yielding ``{}`` for anything the module does not report."""
+    current = report
+    for key in path:
+        if not isinstance(current, Mapping) or key not in current:
+            return {}
+        current = current[key]
+    return current
+
+
+def _s203_call(name, *args, **kwargs):
+    """Call an S2-03 entrypoint, or ``({}, [])`` on a module that lacks it."""
+    api = getattr(profile_migration, name, None)
+    if api is None:
+        return {}, []
+    report, diagnostics = api(*args, **kwargs)
+    return dict(report), list(diagnostics)
+
+
+def _s203_codes(diagnostics):
+    return [str(getattr(item, "code", "")) for item in diagnostics]
+
+
+def _s203_seed_head_source(path: Path, *, revision: str = S203_HEAD_REVISION) -> Path:
+    """A sidecar-free synthetic source carrying the snapshot's target schema."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("create table alembic_version(version_num text)")
+        connection.execute("insert into alembic_version values(?)", (revision,))
+        connection.execute("create table facts(id text, subject text)")
+        connection.execute("insert into facts values('fact-1','subject-1')")
+        connection.execute("create table outbox_entries(id text, status text)")
+        connection.execute("insert into outbox_entries values('outbox-1','pending')")
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def _s203_directory_bytes(root: Path) -> dict:
+    """Name -> (mode, bytes) for every regular file under *root*."""
+    return {
+        path.name: (path.stat().st_mode, path.read_bytes())
+        for path in sorted(root.iterdir())
+        if path.is_file()
+    }
+
+
+@pytest.mark.asyncio
+class TestQualifiedSourceInspection:
+    async def test_provider_written_wal_source_is_qualified_without_a_provider_reopen(
+        self, tmp_path
+    ):
+        """A real provider-written, cleanly closed source is qualified end to end."""
+        db_path = tmp_path / "provider-wal.db"
+        provider = SQLiteProvider(url=f"sqlite+aiosqlite:///{db_path}")
+        await provider.initialize()
+        await provider.create_fact(
+            make_fact(id="wal-1", subject="Docker", predicate="runs_on", object="OMV")
+        )
+        await provider.close()
+
+        # A clean close leaves a WAL-mode image with the sidecars removed.
+        assert db_path.read_bytes()[18] == 2
+        assert not (tmp_path / "provider-wal.db-wal").exists()
+        assert not (tmp_path / "provider-wal.db-shm").exists()
+        before = _s203_directory_bytes(tmp_path)
+
+        report, diagnostics = _s203_call(
+            "qualify_sqlite_source", db_path, run_dir=tmp_path / "run"
+        )
+
+        codes = _s203_codes(diagnostics)
+        assert _s203_get(report, "probe", "policy") == "sidecars_absent_writable_probe"
+        assert _s203_get(report, "probe", "performed") is True
+        assert _s203_get(report, "probe", "rolled_back") is True
+        assert _s203_get(report, "probe", "qualified") is True
+        assert _s203_get(report, "probe", "journal_mode_header") == "wal"
+        assert _s203_get(report, "snapshot", "created") is True
+        assert _s203_get(report, "snapshot", "api") == "sqlite3.Connection.backup"
+        assert _s203_get(report, "snapshot", "verification", "integrity") == "ok"
+        assert _s203_get(report, "snapshot", "verification", "ids", "facts", "count") == 1
+        # The provider's own schema carries no alembic_version marker.
+        assert "E_SQLITE_SCHEMA" in codes
+        assert _s203_get(report, "snapshot", "verification", "alembic_revision") is None
+        # Probing a WAL-mode source created no WAL/SHM and did not touch it.
+        assert _s203_directory_bytes(tmp_path) == before
+
+    async def test_qualification_never_constructs_the_sqlite_provider(self, tmp_path, monkeypatch):
+        """Source inspection is stdlib sqlite3 only; the provider is never built."""
+        db_path = _s203_seed_head_source(tmp_path / "synthetic" / "memory.db")
+
+        def _refuse(*args, **kwargs):
+            raise AssertionError("SQLiteProvider must not be used for source inspection")
+
+        monkeypatch.setattr(SQLiteProvider, "__init__", _refuse)
+        monkeypatch.setattr(SQLiteProvider, "initialize", _refuse)
+
+        report, diagnostics = _s203_call(
+            "qualify_sqlite_source", db_path, run_dir=tmp_path / "run"
+        )
+
+        assert diagnostics == []
+        assert _s203_get(report, "probe", "qualified") is True
+        assert _s203_get(report, "snapshot", "created") is True
+        assert _s203_get(report, "snapshot", "verification", "integrity") == "ok"
+        assert (
+            _s203_get(report, "snapshot", "verification", "alembic_revision")
+            == S203_HEAD_REVISION
+        )

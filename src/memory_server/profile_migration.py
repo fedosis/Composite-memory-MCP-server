@@ -36,6 +36,24 @@ and a raw/effective config report:
 * the disk margin (1.25), lock state, collisions and the operation plan are
   populated instead of guessed; unknown space stays a blocker.
 
+Slice S2-03 qualifies the maintenance path's SQLite side of DETAIL 6.3 step 10,
+7.3 and 10.1, without wiring it into ``apply`` (publication belongs to the later
+engine slices):
+
+* ``qualify_sqlite_source`` considers ONLY a sidecar-free regular source, so a
+  present WAL, SHM or journal -- including a zero-byte one -- means no SQLite
+  open of any kind: no recovery, no checkpoint, no trimmed WAL;
+* the exact bounded ``BEGIN IMMEDIATE`` / ``ROLLBACK`` write-lock probe is run
+  through a WRITABLE ``mode=rw`` URI (never the ``immutable=1`` read-only one,
+  which cannot take a write lock), together with a competing-writer refusal, and
+  the database bytes, every sidecar entry and the parent listing must be
+  identical across it or the answer is ``E_SQLITE_PROBE_UNSAFE``;
+* the safety snapshot is taken with ``sqlite3.Connection.backup`` from the
+  percent-encoded ``mode=ro&immutable=1`` URI into the run directory, then
+  reopened THERE for integrity, table set, Alembic revision, bounded ordered ID
+  digests and outbox status counts -- never against the live source, and never by
+  copying the database file, its WAL or its SHM.
+
 Still planner-only: every mutating entrypoint fails closed.
 """
 from __future__ import annotations
@@ -49,10 +67,11 @@ import re
 import shutil
 import sqlite3
 import stat
+import sys
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Literal, Mapping, cast, get_args
+from typing import Any, Callable, Literal, Mapping, cast, get_args
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -116,6 +135,43 @@ _UNKNOWN_OUTBOX_COUNTS: dict[str, str] = {
     "completed": "unknown",
     "failed": "unknown",
 }
+
+# ---------------------------------------------------------------------------
+# S2-03 bounds and stable strings: the qualified write-lock probe and the
+# run-owned safety snapshot (DETAIL 6.3 step 10, 7.3, 10.1).
+#
+# The probe is the ONLY place a writable SQLite handle is opened, and it is a
+# separate query string from the immutable read-only one on purpose: an
+# ``immutable=1`` connection cannot take a write lock, so a write-lock probe
+# through that URI would prove nothing (card S2-03 acceptance 2).
+# ---------------------------------------------------------------------------
+SQLITE_READONLY_IMMUTABLE_QUERY = "mode=ro&immutable=1"
+SQLITE_WRITABLE_PROBE_QUERY = "mode=rw"
+PROBE_BEGIN_SQL = "BEGIN IMMEDIATE"
+PROBE_ROLLBACK_SQL = "ROLLBACK"
+SQLITE_PROBE_POLICY_ABSENT = "sidecars_absent_writable_probe"
+SQLITE_PROBE_POLICY_PRESENT = "sidecars_present_no_probe"
+SQLITE_PROBE_POLICY_NOT_REGULAR = "source_not_regular_no_probe"
+SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
+SQLITE_HEADER_WAL = 2
+SQLITE_HEADER_ROLLBACK = 1
+MAX_PARENT_ENTRIES = 1024
+SNAPSHOT_DIR_NAME = "snapshot"
+SNAPSHOT_DB_NAME = "memory.db"
+SNAPSHOT_API = "sqlite3.Connection.backup"
+SNAPSHOT_VERIFY_OPEN_POLICY = "run_directory_normal_open"
+OUTBOX_TABLE_NAME = "outbox_entries"
+OUTBOX_STATUSES = ("pending", "processing", "completed", "failed")
+MAX_DISTINCT_OUTBOX_STATUSES = 16
+# The minimum a snapshot must carry for THIS verification: the revision marker,
+# the canonical record table whose ordered ID digest is recorded, and the outbox
+# queue whose status counts are recorded. Requiring the accepted head revision
+# below transitively implies the rest of the canonical schema.
+REQUIRED_SNAPSHOT_TABLES = ("alembic_version", "facts", OUTBOX_TABLE_NAME)
+# Migration head of this tree: migrations/versions/7a1b2c3d4e5f_*.py, reached
+# through 70e6afc8d15d -> 5d4e3c2b1a0f -> 6a7b8c9d0e1f. An intermediate or
+# unknown revision is a blocker, never silently accepted for a rebuild source.
+ACCEPTED_SQLITE_SCHEMA_REVISIONS = frozenset({"7a1b2c3d4e5f"})
 _RUNTIME_STOP_INSTRUCTIONS = (
     "stop every CMMS runtime for this profile and confirm no writer remains",
     "re-run this dry-run after shutdown; a zero-byte WAL is still an apply blocker",
@@ -900,6 +956,17 @@ def _bounded_count(connection: sqlite3.Connection, table: str) -> int | str:
     return f"{SQLITE_COUNT_CAP}+" if total > SQLITE_COUNT_CAP else total
 
 
+def _sqlite_uri(source: Path, query: str) -> str:
+    """Percent-encoded absolute ``file:`` URI for exactly one query string.
+
+    ``quote(..., safe="/")`` encodes spaces and every other URI-reserved byte of
+    the path, so a directory or file name that contains ``?``, ``#`` or a space
+    cannot silently add to or truncate the query. The read-only immutable and the
+    writable probe URI are built here so both are stated in one place (S2-03).
+    """
+    return "file:" + quote(str(source), safe="/") + "?" + query
+
+
 def _immutable_readonly_probe(source: Path) -> dict[str, Any]:
     """Bounded metadata queries over an encoded ``immutable=1&mode=ro`` URI.
 
@@ -908,7 +975,7 @@ def _immutable_readonly_probe(source: Path) -> dict[str, Any]:
     SQLiteProvider, SQLAlchemy, aiosqlite, ``PRAGMA wal_checkpoint``, recovery
     or normal open is involved — one stdlib read-only connection to the source.
     """
-    uri = "file:" + quote(str(source), safe="/") + "?mode=ro&immutable=1"
+    uri = _sqlite_uri(source, SQLITE_READONLY_IMMUTABLE_QUERY)
     connection = sqlite3.connect(uri, uri=True, timeout=0)
     try:
         connection.execute("PRAGMA query_only = ON")
@@ -1000,6 +1067,705 @@ def _qualify_sqlite(
         diagnostics.append(
             Diagnostic("E_SQLITE_INTEGRITY", "error", "PRAGMA integrity_check did not return ok", "sqlite")
         )
+    return report, diagnostics
+
+
+# ---------------------------------------------------------------------------
+# S2-03 -- qualified write-lock probe (DETAIL 6.3 step 10) and run-owned safety
+# snapshot (DETAIL 7.3, 10.1)
+#
+# Nothing here is reachable from the dry-run planner: DETAIL 7.2 forbids a
+# normal SQLite open in dry-run, so the writable handle below only exists on
+# the apply/maintenance path, on a source that already passed the sidecar-free
+# and regular-file gates. Every function is fail-closed: an unproven step is a
+# blocker with a stable code, never a weaker contract.
+# ---------------------------------------------------------------------------
+
+
+def _sqlite_runtime_triple() -> dict[str, Any]:
+    """The exact Python/SQLite/platform combination carrying a probe result.
+
+    DETAIL 6.3 step 10 permits the write-lock probe only when this exact
+    combination was proven side-effect free, so the combination travels with the
+    probe report instead of being assumed from the source tree.
+    """
+    uname = os.uname() if hasattr(os, "uname") else None
+    triple: dict[str, Any] = {
+        "python": ".".join(str(part) for part in sys.version_info[:3]),
+        "sqlite3_module": getattr(sqlite3, "version", "unknown"),
+        "sqlite_version": sqlite3.sqlite_version,
+        "platform": sys.platform,
+        "machine": getattr(uname, "machine", "unknown"),
+        "release": getattr(uname, "release", "unknown"),
+    }
+    triple["digest"] = _digest(triple)
+    return triple
+
+
+def _journal_mode_hint(source: Path) -> str:
+    """Journal mode from the database header, without opening SQLite at all.
+
+    Bytes 18/19 of the header are the file format write/read version: 2 is WAL,
+    1 is the legacy rollback-journal format. Reading them is how the
+    qualification log can name the mode it qualified without an open of its own.
+    """
+    try:
+        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError:
+        return "unknown"
+    try:
+        header = os.read(descriptor, 100)
+    finally:
+        os.close(descriptor)
+    if len(header) < 20 or not header.startswith(SQLITE_HEADER_MAGIC):
+        return "unknown"
+    if header[18] == SQLITE_HEADER_WAL:
+        return "wal"
+    return "rollback" if header[18] == SQLITE_HEADER_ROLLBACK else "unknown"
+
+
+def _parent_listing_key(source: Path) -> tuple[tuple[str, ...], str]:
+    """Sorted no-follow parent-directory entry names plus a proof status.
+
+    ``ok`` means every entry name was listed and the listing is bounded. A
+    directory with more than ``MAX_PARENT_ENTRIES`` entries, or one that cannot
+    be listed no-follow, is reported as unproven rather than compared partially.
+    """
+    try:
+        with storage_lock.open_directory_nofollow(source.parent) as descriptor:
+            names = tuple(sorted(os.listdir(descriptor)))
+    except (OSError, storage_lock.StorageLockError):
+        return (), "unreadable"
+    if len(names) > MAX_PARENT_ENTRIES:
+        return names[:MAX_PARENT_ENTRIES], "unbounded"
+    return names, "ok"
+
+
+def _probe_invariance_key(source: Path) -> tuple[tuple[Any, ...], tuple[tuple[str, ...], str]]:
+    """(database+sidecar identities, parent listing) captured around the probe."""
+    artifacts = (
+        _identity_key(_inventory(source, artifact="source")),
+        _sidecar_entries_key(source),
+    )
+    return artifacts, _parent_listing_key(source)
+
+
+def _competing_writer_refusal(uri: str) -> dict[str, Any]:
+    """Try to take the write lock from a second connection; record the answer.
+
+    Write-lock exclusion is only proven when an independent connection is
+    REFUSED while the probe holds the transaction. The competing connection
+    never writes: acquiring ``BEGIN IMMEDIATE`` is already enough to show the
+    exclusion does not hold.
+    """
+    outcome: dict[str, Any] = {
+        "attempted": True,
+        "refused": False,
+        "sqlite_errorname": None,
+        "detail": "a competing writer acquired the write lock; exclusion is not proven",
+    }
+    connection = sqlite3.connect(uri, uri=True, timeout=0, isolation_level=None)
+    try:
+        try:
+            connection.execute(PROBE_BEGIN_SQL)
+        except sqlite3.Error as exc:
+            outcome["refused"] = True
+            outcome["sqlite_errorname"] = getattr(exc, "sqlite_errorname", None)
+            outcome["detail"] = str(exc)
+        else:
+            connection.execute(PROBE_ROLLBACK_SQL)
+    finally:
+        connection.close()
+    return outcome
+
+
+def _transaction_probe(
+    source: Path, *, competing_writer: bool = True, while_locked: Callable[[], Any] | None = None
+) -> dict[str, Any]:
+    """The exact bounded ``BEGIN IMMEDIATE`` / ``ROLLBACK`` no-logical-write probe.
+
+    DETAIL 6.3 step 10 and 7.3: the probe is NEVER attempted through an
+    ``immutable=1`` read-only URI, because an immutable connection cannot take a
+    write lock and could not prove anything. ``isolation_level=None`` makes the
+    driver emit the two statements verbatim instead of opening an implicit
+    transaction of its own; ``timeout=0`` bounds the lock wait so a live writer
+    is reported instead of waited out; ``ROLLBACK`` is issued before the handle
+    is closed so the qualified sequence is the recorded one.
+
+    ``while_locked`` is an optional observation hook invoked while the
+    transaction is held, which is how the qualification tests observe the
+    exclusion from an independent connection.
+    """
+    uri = _sqlite_uri(source, SQLITE_WRITABLE_PROBE_QUERY)
+    report: dict[str, Any] = {
+        "uri": uri,
+        "sql": [PROBE_BEGIN_SQL, PROBE_ROLLBACK_SQL],
+        "performed": False,
+        "in_transaction": False,
+        "rolled_back": False,
+        "competing_writer": {
+            "attempted": False,
+            "refused": False,
+            "sqlite_errorname": None,
+            "detail": "",
+        },
+    }
+    connection = sqlite3.connect(uri, uri=True, timeout=0, isolation_level=None)
+    try:
+        connection.execute(PROBE_BEGIN_SQL)
+        report["performed"] = True
+        report["in_transaction"] = bool(connection.in_transaction)
+        if competing_writer:
+            report["competing_writer"] = _competing_writer_refusal(uri)
+        if while_locked is not None:
+            while_locked()
+        connection.execute(PROBE_ROLLBACK_SQL)
+        report["rolled_back"] = True
+    finally:
+        connection.close()
+    return report
+
+
+def _qualify_transaction_probe(
+    source: Path,
+    *,
+    source_identity: ArtifactIdentity,
+    sidecars: Mapping[str, ArtifactIdentity],
+    competing_writer: bool = True,
+    while_locked: Callable[[], Any] | None = None,
+) -> tuple[dict[str, Any], list[Diagnostic]]:
+    """Qualify the exact transaction probe on a sidecar-free regular source only.
+
+    Order (DETAIL 6.3 step 10, 7.3): sidecar-free regular source first, then the
+    probe with its competing-writer refusal, then the byte/entry/parent
+    invariance proof. A source with ANY sidecar -- including a zero-byte WAL --
+    is never opened at all, so no recovery, no checkpoint and no trimmed WAL can
+    happen here. Everything unproven is ``E_SQLITE_PROBE_UNSAFE``.
+    """
+    diagnostics: list[Diagnostic] = []
+    report: dict[str, Any] = {
+        "runtime": _sqlite_runtime_triple(),
+        "policy": SQLITE_PROBE_POLICY_NOT_REGULAR,
+        "uri": None,
+        "sql": [PROBE_BEGIN_SQL, PROBE_ROLLBACK_SQL],
+        "journal_mode_header": "unknown",
+        "performed": False,
+        "in_transaction": False,
+        "rolled_back": False,
+        "competing_writer": {
+            "attempted": False,
+            "refused": False,
+            "sqlite_errorname": None,
+            "detail": "",
+        },
+        "invariance": {"artifacts": "unknown", "parent": "unknown"},
+        "failure": None,
+        "unsafe": False,
+        "qualified": False,
+    }
+    if any(item.kind != "absent" for item in sidecars.values()):
+        report["policy"] = SQLITE_PROBE_POLICY_PRESENT
+        for suffix, code in _SIDECAR_CODES.items():
+            if sidecars[suffix].kind != "absent":
+                diagnostics.append(
+                    Diagnostic(
+                        code,
+                        "error",
+                        f"SQLite sidecar {suffix} is present; the write-lock probe is not run",
+                        "sqlite",
+                    )
+                )
+        return report, diagnostics
+    if source_identity.kind != "regular_file" or source_identity.size is None:
+        report["policy"] = SQLITE_PROBE_POLICY_NOT_REGULAR
+        diagnostics.append(
+            Diagnostic(
+                "E_SOURCE_SQL_NOT_REGULAR",
+                "error",
+                "the write-lock probe is only run on a regular file source",
+                "sqlite",
+            )
+        )
+        return report, diagnostics
+    report["policy"] = SQLITE_PROBE_POLICY_ABSENT
+    report["uri"] = _sqlite_uri(source, SQLITE_WRITABLE_PROBE_QUERY)
+    report["journal_mode_header"] = _journal_mode_hint(source)
+    before_artifacts, before_parent = _probe_invariance_key(source)
+    try:
+        probe = _transaction_probe(source, competing_writer=competing_writer, while_locked=while_locked)
+    except sqlite3.Error as exc:
+        # The probe could not take the write lock at all (a live writer, an
+        # unwritable source or another open refusal). No transaction was held, so
+        # nothing changed, but exclusion and the ROLLBACK contract stay UNPROVEN.
+        report["unsafe"] = True
+        report["failure"] = {
+            "sqlite_errorname": getattr(exc, "sqlite_errorname", None),
+            "detail": str(exc),
+        }
+        diagnostics.append(
+            Diagnostic(
+                "E_SQLITE_PROBE_UNSAFE",
+                "error",
+                "the bounded write-lock probe could not take the write lock; exclusion is not proven",
+                "sqlite",
+            )
+        )
+        return report, diagnostics
+    report.update(probe)
+    after_artifacts, after_parent = _probe_invariance_key(source)
+    artifacts_ok = before_artifacts == after_artifacts
+    parent_ok = before_parent == after_parent and before_parent[1] == "ok"
+    report["invariance"] = {
+        "artifacts": "ok" if artifacts_ok else "failed",
+        "parent": "ok" if parent_ok else "failed",
+    }
+    if not artifacts_ok or not parent_ok:
+        report["unsafe"] = True
+        diagnostics.append(
+            Diagnostic(
+                "E_SQLITE_PROBE_UNSAFE",
+                "error",
+                "the source database, a sidecar entry or the parent listing changed across the probe",
+                "sqlite",
+            )
+        )
+        return report, diagnostics
+    if not report["in_transaction"] or not report["rolled_back"]:
+        report["unsafe"] = True
+        diagnostics.append(
+            Diagnostic(
+                "E_SQLITE_PROBE_UNSAFE",
+                "error",
+                "the probe did not hold and roll back exactly one bounded transaction",
+                "sqlite",
+            )
+        )
+        return report, diagnostics
+    if competing_writer and not report["competing_writer"]["refused"]:
+        report["unsafe"] = True
+        diagnostics.append(
+            Diagnostic(
+                "E_SQLITE_PROBE_UNSAFE",
+                "error",
+                "a competing writer was not refused; write-lock exclusion is not proven",
+                "sqlite",
+            )
+        )
+        return report, diagnostics
+    report["qualified"] = not report["unsafe"]
+    return report, diagnostics
+
+
+def _existing_entry_kind(path: Path) -> str:
+    """No-follow kind of one entry: absent/directory/regular_file/symlink/special."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unreadable"
+    if stat.S_ISLNK(info.st_mode):
+        return "symlink"
+    if stat.S_ISDIR(info.st_mode):
+        return "directory"
+    return "regular_file" if stat.S_ISREG(info.st_mode) else "special"
+
+
+def _unknown_snapshot_verification() -> dict[str, Any]:
+    """The verification shape a snapshot reports until it is actually read."""
+    return {
+        "open_policy": SNAPSHOT_VERIFY_OPEN_POLICY,
+        "integrity": "unknown",
+        "schema": "unknown",
+        "tables": (),
+        "alembic_revision": None,
+        "revision_accepted": False,
+        "ids": {},
+        "ids_digest": None,
+        "outbox_counts": dict(_UNKNOWN_OUTBOX_COUNTS),
+        "unexpected_outbox_statuses": (),
+    }
+
+
+def _quoted_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _ordered_id_digest(connection: sqlite3.Connection, table: str) -> dict[str, Any]:
+    """Bounded, order-stable digest of one table's ``id`` column.
+
+    Rows are streamed in ``id`` order and folded into one digest, so the result
+    is a stable identity of the snapshot's ID set without materializing it. A
+    table that reaches ``SQLITE_COUNT_CAP`` is reported as capped instead of a
+    digest that pretends to cover every row.
+    """
+    quoted = _quoted_identifier(table)
+    cursor = connection.execute(
+        f"SELECT id FROM {quoted} WHERE id IS NOT NULL ORDER BY id LIMIT ?", (SQLITE_COUNT_CAP + 1,)
+    )
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        while True:
+            rows = cursor.fetchmany(256)
+            if not rows:
+                break
+            for (value,) in rows:
+                if count >= SQLITE_COUNT_CAP:
+                    return {"count": f"{SQLITE_COUNT_CAP}+", "digest": None}
+                digest.update(str(value).encode("utf-8", "surrogatepass"))
+                digest.update(b"\x00")
+                count += 1
+    finally:
+        cursor.close()
+    return {"count": count, "digest": digest.hexdigest()}
+
+
+def _bounded_status_count(connection: sqlite3.Connection, table: str, status: str) -> int | str:
+    """Row count of one outbox status, bounded by ``SQLITE_COUNT_CAP``."""
+    quoted = _quoted_identifier(table)
+    row = connection.execute(
+        f"SELECT COUNT(*) FROM (SELECT 1 FROM {quoted} WHERE status = ? LIMIT ?)",
+        (status, SQLITE_COUNT_CAP + 1),
+    ).fetchone()
+    total = int(row[0]) if row else 0
+    return f"{SQLITE_COUNT_CAP}+" if total > SQLITE_COUNT_CAP else total
+
+
+def verify_snapshot(
+    snapshot_path: Path, *, accepted_revisions: frozenset[str] = ACCEPTED_SQLITE_SCHEMA_REVISIONS
+) -> tuple[dict[str, Any], list[Diagnostic]]:
+    """Reopen a run-owned snapshot and verify it IN the run directory.
+
+    DETAIL 7.3 and 10.3: the snapshot is opened normally where it lives -- the
+    live source is never re-opened, so a source that moved on after the snapshot
+    was taken cannot influence the verdict. Integrity, the table set, the
+    Alembic revision, the bounded ordered ID digests and the outbox status
+    counts are all read from the snapshot itself; anything else stays ``unknown``
+    and blocks with a stable code.
+    """
+    path = Path(snapshot_path)
+    diagnostics: list[Diagnostic] = []
+    verification = _unknown_snapshot_verification()
+    identity = _inventory(path, artifact="snapshot")
+    if identity.kind != "regular_file" or identity.size is None:
+        diagnostics.append(
+            Diagnostic("E_BACKUP_VERIFY", "error", "the snapshot is not a readable regular file", "snapshot")
+        )
+        return verification, diagnostics
+    try:
+        connection = sqlite3.connect(path)
+    except sqlite3.Error as exc:
+        diagnostics.append(
+            Diagnostic(
+                "E_BACKUP_VERIFY",
+                "error",
+                f"the snapshot could not be opened for verification ({type(exc).__name__})",
+                "snapshot",
+            )
+        )
+        return verification, diagnostics
+    try:
+        integrity_row = connection.execute("PRAGMA integrity_check(1)").fetchone()
+        integrity = "ok" if integrity_row and integrity_row[0] == "ok" else "failed"
+        tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                " ORDER BY name LIMIT ?",
+                (MAX_SQLITE_TABLES,),
+            )
+        )
+        missing = tuple(name for name in REQUIRED_SNAPSHOT_TABLES if name not in tables)
+        revision_rows = (
+            connection.execute("SELECT version_num FROM alembic_version ORDER BY version_num LIMIT 2").fetchall()
+            if "alembic_version" in tables
+            else []
+        )
+        revision = str(revision_rows[0][0]) if len(revision_rows) == 1 else None
+        ids: dict[str, Any] = {}
+        for table in tables:
+            columns = tuple(
+                str(row[1]) for row in connection.execute(f"PRAGMA table_info({_quoted_identifier(table)})")
+            )
+            if "id" in columns:
+                ids[table] = _ordered_id_digest(connection, table)
+    except sqlite3.Error as exc:
+        diagnostics.append(
+            Diagnostic(
+                "E_BACKUP_VERIFY",
+                "error",
+                f"the snapshot could not be verified ({type(exc).__name__})",
+                "snapshot",
+            )
+        )
+        return verification, diagnostics
+    finally:
+        connection.close()
+    verification["integrity"] = integrity
+    verification["schema"] = "known"
+    verification["tables"] = tables
+    verification["alembic_revision"] = revision
+    verification["revision_accepted"] = bool(revision is not None and revision in accepted_revisions)
+    verification["ids"] = ids
+    verification["ids_digest"] = _digest(ids)
+    if OUTBOX_TABLE_NAME in tables:
+        connection = sqlite3.connect(path)
+        try:
+            verification["outbox_counts"] = {
+                status: _bounded_status_count(connection, OUTBOX_TABLE_NAME, status)
+                for status in OUTBOX_STATUSES
+            }
+            statuses = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT DISTINCT status FROM {_quoted_identifier(OUTBOX_TABLE_NAME)} ORDER BY status LIMIT ?",
+                    (MAX_DISTINCT_OUTBOX_STATUSES,),
+                )
+            )
+        except sqlite3.Error as exc:
+            diagnostics.append(
+                Diagnostic(
+                    "E_BACKUP_VERIFY",
+                    "error",
+                    f"the snapshot outbox counts could not be read ({type(exc).__name__})",
+                    "snapshot",
+                )
+            )
+            return verification, diagnostics
+        finally:
+            connection.close()
+        verification["unexpected_outbox_statuses"] = tuple(
+            status for status in statuses if status not in OUTBOX_STATUSES
+        )
+    if integrity != "ok":
+        diagnostics.append(
+            Diagnostic(
+                "E_BACKUP_VERIFY", "error", "PRAGMA integrity_check on the snapshot did not return ok", "snapshot"
+            )
+        )
+    if missing:
+        diagnostics.append(
+            Diagnostic(
+                "E_SQLITE_SCHEMA",
+                "error",
+                f"the snapshot is missing required tables {list(missing)}",
+                "snapshot",
+            )
+        )
+    if not verification["revision_accepted"]:
+        diagnostics.append(
+            Diagnostic(
+                "E_SQLITE_SCHEMA",
+                "error",
+                "the snapshot Alembic revision is absent, ambiguous or not accepted",
+                "snapshot",
+            )
+        )
+    return verification, diagnostics
+
+
+def _snapshot_source_sql(
+    source: Path, *, run_dir: Path, accepted_revisions: frozenset[str] = ACCEPTED_SQLITE_SCHEMA_REVISIONS
+) -> tuple[dict[str, Any], list[Diagnostic]]:
+    """Materialize the run-owned safety snapshot from the immutable read-only source.
+
+    DETAIL 7.3 and 10.1: the snapshot is taken with
+    ``sqlite3.Connection.backup`` from the SAME percent-encoded
+    ``mode=ro&immutable=1`` URI the dry-run probe qualified. The database file is
+    never copied, and no WAL/SHM is copied, checkpointed or recovered. An
+    existing run artifact is never overwritten, and a symlinked or special
+    snapshot path is refused instead of followed.
+    """
+    diagnostics: list[Diagnostic] = []
+    report: dict[str, Any] = {
+        "path": None,
+        "source_uri": _sqlite_uri(source, SQLITE_READONLY_IMMUTABLE_QUERY),
+        "api": SNAPSHOT_API,
+        "created": False,
+        "snapshot_sha256": None,
+        "size": None,
+        "verification": _unknown_snapshot_verification(),
+    }
+    directory = Path(run_dir) / SNAPSHOT_DIR_NAME
+    target = directory / SNAPSHOT_DB_NAME
+    report["path"] = str(target)
+    directory_kind = _existing_entry_kind(directory)
+    if directory_kind == "symlink":
+        diagnostics.append(
+            Diagnostic(
+                "E_PATH_FINAL_SYMLINK_UNSAFE",
+                "error",
+                "the run-owned snapshot directory is a symlink and is never followed",
+                "snapshot",
+            )
+        )
+        return report, diagnostics
+    if directory_kind in {"special", "regular_file"}:
+        diagnostics.append(
+            Diagnostic(
+                "E_PATH_SPECIAL_FILE",
+                "error",
+                "the run-owned snapshot directory path is not a directory",
+                "snapshot",
+            )
+        )
+        return report, diagnostics
+    if directory_kind == "unreadable":
+        diagnostics.append(
+            Diagnostic("E_BACKUP_VERIFY", "error", "the run-owned snapshot directory cannot be inspected", "snapshot")
+        )
+        return report, diagnostics
+    if directory_kind == "absent":
+        try:
+            directory.mkdir(parents=True, mode=0o700)
+            os.chmod(directory, 0o700)
+        except OSError as exc:
+            diagnostics.append(
+                Diagnostic(
+                    _path_code(exc),
+                    "error",
+                    "the run-owned snapshot directory could not be created",
+                    "snapshot",
+                )
+            )
+            return report, diagnostics
+    target_kind = _existing_entry_kind(target)
+    if target_kind == "symlink":
+        diagnostics.append(
+            Diagnostic(
+                "E_PATH_FINAL_SYMLINK_UNSAFE",
+                "error",
+                "a symlink already exists at the snapshot path; it is never followed or overwritten",
+                "snapshot",
+            )
+        )
+        return report, diagnostics
+    if target_kind == "special":
+        diagnostics.append(
+            Diagnostic("E_PATH_SPECIAL_FILE", "error", "the snapshot path is not a regular file", "snapshot")
+        )
+        return report, diagnostics
+    if target_kind == "regular_file":
+        diagnostics.append(
+            Diagnostic(
+                "E_BACKUP_COLLISION",
+                "error",
+                "a run artifact already exists at the snapshot path; it is never overwritten",
+                "snapshot",
+            )
+        )
+        return report, diagnostics
+    if target_kind == "unreadable":
+        diagnostics.append(
+            Diagnostic("E_BACKUP_VERIFY", "error", "the snapshot path cannot be inspected no-follow", "snapshot")
+        )
+        return report, diagnostics
+    try:
+        source_connection = sqlite3.connect(report["source_uri"], uri=True, timeout=0)
+    except sqlite3.Error as exc:
+        diagnostics.append(
+            Diagnostic(
+                "E_BACKUP_VERIFY",
+                "error",
+                f"the qualified immutable read-only source could not be opened ({type(exc).__name__})",
+                "snapshot",
+            )
+        )
+        return report, diagnostics
+    try:
+        source_connection.execute("PRAGMA query_only = ON")
+        try:
+            target_connection = sqlite3.connect(target)
+        except sqlite3.Error as exc:
+            diagnostics.append(
+                Diagnostic(
+                    "E_BACKUP_VERIFY",
+                    "error",
+                    f"the run-owned snapshot could not be created ({type(exc).__name__})",
+                    "snapshot",
+                )
+            )
+            return report, diagnostics
+        try:
+            source_connection.backup(target_connection)
+        except sqlite3.Error as exc:
+            diagnostics.append(
+                Diagnostic(
+                    "E_BACKUP_VERIFY",
+                    "error",
+                    f"sqlite3.Connection.backup could not complete ({type(exc).__name__})",
+                    "snapshot",
+                )
+            )
+            return report, diagnostics
+        finally:
+            target_connection.close()
+    finally:
+        source_connection.close()
+    report["created"] = True
+    _fsync_directory(directory)
+    identity = _inventory(target, artifact="snapshot")
+    report["snapshot_sha256"] = identity.sha256
+    report["size"] = identity.size
+    verification, verification_diagnostics = verify_snapshot(target, accepted_revisions=accepted_revisions)
+    report["verification"] = verification
+    diagnostics.extend(verification_diagnostics)
+    return report, diagnostics
+
+
+def qualify_sqlite_source(
+    source: Path,
+    *,
+    run_dir: Path,
+    competing_writer: bool = True,
+    while_locked: Callable[[], Any] | None = None,
+    accepted_revisions: frozenset[str] = ACCEPTED_SQLITE_SCHEMA_REVISIONS,
+) -> tuple[dict[str, Any], list[Diagnostic]]:
+    """Qualify one SQLite source and materialize its run-owned safety snapshot.
+
+    DETAIL 6.3 step 10, 7.3 and 10.1, fail-closed and in this order:
+
+    1. only a sidecar-free regular source is considered at all (a present WAL,
+       SHM or journal -- including a zero-byte one -- means NO SQLite open of any
+       kind, so no recovery, no checkpoint and no trimmed WAL);
+    2. the exact ``BEGIN IMMEDIATE`` / ``ROLLBACK`` write-lock probe runs on the
+       source together with a competing-writer refusal, and the database bytes,
+       every sidecar entry and the parent listing are proven unchanged across it;
+    3. only then is the safety snapshot taken with ``sqlite3.Connection.backup``
+       from the percent-encoded immutable read-only URI and verified inside the
+       run directory.
+
+    Any unproven step is ``E_SQLITE_PROBE_UNSAFE`` and no snapshot is created
+    from an unqualified source. The source is never checkpointed, recovered,
+    trimmed or copied, and the writable handle is the bounded probe only.
+    """
+    source = Path(source)
+    run_dir = Path(run_dir)
+    diagnostics: list[Diagnostic] = []
+    source_identity = _inventory(source, artifact="source", diagnostics=diagnostics)
+    sidecars = {
+        suffix: _inventory(
+            source.with_name(source.name + suffix), artifact=f"sidecar{suffix}", diagnostics=diagnostics
+        )
+        for suffix in _SIDECAR_SUFFIXES
+    }
+    probe, probe_diagnostics = _qualify_transaction_probe(
+        source,
+        source_identity=source_identity,
+        sidecars=sidecars,
+        competing_writer=competing_writer,
+        while_locked=while_locked,
+    )
+    diagnostics.extend(probe_diagnostics)
+    report: dict[str, Any] = {"probe": probe, "snapshot": None}
+    if probe_diagnostics:
+        return report, diagnostics
+    snapshot, snapshot_diagnostics = _snapshot_source_sql(
+        source, run_dir=run_dir, accepted_revisions=accepted_revisions
+    )
+    report["snapshot"] = snapshot
+    diagnostics.extend(snapshot_diagnostics)
     return report, diagnostics
 
 
