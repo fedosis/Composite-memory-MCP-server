@@ -763,3 +763,110 @@ class TestSnapshotValidationHook:
         assert SimpleGraph.validate_snapshot(path).valid
         assert self._listing(tmp_path) == before
         assert not any(p.name.endswith(".lock") or p.name.endswith(".tmp") for p in tmp_path.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# S3-05 -- the staged verifier at the REAL graph boundary
+# (DETAIL 10.3; consumer duty R-S303-a: a zero-node result means EMPTY, never
+# complete; an orphan edge is refused structurally by S3-03's own hook)
+# ---------------------------------------------------------------------------
+
+
+def _s305_graph_fixture(tmp_path: Path) -> tuple[str, Path, Path, str]:
+    """A real minimal snapshot plus the staged artifact paths it implies."""
+    import sqlite3
+    import uuid
+
+    db_path = tmp_path / "snapshot.db"
+    connection = sqlite3.connect(db_path)
+    connection.executescript("""
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
+        CREATE TABLE beliefs (id TEXT PRIMARY KEY, proposition TEXT, confidence REAL,
+            source TEXT, tags TEXT, lifecycle_state TEXT);
+        CREATE TABLE decisions (id TEXT PRIMARY KEY, choice TEXT, reason TEXT,
+            context TEXT, lifecycle_state TEXT);
+        CREATE TABLE facts (id TEXT PRIMARY KEY, subject TEXT, predicate TEXT,
+            object TEXT, source TEXT, lifecycle_state TEXT);
+        CREATE TABLE skills (id TEXT PRIMARY KEY, purpose TEXT, steps TEXT,
+            lifecycle_state TEXT);
+        CREATE TABLE outbox_entries (id TEXT PRIMARY KEY, status TEXT, created_at TEXT);
+        INSERT INTO alembic_version VALUES ('0005');
+        INSERT INTO facts VALUES ('f1', 'Widget', 'uses', 'Caddy', 's', 'active');
+        INSERT INTO outbox_entries VALUES ('o1', 'pending', '2026-09-13T00:00:00Z');
+    """)
+    connection.commit()
+    connection.close()
+    return (
+        f"sqlite+aiosqlite:///{db_path}",
+        tmp_path / "staging" / "lancedb",
+        tmp_path / "staging" / "graph.json",
+        str(uuid.uuid5(uuid.NAMESPACE_DNS, "fact:f1")),
+    )
+
+
+@pytest.mark.asyncio
+async def test_s305_seam_refuses_zero_node_and_orphan_edge_graph_artifacts(tmp_path: Path) -> None:
+    """Graph artifacts are compared EXACTLY, in the A.3.3 digest domain.
+
+    A zero-node snapshot is structurally valid for S3-03's hook (R-S303-a), so a
+    verifier that treats "structurally valid" as "complete" would publish an
+    empty graph for a non-empty corpus. The second half adds an edge whose
+    target node does not exist, which the hook refuses by cause.
+
+    At BASE the unconditional stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    from memory_server.projection_rebuild import id_digest, verify_staged_projections
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    url, vector_path, graph_path, point_id = _s305_graph_fixture(tmp_path)
+    provider = LanceDBProvider(db_path=str(vector_path), vector_size=4)
+    await provider.upsert_batch([
+        {
+            "id": point_id,
+            "vector": [0.1, 0.2, 0.3, 0.4],
+            "payload": {
+                "subject": "Widget", "predicate": "uses", "object": "Caddy",
+                "source": "s", "memory_type": "fact",
+            },
+        }
+    ])
+    await provider.close()
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+
+    graph_path.write_text(json.dumps({"nodes": {}, "edges": []}), encoding="utf-8")
+    zero_node = SimpleGraph.validate_snapshot(graph_path)
+    assert zero_node.valid is True, "S3-03 accepts a zero-node snapshot as EMPTY"
+    assert zero_node.node_count == 0
+
+    verdict = await verify_staged_projections(
+        snapshot_url=url,
+        staging_vector_path=vector_path,
+        staging_graph_path=graph_path,
+        expected_vector_size=4,
+    )
+    assert verdict.valid is False, "an empty graph cannot prove a non-empty corpus"
+    assert any("node" in error for error in verdict.errors), verdict.errors
+    assert verdict.graph_nodes_digest == id_digest(set())
+    assert verdict.graph_nodes_digest != id_digest({"widget", "caddy"})
+
+    graph_path.write_text(json.dumps({
+        "nodes": {
+            "widget": {"id": "widget", "type": "entity", "name": "Widget", "attributes": {}},
+            "caddy": {"id": "caddy", "type": "entity", "name": "Caddy", "attributes": {}},
+        },
+        "edges": [
+            {"source_id": "widget", "target_id": "caddy", "relation": "uses", "attributes": {}},
+            {"source_id": "widget", "target_id": "ghost", "relation": "mentions", "attributes": {}},
+        ],
+    }), encoding="utf-8")
+    orphaned = SimpleGraph.validate_snapshot(graph_path)
+    assert orphaned.valid is False, "the orphan edge must be refused structurally"
+
+    orphan_verdict = await verify_staged_projections(
+        snapshot_url=url,
+        staging_vector_path=vector_path,
+        staging_graph_path=graph_path,
+        expected_vector_size=4,
+    )
+    assert orphan_verdict.valid is False, "an orphan edge must refuse the artifact"
+    assert any("not present in nodes" in error for error in orphan_verdict.errors), orphan_verdict.errors

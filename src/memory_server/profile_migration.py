@@ -5577,6 +5577,172 @@ def _resume_blocked_by(next_checkpoint: str | None, next_operations: tuple[str, 
     return "E_MIGRATION_NOT_IMPLEMENTED"
 
 
+# ---------------------------------------------------------------------------
+# S3-05 -- the engine ASKS the one verifier (DETAIL 10.3, DETAIL.md:637-645;
+# DETAIL 19.10, DETAIL.md:1077; addendum PART A).
+#
+# There is exactly ONE staged/published verification implementation in this
+# project and it lives in `memory_server.projection_rebuild`. This section adds
+# no second one: it resolves the artifact paths the run owns, CALLS the seam, and
+# turns the seam's verdict into the S2-06 `CheckpointEvidence` objects the
+# forward checkpoints already require (`staged_verification`, `reopen_verification`
+# -- see `_EVIDENCE_REQUIRED_DETAIL`). No store is opened here; nothing below
+# reads a table, a snapshot or a graph, and nothing below can substitute a
+# verdict of its own.
+#
+# Layout hand-off (S3-04 review residual R-S304-a): the staged artifacts live in
+# the run's own staging directory under the very names the S2-06 publication code
+# already uses -- `BACKUP_STAGING_NAME` + `ARTIFACT_STAGING_NAMES`, i.e. DETAIL
+# 9.1's `<run>/staging/{lancedb,graph.json}`. The published artifacts are the
+# run's PINNED targets (`plan.targets[label].lexical_path`), which is exactly
+# where DETAIL 10.4 renames the verified staged entry to. No new run-directory
+# scheme and no new staging name is introduced, so the engine's own
+# staged-identity revalidation and this hand-off cannot disagree.
+# ---------------------------------------------------------------------------
+
+STAGED_VERIFICATION_REFUSED = "E_STAGED_VERIFICATION_REFUSED"
+PUBLISHED_REOPEN_MISMATCH = "E_PUBLISHED_REOPEN_MISMATCH"
+# The provider's default embedding dimension (`lancedb_provider.DEFAULT_VECTOR_SIZE`,
+# 384). Repeated as a literal so the engine keeps no provider import of its own --
+# the dimension stays a CALLER expectation, and the seam reports the store's own
+# dimension back so a mismatch is refused rather than assumed.
+DEFAULT_PROJECTION_VECTOR_SIZE = 384
+
+
+def staged_projection_paths(run_dir: Path) -> dict[str, Path]:
+    """The DETAIL 9.1 staged entries of one run, from the engine's own names."""
+    staging = Path(run_dir) / BACKUP_STAGING_NAME
+    return {label: staging / ARTIFACT_STAGING_NAMES[label] for label in PUBLICATION_ARTIFACTS}
+
+
+def published_projection_paths(plan: MigrationPlan) -> dict[str, Path]:
+    """The published entries of one run: its pinned per-artifact targets."""
+    return {label: Path(plan.targets[label].lexical_path) for label in PUBLICATION_ARTIFACTS}
+
+
+def snapshot_url_for(path: Path) -> str:
+    """The canonical snapshot URL the seam re-reads the expectation from."""
+    return f"sqlite+aiosqlite:///{Path(path).absolute()}"
+
+
+def _verdict_reason(verdict: Any) -> str:
+    errors = tuple(getattr(verdict, "errors", ()))
+    return "; ".join(errors) if errors else "the verification seam refused without a cause"
+
+
+def staged_projection_verification(
+    snapshot_path: Path,
+    run_dir: Path,
+    *,
+    expected_vector_size: int = DEFAULT_PROJECTION_VECTOR_SIZE,
+    batch_size: int = 32,
+) -> Any:
+    """CALL the one verifier on this run's staged entries.
+
+    ``expected_vector_size`` is the run's configured expectation, not something
+    the store attests: the seam compares the reopened schema against it and
+    reports the store's own dimension back.
+    """
+    paths = staged_projection_paths(run_dir)
+    return _run_verification_probe(
+        lambda _ignored: projection_rebuild.verify_staged_projections(
+            snapshot_url=snapshot_url_for(snapshot_path),
+            staging_vector_path=paths["vector"],
+            staging_graph_path=paths["graph"],
+            expected_vector_size=expected_vector_size,
+            batch_size=batch_size,
+        ),
+        None,
+    )
+
+
+def published_reopen_verdict(
+    snapshot_path: Path,
+    plan: MigrationPlan,
+    *,
+    expected_vector_size: int = DEFAULT_PROJECTION_VECTOR_SIZE,
+    batch_size: int = 32,
+) -> Any:
+    """CALL the one verifier on this run's PUBLISHED entries (before `complete`)."""
+    paths = published_projection_paths(plan)
+    return _run_verification_probe(
+        lambda _ignored: projection_rebuild.verify_published_projections(
+            snapshot_url=snapshot_url_for(snapshot_path),
+            published_vector_path=paths["vector"],
+            published_graph_path=paths["graph"],
+            expected_vector_size=expected_vector_size,
+            batch_size=batch_size,
+        ),
+        None,
+    )
+
+
+def staged_verification_evidence(
+    snapshot_path: Path,
+    run_dir: Path,
+    *,
+    expected_vector_size: int = DEFAULT_PROJECTION_VECTOR_SIZE,
+    batch_size: int = 32,
+) -> CheckpointEvidence:
+    """The `staged_verified` checkpoint's evidence, built from the seam's verdict.
+
+    A refused staged verification raises instead of producing evidence, so the
+    checkpoint cannot be recorded for an artifact the seam refused.
+    """
+    verdict = staged_projection_verification(
+        snapshot_path, run_dir, expected_vector_size=expected_vector_size, batch_size=batch_size
+    )
+    if not getattr(verdict, "valid", False):
+        raise _manifest_failure(STAGED_VERIFICATION_REFUSED, _verdict_reason(verdict))
+    detail = {
+        "basis": str(getattr(verdict, "basis", "")),
+        "staging_digest": str(getattr(verdict, "staging_digest", "")),
+        "artifacts": list(getattr(verdict, "artifacts", ())),
+    }
+    return CheckpointEvidence("staged_verified", "staged_verification", _digest(detail), detail)
+
+
+def _artifact_identity(verdict: Any, label: str) -> tuple[Any, ...]:
+    """One artifact's verified identity, comparable across staged and published."""
+    if label == "vector":
+        return (tuple(getattr(verdict, "vector_ids", ())), getattr(verdict, "vector_ids_digest", ""))
+    return (getattr(verdict, "graph_nodes_digest", ""), getattr(verdict, "graph_edges_digest", ""))
+
+
+def reopen_verification_evidence(
+    snapshot_path: Path,
+    plan: MigrationPlan,
+    staged_verdict: Any,
+    *,
+    expected_vector_size: int = DEFAULT_PROJECTION_VECTOR_SIZE,
+    batch_size: int = 32,
+) -> CheckpointEvidence:
+    """The `verified` checkpoint's evidence: the reopened publication, per artifact.
+
+    Every artifact must be reopened AND still match the identity the staged
+    verification recorded; otherwise this refuses with
+    ``E_PUBLISHED_REOPEN_MISMATCH`` and `complete` stays out of reach.
+    """
+    verdict = published_reopen_verdict(
+        snapshot_path, plan, expected_vector_size=expected_vector_size, batch_size=batch_size
+    )
+    reopened = bool(getattr(verdict, "valid", False))
+    artifacts: dict[str, dict[str, Any]] = {}
+    for label in PUBLICATION_ARTIFACTS:
+        matches = reopened and _artifact_identity(verdict, label) == _artifact_identity(staged_verdict, label)
+        artifacts[label] = {
+            "matches_staged": bool(matches),
+            "digest": _digest(_artifact_identity(verdict, label)),
+        }
+    if not all(entry["matches_staged"] for entry in artifacts.values()):
+        raise _manifest_failure(
+            PUBLISHED_REOPEN_MISMATCH,
+            f"the reopened publication does not match the verified staged identity: {_verdict_reason(verdict)}",
+        )
+    detail = {"artifacts": artifacts}
+    return CheckpointEvidence("verified", "reopen_verification", _digest(detail), detail)
+
+
 def classify_resume(manifest_path: Path, request: MigrationRequest) -> ResumeOutcome:
     """Repeat every precondition, confirm every durable identity, then classify.
 

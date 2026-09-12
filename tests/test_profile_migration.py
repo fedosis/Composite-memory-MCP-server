@@ -3693,13 +3693,21 @@ def test_s206_the_s0_stub_seam_reports_no_capability_and_the_gate_stays_shut(
 ) -> None:
     """MISSING-CAPABILITY at BASE: there is no capability report at all.
 
+    RETARGETED BY S3-05 (disclosed): this node's subject was the S0 STUB. S3-05
+    replaced that stub with the real verifier, so the two lines that asserted the
+    stub's positional call contract (`verify_staged_projections(probe)` returning
+    a valid-looking verdict) no longer describe the seam. The clause the node
+    exists for is UNCHANGED and is now proven with a forged verdict: the gate
+    reads the seam's CAPABILITY REPORT and never its return value.
+
+    The report still says `implemented=False`: the real seam's contract is
+    keyword-only, so S2-06's single-positional negative probe cannot qualify it
+    and every gated transition below is still refused by cause. Opening the gate
+    -- and `complete` end-to-end -- is S3-06's deliverable, which is exactly the
+    hand-off this node records.
+
     Behavioural successor (S3-06): the node drives the public entrypoints once
     the stage is wired, so the same contract gets a behavioural RED then.
-
-    At HEAD this is the card's central safety proof: the shared seam is still the
-    S0 stub, its own answer to the negative-probe input is a VALID-looking
-    verdict, and the gate nevertheless stays shut -- which is exactly the
-    "never because of the seam's RETURN VALUE" clause of acceptance 5.
     """
     import asyncio
 
@@ -3711,13 +3719,26 @@ def test_s206_the_s0_stub_seam_reports_no_capability_and_the_gate_stays_shut(
     capability = report()
     assert capability.implemented is False
     assert capability.basis
-    assert "implemented" not in capability.basis.replace("unimplemented", "")
+    assert "not implemented" not in capability.basis
+    assert capability.basis == "unimplemented", capability.basis
 
-    # The seam's own verdict on an unverifiable staged input is valid=True: this
-    # line is the reason the gate may not read the return value.
-    probe = tmp_path / "absent-staged-entry"
-    seam_verdict = asyncio.run(projection_rebuild.verify_staged_projections(probe))
-    assert getattr(seam_verdict, "valid", None) is True
+    # The REAL seam (S3-05) refuses an unverifiable staged input when it is
+    # called with the contract it actually owns. Its REFUSAL is not what opens
+    # the gate -- the report above is -- but the returned verdict must not be
+    # readable as a success either.
+    seam_verdict = asyncio.run(
+        projection_rebuild.verify_staged_projections(
+            snapshot_url=f"sqlite+aiosqlite:///{tmp_path / 'absent.db'}",
+            staging_vector_path=tmp_path / "absent-staged-entry",
+            staging_graph_path=tmp_path / "absent-graph.json",
+        )
+    )
+    assert seam_verdict.valid is False, seam_verdict.errors
+
+    # The gate reads the capability report ONLY: a verdict that CLAIMS
+    # valid=True opens nothing.
+    forged = projection_rebuild.ProjectionVerification(True)
+    assert forged.valid is True
 
     for target, current in (
         ("staged_verified", "projections_built"),
@@ -6411,3 +6432,812 @@ async def test_s304_remote_allow_path_uses_confined_synthetic_embedder(tmp_path:
     assert result.plan.eligible_records == 2
     assert embedder.calls == 1
     assert len(result.vector_ids) == 2
+
+
+# ---------------------------------------------------------------------------
+# S3-05 -- independent staged/published verification
+# (DETAIL 10.3, DETAIL.md:637-645; DETAIL 19.10, DETAIL.md:1077; addendum PART A)
+#
+# The verifier under test is `memory_server.projection_rebuild`: the ONE place
+# staged/published verification lives. Every node drives REAL artifacts -- a
+# real SQLite snapshot carrying the accepted revision, a real LanceDB staged
+# table built through the real provider and a real graph JSON -- so no
+# verification-boundary input here is a mock. The expected node/edge/vector
+# sets are derived by the verifier ITSELF from the canonical snapshot, never
+# from `RebuildResult`, so these nodes also pin that the engine cannot hand it
+# the rebuild's own answer.
+# ---------------------------------------------------------------------------
+
+S305_VECTOR_SIZE = 4
+
+_S305_CANONICAL_TABLES = """
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
+        CREATE TABLE beliefs (id TEXT PRIMARY KEY, proposition TEXT, confidence REAL,
+            source TEXT, tags TEXT, lifecycle_state TEXT);
+        CREATE TABLE decisions (id TEXT PRIMARY KEY, choice TEXT, reason TEXT,
+            context TEXT, lifecycle_state TEXT);
+        CREATE TABLE facts (id TEXT PRIMARY KEY, subject TEXT, predicate TEXT,
+            object TEXT, source TEXT, lifecycle_state TEXT);
+        CREATE TABLE skills (id TEXT PRIMARY KEY, purpose TEXT, steps TEXT,
+            lifecycle_state TEXT);
+        CREATE TABLE outbox_entries (id TEXT PRIMARY KEY, status TEXT, created_at TEXT);
+        INSERT INTO alembic_version VALUES ('0005');
+"""
+
+
+def _s305_snapshot(path: Path, *, extra_fact: bool = False, null_source_fact: bool = False) -> str:
+    """A real snapshot the verifier can verify, with a real eligible corpus.
+
+    Eligible projection mapping for the default corpus (DETAIL 10.2 / addendum
+    A.3.2): vectors `fact:f1`, `fact:f2`, `belief:b1`; graph nodes `widget`,
+    `caddy`, `b`, `c` (entity), `decision-pick-caddy` (decision, both `d1` and
+    the case-colliding `d2` collapse onto it) and `skill-usable` (skill); graph
+    edges `widget|uses|caddy`, `b|uses|c` and exactly one
+    `decision-pick-caddy|widget|decides`.
+    """
+    connection = sqlite3.connect(path)
+    connection.executescript(_S305_CANONICAL_TABLES)
+    connection.executescript("""
+        INSERT INTO beliefs VALUES ('b1', 'active belief', 0.8, 's', '["tag"]', 'active');
+        INSERT INTO decisions VALUES ('d1', 'Pick Caddy', 'safe', 'Widget', 'active');
+        INSERT INTO decisions VALUES ('d2', 'pick caddy', 'same', 'Widget', 'active');
+        INSERT INTO facts VALUES ('f0', 'A', 'is', 'B', 's', 'archived');
+        INSERT INTO facts VALUES ('f1', 'Widget', 'uses', 'Caddy', 's', 'active');
+        INSERT INTO facts VALUES ('f2', 'B', 'uses', 'C', 's', 'validated');
+        INSERT INTO skills VALUES ('s1', 'usable', '["step"]', 'validated');
+        INSERT INTO skills VALUES ('s0', 'empty', '[]', 'active');
+        INSERT INTO outbox_entries VALUES ('o1', 'pending', '2026-09-13T00:00:00Z');
+    """)
+    if extra_fact:
+        connection.execute(
+            "INSERT INTO facts VALUES ('f3', 'Extra', 'uses', 'Delta', 's', 'active')"
+        )
+    if null_source_fact:
+        connection.execute(
+            "INSERT INTO facts VALUES ('f4', 'Nulled', 'uses', 'Source', NULL, 'active')"
+        )
+    connection.commit()
+    connection.close()
+    return f"sqlite+aiosqlite:///{path}"
+
+
+def _s305_expected_vector_ids() -> set[str]:
+    """The pinned vector ID set, derived in the TEST from the corpus mapping."""
+    return {
+        str(uuid5(NAMESPACE_DNS, "fact:f1")),
+        str(uuid5(NAMESPACE_DNS, "fact:f2")),
+        str(uuid5(NAMESPACE_DNS, "belief:b1")),
+    }
+
+
+_S305_EXPECTED_NODE_IDS = {"widget", "caddy", "b", "c", "decision-pick-caddy", "skill-usable"}
+# A.3.3 digest domain: the edge KEY is `source_id|target_id|relation`, exactly
+# as `projection_rebuild.graph_id_digests` already encodes it.
+_S305_EXPECTED_EDGE_KEYS = {
+    "widget|caddy|uses",
+    "b|c|uses",
+    "decision-pick-caddy|widget|decides",
+}
+
+
+async def _s305_staged(tmp_path: Path, db_path: Path, *, run_dir: Path | None = None) -> tuple[str, Path, Path]:
+    """Build REAL staged artifacts with the S3-04 rebuild into a staged layout.
+
+    The staged layout is the S2-06 engine's own DETAIL 9.1 shape:
+    ``<run_dir>/staging/lancedb`` and ``<run_dir>/staging/graph.json``.
+    """
+    url = f"sqlite+aiosqlite:///{db_path}"
+    root = tmp_path if run_dir is None else run_dir
+    vector_path = root / "staging" / "lancedb"
+    graph_path = root / "staging" / "graph.json"
+    records = [
+        record
+        async for record in projection_rebuild.iter_canonical_projection_records(url, batch_size=2)
+    ]
+    await projection_rebuild.rebuild_projections(
+        url,
+        staging_vector_path=vector_path,
+        staging_graph_path=graph_path,
+        embedder=_CountingEmbedder(dimension=S305_VECTOR_SIZE),
+        vector_size=S305_VECTOR_SIZE,
+        batch_size=2,
+        embedding_plan_digest=projection_rebuild.embedding_plan_digest(records),
+    )
+    return url, vector_path, graph_path
+
+
+async def _s305_verify(url: str, vector_path: Path, graph_path: Path):
+    """Ask the ONE verifier with the keyword-only contract it owns."""
+    return await projection_rebuild.verify_staged_projections(
+        snapshot_url=url,
+        staging_vector_path=vector_path,
+        staging_graph_path=graph_path,
+        expected_vector_size=S305_VECTOR_SIZE,
+    )
+
+
+def _s305_graph_json(graph_path: Path) -> dict:
+    return json.loads(graph_path.read_text(encoding="utf-8"))
+
+
+def _s305_write_graph_json(graph_path: Path, data: dict) -> None:
+    graph_path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _s305_inventory(root: Path) -> dict[str, str]:
+    """Path -> sha256 for every regular file under *root*, for an untouched check."""
+    inventory: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            inventory[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return inventory
+
+
+@pytest.mark.asyncio
+async def test_s305_staged_verification_is_green_on_real_artifacts(tmp_path: Path) -> None:
+    """Acceptance 1: the ACTUAL reopened artifacts must match exact expectations.
+
+    At BASE the seam is the unconditional stub, so this node dies on
+    ``verdict.valid is True`` with no identity at all: MISSING CAPABILITY.
+    """
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    url, vector_path, graph_path = await _s305_staged(tmp_path, db_path)
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert verdict.valid is True, verdict.errors
+    assert verdict.errors == ()
+    assert verdict.basis == "staged"
+    assert tuple(verdict.artifacts) == ("vector", "graph")
+    # Actual reopened vector identity.
+    assert set(verdict.vector_ids) == _s305_expected_vector_ids()
+    assert verdict.vector_ids_digest == projection_rebuild.id_digest(_s305_expected_vector_ids())
+    assert verdict.vector_row_count == 3
+    assert verdict.vector_dimension == S305_VECTOR_SIZE
+    assert verdict.vector_table == "memories"
+    # Actual reopened graph identity, in the A.3.3 digest domain (ids + edge keys).
+    assert verdict.graph_nodes_digest == projection_rebuild.id_digest(_S305_EXPECTED_NODE_IDS)
+    assert verdict.graph_edges_digest == projection_rebuild.id_digest(_S305_EXPECTED_EDGE_KEYS)
+    assert verdict.graph_node_count == 6
+    assert verdict.graph_edge_count == 3
+    # Snapshot integrity / schema / revision (DETAIL 10.3 first bullet).
+    assert verdict.snapshot_integrity == "ok"
+    assert verdict.snapshot_revision == "0005"
+    assert verdict.outbox_counts.get("pending") == 1
+    # R-S302-a: the plain-table metric is NOT artifact evidence.
+    assert verdict.metric_verifiable is False
+    assert len(verdict.staging_digest) == 64
+    assert verdict.expected_vector_ids == tuple(sorted(_s305_expected_vector_ids()))
+
+
+@pytest.mark.asyncio
+async def test_s305_expected_sets_come_from_the_snapshot_not_from_the_rebuild(
+    tmp_path: Path,
+) -> None:
+    """Acceptance 2: expectations are re-derived from the snapshot handed in.
+
+    The staged artifacts are built from ONE corpus and then verified against a
+    DIFFERENT snapshot (one extra eligible fact). An expectation echoed from the
+    rebuild's own `RebuildResult` -- or read back off the staged store -- would
+    accept it; an independent derivation from the snapshot must refuse.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    built_db = tmp_path / "built.db"
+    _s305_snapshot(built_db)
+    _, vector_path, graph_path = await _s305_staged(tmp_path, built_db)
+
+    moved_on_db = tmp_path / "moved-on.db"
+    moved_on_url = _s305_snapshot(moved_on_db, extra_fact=True)
+    verdict = await _s305_verify(moved_on_url, vector_path, graph_path)
+
+    assert verdict.valid is False, "a changed canonical corpus must refuse the artifact"
+    assert any("ID set mismatch" in error or "digest" in error for error in verdict.errors), verdict.errors
+    assert str(uuid5(NAMESPACE_DNS, "fact:f3")) in verdict.expected_vector_ids
+    assert str(uuid5(NAMESPACE_DNS, "fact:f3")) not in set(verdict.vector_ids)
+
+
+@pytest.mark.asyncio
+async def test_s305_same_counts_wrong_ids_must_fail(tmp_path: Path) -> None:
+    """Acceptance 4: equal counts with WRONG IDs must fail (counts are never proof).
+
+    One real ID is replaced by a real stranger ID, so the staged store keeps
+    exactly three rows and three distinct ids.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    url, vector_path, graph_path = await _s305_staged(tmp_path, db_path)
+
+    provider = LanceDBProvider(db_path=str(vector_path), vector_size=S305_VECTOR_SIZE)
+    await provider.delete(point_id=str(uuid5(NAMESPACE_DNS, "fact:f1")))
+    await provider.upsert_batch([
+        {
+            "id": "ffffffff-0000-0000-0000-000000000001",
+            "vector": [0.5] * S305_VECTOR_SIZE,
+            "payload": {
+                "subject": "Widget", "predicate": "uses", "object": "Caddy",
+                "source": "s", "memory_type": "fact",
+            },
+        }
+    ])
+    await provider.close()
+
+    description = await LanceDBProvider(
+        db_path=str(vector_path), vector_size=S305_VECTOR_SIZE
+    ).describe_collection()
+    assert description.row_count == 3, "the adversarial store must keep the SAME count"
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert verdict.valid is False, "same counts with wrong IDs must never pass"
+    assert any("ID set mismatch" in error for error in verdict.errors), verdict.errors
+
+
+@pytest.mark.asyncio
+async def test_s305_tampered_payload_is_refused(tmp_path: Path) -> None:
+    """Acceptance 1 + R-S302-g: the payload allowlist is enforced per row.
+
+    The same ID is rewritten with a payload that carries an unknown key (and a
+    NULL `source` variant in the second half), so the ID set, the ID digest and
+    the row count are all unchanged and ONLY the payload contract can catch it.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    url, vector_path, graph_path = await _s305_staged(tmp_path, db_path)
+
+    provider = LanceDBProvider(db_path=str(vector_path), vector_size=S305_VECTOR_SIZE)
+    await provider.upsert_batch([
+        {
+            "id": str(uuid5(NAMESPACE_DNS, "fact:f1")),
+            "vector": [0.5] * S305_VECTOR_SIZE,
+            "payload": {
+                "subject": "Widget", "predicate": "uses", "object": "Caddy",
+                "source": "s", "memory_type": "fact", "extra_key": "tampered",
+            },
+        }
+    ])
+    await provider.close()
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert verdict.valid is False, "an unknown payload key must refuse the artifact"
+    assert any("unknown payload keys" in error for error in verdict.errors), verdict.errors
+    assert any("invalid payload" in error for error in verdict.errors), verdict.errors
+
+
+@pytest.mark.asyncio
+async def test_s305_null_source_payload_refuses_the_whole_artifact(tmp_path: Path) -> None:
+    """R-S302-g decision: a NULL canonical `source` refuses the artifact, verbatim.
+
+    `_PAYLOAD_CONTRACT` requires a string `source`, so the verifier must surface
+    the provider's cause-specific refusal (it is NOT weakened here) and fail the
+    whole artifact closed.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path, null_source_fact=True)
+    url, vector_path, graph_path = await _s305_staged(tmp_path, db_path)
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert verdict.valid is False, "a NULL source payload must refuse the artifact"
+    assert any(
+        "wrong value type for 'source'" in error for error in verdict.errors
+    ), verdict.errors
+
+
+@pytest.mark.asyncio
+async def test_s305_tampered_vector_dimension_is_refused(tmp_path: Path) -> None:
+    """Acceptance 1: the ACTUAL reopened dimension must be the expected one.
+
+    A staged store is built at dimension 7 and verified against the run's
+    expected dimension 4.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    vector_path = tmp_path / "staging" / "lancedb"
+    graph_path = tmp_path / "staging" / "graph.json"
+    records = [
+        record
+        async for record in projection_rebuild.iter_canonical_projection_records(url, batch_size=2)
+    ]
+    await projection_rebuild.rebuild_projections(
+        url,
+        staging_vector_path=vector_path,
+        staging_graph_path=graph_path,
+        embedder=_CountingEmbedder(dimension=7),
+        vector_size=7,
+        batch_size=2,
+        embedding_plan_digest=projection_rebuild.embedding_plan_digest(records),
+    )
+    description = await LanceDBProvider(db_path=str(vector_path), vector_size=7).describe_collection()
+    assert description.vector_size == 7
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert verdict.valid is False, "a dimension mismatch must refuse the artifact"
+    assert any("dimension" in error for error in verdict.errors), verdict.errors
+
+
+@pytest.mark.asyncio
+async def test_s305_missing_graph_edge_must_fail(tmp_path: Path) -> None:
+    """Acceptance 1/4: a missing graph edge must fail even with equal counts.
+
+    The staged graph stays structurally valid (S3-03's own hook accepts it and
+    every node still exists), so ONLY the exact expected edge-key comparison can
+    catch the dropped edge.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    url, vector_path, graph_path = await _s305_staged(tmp_path, db_path)
+
+    data = _s305_graph_json(graph_path)
+    removed = [edge for edge in data["edges"] if edge["target_id"] == "caddy"]
+    assert removed, "the fixture must contain the edge this node removes"
+    data["edges"] = [edge for edge in data["edges"] if edge["target_id"] != "caddy"]
+    _s305_write_graph_json(graph_path, data)
+    validation = SimpleGraph.validate_snapshot(graph_path)
+    assert validation.valid is True, validation.error
+    assert validation.node_count == 6
+    assert validation.edge_count == 2
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert verdict.valid is False, "a missing graph edge must refuse the artifact"
+    assert any("edge" in error for error in verdict.errors), verdict.errors
+    assert verdict.graph_edges_digest != projection_rebuild.id_digest(_S305_EXPECTED_EDGE_KEYS)
+
+
+@pytest.mark.asyncio
+async def test_s305_orphan_graph_edge_must_fail(tmp_path: Path) -> None:
+    """Acceptance 1/4: an extra/orphan edge must fail.
+
+    The extra edge names a target no node carries, which is exactly what the
+    S3-03 structural hook refuses.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    url, vector_path, graph_path = await _s305_staged(tmp_path, db_path)
+
+    data = _s305_graph_json(graph_path)
+    data["edges"].append(
+        {"source_id": "widget", "target_id": "ghost", "relation": "mentions", "attributes": {}}
+    )
+    _s305_write_graph_json(graph_path, data)
+    validation = SimpleGraph.validate_snapshot(graph_path)
+    assert validation.valid is False, "the orphan edge must be structurally refused"
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert verdict.valid is False, "an orphan edge must refuse the artifact"
+    assert any("not present in nodes" in error for error in verdict.errors), verdict.errors
+
+
+@pytest.mark.asyncio
+async def test_s305_falsely_successful_graph_save_is_refused(tmp_path: Path) -> None:
+    """Acceptance 1/4: a save that REPORTS success while the content is wrong.
+
+    A graph with one extra, fully connected node is saved through the real
+    provider (``save_snapshot`` returns normally), and S3-03's structural hook
+    accepts it. Only the exact expected ``(id, type)`` node set can catch it.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    url, vector_path, graph_path = await _s305_staged(tmp_path, db_path)
+
+    reopened = SimpleGraph(snapshot_path=graph_path)
+    reopened.load_snapshot(graph_path)
+    reopened.add_node(id="ghost", type="entity", name="Ghost")
+    reopened.add_edge("widget", "ghost", "mentions")
+    reopened.save_snapshot(graph_path)
+    validation = SimpleGraph.validate_snapshot(graph_path)
+    assert validation.valid is True, validation.error
+    assert validation.node_count == 7, "the falsely saved graph really carries the extra node"
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert verdict.valid is False, "an extra node must refuse the artifact"
+    assert any("node" in error for error in verdict.errors), verdict.errors
+    assert verdict.graph_node_count == 7
+    assert verdict.graph_nodes_digest != projection_rebuild.id_digest(_S305_EXPECTED_NODE_IDS)
+
+
+@pytest.mark.asyncio
+async def test_s305_duplicate_decides_edge_multiplicity_is_refused(tmp_path: Path) -> None:
+    """A.3.2/A.4.1: ``decides`` is deduplicated by ``(source, target, relation)``.
+
+    ``d1`` = "Pick Caddy" and ``d2`` = "pick caddy" both normalize to
+    ``decision-pick-caddy``, so this corpus is the A.3.2 collision corpus. A
+    second parallel ``decides`` edge for the same pair is what the runtime's
+    ``get_edge`` guard never creates; the id-set digest CANNOT see it (A.3.3),
+    so multiplicity is asserted separately and exactly.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    url, vector_path, graph_path = await _s305_staged(tmp_path, db_path)
+
+    data = _s305_graph_json(graph_path)
+    decides = [edge for edge in data["edges"] if edge["relation"] == "decides"]
+    assert len(decides) == 1, "the real rebuild must create exactly ONE decides edge"
+    data["edges"].append(dict(decides[0]))
+    _s305_write_graph_json(graph_path, data)
+    validation = SimpleGraph.validate_snapshot(graph_path)
+    assert validation.valid is True, validation.error
+    assert validation.edge_count == 4
+    duplicated = [f"{e['source_id']}|{e['target_id']}|{e['relation']}" for e in data["edges"]]
+    assert projection_rebuild.id_digest(set(duplicated)) == projection_rebuild.id_digest(
+        _S305_EXPECTED_EDGE_KEYS
+    ), "the edge ID-SET digest cannot see a duplicated parallel edge"
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert verdict.valid is False, "a duplicated parallel edge must refuse the artifact"
+    assert any("duplicate" in error or "multiplicity" in error for error in verdict.errors), verdict.errors
+
+
+@pytest.mark.asyncio
+async def test_s305_empty_store_against_a_nonempty_corpus_must_fail(tmp_path: Path) -> None:
+    """Acceptance 4: a NON-EMPTY corpus can never pass empty digests.
+
+    Two real adversarial shapes: (a) the staged entries are absent entirely, and
+    (b) the staged VECTOR store is REAL but EMPTY (a created table with zero
+    rows) while the canonical corpus implies three vectors. Neither may pass,
+    and the refused verdict must report the empty-input digest rather than an
+    accepted identity.
+
+    At BASE the stub answers `valid=True`: BEHAVIOURAL failure.
+    """
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    url, vector_path, graph_path = await _s305_staged(tmp_path, db_path)
+
+    absent = await projection_rebuild.verify_staged_projections(
+        snapshot_url=url,
+        staging_vector_path=tmp_path / "absent" / "lancedb",
+        staging_graph_path=tmp_path / "absent" / "graph.json",
+        expected_vector_size=S305_VECTOR_SIZE,
+    )
+    assert absent.valid is False, "unreadable staged artifacts must refuse"
+    assert absent.errors
+
+    empty_path = tmp_path / "empty-staging" / "lancedb"
+    empty_provider = LanceDBProvider(db_path=str(empty_path), vector_size=S305_VECTOR_SIZE)
+    await empty_provider.upsert_batch([
+        {
+            "id": "placeholder-row",
+            "vector": [0.0] * S305_VECTOR_SIZE,
+            "payload": {
+                "subject": "Widget", "predicate": "uses", "object": "Caddy",
+                "source": "s", "memory_type": "fact",
+            },
+        }
+    ])
+    await empty_provider.delete(point_id="placeholder-row")
+    await empty_provider.close()
+    assert await empty_provider.count_points() == 0, "the fixture store must really be EMPTY"
+
+    empty = await projection_rebuild.verify_staged_projections(
+        snapshot_url=url,
+        staging_vector_path=empty_path,
+        staging_graph_path=graph_path,
+        expected_vector_size=S305_VECTOR_SIZE,
+    )
+
+    assert empty.valid is False, "an empty store cannot prove a non-empty corpus"
+    joined = " | ".join(empty.errors)
+    assert "vector" in joined, empty.errors
+    assert "ID set mismatch" in joined or "row count" in joined, empty.errors
+    assert projection_rebuild.id_digest(set()) == EMPTY_DIGEST
+    assert empty.vector_ids_digest == EMPTY_DIGEST
+    assert empty.vector_ids == ()
+    assert empty.vector_ids_digest != projection_rebuild.id_digest(_s305_expected_vector_ids())
+
+
+EMPTY_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def _s305_open_fds_under(root: Path) -> list[str]:
+    """Real descriptor scan: which of THIS process's fds point under *root*."""
+    prefix = str(root)
+    found: list[str] = []
+    for entry in sorted(os.listdir("/proc/self/fd")):
+        try:
+            target = os.readlink(f"/proc/self/fd/{entry}")
+        except OSError:
+            continue
+        if target.startswith(prefix):
+            found.append(f"{entry}->{target}")
+    return found
+
+
+def _s305_source_inventory(db_path: Path) -> dict[str, Any]:
+    """Byte identity of the source DB and its sidecar set, plus outbox rows."""
+    files = {}
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(f"{db_path}{suffix}")
+        files[path.name] = (
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "ABSENT"
+        )
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT id, status FROM outbox_entries ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+    return {"files": files, "outbox": rows}
+
+
+@pytest.mark.asyncio
+async def test_s305_published_stores_are_reopened_and_reverified_before_complete(
+    tmp_path: Path,
+) -> None:
+    """Acceptance 5 + the S2-06 evidence contract, through the ENGINE.
+
+    The engine ASKS the one verifier: `staged_verification_evidence` builds the
+    `staged_verified` evidence and `reopen_verification_evidence` builds the
+    `verified` (reopen) evidence. The gated transitions stay unreachable
+    WITHOUT the seam's capability report -- the gate is untouched -- and the
+    reopen must match the staged identity exactly, so a tampered published store
+    removes `complete` from reach.
+
+    At BASE the stub answers `valid=True` with no identity: the node dies on the
+    evidence detail (MISSING CAPABILITY) and the tampered half dies
+    BEHAVIOURALLY.
+    """
+    from types import SimpleNamespace
+
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    run_dir = tmp_path / "run"
+    url, vector_path, graph_path = await _s305_staged(run_dir, db_path, run_dir=run_dir)
+    staged_verdict = await _s305_verify(url, vector_path, graph_path)
+
+    assert profile_migration.staged_projection_paths(run_dir) == {
+        "vector": run_dir / "staging" / "lancedb",
+        "graph": run_dir / "staging" / "graph.json",
+    }, "the DETAIL 9.1 staged layout must come from the engine's own constants"
+
+    staged_evidence = profile_migration.staged_verification_evidence(
+        db_path, run_dir, expected_vector_size=S305_VECTOR_SIZE
+    )
+    assert staged_evidence.checkpoint == "staged_verified"
+    assert staged_evidence.code == "staged_verification"
+    assert set(staged_evidence.detail) == {"basis", "staging_digest", "artifacts"}
+    assert staged_evidence.detail["basis"] == "staged"
+    assert tuple(staged_evidence.detail["artifacts"]) == ("vector", "graph")
+    assert staged_evidence.detail["staging_digest"] == staged_verdict.staging_digest
+
+    capable = profile_migration.StagedVerificationCapability(True, "explicit_flag")
+    assert (
+        profile_migration.validate_forward_transition(
+            "projections_built", "staged_verified", [staged_evidence], capability=capable
+        )
+        == "staged_verified"
+    )
+    # The gate itself is NOT weakened: without the seam's capability report the
+    # same evidence is still refused by cause.
+    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+        profile_migration.validate_forward_transition(
+            "projections_built",
+            "staged_verified",
+            [staged_evidence],
+            capability=profile_migration.StagedVerificationCapability(False, "unimplemented"),
+        )
+
+    published = tmp_path / "published"
+    published.mkdir()
+    plan = SimpleNamespace(
+        targets={
+            "vector": SimpleNamespace(lexical_path=str(published / "lancedb")),
+            "graph": SimpleNamespace(lexical_path=str(published / "graph.json")),
+        }
+    )
+    assert profile_migration.published_projection_paths(plan) == {
+        "vector": published / "lancedb",
+        "graph": published / "graph.json",
+    }
+    os.replace(vector_path, published / "lancedb")
+    os.replace(graph_path, published / "graph.json")
+
+    reopened = profile_migration.published_reopen_verdict(
+        db_path, plan, expected_vector_size=S305_VECTOR_SIZE
+    )
+    assert reopened.valid is True, reopened.errors
+    assert reopened.basis == "published"
+
+    reopen_evidence = profile_migration.reopen_verification_evidence(
+        db_path, plan, staged_verdict, expected_vector_size=S305_VECTOR_SIZE
+    )
+    assert reopen_evidence.checkpoint == "verified"
+    assert reopen_evidence.code == "reopen_verification"
+    assert set(reopen_evidence.detail["artifacts"]) == {"vector", "graph"}
+    assert reopen_evidence.detail["artifacts"]["vector"]["matches_staged"] is True
+    assert reopen_evidence.detail["artifacts"]["graph"]["matches_staged"] is True
+    assert (
+        profile_migration.validate_forward_transition(
+            "published", "verified", [reopen_evidence], capability=capable
+        )
+        == "verified"
+    )
+
+    provider = LanceDBProvider(db_path=str(published / "lancedb"), vector_size=S305_VECTOR_SIZE)
+    await provider.delete(point_id=str(uuid5(NAMESPACE_DNS, "belief:b1")))
+    await provider.close()
+
+    tampered = profile_migration.published_reopen_verdict(
+        db_path, plan, expected_vector_size=S305_VECTOR_SIZE
+    )
+    assert tampered.valid is False, "a tampered published store must not reopen verified"
+    with pytest.raises(ValueError, match="E_PUBLISHED_REOPEN_MISMATCH"):
+        profile_migration.reopen_verification_evidence(
+            db_path, plan, staged_verdict, expected_vector_size=S305_VECTOR_SIZE
+        )
+
+
+@pytest.mark.asyncio
+async def test_s305_handles_are_released_before_rename_and_the_source_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance 5: handles released before the rename; source/outbox untouched.
+
+    Evidence, all real: the verifier CLOSES every provider it opened (observed on
+    the provider object itself), no tracked verification handle survives, no
+    descriptor of this process points into the staged artifacts, the staged
+    inventory is byte-identical before/after (the verifier wrote nothing), the
+    verified entries then take a real rename and a real write in the same
+    process, and the source DB, its sidecars and the outbox rows are unchanged.
+
+    At BASE the verdict carries no identity at all: the node dies on
+    `outstanding_verification_handles` (MISSING CAPABILITY).
+    """
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    db_path = tmp_path / "snapshot.db"
+    url = _s305_snapshot(db_path)
+    run_dir = tmp_path / "run"
+    url, vector_path, graph_path = await _s305_staged(run_dir, db_path, run_dir=run_dir)
+    source_before = _s305_source_inventory(db_path)
+    staged_before = _s305_inventory(run_dir / "staging")
+    assert staged_before, "the fixture must have staged something"
+
+    closed: list[str] = []
+    original_close = LanceDBProvider.close
+
+    async def counting_close(self) -> None:
+        closed.append(str(self._db_path))
+        return await original_close(self)
+
+    monkeypatch.setattr(LanceDBProvider, "close", counting_close, raising=False)
+
+    verdict = await _s305_verify(url, vector_path, graph_path)
+    assert verdict.valid is True, verdict.errors
+    assert verdict.staging_digest, "the verdict must carry a real staging digest"
+
+    assert closed, "the verifier must RELEASE the provider(s) it opened"
+    assert projection_rebuild.outstanding_verification_handles() == (), (
+        "every store handle the verifier opened must be released"
+    )
+    assert _s305_open_fds_under(run_dir / "staging") == [], (
+        "no descriptor of this process may still point into the staged artifacts"
+    )
+    assert _s305_inventory(run_dir / "staging") == staged_before, (
+        "verification must not mutate the artifacts it opens"
+    )
+
+    published = tmp_path / "published"
+    published.mkdir()
+    os.replace(vector_path, published / "lancedb")
+    os.replace(graph_path, published / "graph.json")
+    provider = LanceDBProvider(db_path=str(published / "lancedb"), vector_size=S305_VECTOR_SIZE)
+    await provider.upsert_batch([
+        {
+            "id": "write-after-rename",
+            "vector": [0.25] * S305_VECTOR_SIZE,
+            "payload": {
+                "proposition": "written after the rename",
+                "confidence": 0.5,
+                "tags": [],
+                "source": "s",
+                "memory_type": "belief",
+            },
+        }
+    ])
+    assert await provider.count_points() == 4, "the reopened store must still accept writes"
+    await provider.close()
+
+    assert _s305_source_inventory(db_path) == source_before, (
+        "the source DB, its sidecars and the outbox rows must be unchanged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_s305_the_engine_calls_the_one_verifier_and_holds_no_second_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Stop condition: ONE verifier, and the engine CALLS it.
+
+    Two independent proofs: (a) the engine's evidence builder delegates to
+    `projection_rebuild.verify_staged_projections` -- observed through a spy that
+    delegates to the real function -- and (b) the engine module's own AST never
+    touches the provider store hooks (`describe_collection`,
+    `validate_collection`, `validate_snapshot`, `LanceDBProvider`, `SimpleGraph`),
+    so a second store-level verification implementation cannot be hiding there.
+
+    At BASE this dies on the evidence detail (MISSING CAPABILITY).
+    """
+    db_path = tmp_path / "snapshot.db"
+    _s305_snapshot(db_path)
+    run_dir = tmp_path / "run"
+    await _s305_staged(run_dir, db_path, run_dir=run_dir)
+
+    observed: list[dict] = []
+    original = projection_rebuild.verify_staged_projections
+
+    async def spy(**kwargs):
+        observed.append(kwargs)
+        return await original(**kwargs)
+
+    monkeypatch.setattr(projection_rebuild, "verify_staged_projections", spy)
+    evidence = profile_migration.staged_verification_evidence(
+        db_path, run_dir, expected_vector_size=S305_VECTOR_SIZE
+    )
+
+    assert len(observed) == 1, "the engine must ask the seam exactly once"
+    assert observed[0]["snapshot_url"] == f"sqlite+aiosqlite:///{db_path}"
+    assert observed[0]["staging_vector_path"] == run_dir / "staging" / "lancedb"
+    assert observed[0]["staging_graph_path"] == run_dir / "staging" / "graph.json"
+    assert len(evidence.detail["staging_digest"]) == 64
+
+    delegated = await original(**observed[0])
+    assert evidence.detail["staging_digest"] == delegated.staging_digest, (
+        "the engine must publish the SEAM's verdict, not its own recomputation"
+    )
+
+    tree = ast.parse(Path(profile_migration.__file__).read_text(encoding="utf-8"))
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    for token in (
+        "describe_collection",
+        "validate_collection",
+        "validate_snapshot",
+        "LanceDBProvider",
+        "SimpleGraph",
+    ):
+        assert token not in attributes | names, (
+            f"the engine must not carry a second verification implementation ({token})"
+        )
