@@ -384,6 +384,20 @@ class MaintenanceStorageLocks:
             raise
 
     @property
+    def graph_lock_identity(self) -> os.stat_result | None:
+        """The identity of the exact graph-lock entry this object holds open.
+
+        DETAIL 10.1: the held inode is never replaced, and a graph lock CREATED
+        by this run must be removable after unlock. The identity is taken from
+        the OWNED descriptor, so a path swap after acquisition cannot redirect
+        the record that post-unlock cleanup acts on, and it is ``None`` when no
+        graph lock is held at all.
+        """
+        if self._graph_handle is None:
+            return None
+        return os.fstat(self._graph_handle)
+
+    @property
     def held(self) -> bool:
         return bool(self._handles) or self._graph_handle is not None
 
@@ -435,6 +449,44 @@ class MaintenanceStorageLocks:
         self._critical_sections = 0
         self.release()
         return False
+
+
+def remove_created_lock_entry(record: Mapping[str, Any]) -> bool:
+    """Remove exactly the lock entry a recorded run created, or refuse.
+
+    DETAIL 10.1 post-unlock cleanup. Cleanup may only take back what the run
+    itself created, so the record must say ``created`` and must carry the
+    ``(device, inode)`` the lock owner actually held open. The recorded identity
+    is compared against the entry through a pinned no-follow parent descriptor
+    and the entry is unlinked only when BOTH match: a replaced, re-created or
+    foreign entry is ``E_ARTIFACT_IDENTITY_CHANGED`` and stays exactly where it
+    is, because deleting the lock the next writer holds would split the lock, not
+    release it. An entry that is already gone reports ``False`` (nothing was
+    removed) instead of raising, and a record that does not claim creation is
+    ``E_LOCK_RELEASE_UNSAFE``.
+    """
+    if not isinstance(record, Mapping):
+        raise StorageLockError("E_LOCK_RELEASE_UNSAFE", "the cleanup record is not a mapping")
+    if not record.get("created"):
+        raise StorageLockError("E_LOCK_RELEASE_UNSAFE", "this run did not create the lock entry")
+    path = _lexical(Path(str(record.get("path") or "")))
+    device = record.get("device")
+    inode = record.get("inode")
+    if not path.name or not isinstance(device, int) or not isinstance(inode, int):
+        raise StorageLockError("E_LOCK_RELEASE_UNSAFE", "the cleanup record carries no lock entry identity")
+    with open_directory_nofollow(path.parent) as parent_fd:
+        try:
+            info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise _raise_oserror(exc) from exc
+        if (info.st_dev, info.st_ino) != (device, inode):
+            raise StorageLockError(
+                "E_ARTIFACT_IDENTITY_CHANGED", "the lock entry is not the one this run created"
+            )
+        os.unlink(path.name, dir_fd=parent_fd)
+    return True
 
 
 def inspect_existing_lock_readonly(root: Path) -> LockInspection:

@@ -2513,3 +2513,706 @@ def test_s204_fix1_a_live_upgraded_runtime_is_still_detected_after_a_lock_cycle(
         if proc.is_alive():
             proc.terminate()
     assert proc.exitcode == 0
+
+
+# ---------------------------------------------------------------------------
+# S2-05 -- immutable backup of regular artifacts and final legacy link entries
+#
+# DETAIL 9.1 / 10.1. PRE-FIX CLASSIFICATION OF THIS SECTION (filed with the RED
+# in S2-05_EVIDENCE):
+#
+# * ``test_s205_replacing_a_recorded_coordination_entry_is_plan_stale`` is the
+#   BEHAVIOURAL pre-fix node of the N1 pin. It drives only the already-approved
+#   public surface (``plan_profile_migration`` +
+#   ``validate_mutation_preconditions``) and fails at the parent commit because
+#   the replacement is ACCEPTED -- "DID NOT RAISE ValueError matching
+#   'E_PLAN_STALE'" -- where E_PLAN_STALE is required after the pin.
+# * ``test_s205_the_shared_streaming_digest_covers_bytes_beyond_64k`` is the
+#   BEHAVIOURAL node of the identity-digest contract: it exercises the real
+#   streaming reader over a real descriptor at the parent commit. It PASSES
+#   there (a guard, not a RED) and fails if an identity digest is ever replaced
+#   by the bounded 64 KiB reader (routing-matrix residual F7).
+# * ``test_s205_a_plan_recording_absent_coordination_entries_stays_fresh`` is the
+#   behavioural NEGATIVE CONTROL of the pin: a legitimate lock cycle must not
+#   read as a stale plan.
+# * every other node drives the backup stage, which the parent commit does not
+#   have AT ALL. Those are MISSING-CAPABILITY nodes: the tolerant accessors
+#   return None/{} so the pre-fix failure is an assertion, never a collection
+#   ImportError, a TypeError/KeyError from a helper, and never pytest.fail. The
+#   behavioural coverage of the same contract is the three nodes above plus the
+#   post-publication verification every backup node performs on real files.
+# ---------------------------------------------------------------------------
+
+S205_RUN_DIRECTORY_NAME = ".cmms-migrations"
+S205_BACKUP_NAME = "backup"
+S205_LINK_ENTRIES_NAME = "link-entries"
+S205_REPORT_NAME = "backup-report.json"
+
+
+def _s205_api(name: str) -> Any:
+    """The S2-05 callable, or None -- MISSING CAPABILITY, never behavioural proof."""
+    return getattr(profile_migration, name, None)
+
+
+def _s205_home(tmp_path: Path) -> tuple[Path, Path]:
+    """A synthetic profile: canonical SQL, a real graph file, a real vector tree."""
+    home = tmp_path / "home"
+    db_path = _s203_seed_canonical_db(home / "data" / "memory.db")
+    (home / "data" / "graph.json").write_bytes(b'{"graph": true}\n')
+    vector = home / "data" / "lancedb"
+    (vector / "nested").mkdir(parents=True)
+    (vector / "a.bin").write_bytes(b"A" * 4096)
+    (vector / "nested" / "b.bin").write_bytes(b"B" * 8192)
+    return home, db_path
+
+
+def _s205_backup(plan: Any) -> Any:
+    """create_run_backup(plan), or None when the capability does not exist."""
+    api = _s205_api("create_run_backup")
+    return api(plan) if api is not None else None
+
+
+def _s205_backup_artifact(plan: Any, label: str, path: Path) -> Any:
+    """backup_artifact(plan, label, path), or None when the capability is absent."""
+    api = _s205_api("backup_artifact")
+    return api(plan, label, path) if api is not None else None
+
+
+def _s205_entries(result: Any) -> dict[str, Any]:
+    """Backup entries keyed by artifact label; {} when the API is absent."""
+    return {
+        str(getattr(entry, "artifact", "")): entry
+        for entry in (getattr(result, "entries", None) or ())
+    }
+
+
+def _s205_field(item: Any, name: str, default: Any = None) -> Any:
+    """Tolerant field read: a missing result yields the default, never a KeyError."""
+    return getattr(item, name, default)
+
+
+def _s205_run_dir(home: Path, plan: Any) -> Path:
+    return home / S205_RUN_DIRECTORY_NAME / plan.request.run_id
+
+
+def _s205_file_sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _s205_mode(path: Path) -> int:
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+def _s205_legacy_home(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A profile whose vector store is a final symlink, as the live layout is."""
+    home, db_path = _s205_home(tmp_path)
+    external = tmp_path / "external-lancedb"
+    external.mkdir()
+    (external / "referent.bin").write_bytes(b"REFERENT")
+    vector = home / "data" / "lancedb"
+    import shutil as _shutil
+
+    _shutil.rmtree(vector)
+    vector.symlink_to(external, target_is_directory=True)
+    return home, db_path, external
+
+
+def _s205_legacy_plan(home: Path, db_path: Path):
+    """The approved S2-02 fixture request, extended with the apply fields."""
+    request = _s202_request(
+        home,
+        source_sql=db_path,
+        raw_config=_S202_CONFIG_BLOCK,
+        mode="apply",
+        confirm_target=str(home),
+        stop_attestation="maintenance-ticket",
+    )
+    return request, plan_profile_migration(request)
+
+
+def test_s205_replacing_a_recorded_coordination_entry_is_plan_stale(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """N1 pin: a coordination entry the plan recorded as PRESENT keeps its inode.
+
+    S2-04 excluded ``root_lock``/``graph_lock`` from ``_plan_identity_digest``
+    because the lock stage creates them and never unlinks them, so a legitimate
+    lock cycle must not read as a stale plan. That also stopped anything from
+    noticing that ``root_lock`` had been REPLACED by a different ordinary regular
+    file (``nlink == 1``), which the old digest refused. This node is the
+    behavioural pre-fix RED for the pin: at the parent commit the replacement is
+    accepted and the validation returns instead of refusing.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    root_lock = Path(plan.layout.root_lock_path)
+    assert plan.targets["root_lock"].kind == "absent"
+    assert not root_lock.exists()
+
+    _s204_fix1_lock_cycle(plan)
+    assert root_lock.is_file()
+    # A plan built AFTER the lock cycle records the entry as PRESENT.
+    planned = plan_profile_migration(request)
+    assert planned.blockers == ()
+    recorded = planned.targets["root_lock"]
+    assert recorded.kind == "regular_file"
+    assert (recorded.device, recorded.inode) == (
+        os.lstat(root_lock).st_dev,
+        os.lstat(root_lock).st_ino,
+    )
+
+    # The coordination entry is replaced by a DIFFERENT ordinary regular file.
+    # The replacement is created first and renamed over the entry, so the new
+    # inode is already allocated and the filesystem cannot hand back the freed
+    # one (an unlink-then-create can and did reuse it, which would make this
+    # node's premise, not its contract, the thing under test).
+    replacement_path = home / "replacement-coordination-entry"
+    replacement_path.write_bytes(b"replaced-coordination-entry\n")
+    os.replace(replacement_path, root_lock)
+    replacement = os.lstat(root_lock)
+    assert replacement.st_nlink == 1
+    assert replacement.st_ino != recorded.inode
+
+    with pytest.raises(ValueError, match="E_PLAN_STALE"):
+        profile_migration.validate_mutation_preconditions(request, plan=planned)
+
+
+def test_s205_the_same_coordination_inode_keeps_a_planned_plan_fresh(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """Negative control of the pin: a live lock re-acquisition is NOT drift.
+
+    The pin must confirm the inode only. Re-acquiring the lock touches the same
+    inode's size and mtime (the reason S2-04 removed the entries from the digest
+    in the first place), and that must stay fresh -- otherwise the pin would make
+    the lock stage and the freshness gate uncomposable again.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    _s204_fix1_lock_cycle(plan)
+    planned = plan_profile_migration(request)
+    root_lock = Path(planned.layout.root_lock_path)
+    recorded = planned.targets["root_lock"]
+    with root_lock.open("r+b") as handle:
+        handle.write(b"ticket")
+    after = os.lstat(root_lock)
+    assert after.st_ino == recorded.inode
+    assert (after.st_size, after.st_mtime_ns) != (recorded.size, recorded.mtime_ns)
+
+    preconditions = profile_migration.validate_mutation_preconditions(request, plan=planned)
+    assert preconditions.plan_digest == preconditions.replan_digest
+
+
+def test_s205_a_plan_recording_absent_coordination_entries_stays_fresh(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """Negative control: entries the plan recorded as ABSENT may appear later.
+
+    The lock stage of this same card creates them, so a plan built before the
+    lock cycle must stay fresh after it -- the behaviour S2-04 fix round 1
+    established, kept here as the pin's other negative control.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    assert plan.targets["root_lock"].kind == "absent"
+    assert plan.targets["graph_lock"].kind == "absent"
+    _s204_fix1_lock_cycle(plan)
+    assert Path(plan.layout.root_lock_path).exists()
+    assert Path(plan.layout.graph_lock_path).exists()
+
+    preconditions = profile_migration.validate_mutation_preconditions(request, plan=plan)
+    assert preconditions.plan_digest == preconditions.replan_digest
+
+
+def test_s205_regular_tree_backup_is_verified_byte_for_byte(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """DETAIL 10.1: the regular tree is copied, verified and never overwritten.
+
+    Every regular file entry must carry the source's SHA-256, mode, size and
+    identity, its published copy must be byte-identical and mode 0600, the
+    directory tree must be mirrored at 0700, the run must own a durable report,
+    and the source tree must be byte-identical afterwards.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    graph_source = Path(plan.layout.graph_snapshot_path)
+    vector_source = Path(plan.targets["vector"].lexical_path)
+    assert graph_source == home / "data" / "graph.json"
+    assert vector_source == home / "data" / "lancedb"
+    run_dir = _s205_run_dir(home, plan)
+    before = _tree_snapshot(home / "data")
+
+    result = _s205_backup(plan)
+
+    assert _s205_field(result, "run_dir") == str(run_dir)
+    assert _s205_field(result, "run_id") == plan.request.run_id
+    assert _s205_field(result, "report_path") == str(run_dir / S205_REPORT_NAME)
+    entries = _s205_entries(result)
+    assert entries, "no backup entry was recorded at all"
+    for entry in entries.values():
+        if _s205_field(entry, "kind") != "regular_file":
+            continue
+        source = Path(str(_s205_field(entry, "source_path")))
+        published = run_dir / str(_s205_field(entry, "run_relative_path"))
+        assert published.is_file()
+        assert published.read_bytes() == source.read_bytes()
+        assert _s205_file_sha(published) == _s205_field(entry, "sha256")
+        assert _s205_file_sha(source) == _s205_field(entry, "sha256")
+        assert _s205_field(entry, "size") == os.lstat(source).st_size
+        assert _s205_field(entry, "mode") == stat.S_IMODE(os.lstat(source).st_mode)
+        assert _s205_field(entry, "device") == os.lstat(source).st_dev
+        assert _s205_field(entry, "inode") == os.lstat(source).st_ino
+        assert _s205_field(entry, "present") is True
+        assert _s205_field(entry, "digest_scope") == "content"
+        assert _s205_mode(published) == 0o600
+    # The regular target file and the directory tree are both recorded.
+    graph_entry = entries.get("target:graph")
+    assert _s205_field(graph_entry, "sha256") == _s205_file_sha(graph_source)
+    tree_entry = entries.get("target:vector")
+    assert _s205_field(tree_entry, "kind") == "directory"
+    assert _s205_field(tree_entry, "digest_scope") == "listing"
+    assert re.fullmatch(r"[0-9a-f]{64}", str(_s205_field(tree_entry, "sha256")))
+    assert _s205_field(tree_entry, "device") == os.lstat(vector_source).st_dev
+    assert _s205_field(tree_entry, "inode") == os.lstat(vector_source).st_ino
+    assert _s205_mode(run_dir / S205_BACKUP_NAME) == 0o700
+    assert _s205_mode(run_dir / S205_BACKUP_NAME / "vector") == 0o700
+    assert _s205_mode(run_dir / S205_BACKUP_NAME / "vector" / "nested") == 0o700
+    assert (
+        run_dir / S205_BACKUP_NAME / "vector" / "nested" / "b.bin"
+    ).read_bytes() == (vector_source / "nested" / "b.bin").read_bytes()
+    assert "target:vector/nested/b.bin" in entries
+    # The durable report records every entry, the SQL record and the digest.
+    report_path = run_dir / S205_REPORT_NAME
+    assert report_path.is_file()
+    assert _s205_mode(report_path) == 0o600
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert len(report["entries"]) == len(entries)
+    assert re.fullmatch(r"[0-9a-f]{64}", report["digest"])
+    assert _s205_field(result, "digest") == report["digest"]
+    assert report["run_id"] == plan.request.run_id
+    assert report["sqlite"]["api"] == profile_migration.SNAPSHOT_API
+    assert report["sqlite"]["path"] == plan.source_sql.lexical_path
+    assert report["coordination"]["root_lock"]["kind"] == "absent"
+    assert report["graph_lock"]["created"] is False
+    # The source tree is byte-identical after the backup.
+    assert _tree_snapshot(home / "data") == before
+
+
+def test_s205_an_existing_run_backup_is_never_overwritten(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """DETAIL 10.1: never overwrite a backup and never reuse a run id."""
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    run_dir = _s205_run_dir(home, plan)
+
+    result = _s205_backup(plan)
+
+    published = run_dir / S205_BACKUP_NAME / "graph.json"
+    report_path = run_dir / S205_REPORT_NAME
+    assert published.is_file()
+    assert report_path.is_file()
+    published_before = published.read_bytes()
+    report_before = report_path.read_bytes()
+    assert _s205_field(result, "report_path") == str(report_path)
+
+    with pytest.raises(ValueError, match="E_BACKUP_COLLISION"):
+        _s205_backup(plan)
+
+    assert published.read_bytes() == published_before
+    assert report_path.read_bytes() == report_before
+
+
+def test_s205_interior_symlink_special_file_and_hardlink_are_refused(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """DETAIL 10.1: reject an interior symlink, a special file and a hard link.
+
+    Nothing may be published by a refused tree: the whole tree is staged and
+    verified before any published name exists, so the backup area stays absent
+    and the source tree stays byte-identical.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    vector_source = Path(plan.targets["vector"].lexical_path)
+    run_dir = _s205_run_dir(home, plan)
+    before = _tree_snapshot(home / "data")
+
+    (vector_source / "escape").symlink_to(home / "data" / "graph.json")
+    with pytest.raises(ValueError, match="E_PATH_FINAL_SYMLINK_UNSAFE"):
+        _s205_backup_artifact(plan, "target:vector", vector_source)
+    (vector_source / "escape").unlink()
+
+    os.mkfifo(vector_source / "pipe")
+    with pytest.raises(ValueError, match="E_PATH_SPECIAL_FILE"):
+        _s205_backup_artifact(plan, "target:vector", vector_source)
+    (vector_source / "pipe").unlink()
+
+    os.link(vector_source / "a.bin", vector_source / "a-link.bin")
+    assert os.lstat(vector_source / "a-link.bin").st_nlink == 2
+    with pytest.raises(ValueError, match="E_PATH_HARDLINK_UNSAFE"):
+        _s205_backup_artifact(plan, "target:vector", vector_source)
+    (vector_source / "a-link.bin").unlink()
+
+    assert not (run_dir / S205_BACKUP_NAME).exists()
+    assert _tree_snapshot(home / "data") == before
+
+
+def test_s205_a_final_legacy_symlink_is_backed_up_as_a_raw_link_entry(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """DETAIL 10.1: a final legacy symlink is its exact RAW link entry only.
+
+    The referent is never opened, enumerated, hashed, copied, modified or
+    validated as a store; an absent entry is recorded explicitly instead of
+    being silently skipped.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path, external = _s205_legacy_home(tmp_path)
+    request, plan = _s205_legacy_plan(home, db_path)
+    vector = home / "data" / "lancedb"
+    assert vector.is_symlink()
+    raw_target = os.readlink(vector)
+    legacy = [identity for identity in plan.legacy_projections if identity.kind == "symlink"]
+    assert [identity.lexical_path for identity in legacy] == [str(vector)]
+    assert [identity.raw_link_target for identity in legacy] == [raw_target]
+    referent_before = _tree_snapshot(external)
+    run_dir = _s205_run_dir(home, plan)
+
+    result = _s205_backup(plan)
+
+    entries = _s205_entries(result)
+    link_entries = [
+        entry for entry in entries.values() if _s205_field(entry, "kind") == "symlink"
+    ]
+    assert link_entries, "no link entry was recorded"
+    assert {_s205_field(entry, "raw_link_target") for entry in link_entries} == {raw_target}
+    for entry in link_entries:
+        assert _s205_field(entry, "present") is True
+        assert _s205_field(entry, "sha256") is None
+        assert _s205_field(entry, "digest_scope") == ""
+        published = run_dir / str(_s205_field(entry, "run_relative_path"))
+        assert published.is_symlink()
+        assert os.readlink(published) == raw_target
+        assert str(published).startswith(str(run_dir / S205_BACKUP_NAME / S205_LINK_ENTRIES_NAME))
+    # The referent was inventoried, never traversed, never copied.
+    assert _tree_snapshot(external) == referent_before
+    assert not (run_dir / S205_BACKUP_NAME / "vector").exists()
+
+    # An absent entry is recorded explicitly.
+    absent = _s205_backup_artifact(plan, "legacy:absent", home / "data" / "graph.json.legacy")
+    assert isinstance(absent, tuple)
+    absent_entry = _s205_entries(type("R", (), {"entries": absent})()).get("legacy:absent")
+    assert _s205_field(absent_entry, "present") is False
+    assert _s205_field(absent_entry, "kind") == "absent"
+    assert _s205_field(absent_entry, "run_relative_path") is None
+    assert _s205_field(absent_entry, "sha256") is None
+    assert not (run_dir / S205_BACKUP_NAME / S205_LINK_ENTRIES_NAME / "legacy-absent").exists()
+
+
+def test_s205_the_s2_03_source_snapshot_survives_the_backup_stage(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """DETAIL 10.1: the S2-03 safety snapshot is not rewritten by the backup."""
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    run_dir = _s205_run_dir(home, plan)
+
+    report, diagnostics = _s203_qualify(db_path, run_dir)
+    assert _s203_section(report, "snapshot", "created") is True, diagnostics
+    snapshot = run_dir / "snapshot" / "memory.db"
+    assert snapshot.is_file()
+    snapshot_before = snapshot.read_bytes()
+    stat_before = os.lstat(snapshot)
+
+    result = _s205_backup(plan)
+
+    assert _s205_field(result, "report_path") == str(run_dir / S205_REPORT_NAME)
+    stat_after = os.lstat(snapshot)
+    assert snapshot.read_bytes() == snapshot_before
+    assert (stat_after.st_ino, stat_after.st_size, stat_after.st_mtime_ns) == (
+        stat_before.st_ino,
+        stat_before.st_size,
+        stat_before.st_mtime_ns,
+    )
+    verified = json.loads((run_dir / S205_REPORT_NAME).read_text(encoding="utf-8"))
+    assert verified["sqlite"]["snapshot"]["kind"] == "regular_file"
+    assert verified["sqlite"]["snapshot"]["sha256"] == hashlib.sha256(snapshot_before).hexdigest()
+    assert profile_migration.verify_snapshot(snapshot)[0]["revision_accepted"] is True
+
+
+def test_s205_backup_identity_digest_changes_for_a_byte_beyond_64k(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """Acceptance 2 / residual F7: the backup identity digest is not 64 KiB-bounded.
+
+    A byte beyond the first 64 KiB must move the digest the backup records and
+    publishes, while the bounded 64 KiB reader cannot see it at all.
+    """
+    from memory_server.storage_lock import read_regular_file_nofollow
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    graph_source = home / "data" / "graph.json"
+    graph_source.write_bytes(b"G" * 200_000)
+    original = graph_source.read_bytes()
+    request, plan = _s204_planned_request(home, db_path)
+
+    first = _s205_backup(plan)
+    first_digest = _s205_field(_s205_entries(first).get("target:graph"), "sha256")
+    assert re.fullmatch(r"[0-9a-f]{64}", str(first_digest))
+    assert first_digest == hashlib.sha256(original).hexdigest()
+
+    with graph_source.open("r+b") as handle:
+        handle.seek(150_000)
+        handle.write(b"\xff")
+    mutated = graph_source.read_bytes()
+    assert mutated[:65536] == original[:65536]
+    assert mutated != original
+
+    second_plan = plan_profile_migration(replace(request, run_id="b" * 32))
+    second = _s205_backup(second_plan)
+    second_digest = _s205_field(_s205_entries(second).get("target:graph"), "sha256")
+    assert second_digest == hashlib.sha256(mutated).hexdigest()
+    assert second_digest != first_digest
+    second_run_dir = _s205_run_dir(home, second_plan)
+    assert (second_run_dir / S205_BACKUP_NAME / "graph.json").read_bytes() == mutated
+
+    # The bounded 64 KiB reader cannot see that byte at all (residual F7).
+    bounded = read_regular_file_nofollow(graph_source)
+    assert len(bounded) <= 65536
+    assert hashlib.sha256(bounded).hexdigest() == hashlib.sha256(original[:65536]).hexdigest()
+    assert hashlib.sha256(bounded).hexdigest() != second_digest
+
+
+def test_s205_the_shared_streaming_digest_covers_bytes_beyond_64k(tmp_path: Path) -> None:
+    """BEHAVIOURAL at the parent commit: the identity reader reads the whole file.
+
+    This is the behavioural node of the same identity contract the backup
+    records: the streaming, size-bounded, looped fd-relative read the backup
+    reuses must digest every byte, and the bounded 64 KiB reader must not.
+    """
+    from memory_server.storage_lock import read_regular_file_nofollow
+
+    path = tmp_path / "identity.bin"
+    path.write_bytes(b"S" * 200_000)
+    streamed = profile_migration._streamed_digest
+    with path.open("rb") as handle:
+        first, refusal = streamed(handle.fileno(), os.fstat(handle.fileno()), artifact="probe")
+    assert refusal is None
+    assert first == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    with path.open("r+b") as handle:
+        handle.seek(150_000)
+        handle.write(b"\x00")
+    with path.open("rb") as handle:
+        second, refusal = streamed(handle.fileno(), os.fstat(handle.fileno()), artifact="probe")
+    assert refusal is None
+    assert second == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert second != first
+
+    bounded = read_regular_file_nofollow(path)
+    assert len(bounded) <= 65536
+    assert hashlib.sha256(bounded).hexdigest() not in {first, second}
+
+
+def test_s205_an_injected_copy_failure_leaves_the_source_and_backup_intact(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evidence to clear: an injected COPY failure retains source and backup.
+
+    The failure is injected at the staged write of the run's own staging
+    directory. Nothing may appear under a published backup name, no report may be
+    written, and the source tree must be byte-identical: a failure can never
+    produce a partial backup or a target swap.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    run_dir = _s205_run_dir(home, plan)
+    before = _tree_snapshot(home / "data")
+    real_write = os.write
+
+    def _failing_write(descriptor: int, data: bytes) -> int:
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            target = ""
+        if "backup-tmp" in target:
+            raise OSError(errno.EIO, "injected copy failure")
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(os, "write", _failing_write)
+    try:
+        with pytest.raises(ValueError, match="E_BACKUP_VERIFY"):
+            _s205_backup(plan)
+    finally:
+        monkeypatch.undo()
+
+    assert _tree_snapshot(home / "data") == before
+    assert not (run_dir / S205_BACKUP_NAME).exists()
+    assert not (run_dir / S205_REPORT_NAME).exists()
+
+
+def test_s205_an_injected_fsync_failure_publishes_nothing(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evidence to clear: an injected FSYNC failure publishes no backup at all."""
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    run_dir = _s205_run_dir(home, plan)
+    before = _tree_snapshot(home / "data")
+    real_fsync = os.fsync
+
+    def _failing_fsync(descriptor: int) -> None:
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            target = ""
+        if "backup-tmp" in target:
+            raise OSError(errno.EIO, "injected fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", _failing_fsync)
+    try:
+        with pytest.raises(ValueError, match="E_BACKUP_VERIFY"):
+            _s205_backup(plan)
+    finally:
+        monkeypatch.undo()
+
+    assert _tree_snapshot(home / "data") == before
+    assert not (run_dir / S205_BACKUP_NAME).exists()
+    assert not (run_dir / S205_REPORT_NAME).exists()
+
+
+def test_s205_a_created_graph_lock_is_recorded_and_cleanup_removes_exactly_it(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """DETAIL 10.1: the graph lock inode is never replaced, and its creation is
+    recorded so post-unlock cleanup removes exactly what this run created."""
+    import memory_server.storage_lock as storage_lock_module
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    graph_lock = Path(plan.layout.graph_lock_path)
+    root_lock = Path(plan.layout.root_lock_path)
+    assert not graph_lock.exists()
+    run_dir = _s205_run_dir(home, plan)
+
+    locks = profile_migration.acquire_maintenance_locks(plan, timeout=2)
+    try:
+        recorded = _s205_api("graph_lock_creation_record")
+        record = recorded(plan, locks) if recorded is not None else {}
+        identity = getattr(locks, "graph_lock_identity", None)
+        assert identity is not None, "the lock owner cannot report its graph lock identity"
+        held = os.lstat(graph_lock)
+        assert (record.get("device"), record.get("inode")) == (held.st_dev, held.st_ino)
+        assert (record.get("device"), record.get("inode")) == (identity.st_dev, identity.st_ino)
+        assert record.get("created") is True
+        assert record.get("held") is True
+        assert record.get("path") == str(graph_lock)
+        create_locked = _s205_api("create_run_backup")
+        assert create_locked is not None
+        result = create_locked(plan, locks=locks)
+        assert _s205_field(result, "run_dir") == str(run_dir)
+    finally:
+        locks.release()
+
+    # The backup stage never replaces the lock inode it recorded.
+    assert os.lstat(graph_lock).st_ino == held.st_ino
+    report = json.loads((run_dir / S205_REPORT_NAME).read_text(encoding="utf-8"))
+    assert report["graph_lock"]["created"] is True
+    assert (report["graph_lock"]["device"], report["graph_lock"]["inode"]) == (
+        held.st_dev,
+        held.st_ino,
+    )
+    assert _s205_field(result, "graph_lock")["created"] is True
+
+    # Post-unlock cleanup removes exactly the entry this run created. The
+    # replacement entry is created while the original still exists, so its inode
+    # is guaranteed different: an inode freed by a preceding unlink can and does
+    # get handed straight back, which would make this premise, not the contract,
+    # the thing under test.
+    foreign = home / "foreign-lock-entry"
+    foreign.write_bytes(b"foreign\n")
+    assert os.lstat(foreign).st_ino != held.st_ino
+
+    remove = _s205_api("remove_created_lock_entry") or getattr(
+        storage_lock_module, "remove_created_lock_entry", None
+    )
+    assert remove is not None, "no identity-checked lock cleanup exists"
+    assert remove(report["graph_lock"]) is True
+    assert not graph_lock.exists()
+    assert root_lock.exists()
+
+    # A REPLACED entry is refused: cleanup can never delete a foreign lock.
+    os.replace(foreign, graph_lock)
+    assert os.lstat(graph_lock).st_ino != held.st_ino
+    with pytest.raises(storage_lock_module.StorageLockError) as replaced:
+        remove(report["graph_lock"])
+    assert replaced.value.code == "E_ARTIFACT_IDENTITY_CHANGED"
+    assert graph_lock.exists()
+    # A record that does not claim creation is refused too.
+    with pytest.raises(storage_lock_module.StorageLockError) as not_created:
+        remove(dict(report["graph_lock"], created=False))
+    assert not_created.value.code == "E_LOCK_RELEASE_UNSAFE"
+
+
+def test_s205_staging_and_publication_share_one_filesystem(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DETAIL 9.1: staging and publication must be on the source's filesystem.
+
+    The refusal is exercised directly (a real second filesystem is not available
+    under the sandbox), and the real backup call is spied on to prove it consults
+    the check with the RUN directory's device for every artifact it copies.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    run_dir = _s205_run_dir(home, plan)
+
+    check = _s205_api("_require_same_device")
+    assert check is not None, "no same-filesystem check exists"
+    run_device = os.lstat(plan.layout.data_root).st_dev
+    check(run_device, run_device, artifact="same-device control")
+    with pytest.raises(ValueError, match="E_CROSS_FILESYSTEM_PUBLICATION"):
+        check(run_device, run_device + 1, artifact="injected device mismatch")
+
+    calls: list[tuple[int, int, str]] = []
+    real = profile_migration._require_same_device
+
+    def _spy(run_device_arg: int, source_device_arg: int, *, artifact: str) -> None:
+        calls.append((run_device_arg, source_device_arg, artifact))
+        real(run_device_arg, source_device_arg, artifact=artifact)
+
+    monkeypatch.setattr(profile_migration, "_require_same_device", _spy)
+    result = _s205_backup(plan)
+
+    assert calls, "the backup never checked the filesystem of its sources"
+    assert all(run == source for run, source, _ in calls)
+    assert all(call_run == run_device for call_run, _, _ in calls)
+    assert _s205_field(result, "run_dir") == str(run_dir)
