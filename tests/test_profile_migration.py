@@ -19,9 +19,11 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, replace
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping, cast
 from urllib.parse import quote
@@ -6214,3 +6216,48 @@ async def test_s304_wrong_dimension_stays_resumable_without_graph(tmp_path: Path
     assert state["status"] == "resumable"
     assert state["count"] == 0
     assert not (tmp_path / "graph.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_s304_remote_backend_uses_local_fake_http_endpoint(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            size = int(self.headers["Content-Length"])
+            import json as _json
+            count = len(_json.loads(self.rfile.read(size))["input"])
+            body = _json.dumps({"data": [{"index": i, "embedding": [0.1] * 4} for i in range(count)]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: Any) -> None:
+            return
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    except PermissionError:
+        pytest.skip("certified sandbox denies local socket binding")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        from memory_server.providers.embedding_provider import OpenAIEmbeddingProvider
+        embedder = OpenAIEmbeddingProvider(base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-fake")
+        records = [record async for record in projection_rebuild.iter_canonical_projection_records(
+            f"sqlite+aiosqlite:///{db_path}", batch_size=4
+        )]
+        result = await projection_rebuild.rebuild_projections(
+            f"sqlite+aiosqlite:///{db_path}", staging_vector_path=tmp_path / "vectors",
+            staging_graph_path=tmp_path / "graph.json", embedder=embedder,
+            backend="remote", allow_network=True, vector_size=4, batch_size=4,
+            embedding_plan_digest=projection_rebuild.embedding_plan_digest(records),
+        )
+        assert result.plan.network is True
+        assert len(result.vector_ids) == 2
+    finally:
+        server.shutdown()
+        server.server_close()
