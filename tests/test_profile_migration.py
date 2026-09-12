@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, cast
 from urllib.parse import quote
+from uuid import NAMESPACE_DNS, uuid5
 
 import pytest
 
@@ -111,7 +112,7 @@ def test_s301_mapping_is_order_independent_for_ids_types_and_edge_digest() -> No
 def test_s301_exact_vector_mapping() -> None:
     mapped = projection_rebuild.map_projection_record(_s301_records()[-1])
     assert mapped.vector_text == "Widget uses Caddy"
-    assert mapped.point_id == projection_rebuild.deterministic_vector_id("fact", "f1")
+    assert mapped.point_id == str(uuid5(NAMESPACE_DNS, "fact:f1"))
     assert mapped.payload == {
         "subject": "Widget", "predicate": "uses", "object": "Caddy",
         "source": "s", "memory_type": "fact",
@@ -125,7 +126,7 @@ def test_s301_belief_mapping_has_vector_payload_and_no_graph_projection() -> Non
     })
     mapped = projection_rebuild.map_projection_record(record)
     assert mapped.vector_text == "Sky is blue"
-    assert mapped.point_id == projection_rebuild.deterministic_vector_id("belief", "b1")
+    assert mapped.point_id == str(uuid5(NAMESPACE_DNS, "belief:b1"))
     assert set(mapped.payload) == {"proposition", "confidence", "tags", "source", "memory_type"}
     graph = projection_rebuild.build_shared_projection_graph([record])
     assert all(node.type != "belief" for node in graph.get_all_nodes())
@@ -175,15 +176,83 @@ async def test_s301_iterator_is_ordered_bounded_and_read_only(tmp_path: Path) ->
     assert [(record.record_type, record.record_id) for record in records] == [
         ("belief", "b1"), ("decision", "d1"), ("fact", "f1"), ("skill", "s1")
     ]
-    connection = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
-    try:
-        with pytest.raises(sqlite3.OperationalError):
-            connection.execute("CREATE TABLE forbidden (id TEXT)")
-    finally:
-        connection.close()
     with pytest.raises(ValueError, match="batch_size must be positive"):
         async for _ in projection_rebuild.iter_canonical_projection_records(url, batch_size=0):
             pass
+
+
+@pytest.mark.asyncio
+async def test_s301_iterator_uses_plain_ro_for_wal_and_preserves_committed_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "wal-snapshot.db"
+    _seed_s301_snapshot(db_path)
+    writer = sqlite3.connect(db_path)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("INSERT INTO facts VALUES ('f2', 'A', 'has', 'WAL', 's', 'active')")
+    writer.commit()
+    assert (db_path.parent / f"{db_path.name}-wal").lstat().st_size > 0
+
+    captured: list[str] = []
+    real_create = projection_rebuild.create_async_engine
+
+    def capture_engine(url: str, **kwargs):
+        captured.append(url)
+        return real_create(url, **kwargs)
+
+    monkeypatch.setattr(projection_rebuild, "create_async_engine", capture_engine)
+    records = [record async for record in projection_rebuild.iter_canonical_projection_records(
+        f"sqlite+aiosqlite:///{db_path}", batch_size=10
+    )]
+    assert [(record.record_type, record.record_id) for record in records] == [
+        ("belief", "b1"), ("decision", "d1"), ("fact", "f1"), ("fact", "f2"), ("skill", "s1")
+    ]
+    assert len(captured) == 1
+    assert "mode=ro" in captured[0]
+    assert "immutable=1" not in captured[0]
+    ro_engine = real_create(captured[0])
+    try:
+        async with ro_engine.connect() as conn:
+            with pytest.raises(Exception, match="readonly|read-only"):
+                await conn.run_sync(lambda sync: sync.exec_driver_sql("CREATE TABLE forbidden (id TEXT)"))
+    finally:
+        await ro_engine.dispose()
+        writer.close()
+
+
+@pytest.mark.asyncio
+async def test_s301_iterator_query_url_is_rewritten_without_corrupting_query(tmp_path: Path) -> None:
+    db_path = tmp_path / "query-snapshot.db"
+    _seed_s301_snapshot(db_path)
+    records = [record async for record in projection_rebuild.iter_canonical_projection_records(
+        f"sqlite+aiosqlite:///{db_path}?timeout=5", batch_size=10
+    )]
+    assert [(record.record_type, record.record_id) for record in records] == [
+        ("belief", "b1"), ("decision", "d1"), ("fact", "f1"), ("skill", "s1")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_s301_iterator_uses_immutable_fast_path_without_sidecars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "clean-snapshot.db"
+    _seed_s301_snapshot(db_path)
+    captured: list[str] = []
+    real_create = projection_rebuild.create_async_engine
+
+    def capture_engine(url: str, **kwargs):
+        captured.append(url)
+        return real_create(url, **kwargs)
+
+    monkeypatch.setattr(projection_rebuild, "create_async_engine", capture_engine)
+    records = [record async for record in projection_rebuild.iter_canonical_projection_records(
+        f"sqlite+aiosqlite:///{db_path}", batch_size=10
+    )]
+    assert len(records) == 4
+    assert len(captured) == 1
+    assert "mode=ro" in captured[0]
+    assert "immutable=1" in captured[0]
 
 
 def test_s301_rebuild_matches_real_graph_router_fact_path() -> None:
