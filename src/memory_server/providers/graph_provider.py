@@ -33,6 +33,7 @@ Windows) — stdlib only, so the package gains no new dependency.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -55,6 +56,7 @@ except ImportError:  # pragma: no cover - Windows
 # How long a writer/reader waits for the inter-process snapshot lock before
 # giving up (writes are skipped with an error log; a crash releases flock).
 GRAPH_LOCK_TIMEOUT = float(os.environ.get("MEMORY_GRAPH_LOCK_TIMEOUT", "30"))
+_MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 
 
 @dataclass
@@ -77,8 +79,18 @@ class GraphEdge:
     attributes: dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Inter-process lock helpers (stdlib only).
+@dataclass(frozen=True)
+class GraphValidation:
+    """Result of validating a graph snapshot without opening a graph."""
+
+    valid: bool
+    node_count: int = 0
+    edge_count: int = 0
+    node_digest: str = ""
+    edge_digest: str = ""
+    error: str | None = None
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -737,6 +749,49 @@ class SimpleGraph:
                     self._write_snapshot(snapshot_path)
         except Exception:
             logger.exception("Failed to export graph snapshot to %s", snapshot_path)
+
+    @classmethod
+    def validate_snapshot(cls, path: Path) -> GraphValidation:
+        """Validate a snapshot with bounded, no-follow, read-only I/O."""
+        snapshot_path = Path(path).absolute()
+        try:
+            for parent in reversed(snapshot_path.parents):
+                if parent.is_symlink():
+                    raise ValueError(f"{snapshot_path}: symlink parent is not allowed")
+            file_info = snapshot_path.lstat()
+            if file_info.st_size > _MAX_SNAPSHOT_BYTES:
+                raise ValueError(f"{snapshot_path}: exceeds maximum snapshot size of {_MAX_SNAPSHOT_BYTES} bytes")
+            if not snapshot_path.is_file():
+                raise ValueError(f"{snapshot_path}: snapshot is not a regular file")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            with os.fdopen(os.open(snapshot_path, flags), "rb") as stream:
+                raw = stream.read(_MAX_SNAPSHOT_BYTES + 1)
+            if len(raw) > _MAX_SNAPSHOT_BYTES:
+                raise ValueError(f"{snapshot_path}: exceeds maximum snapshot size of {_MAX_SNAPSHOT_BYTES} bytes")
+            data = json.loads(raw.decode("utf-8"))
+            nodes, edges = cls._build_state_from(data)
+            node_parts = [
+                json.dumps({"id": node.id, "type": node.type, "name": node.name, "attributes": node.attributes},
+                           sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                for node in sorted(nodes.values(), key=lambda item: item.id)
+            ]
+            edge_values = [edge for targets in edges.values() for edge_list in targets.values() for edge in edge_list]
+            edge_parts = [
+                json.dumps({"source_id": edge.source_id, "target_id": edge.target_id,
+                            "relation": edge.relation, "attributes": edge.attributes},
+                           sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                for edge in sorted(edge_values, key=lambda item: (item.source_id, item.target_id, item.relation,
+                                                                    json.dumps(item.attributes, sort_keys=True)))
+            ]
+            return GraphValidation(
+                valid=True,
+                node_count=len(nodes),
+                edge_count=len(edge_values),
+                node_digest=hashlib.sha256(b"".join(node_parts)).hexdigest(),
+                edge_digest=hashlib.sha256(b"".join(edge_parts)).hexdigest(),
+            )
+        except Exception as exc:
+            return GraphValidation(valid=False, error=str(exc))
 
     def _read_state_file(self, snapshot_path: Path) -> tuple[dict, dict]:
         """Read and fully validate a snapshot file.

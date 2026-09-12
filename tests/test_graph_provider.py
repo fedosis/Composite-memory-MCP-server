@@ -1,11 +1,12 @@
 """Tests for in-memory graph engine (Card 017)."""
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
-from memory_server.providers.graph_provider import SimpleGraph
+from memory_server.providers.graph_provider import GraphValidation, SimpleGraph
 from memory_server.router.graph_router import GraphRouter
 
 
@@ -635,5 +636,130 @@ class TestConcurrentWriteCost:
         assert len(reopened.to_dict()["edges"]) == 1500
         # Generous bound: correctness is the point, this only guards against
         # accidental quadratic blowups from per-write full-file rewrites.
+        assert elapsed < 120
         assert elapsed < 30.0, f"batch ingest took {elapsed:.2f}s"
         print(f"\n[cost] 1500 facts / 3000 nodes batch ingest: {elapsed:.3f}s")
+
+
+class TestSnapshotValidationHook:
+    """The staging hook validates snapshots without opening a live graph."""
+
+    @staticmethod
+    def _valid_payload():
+        return {
+            "nodes": {
+                "b": {"id": "b", "type": "thing", "name": "B", "attributes": {"z": 2}},
+                "a": {"id": "a", "type": "thing", "name": "A", "attributes": {"x": 1}},
+            },
+            "edges": [
+                {"source_id": "a", "target_id": "b", "relation": "links", "attributes": {"k": "v"}}
+            ],
+        }
+
+    @staticmethod
+    def _listing(path):
+        return sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in path.iterdir())
+
+    @staticmethod
+    def _independent_digests(payload):
+        nodes = []
+        for node_id, node in sorted(payload["nodes"].items()):
+            nodes.append(json.dumps({
+                "id": node.get("id", node_id), "type": node.get("type", ""),
+                "name": node.get("name", ""), "attributes": node.get("attributes", {}),
+            }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
+        def edge_keys(edge):
+            return (
+                edge.get("source_id", ""), edge.get("target_id", ""), edge.get("relation", ""),
+                json.dumps(edge.get("attributes", {}), sort_keys=True),
+            )
+        edges = [json.dumps(edge, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+                 for edge in sorted(payload["edges"], key=edge_keys)]
+        return (
+            hashlib.sha256(b"".join(nodes)).hexdigest(),
+            hashlib.sha256(b"".join(edges)).hexdigest(),
+        )
+
+    def test_valid_snapshot_reports_counts_and_literal_digests(self, tmp_path):
+        payload = self._valid_payload()
+        path = tmp_path / "valid.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        before = self._listing(tmp_path)
+        result = SimpleGraph.validate_snapshot(path)
+        after = self._listing(tmp_path)
+        node_digest, edge_digest = self._independent_digests(payload)
+        assert isinstance(result, GraphValidation)
+        assert result.valid is True
+        assert (result.node_count, result.edge_count) == (2, 1)
+        assert (result.node_digest, result.edge_digest) == (node_digest, edge_digest)
+        assert path.read_bytes() == json.dumps(payload).encode()
+        assert after == before
+
+    @pytest.mark.parametrize("payload, cause", [
+        (None, "Expecting value"),
+        ({"nodes": ["bad"], "edges": []}, "'nodes' must be a dict"),
+        ({"nodes": {"a": {"id": 1}}, "edges": []}, "invalid id"),
+        ({"nodes": {}, "edges": [{"source_id": "a", "target_id": "b"}]}, "source node"),
+    ])
+    def test_invalid_payload_reports_cause_and_preserves_directory(self, tmp_path, payload, cause):
+        path = tmp_path / "invalid.json"
+        path.write_text("not-json" if payload is None else json.dumps(payload), encoding="utf-8")
+        before_bytes, before_listing = path.read_bytes(), self._listing(tmp_path)
+        result = SimpleGraph.validate_snapshot(path)
+        assert result.valid is False
+        assert cause in result.error
+        assert path.read_bytes() == before_bytes
+        assert self._listing(tmp_path) == before_listing
+
+    def test_missing_snapshot_is_refused_not_empty(self, tmp_path):
+        result = SimpleGraph.validate_snapshot(tmp_path / "missing.json")
+        assert result.valid is False
+        assert result.error is not None
+        assert "No such file or directory" in result.error
+        assert self._listing(tmp_path) == []
+
+    def test_orphan_edge_is_rejected_by_build_state_from(self, tmp_path):
+        payload = {"nodes": {"a": {"id": "a"}}, "edges": [{"source_id": "a", "target_id": "missing"}]}
+        path = tmp_path / "orphan.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        result = SimpleGraph.validate_snapshot(path)
+        assert result.valid is False
+        assert "target node 'missing' not present" in result.error
+
+    def test_snapshot_symlink_is_not_followed(self, tmp_path):
+        target = tmp_path / "target.json"
+        target.write_text(json.dumps(self._valid_payload()), encoding="utf-8")
+        link = tmp_path / "link.json"
+        link.symlink_to(target)
+        before = self._listing(tmp_path)
+        result = SimpleGraph.validate_snapshot(link)
+        assert result.valid is False
+        assert "symlink" in result.error
+        assert self._listing(tmp_path) == before
+
+    def test_symlinked_parent_is_not_followed(self, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        path = real / "snapshot.json"
+        path.write_text(json.dumps(self._valid_payload()), encoding="utf-8")
+        parent_link = tmp_path / "parent"
+        parent_link.symlink_to(real, target_is_directory=True)
+        result = SimpleGraph.validate_snapshot(parent_link / "snapshot.json")
+        assert result.valid is False
+        assert "symlink" in result.error
+
+    def test_oversized_snapshot_is_refused_at_bound(self, tmp_path):
+        path = tmp_path / "large.json"
+        path.write_bytes(b"{" + b" " * (8 * 1024 * 1024) + b"}")
+        result = SimpleGraph.validate_snapshot(path)
+        assert result.valid is False
+        assert "maximum snapshot size" in result.error
+        assert self._listing(tmp_path) == [("large.json", path.stat().st_size, path.stat().st_mtime_ns)]
+
+    def test_hook_has_no_live_graph_or_journal_side_effects(self, tmp_path):
+        path = tmp_path / "valid.json"
+        path.write_text(json.dumps(self._valid_payload()), encoding="utf-8")
+        before = self._listing(tmp_path)
+        assert SimpleGraph.validate_snapshot(path).valid
+        assert self._listing(tmp_path) == before
+        assert not any(p.name.endswith(".lock") or p.name.endswith(".tmp") for p in tmp_path.iterdir())
