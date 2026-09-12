@@ -4,10 +4,8 @@ The planner is deliberately side-effect free. Mutating operations require
 explicit confirmation and a stop attestation and only operate on
 synthetic/operator roots.
 
-Slice S0 keeps the guard-level seam only: backup, staging, publication,
-resume and rollback bodies are implemented and contract-tested in a later
-slice, so ``apply_profile_migration`` stops after the lock/checkpoint guard and
-does not move any artifact.
+Slice S0 exposes planning only. Mutating entrypoints refuse until the later
+engine slices provide backup, staging, publication, resume and rollback.
 """
 from __future__ import annotations
 
@@ -26,7 +24,6 @@ from memory_server.paths import (
     classify_artifact_nofollow,
     resolve_storage_layout,
 )
-from memory_server.storage_lock import MaintenanceStorageLocks
 
 MigrationStrategy = Literal["rebuild-from-profile-sql"]
 MigrationMode = Literal["dry-run", "apply", "resume", "rollback"]
@@ -168,6 +165,8 @@ def _digest(obj: Any) -> str:
 
 def plan_profile_migration(request: MigrationRequest) -> MigrationPlan:
     """Build a strictly read-only migration plan."""
+    if request.mode not in {"dry-run", "apply", "resume", "rollback"}:
+        raise ValueError("E_INVALID_MODE")
     source = Path(request.source_sql or Path(request.profile_home) / "data/memory.db")
     root = Path(request.target_root or request.profile_home)
     layout = resolve_storage_layout(
@@ -243,53 +242,28 @@ def _write_manifest(path: Path, manifest: MigrationManifest) -> None:
     os.replace(tmp, path)
 
 
-def apply_profile_migration(plan: MigrationPlan) -> MigrationManifest:
-    """Guard-level apply: confirmations, then lock/checkpoint only.
-
-    Slice S0 performs NO backup, staging or publication; it validates intent and
-    the target lock path so the caller cannot mistake this for a completed
-    migration. The full state machine lands in a later slice.
-    """
-    request = plan.request
-    if request.confirm_target != str(plan.layout.data_root):
+def _require_mutation_preconditions(
+    request: MigrationRequest, plan: MigrationPlan | None = None
+) -> None:
+    if request.confirm_target != str(plan.layout.data_root if plan else request.profile_home):
         raise ValueError("E_CONFIRM_TARGET_MISMATCH")
     if not request.stop_attestation:
         raise ValueError("E_STOP_ATTESTATION_REQUIRED")
-    if plan.blockers:
+    if request.mode == "dry-run":
+        raise ValueError("E_APPLY_MODE_REQUIRED")
+    if plan is not None:
+        if not request.embedding_plan_digest:
+            raise ValueError("E_EMBEDDING_PLAN_DIGEST_REQUIRED")
+        if request.embedding_plan_digest != plan.embedding.digest:
+            raise ValueError("E_EMBEDDING_PLAN_STALE")
+    if plan is not None and plan.blockers:
         raise ValueError(plan.blockers[0].code)
-    run_dir = plan.layout.data_root / ".cmms-migrations" / request.run_id
-    if run_dir.exists():
-        raise ValueError("E_BACKUP_COLLISION")
-    run_dir.mkdir(parents=True, mode=0o700)
-    (run_dir / "backup").mkdir()
-    (run_dir / "staging").mkdir()
-    manifest = MigrationManifest(
-        schema_version=1,
-        run_id=request.run_id,
-        strategy=request.strategy,
-        checkpoint="planned",
-        status="running",
-        source_identity=plan.source_sql,
-        target_identities_before=plan.targets,
-        config_digest=plan.config_digest,
-        runtime_stop_attestation={"value": request.stop_attestation},
-        artifacts={},
-        embedding=asdict(plan.embedding),
-    )
-    manifest_path = run_dir / "manifest.json"
-    _write_manifest(manifest_path, manifest)
-    locks = MaintenanceStorageLocks.acquire([plan.layout.data_root])
-    try:
-        manifest.checkpoint = "locked"
-        manifest.completed_steps.append("locked")
-        _write_manifest(manifest_path, manifest)
-    finally:
-        locks.release()
-    manifest.status = "complete"
-    manifest.checkpoint = "complete"
-    manifest.completed_steps.append("planned-only-safe-implementation")
-    _write_manifest(manifest_path, manifest)
-    return manifest
+
+
+def apply_profile_migration(plan: MigrationPlan) -> MigrationManifest:
+    """Reject apply until the migration engine is implemented."""
+    _require_mutation_preconditions(plan.request, plan)
+    raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
 
 
 def load_manifest(path: Path) -> MigrationManifest:
@@ -307,16 +281,14 @@ def append_manifest_event(path: Path, event: Mapping[str, Any]) -> MigrationMani
 def resume_profile_migration(
     manifest_path: Path, request: MigrationRequest
 ) -> MigrationManifest:
-    """Slice S0: reload only; resume preconditions/continuation land later."""
-    return load_manifest(manifest_path)
+    """Reject resume until continuation is implemented."""
+    _require_mutation_preconditions(request)
+    raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
 
 
 def rollback_profile_migration(
     manifest_path: Path, request: MigrationRequest
 ) -> MigrationManifest:
-    """Slice S0: status flip only; restore/quarantine land later."""
-    manifest = load_manifest(manifest_path)
-    manifest.status = "rolled_back"
-    manifest.completed_steps.append("rollback.verified")
-    _write_manifest(manifest_path, manifest)
-    return manifest
+    """Reject rollback until restore/quarantine is implemented."""
+    _require_mutation_preconditions(request)
+    raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
