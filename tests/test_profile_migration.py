@@ -6073,3 +6073,144 @@ def test_s208_fix1_an_unrecorded_file_added_to_the_backup_is_refused_before_anyt
     assert "E_ROLLBACK_IDENTITY_MISSING" in str(outcome), f"the refusal is not cause-specific: {outcome!r}"
     assert _s208_failed_current(run_dir) == [], "the refusal happened AFTER something moved"
     assert _s208_tree(target) == state["published"]["vector"], "the published entry was disturbed"
+
+
+class _CountingEmbedder:
+    def __init__(self, dimension: int = 4, fail: BaseException | None = None) -> None:
+        self.dimension = dimension
+        self.fail = fail
+        self.calls = 0
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        if self.fail is not None:
+            raise self.fail
+        return [[float(index + 1)] * self.dimension for index, _ in enumerate(texts)]
+
+
+@pytest.mark.asyncio
+async def test_s304_dry_run_is_embedder_free_and_digest_is_independent(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+    embedder = _CountingEmbedder()
+    report = await projection_rebuild.rebuild_projections(
+        f"sqlite+aiosqlite:///{db_path}",
+        staging_vector_path=tmp_path / "vectors",
+        staging_graph_path=tmp_path / "graph.json",
+        embedder=embedder,
+        vector_size=4,
+        batch_size=2,
+        dry_run=True,
+    )
+    assert report.plan.backend == "local"
+    assert report.plan.eligible_records == 4
+    assert report.plan.batches == 2
+    assert report.plan.digest == hashlib.sha256("belief:b1\ndecision:d1\nfact:f1\nskill:s1".encode()).hexdigest()
+    assert embedder.calls == 0
+    assert not (tmp_path / "vectors").exists()
+    assert not (tmp_path / "graph.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_s304_real_sqlite_lancedb_graph_and_checkpoint_resume(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+    embedder = _CountingEmbedder()
+    checkpoint = tmp_path / "checkpoint.json"
+    result = await projection_rebuild.rebuild_projections(
+        f"sqlite+aiosqlite:///{db_path}",
+        staging_vector_path=tmp_path / "vectors",
+        staging_graph_path=tmp_path / "graph.json",
+        embedder=embedder,
+        vector_size=4,
+        batch_size=2,
+        checkpoint_path=checkpoint,
+        embedding_plan_digest=projection_rebuild.embedding_plan_digest(
+            [record async for record in projection_rebuild.iter_canonical_projection_records(
+                f"sqlite+aiosqlite:///{db_path}", batch_size=2
+            )]
+        ),
+    )
+    assert result.completed_batches == 2
+    state = json.loads(checkpoint.read_text())
+    assert state["last_completed_key"] == ["skill", "s1"]
+    assert state["count"] == 4
+    assert state["id_digest"] == hashlib.sha256("belief:b1\ndecision:d1\nfact:f1\nskill:s1".encode()).hexdigest()
+    assert set(result.vector_ids) == {str(uuid5(NAMESPACE_DNS, "fact:f1")), str(uuid5(NAMESPACE_DNS, "belief:b1"))}
+    resumed = await projection_rebuild.rebuild_projections(
+        f"sqlite+aiosqlite:///{db_path}",
+        staging_vector_path=tmp_path / "vectors",
+        staging_graph_path=tmp_path / "graph.json",
+        embedder=embedder,
+        vector_size=4,
+        batch_size=2,
+        checkpoint_path=checkpoint,
+        resume=True,
+        embedding_plan_digest=result.plan.digest,
+    )
+    assert resumed.vector_ids == result.vector_ids
+    assert resumed.graph_nodes_digest == result.graph_nodes_digest
+    assert resumed.graph_edges_digest == result.graph_edges_digest
+
+
+@pytest.mark.asyncio
+async def test_s304_plan_drift_and_backend_failure_are_resumable(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+    checkpoint = tmp_path / "checkpoint.json"
+    with pytest.raises(ValueError, match="E_EMBEDDING_PLAN_STALE"):
+        await projection_rebuild.rebuild_projections(
+            f"sqlite+aiosqlite:///{db_path}", staging_vector_path=tmp_path / "vectors",
+            staging_graph_path=tmp_path / "graph.json", embedder=_CountingEmbedder(),
+            vector_size=4, batch_size=2, checkpoint_path=checkpoint,
+            embedding_plan_digest="0" * 64,
+        )
+    embedder = _CountingEmbedder(fail=RuntimeError("quota"))
+    with pytest.raises(RuntimeError, match="quota"):
+        await projection_rebuild.rebuild_projections(
+            f"sqlite+aiosqlite:///{db_path}", staging_vector_path=tmp_path / "vectors",
+            staging_graph_path=tmp_path / "graph.json", embedder=embedder,
+            vector_size=4, batch_size=2, checkpoint_path=checkpoint,
+            embedding_plan_digest=projection_rebuild.embedding_plan_digest(
+                [record async for record in projection_rebuild.iter_canonical_projection_records(
+                    f"sqlite+aiosqlite:///{db_path}", batch_size=2
+                )]
+            ),
+        )
+    state = json.loads(checkpoint.read_text())
+    assert state["status"] == "resumable"
+    assert state["count"] == 0
+    assert not (tmp_path / "graph.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_s304_remote_backend_requires_explicit_allow_network(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+    with pytest.raises(PermissionError, match="allow-network"):
+        await projection_rebuild.rebuild_projections(
+            f"sqlite+aiosqlite:///{db_path}", staging_vector_path=tmp_path / "vectors",
+            staging_graph_path=tmp_path / "graph.json", embedder=_CountingEmbedder(),
+            backend="remote", allow_network=False, dry_run=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_s304_wrong_dimension_stays_resumable_without_graph(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+    checkpoint = tmp_path / "checkpoint.json"
+    records = [record async for record in projection_rebuild.iter_canonical_projection_records(
+        f"sqlite+aiosqlite:///{db_path}", batch_size=2
+    )]
+    with pytest.raises(ValueError, match="E_EMBEDDING_DIMENSION"):
+        await projection_rebuild.rebuild_projections(
+            f"sqlite+aiosqlite:///{db_path}", staging_vector_path=tmp_path / "vectors",
+            staging_graph_path=tmp_path / "graph.json", embedder=_CountingEmbedder(dimension=3),
+            vector_size=4, batch_size=2, checkpoint_path=checkpoint,
+            embedding_plan_digest=projection_rebuild.embedding_plan_digest(records),
+        )
+    state = json.loads(checkpoint.read_text())
+    assert state["status"] == "resumable"
+    assert state["count"] == 0
+    assert not (tmp_path / "graph.json").exists()
