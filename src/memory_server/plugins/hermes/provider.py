@@ -21,7 +21,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from memory_server.paths import StorageLayout, StorageLayoutError
+from memory_server.paths import (
+    StorageLayout,
+    StorageLayoutError,
+    serialize_layout_redacted,
+    validate_write_target,
+)
 from memory_server.plugins.hermes.config import HermesPluginConfig
 from memory_server.plugins.hermes.llm_factory import (
     LLMExtractorFn,
@@ -33,7 +38,7 @@ from memory_server.plugins.hermes.resolver import (
 )
 from memory_server.plugins.hermes.writer import WriterQueue
 from memory_server.settings import get_openai_api_key, get_settings
-from memory_server.storage_lock import RuntimeStorageLock
+from memory_server.storage_lock import RuntimeStorageLock, open_directory_nofollow
 
 logger = logging.getLogger(__name__)
 
@@ -96,18 +101,32 @@ def _supports_background_outbox(db_url: str) -> bool:
 
 
 def _resolve_cmms_data_path(
-    provider: "HermesProvider",
-    relative_path: str,
-    *,
-    env_var: str | None = None,
+    provider: "HermesProvider", relative_path: str, *, env_var: str | None = None,
 ) -> Path:
-    if provider._storage_layout is None:
+    """Deprecated lookup shim: only known frozen members, never a path join."""
+    layout = provider._storage_layout
+    if layout is None:
         raise RuntimeError("storage layout is not initialized")
-    if relative_path == str(get_settings().graph_snapshot_path):
-        return provider._storage_layout.graph_snapshot_path
-    if relative_path == str(get_settings().lancedb_path):
-        return provider._storage_layout.vector.local_path
-    return provider._storage_layout.data_root / relative_path
+    cfg = provider._config
+    graph_names = {"data/graph.json", str(layout.graph_snapshot_path)}
+    vector_names = {"data/lancedb", str(layout.vector.local_path)}
+    if cfg is not None:
+        graph_names.add(str(cfg.graph_snapshot_path))
+        vector_names.add(str(cfg.lancedb_path))
+    if env_var in {"MEMORY_SERVER_GRAPH_SNAPSHOT_PATH", "MEMORY_GRAPH_SNAPSHOT_PATH"} or relative_path in graph_names:
+        return layout.graph_snapshot_path
+    if relative_path in vector_names and layout.vector.local_path is not None:
+        return layout.vector.local_path
+    raise ValueError("unknown frozen storage member")
+
+
+def _prepare_store_path(provider: "HermesProvider", path: Path) -> None:
+    layout = provider._storage_layout
+    if layout is None:
+        raise RuntimeError("storage layout is not initialized")
+    validate_write_target(layout, path)
+    with open_directory_nofollow(path.parent, create=True):
+        validate_write_target(layout, path)
 
 
 async def _get_graph(provider: "HermesProvider"):
@@ -119,10 +138,9 @@ async def _get_graph(provider: "HermesProvider"):
     if "graph" in provider._storage_layout.unavailable_projections:
         raise RuntimeError("E_PROJECTION_UNAVAILABLE: graph requires migration")
     if provider._graph is None:
-        snapshot_path = _resolve_cmms_data_path(
-            provider,
-            str(get_settings().graph_snapshot_path),
-        )
+        snapshot_path = provider._storage_layout.graph_snapshot_path
+        _prepare_store_path(provider, snapshot_path)
+        validate_write_target(provider._storage_layout, provider._storage_layout.graph_lock_path)
         provider._graph = SimpleGraph(snapshot_path=snapshot_path)
         provider._graph.load_snapshot()
     return provider._graph
@@ -143,12 +161,12 @@ async def _get_vector_provider(provider: "HermesProvider"):
             # Persistent Qdrant only when a host URL is configured; otherwise
             # fall back to in-memory (parity with the MCP server path, where
             # indexes are process-local by default).
-            settings = get_settings()
+            settings = provider._settings
             provider._qdrant = QdrantProvider(
-                location=settings.qdrant_location,
+                location=provider._storage_layout.vector.qdrant_location,
                 port=settings.qdrant_port,
                 prefer_grpc=settings.qdrant_prefer_grpc,
-                collection=settings.vector_collection,
+                collection=provider._storage_layout.vector.collection,
                 vector_size=settings.vector_size,
                 distance=settings.vector_metric,
             )
@@ -157,13 +175,14 @@ async def _get_vector_provider(provider: "HermesProvider"):
     if provider._lancedb is None:
         from memory_server.providers.lancedb_provider import LanceDBProvider
 
-        settings = get_settings()
+        settings = provider._settings
         db_path = provider._storage_layout.vector.local_path
         if db_path is None:
             raise RuntimeError("E_PROJECTION_UNAVAILABLE: local vector path missing")
+        _prepare_store_path(provider, db_path)
         provider._lancedb = LanceDBProvider(
             db_path=str(db_path),
-            table=settings.vector_collection,
+            table=provider._storage_layout.vector.collection,
             metric=settings.vector_metric,
             vector_size=settings.vector_size,
         )
@@ -178,7 +197,7 @@ async def _get_embedder(provider: "HermesProvider"):
             SentenceTransformerEmbeddingProvider,
         )
 
-        settings = get_settings()
+        settings = provider._settings
         if settings.embedding_provider == "openai":
             provider._embedder = OpenAIEmbeddingProvider(
                 model=settings.openai_embedding_model,
@@ -371,17 +390,13 @@ class HermesProvider:
                     self._config.storage_mode = "standalone"
                 else:
                     raise StorageLayoutError("E_HERMES_HOME_REQUIRED", "hermes_home is required in profile mode")
-            # Preserve the compatibility hook and its side-effect-free contract.
-            configured_db_url = self._config.resolve_db_url(self._hermes_home)
-            self._config.db_url = configured_db_url
             self._storage_layout = self._config.resolve_storage_layout(
                 hermes_home=self._hermes_home, settings=self._settings
             )
             self._projection_degraded_reason = "; ".join(self._storage_layout.compatibility) or None
             self._root_lock = RuntimeStorageLock.acquire(self._storage_layout.data_root, timeout=5.0)
-            self._storage_layout.data_root.mkdir(parents=True, exist_ok=True)
             if self._storage_layout.sqlite.local_path is not None:
-                self._storage_layout.sqlite.local_path.parent.mkdir(parents=True, exist_ok=True)
+                _prepare_store_path(self, self._storage_layout.sqlite.local_path)
 
             # SQLiteProvider(busy_timeout_ms=60000) BEFORE await initialize().
             db_url = self._storage_layout.sqlite.effective_url
@@ -414,8 +429,12 @@ class HermesProvider:
 
             # STEP 8 — only now signal ready.
             self._initialized = True
-            logger.info(
-                "HermesProvider initialized (session=%s, db=%s)", session_id, db_url
+            report = serialize_layout_redacted(self._storage_layout)
+            logger.log(
+                logging.WARNING
+                if self._storage_layout.compatibility or self._storage_layout.mode == "shared"
+                else logging.INFO,
+                "cmms.storage_layout %s", report,
             )
         except Exception:
             logger.exception("HermesProvider: initialization failed — rolling back")
@@ -482,7 +501,7 @@ class HermesProvider:
         vector_provider = await _get_vector_provider(self)
         embedder = await _get_embedder(self)
         graph = await _get_graph(self)
-        settings = get_settings()
+        settings = self._settings
         graph_router = GraphRouter(
             graph=graph,
             max_path_depth=settings.graph_max_path_depth,

@@ -1,18 +1,14 @@
-"""Pure, no-follow storage layout resolution for CMMS.
+"""Pure, lexical and no-follow storage layout resolution for CMMS."""
 
-Resolution is lexical and strictly read-only: this module never creates a
-directory, opens a lock or database, copies, renames, deletes, performs a
-network call or constructs a provider. Symlinks are inspected with ``lstat``
-and are never followed.
-"""
 from __future__ import annotations
 
 import os
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Mapping, cast
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 StorageMode = Literal["profile", "shared", "standalone"]
 StoreKind = Literal["sqlite", "lancedb", "qdrant_remote", "qdrant_memory", "graph"]
@@ -20,12 +16,10 @@ ArtifactKind = Literal["absent", "regular_file", "directory", "symlink", "specia
 OriginKind = Literal["default", "settings", "yaml", "env", "legacy_env"]
 
 _DEFAULT_SQLITE_URL = "sqlite+aiosqlite:///data/memory.db"
-_AIOSQLITE_PREFIX = "sqlite+aiosqlite:///"
-_SQLITE_PREFIX = "sqlite:///"
 
 
 class StorageLayoutError(ValueError):
-    """Typed layout failure carrying a stable DETAIL diagnostic code."""
+    """A layout failure with a stable diagnostic code."""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -48,6 +42,7 @@ class ComponentIdentity:
     uid: int | None = None
     gid: int | None = None
     raw_link_target: str | None = None
+    nlink: int | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +78,7 @@ class StorageResolutionInputs:
     vector_collection: str = "memories"
     origins: Mapping[str, ValueOrigin] = field(default_factory=dict)
     legacy_split_compat: bool = True
+    installation_path: str | Path | None = None
 
 
 @dataclass(frozen=True)
@@ -101,19 +97,13 @@ class StorageLayout:
 
 
 def _lexical(value: str | Path) -> Path:
-    """Return the absolute lexical form of ``value`` (never dereferences links)."""
     text = os.path.expanduser(str(value))
-    if not text or "\x00" in text:
+    if not text.strip() or "\x00" in text:
         raise StorageLayoutError("E_PATH_OUTSIDE_ROOT", "blank or NUL path")
     return Path(os.path.abspath(os.path.normpath(text)))
 
 
-def classify_artifact_nofollow(path: Path) -> ArtifactKind:
-    """Classify a path with ``lstat`` only; never follow a final symlink."""
-    try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        return "absent"
+def _kind(mode: int) -> ArtifactKind:
     if stat.S_ISLNK(mode):
         return "symlink"
     if stat.S_ISREG(mode):
@@ -123,55 +113,79 @@ def classify_artifact_nofollow(path: Path) -> ArtifactKind:
     return "special"
 
 
-def _identity(path: Path) -> ComponentIdentity:
-    try:
-        status = os.lstat(path)
-    except FileNotFoundError:
-        return ComponentIdentity(str(path), "absent")
-    kind = classify_artifact_nofollow(path)
+def _component(path: Path, info: os.stat_result, raw: str | None = None) -> ComponentIdentity:
     return ComponentIdentity(
         str(path),
-        kind,
-        status.st_dev,
-        status.st_ino,
-        status.st_mode,
-        getattr(status, "st_uid", None),
-        getattr(status, "st_gid", None),
-        os.readlink(path) if kind == "symlink" else None,
+        _kind(info.st_mode),
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        raw,
+        info.st_nlink,
     )
 
 
-def inspect_component_chain_nofollow(
-    path: Path, *, anchor: Path
-) -> tuple[ComponentIdentity, ...]:
-    """Inspect every existing component from the filesystem root to ``path``.
+def inspect_component_chain_nofollow(path: Path, *, anchor: Path) -> tuple[ComponentIdentity, ...]:
+    """Inspect entries through pinned no-follow parent descriptors, never referents.
 
-    Any symlink or non-directory component below ``anchor`` is fatal; missing
-    tail components are recorded but never created.
+    Absent tails are recorded without I/O. The final link entry may be inventoried;
+    no caller may use this read-only snapshot as authorization for a later write.
     """
-    path, anchor = _lexical(path), _lexical(anchor)
+    candidate, approved = _lexical(path), _lexical(anchor)
+    if not _under(approved, candidate):
+        raise StorageLayoutError("E_PATH_OUTSIDE_ROOT", str(candidate))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", flags)
+    current = Path("/")
+    identities = [_component(current, os.fstat(fd))]
     try:
-        relative = path.relative_to(anchor)
-    except ValueError as exc:
-        raise StorageLayoutError(
-            "E_PATH_OUTSIDE_ROOT", f"path outside approved root: {path}"
-        ) from exc
-    result = []
-    current = anchor
-    for part in ("/",) + anchor.parts[1:]:
-        current = Path(part) if current == Path("/") else current / part
-        result.append(_identity(current))
-    for part in relative.parts:
-        current = current / part
-        identity = _identity(current)
-        result.append(identity)
-        if current == path:
-            continue
-        if identity.kind == "symlink":
-            raise StorageLayoutError("E_PATH_SYMLINK_PARENT", str(current))
-        if identity.kind not in ("directory", "absent"):
-            raise StorageLayoutError("E_PATH_SPECIAL_FILE", str(current))
-    return tuple(result)
+        parts = candidate.parts[1:]
+        for index, name in enumerate(parts):
+            current /= name
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                identities.append(ComponentIdentity(str(current), "absent"))
+                for missing in parts[index + 1 :]:
+                    current /= missing
+                    identities.append(ComponentIdentity(str(current), "absent"))
+                break
+            kind = _kind(info.st_mode)
+            raw = os.readlink(name, dir_fd=fd) if kind == "symlink" else None
+            identity = _component(current, info, raw)
+            identities.append(identity)
+            final = index == len(parts) - 1
+            if kind == "symlink":
+                after = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if (info.st_dev, info.st_ino, info.st_mode) != (after.st_dev, after.st_ino, after.st_mode):
+                    raise StorageLayoutError("E_ARTIFACT_IDENTITY_CHANGED", str(current))
+                if not final:
+                    raise StorageLayoutError("E_PATH_SYMLINK_PARENT", str(current))
+            if final:
+                break
+            if kind != "directory":
+                raise StorageLayoutError("E_PATH_SPECIAL_FILE", str(current))
+            child = os.open(name, flags, dir_fd=fd)
+            try:
+                after = os.fstat(child)
+                if (info.st_dev, info.st_ino, info.st_mode) != (after.st_dev, after.st_ino, after.st_mode):
+                    raise StorageLayoutError("E_ARTIFACT_IDENTITY_CHANGED", str(current))
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(fd)
+            fd = child
+    except OSError as exc:
+        raise StorageLayoutError("E_ARTIFACT_IDENTITY_CHANGED", "no-follow inspection failed") from exc
+    finally:
+        os.close(fd)
+    return tuple(identities)
+
+
+def classify_artifact_nofollow(path: Path) -> ArtifactKind:
+    return inspect_component_chain_nofollow(path, anchor=Path("/"))[-1].kind
 
 
 def _under(root: Path, candidate: Path) -> bool:
@@ -181,121 +195,186 @@ def _under(root: Path, candidate: Path) -> bool:
         return False
 
 
-def _store_path(
-    raw: str | Path, root: Path, *, final_symlink_compat: bool = False
-) -> tuple[Path, bool]:
-    raw_text = str(raw)
-    candidate = _lexical(raw_text if os.path.isabs(raw_text) else root / raw_text)
-    if not _under(root, candidate):
-        raise StorageLayoutError("E_PATH_OUTSIDE_ROOT", str(candidate))
-    inspect_component_chain_nofollow(candidate, anchor=root)
-    final = classify_artifact_nofollow(candidate)
-    if final == "symlink":
-        if final_symlink_compat:
-            return candidate, True
-        raise StorageLayoutError("E_PATH_FINAL_SYMLINK_UNSAFE", str(candidate))
-    if final == "special":
-        raise StorageLayoutError("E_PATH_SPECIAL_FILE", str(candidate))
-    return candidate, False
+def _inspect_store(path: Path, *, directory: bool = False, allow_link: bool = False) -> bool:
+    identity = inspect_component_chain_nofollow(path, anchor=Path("/"))[-1]
+    if identity.kind == "symlink":
+        if allow_link:
+            return True
+        raise StorageLayoutError("E_PATH_FINAL_SYMLINK_UNSAFE", str(path))
+    if identity.kind not in ("absent", "directory" if directory else "regular_file"):
+        raise StorageLayoutError("E_PATH_SPECIAL_FILE", str(path))
+    if identity.kind == "regular_file" and identity.nlink != 1:
+        raise StorageLayoutError("E_PATH_HARDLINK_UNSAFE", str(path))
+    return False
 
 
-def resolve_sqlite_location(
-    raw_url: str, *, data_root: Path, origin: ValueOrigin
-) -> SQLiteLocation:
-    """Resolve one SQLite URL against ``data_root`` without filesystem writes."""
-    raw_url = raw_url or _DEFAULT_SQLITE_URL
-    if not raw_url.lower().startswith("sqlite"):
-        return SQLiteLocation(raw_url, raw_url, None, "remote", "", origin)
-    if raw_url.startswith(_AIOSQLITE_PREFIX):
-        prefix = _AIOSQLITE_PREFIX
-    elif raw_url.startswith(_SQLITE_PREFIX):
-        prefix = _SQLITE_PREFIX
-    else:
-        kind = "memory" if ":memory:" in raw_url else "file_uri"
-        return SQLiteLocation(raw_url, raw_url, None, kind, urlsplit(raw_url).query, origin)
-    segment = raw_url[len(prefix):]
-    if segment in (":memory:", "", "/:memory:"):
-        return SQLiteLocation(raw_url, raw_url, None, "memory", "", origin)
-    path_part, _, query = segment.partition("?")
-    is_absolute = path_part.startswith("/")
-    local_path = _lexical(path_part if is_absolute else data_root / path_part)
-    effective = f"{prefix}{local_path}" + (f"?{query}" if query else "")
-    return SQLiteLocation(raw_url, effective, local_path, "file", query, origin)
+def _candidate(raw: str | Path, root: Path) -> tuple[Path, bool]:
+    expanded = os.path.expanduser(str(raw))
+    if not expanded.strip() or "\x00" in expanded:
+        raise StorageLayoutError("E_PATH_OUTSIDE_ROOT", "blank or NUL path")
+    absolute = os.path.isabs(expanded)
+    return _lexical(expanded if absolute else root / expanded), absolute
+
+
+def resolve_sqlite_location(raw_url: str, *, data_root: Path, origin: ValueOrigin) -> SQLiteLocation:
+    """Resolve SQLite path forms while preserving scheme and query text."""
+    # An explicitly blank URL is the documented in-memory form.  The
+    # dataclass default is applied only when the argument is omitted.
+    configured = raw_url
+    if configured == "":
+        return SQLiteLocation(configured, configured, None, "memory", "", origin)
+    if configured in ("sqlite://", "sqlite+aiosqlite://", ":memory:"):
+        return SQLiteLocation(configured, configured, None, "memory", "", origin)
+    prefixes = ("sqlite+aiosqlite:///", "sqlite:///")
+    prefix = next((p for p in prefixes if configured.startswith(p)), None)
+    if prefix is None:
+        if configured.startswith("file:"):
+            return SQLiteLocation(configured, configured, None, "file_uri", urlsplit(configured).query, origin)
+        if not configured.lower().startswith("sqlite"):
+            return SQLiteLocation(configured, configured, None, "remote", "", origin)
+        return SQLiteLocation(configured, configured, None, "file_uri", urlsplit(configured).query, origin)
+    segment = configured[len(prefix) :]
+    path_part, separator, query = segment.partition("?")
+    query_text = query if separator else ""
+    query_pairs = dict(parse_qsl(query_text, keep_blank_values=True))
+    if path_part.startswith("file:") or query_pairs.get("uri", "").lower() in {"1", "true", "yes"}:
+        # SQLite URI filenames are opaque to the local-path resolver.  Keep
+        # the configured spelling (not urlunsplit's slash normalization).
+        return SQLiteLocation(configured, configured, None, "file_uri", query_text, origin)
+    if path_part in ("", ":memory:", "/:memory:"):
+        return SQLiteLocation(configured, configured, None, "memory", query_text, origin)
+    # Three slashes encode a path relative to the chosen root. Four slashes
+    # leave a leading slash in the database segment and are POSIX absolute.
+    absolute = path_part.startswith("/")
+    local = _lexical(path_part if absolute else data_root / path_part)
+    effective = f"{prefix}{local}" + (f"?{query}" if separator else "")
+    return SQLiteLocation(configured, effective, local, "file", query if separator else "", origin)
 
 
 def resolve_storage_layout(inputs: StorageResolutionInputs) -> StorageLayout:
-    """Resolve the immutable storage layout; performs no I/O."""
+    """Freeze a complete layout after pure lexical/no-follow validation."""
     mode = inputs.mode
-    home = _lexical(inputs.profile_home) if inputs.profile_home is not None else None
+    if mode not in ("profile", "shared", "standalone"):
+        raise StorageLayoutError("E_STORAGE_MODE_INVALID", f"unsupported storage mode: {mode!r}")
+    home = None
+    if inputs.profile_home is not None:
+        if not str(inputs.profile_home).strip():
+            raise StorageLayoutError("E_HERMES_HOME_REQUIRED", "profile_home is blank")
+        home = _lexical(inputs.profile_home)
     if mode == "profile":
-        if home is None:
-            raise StorageLayoutError(
-                "E_HERMES_HOME_REQUIRED", "profile mode requires hermes_home"
-            )
-        raw_root = inputs.data_root
-        if raw_root is None or str(raw_root).strip() in ("", "."):
-            root = home
-        elif os.path.isabs(str(raw_root)):
-            root = _lexical(raw_root)
-        else:
-            root = _lexical(home / str(raw_root))
+        if home is None or classify_artifact_nofollow(home) != "directory":
+            raise StorageLayoutError("E_HERMES_HOME_REQUIRED", "profile home must be an existing real directory")
+        raw = inputs.data_root
+        root = home if raw is None or str(raw).strip() in ("", ".") else _candidate(raw, home)[0]
         if not _under(home, root):
-            raise StorageLayoutError("E_PROFILE_ROOT_EXTERNAL", str(root))
-    elif mode == "shared":
-        if inputs.data_root is None or not os.path.isabs(str(inputs.data_root)):
-            raise StorageLayoutError(
-                "E_SHARED_ROOT_REQUIRED", "shared mode requires absolute data_root"
-            )
-        root = _lexical(inputs.data_root)
+            raise StorageLayoutError("E_PROFILE_ROOT_EXTERNAL", "external root requires explicit shared mode")
+    elif inputs.data_root is None or not str(inputs.data_root).strip():
+        if mode == "shared":
+            raise StorageLayoutError("E_SHARED_ROOT_REQUIRED", "shared mode requires an absolute root")
+        root = _lexical(Path.cwd())
     else:
-        root = _lexical(inputs.data_root) if inputs.data_root is not None else Path.cwd()
-    if classify_artifact_nofollow(root) not in ("directory", "absent"):
+        expanded = os.path.expanduser(str(inputs.data_root))
+        if not os.path.isabs(expanded):
+            code = "E_SHARED_ROOT_RELATIVE" if mode == "shared" else "E_STANDALONE_ROOT_RELATIVE"
+            raise StorageLayoutError(code, "explicit root must be absolute")
+        root = _lexical(expanded)
+    if root == Path("/"):
+        raise StorageLayoutError("E_FORBIDDEN_TARGET_ROOT", "filesystem root cannot own storage")
+    root_kind = classify_artifact_nofollow(root)
+    if root_kind == "symlink":
         raise StorageLayoutError("E_PATH_SYMLINK_PARENT", str(root))
+    if root_kind not in ("directory", "absent"):
+        raise StorageLayoutError("E_PATH_SPECIAL_FILE", str(root))
+
+    compatibility: list[str] = []
+    unavailable: set[str] = set()
+    # Standalone without an explicit root retains legacy absolute per-store
+    # Settings as well as CWD-relative defaults. Explicit roots require coherence.
+    standalone_legacy = mode == "standalone" and inputs.data_root is None
+
+    def store(label: str, path: Path, *, absolute: bool, directory: bool = False) -> Path:
+        if not _under(root, path):
+            if mode == "shared":
+                raise StorageLayoutError("E_SHARED_SPLIT_LAYOUT", str(path))
+            if not absolute or not (standalone_legacy or (mode == "profile" and inputs.legacy_split_compat)):
+                raise StorageLayoutError("E_PATH_OUTSIDE_ROOT", str(path))
+            compatibility.append(f"legacy-split-layout:{label}")
+        linked = _inspect_store(
+            path,
+            directory=directory,
+            allow_link=label in ("vector", "graph") and mode == "profile" and inputs.legacy_split_compat,
+        )
+        if linked:
+            warning = f"legacy-split-layout:{label}"
+            if warning not in compatibility:
+                compatibility.append(warning)
+            unavailable.add(label)
+        return path
 
     sqlite = resolve_sqlite_location(
         inputs.sqlite_url,
         data_root=root,
         origin=inputs.origins.get("sqlite", ValueOrigin("default")),
     )
-    if sqlite.local_path is not None and not _under(root, sqlite.local_path):
-        if mode == "shared":
-            raise StorageLayoutError("E_SHARED_SPLIT_LAYOUT", str(sqlite.local_path))
-        raise StorageLayoutError("E_PROFILE_ROOT_EXTERNAL", str(sqlite.local_path))
+    if sqlite.local_path is not None:
+        absolute_sql = inputs.sqlite_url.startswith(("sqlite:////", "sqlite+aiosqlite:////"))
+        store("sqlite", sqlite.local_path, absolute=absolute_sql)
+        # Runtime may legitimately use WAL. S1 only rejects unsafe entries;
+        # clean-sidecar-only migration policy/probes remain in S2.
+        for suffix in ("-wal", "-shm", "-journal"):
+            _inspect_store(Path(str(sqlite.local_path) + suffix))
+    elif sqlite.kind == "file_uri":
+        compatibility.append("unsupported-file-uri:sqlite")
 
-    vector_path: Path | None = None
-    unavailable: set[str] = set()
-    compatibility: list[str] = []
-    if inputs.vector_backend == "lancedb":
-        vector_path, linked = _store_path(
-            inputs.lancedb_path, root, final_symlink_compat=inputs.legacy_split_compat
-        )
-        if linked:
-            compatibility.append("legacy-split-layout:vector")
-            unavailable.add("vector")
-    if inputs.vector_backend == "qdrant":
-        vector_kind: Literal["local", "remote", "memory"] = (
-            "memory" if inputs.qdrant_location == ":memory:" else "remote"
-        )
+    backend = inputs.vector_backend
+    if backend not in ("lancedb", "qdrant"):
+        raise StorageLayoutError("E_VECTOR_BACKEND_INVALID", "unknown vector backend")
+    vector_path = None
+    qdrant = None
+    vector_kind: Literal["local", "remote", "memory"] = "local"
+    if backend == "lancedb":
+        candidate, absolute = _candidate(inputs.lancedb_path, root)
+        vector_path = store("vector", candidate, absolute=absolute, directory=True)
     else:
-        vector_kind = "local"
+        qdrant = inputs.qdrant_location
+        if not qdrant or not qdrant.strip() or "\x00" in qdrant:
+            raise StorageLayoutError("E_QDRANT_PROFILE_NAMESPACE_UNDEFINED", "Qdrant location is required")
+        vector_kind = "memory" if qdrant == ":memory:" else "remote"
+        if mode == "profile" and vector_kind == "remote":
+            raise StorageLayoutError("E_QDRANT_PROFILE_NAMESPACE_UNDEFINED", "remote Qdrant has no profile namespace")
+        if vector_kind == "memory":
+            compatibility.append("ephemeral-projection:vector")
+    candidate, absolute = _candidate(inputs.graph_snapshot_path, root)
+    graph = store("graph", candidate, absolute=absolute)
+    graph_lock = graph.with_name(graph.name + ".lock")
+    root_lock = root / ".cmms-storage.lock"
+    _inspect_store(graph_lock)
+    _inspect_store(root_lock)
+    targets = [graph, graph_lock, root_lock]
+    if vector_path is not None:
+        targets.append(vector_path)
+    if sqlite.local_path is not None:
+        targets.extend(
+            [sqlite.local_path, *(Path(str(sqlite.local_path) + suffix) for suffix in ("-wal", "-shm", "-journal"))]
+        )
+    for index, left in enumerate(targets):
+        if left == root:
+            raise StorageLayoutError("E_PATH_OVERLAP", "store cannot replace its root")
+        for right in targets[index + 1 :]:
+            if _under(left, right) or _under(right, left):
+                raise StorageLayoutError("E_PATH_OVERLAP", "storage artifacts overlap")
+    origins = MappingProxyType(dict(inputs.origins))
+    vector_origin = origins.get(
+        "lancedb_path" if backend == "lancedb" else "qdrant_location", origins.get("vector", ValueOrigin("default"))
+    )
     vector = VectorLocation(
-        cast("Literal['lancedb', 'qdrant']", inputs.vector_backend),
+        cast("Literal['lancedb', 'qdrant']", backend),
         vector_path,
-        inputs.qdrant_location if inputs.vector_backend == "qdrant" else None,
+        qdrant,
         inputs.vector_collection,
         vector_kind,
-        inputs.origins.get("vector", ValueOrigin("settings")),
+        vector_origin,
     )
-    graph, linked = _store_path(
-        inputs.graph_snapshot_path, root, final_symlink_compat=inputs.legacy_split_compat
-    )
-    if linked:
-        compatibility.append("legacy-split-layout:graph")
-        unavailable.add("graph")
-    if mode == "shared" and any(
-        entry.startswith("legacy-split") for entry in compatibility
-    ):
-        raise StorageLayoutError("E_SHARED_SPLIT_LAYOUT", "shared layout contains split artifact")
     return StorageLayout(
         mode,
         home,
@@ -303,22 +382,44 @@ def resolve_storage_layout(inputs: StorageResolutionInputs) -> StorageLayout:
         sqlite,
         vector,
         graph,
-        graph.with_name(graph.name + ".lock"),
-        root / ".cmms-storage.lock",
-        dict(inputs.origins),
+        graph_lock,
+        root_lock,
+        origins,
         tuple(compatibility),
         frozenset(unavailable),
     )
 
 
+def _redact_url(url: str, *, redact_all_query: bool = False) -> str:
+    parts = urlsplit(url)
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    query = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        query.append(
+            (
+                key,
+                "<redacted>"
+                if redact_all_query
+                or any(word in key.lower() for word in ("token", "key", "secret", "password", "credential"))
+                else value,
+            )
+        )
+    return urlunsplit((parts.scheme, netloc, parts.path, urlencode(query), parts.fragment))
+
+
 def serialize_layout_redacted(layout: StorageLayout) -> dict[str, object]:
-    """Serialize a layout with no credentials or memory content."""
     return {
         "mode": layout.mode,
         "profile_home": str(layout.profile_home) if layout.profile_home else None,
         "data_root": str(layout.data_root),
-        "sqlite": str(layout.sqlite.local_path or layout.sqlite.effective_url),
-        "vector": str(layout.vector.local_path or layout.vector.qdrant_location),
+        "sqlite": _redact_url(layout.sqlite.effective_url),
+        "vector": (
+            _redact_url(layout.vector.qdrant_location, redact_all_query=True)
+            if layout.vector.qdrant_location and layout.vector.kind == "remote"
+            else str(layout.vector.local_path or layout.vector.qdrant_location)
+        ),
         "graph": str(layout.graph_snapshot_path),
         "compatibility": list(layout.compatibility),
         "unavailable_projections": sorted(layout.unavailable_projections),
@@ -326,15 +427,32 @@ def serialize_layout_redacted(layout: StorageLayout) -> dict[str, object]:
 
 
 def validate_write_target(layout: StorageLayout, path: Path) -> None:
-    """Validate a write target against the frozen layout (no I/O, no writes)."""
+    """Reinspect a candidate; legacy overrides authorize only exact store paths.
+
+    This is not a file-open capability. Write-side callers must use the no-follow
+    descriptor primitives rather than relying on this snapshot alone.
+    """
     candidate = _lexical(path)
+    if candidate == layout.data_root:
+        raise StorageLayoutError("E_FORBIDDEN_TARGET_ROOT", str(candidate))
     if not _under(layout.data_root, candidate):
-        raise StorageLayoutError("E_PATH_OUTSIDE_ROOT", str(candidate))
-    inspect_component_chain_nofollow(candidate, anchor=layout.data_root)
-    if classify_artifact_nofollow(candidate) == "symlink":
+        permitted = {
+            layout.sqlite.local_path,
+            layout.vector.local_path,
+            layout.graph_snapshot_path,
+            layout.graph_lock_path,
+        }
+        if candidate not in permitted or not layout.compatibility or layout.mode == "shared":
+            raise StorageLayoutError("E_PATH_OUTSIDE_ROOT", str(candidate))
+    identity = inspect_component_chain_nofollow(candidate, anchor=Path("/"))[-1]
+    if identity.kind == "symlink":
         raise StorageLayoutError("E_PATH_FINAL_SYMLINK_UNSAFE", str(candidate))
+    if identity.kind == "special":
+        raise StorageLayoutError("E_PATH_SPECIAL_FILE", str(candidate))
+    if identity.kind == "regular_file" and identity.nlink != 1:
+        raise StorageLayoutError("E_PATH_HARDLINK_UNSAFE", str(candidate))
 
 
 def cmms_repo_root() -> Path:
-    """Return the CMMS installation checkout (import path, never a data base)."""
+    """Return the installation checkout for import compatibility only."""
     return Path(__file__).resolve().parents[2]
