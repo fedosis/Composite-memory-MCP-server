@@ -80,9 +80,32 @@ ownership of every lock:
   unlinked, so the resource stays protected after the lock is dropped;
 * the prequalified bounded SQLite transaction probe runs last, on the fresh
   identities only.
+
+Slice S2-05 adds the immutable run-owned backup of the regular artifacts and of
+the final legacy link entries (DETAIL 9.1, 10.1):
+
+* every regular file and every directory is copied through PINNED no-follow
+  descriptors with SHA-256, mode, size and identity recorded; an interior
+  symlink, a special file and a hard-linked regular file are refused, and every
+  identity digest is the streaming, size-bounded, looped fd-relative read
+  fstat'ed before and after on the SAME descriptor -- the bounded 64 KiB readers
+  in ``storage_lock`` are never used for it (routing-matrix residual F7);
+* a final legacy symlink is backed up as a NEW symlink entry carrying the exact
+  RAW ``readlink`` string; its referent is never opened, enumerated, hashed,
+  copied or validated as a store, and an absent entry is recorded explicitly;
+* nothing in the run directory is ever overwritten (every publication is an
+  atomic no-overwrite ``os.link`` of a verified staged copy inside the same
+  filesystem, and a collision is ``E_BACKUP_COLLISION``), every write is
+  fsync'ed, the run directory is 0700 and every file it owns is 0600, and a
+  cross-device run directory is refused before a single byte is copied;
+* the held graph lock inode is never replaced: creating an absent graph lock is
+  recorded with the (device, inode) of the descriptor the lock stage actually
+  owns, so post-unlock cleanup can remove exactly what this run created and
+  never a foreign or replaced entry.
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -97,7 +120,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Iterable, Literal, Mapping, cast, get_args
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, cast, get_args
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -161,6 +184,33 @@ SQL_ACTION_PRESERVE_IN_PLACE = "preserve_in_place"
 RUN_DIRECTORY_NAME = ".cmms-migrations"
 MANIFEST_FILE_NAME = "manifest.json"
 CONFIG_FILE_NAME = "config.yaml"
+
+# S2-05 bounds and stable strings: the immutable run-owned backup of the regular
+# artifacts and of the final legacy link entries (DETAIL 9.1, 10.1).
+#
+# Nothing is overwritten and nothing is followed: every byte is read through a
+# pinned no-follow descriptor, staged inside the run directory, verified there
+# and published with ``os.link`` -- the atomic, no-overwrite publication -- so a
+# copy, fsync or publication failure can leave a staged temp for forensics but
+# can never leave a partial file under a published backup name, and an existing
+# backup is never replaced. The entry and depth bounds make a hostile or
+# accidentally huge tree a bounded refusal instead of an unbounded copy.
+BACKUP_DIRECTORY_NAME = "backup"
+BACKUP_LINK_ENTRIES_NAME = "link-entries"
+BACKUP_STAGING_NAME = "staging"
+BACKUP_STAGING_TEMP_NAME = "backup-tmp"
+BACKUP_REPORT_NAME = "backup-report.json"
+BACKUP_REPORT_SCHEMA_VERSION = 1
+BACKUP_FILE_MODE = 0o600
+BACKUP_DIRECTORY_MODE = 0o700
+MAX_BACKUP_ENTRIES = 1024
+MAX_BACKUP_DEPTH = 16
+MAX_BACKUP_NAME_BYTES = 200
+_RUN_OWNED_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,%d}$" % MAX_BACKUP_NAME_BYTES)
+# The run-directory subpaths DETAIL 9.1 names literally for the two projection
+# targets: ``backup/graph.json`` and ``backup/vector``. A target label outside
+# this table keeps its own sanitized local name.
+_BACKUP_TARGET_NAMES = {"graph": "graph.json", "vector": "vector"}
 CANONICAL_SQLITE_URL = "sqlite+aiosqlite:///data/memory.db"
 SQLITE_OPEN_POLICY_ABSENT = "sidecars_absent_immutable_ro"
 SQLITE_OPEN_POLICY_PRESENT = "sidecars_present_no_open"
@@ -2272,6 +2322,10 @@ def _plan_identity_digest(plan: MigrationPlan) -> str:
     The coordination entries listed in ``_COORDINATION_TARGET_LABELS`` are
     excluded: the lock stage of this card creates them and never unlinks them,
     so they are not part of the payload identity the caller planned against.
+    Excluding them is exactly what stops a legitimate lock cycle from reading as
+    a stale plan, and it is why the INODE of an entry the plan recorded as
+    present is confirmed separately by ``_confirm_coordination_identities``
+    instead of being dropped from verification altogether (S2-05 N1 pin).
     """
     return _digest(
         {
@@ -2287,6 +2341,41 @@ def _plan_identity_digest(plan: MigrationPlan) -> str:
             "config_digest": plan.config_digest,
         }
     )
+
+
+def _confirm_coordination_identities(plan: MigrationPlan, fresh: MigrationPlan) -> None:
+    """Confirm the inode of a coordination entry the caller's plan recorded.
+
+    S2-04 removed ``root_lock``/``graph_lock`` from ``_plan_identity_digest``
+    because a legitimate lock cycle CREATES them and never unlinks them, so any
+    lock-then-validate order was a false ``E_PLAN_STALE``. That removal also
+    stopped noticing a coordination entry REPLACED by a different ordinary
+    regular file (``nlink == 1``), which the old digest refused -- an unsound
+    detection, but a real blind spot once it was gone.
+
+    The digest still cannot carry those entries, so the identity is confirmed
+    here: when the caller's plan recorded the entry as PRESENT, the fresh replan
+    must show the same ``(kind, device, inode)``. A size or mtime change from a
+    legitimate re-acquisition of the SAME inode is not drift and stays fresh; a
+    different inode, a vanished entry and an entry that degraded to a refused
+    kind are ``E_PLAN_STALE``. An entry the plan recorded as ABSENT may
+    legitimately exist now -- this run's own lock stage created it -- and is
+    never stale. Only the two coordination labels are treated this way: every
+    other target keeps its place in ``_plan_identity_digest``.
+    """
+    for label in _COORDINATION_TARGET_LABELS:
+        recorded = plan.targets.get(label)
+        if recorded is None or recorded.kind == "absent":
+            continue
+        observed = fresh.targets.get(label)
+        if observed is None or observed.kind == "absent":
+            raise ValueError("E_PLAN_STALE")
+        if (recorded.kind, recorded.device, recorded.inode) != (
+            observed.kind,
+            observed.device,
+            observed.inode,
+        ):
+            raise ValueError("E_PLAN_STALE")
 
 
 @dataclass(frozen=True)
@@ -2535,7 +2624,10 @@ def validate_mutation_preconditions(
        with the affected roots and the listed process classes recorded;
     3. the replan: a FRESH ``plan_profile_migration`` of the current no-follow
        identities. A caller-supplied plan whose identity digest no longer matches
-       is ``E_PLAN_STALE`` -- a stale plan is never trusted;
+       is ``E_PLAN_STALE`` -- a stale plan is never trusted -- and, because the
+       two coordination entries are outside that digest by design (S2-04), the
+       inode of any one the plan recorded as PRESENT is confirmed against the
+       fresh replan as well (``_confirm_coordination_identities``, S2-05);
     4. sidecars, paths and disk recomputed from that fresh plan;
     5. the complete ``/proc`` descriptor and lock inventory: an old writer
        ``E_OLD_WRITER_ACTIVE``, a live upgraded runtime ``E_WRITER_ACTIVE``, an
@@ -2561,6 +2653,10 @@ def validate_mutation_preconditions(
     plan_digest = _plan_identity_digest(plan) if plan is not None else None
     if plan_digest is not None and plan_digest != replan_digest:
         raise ValueError("E_PLAN_STALE")
+    if plan is not None:
+        # The coordination entries are outside the digest (S2-04), so their
+        # recorded inode is confirmed here instead of being unverified (S2-05).
+        _confirm_coordination_identities(plan, fresh)
     _require_fresh_sidecar_path_and_disk_checks(fresh)
     inventory = _writer_inventory(fresh, proc_root=proc_root, exclude_pids=exclude_pids)
     if not inventory.covered:
@@ -2693,6 +2789,1039 @@ def _write_manifest(path: Path, manifest: MigrationManifest) -> None:
         os.close(descriptor)
     os.replace(temp, target)
     _fsync_directory(run_dir)
+
+
+# ---------------------------------------------------------------------------
+# S2-05 -- the immutable run-owned backup of the regular artifacts and of the
+# final legacy link entries (DETAIL 9.1, 10.1).
+#
+# The whole slice is built on three promises:
+#
+# 1. NOTHING IS FOLLOWED. Every entry is inspected through the pinned no-follow
+#    descriptor of its parent, opened with O_NOFOLLOW, and re-checked against the
+#    immediately preceding no-follow stat. A final symlink is either one of the
+#    plan's OWN legacy projections -- recorded as a raw link entry -- or refused;
+#    an interior symlink, a special file and a hard-linked regular file are
+#    refused. The referent of a legacy link is never opened, enumerated, hashed,
+#    copied, modified or validated as a store.
+# 2. NOTHING IS OVERWRITTEN. Every regular file is staged inside the run
+#    directory, verified there, and published with ``os.link`` -- the atomic
+#    no-overwrite publication on the same filesystem -- so a collision is
+#    ``E_BACKUP_COLLISION`` and a copy/fsync failure leaves a staged temp for
+#    forensics but never a partial file under a published backup name.
+# 3. EVERY IDENTITY COMES FROM A STREAMING READ. Identity digests use the
+#    S2-02 reader (``_streamed_digest``): a looped, size-bounded fd-relative read
+#    with fstat before and after on the SAME descriptor. The bounded 64 KiB
+#    readers in ``storage_lock`` are never used for a backup identity.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BackupEntry:
+    """One verified backup record (DETAIL 10.1).
+
+    ``source_path``/``kind``/``device``/``inode``/``mode``/``size`` are the
+    identity of the ORIGINAL entry as measured through the pinned descriptor it
+    was read with; ``sha256`` is the digest of a regular file's whole content or
+    of a directory's bounded listing (``digest_scope`` says which, and a symlink
+    has neither); ``present`` is the explicit absence record this slice owes
+    instead of a silent skip; ``run_relative_path`` is the run-directory
+    relative destination, None when nothing was created because nothing exists.
+    """
+
+    artifact: str
+    source_path: str
+    run_relative_path: str | None
+    kind: str
+    present: bool
+    digest_scope: str
+    sha256: str | None = None
+    size: int | None = None
+    mode: int | None = None
+    device: int | None = None
+    inode: int | None = None
+    raw_link_target: str | None = None
+
+
+@dataclass(frozen=True)
+class RunBackup:
+    """The immutable backup of one run id: entries, records and report path."""
+
+    run_id: str
+    run_dir: str
+    report_path: str
+    entries: tuple[BackupEntry, ...]
+    sqlite: Mapping[str, Any]
+    graph_lock: Mapping[str, Any]
+    digest: str
+    created_at: str
+
+
+def _backup_failure(code: str, detail: str = "") -> ValueError:
+    """A stable, fail-closed backup refusal; never a silent partial backup."""
+    return ValueError(f"{code}: {detail}" if detail else code)
+
+
+def _staged_file_name() -> str:
+    """A fresh staged name inside the run directory that cannot pre-exist."""
+    return f"stage-{os.getpid()}-{uuid4().hex}"
+
+
+def _backup_entry_name(label: str) -> str:
+    """A bounded, filesystem-safe run-owned name derived from an artifact label.
+
+    The label is a PLAN artifact label (``target:graph``, ``legacy:0``), never
+    caller path input. The local part after the prefix is used, and the two
+    target labels of DETAIL 9.1 keep the run-directory subpaths that section
+    names literally (``backup/vector`` and ``backup/graph.json``); every other
+    label is sanitized into the run-owned name alphabet, so no label can address
+    a parent component, an absolute path, a home root or a link.
+    """
+    prefix, _, local = label.partition(":")
+    if prefix == "target":
+        candidate = _BACKUP_TARGET_NAMES.get(local, local)
+    elif prefix == "legacy":
+        candidate = f"legacy-{local}"
+    else:
+        candidate = label
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", candidate).strip("-") or "entry"
+    return safe[:MAX_BACKUP_NAME_BYTES]
+
+
+def _backup_run_directory(plan: MigrationPlan) -> Path:
+    """The plan's own run directory: ``<data_root>/.cmms-migrations/<run-id>``."""
+    return Path(plan.layout.data_root) / RUN_DIRECTORY_NAME / _validate_run_id(plan.request.run_id)
+
+
+def _require_same_device(run_device: int, source_device: int, *, artifact: str) -> None:
+    """DETAIL 9.1: the run directory must share the source's filesystem.
+
+    Staging and publication are the same run directory, and the publication of a
+    staged copy is an atomic link inside one filesystem. A cross-device run
+    directory therefore cannot publish atomically at all, so the backup refuses
+    BEFORE any byte is copied instead of leaving a copy that would have to be
+    moved across devices.
+    """
+    if run_device != source_device:
+        raise _backup_failure(
+            "E_CROSS_FILESYSTEM_PUBLICATION",
+            f"{artifact} is on device {source_device} but the run directory is on device {run_device}",
+        )
+
+
+def _take_backup_slot(budget: list[int], artifact: str) -> None:
+    """Count one bounded backup entry; exceeding the bound is a refusal."""
+    budget[0] += 1
+    if budget[0] > MAX_BACKUP_ENTRIES:
+        raise _backup_failure(
+            "E_BACKUP_VERIFY", f"{artifact} exceeds the {MAX_BACKUP_ENTRIES}-entry backup bound"
+        )
+
+
+@contextlib.contextmanager
+def _staging_directory(run_dir: Path) -> Iterator[tuple[int, Path]]:
+    """The run-owned staging directory, opened through pinned descriptors."""
+    target = Path(run_dir) / BACKUP_STAGING_NAME / BACKUP_STAGING_TEMP_NAME
+    with storage_lock.open_directory_nofollow(target, create=True) as descriptor:
+        yield descriptor, target
+
+
+@contextlib.contextmanager
+def _run_child_directory(parent_fd: int, name: str) -> Iterator[int]:
+    """Open (creating at 0700) one run-owned child directory, never a link.
+
+    ``name`` is a single bounded component built by this module, never caller
+    path input. The create is idempotent, and the open is
+    ``O_DIRECTORY | O_NOFOLLOW``: a symlink or a non-directory planted at a
+    run-owned path is refused instead of traversed.
+    """
+    if not _RUN_OWNED_NAME_PATTERN.match(name):
+        raise _backup_failure("E_MANIFEST_PATH_ESCAPE", "run-owned directory name is not a bounded component")
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(name, BACKUP_DIRECTORY_MODE, dir_fd=parent_fd)
+    try:
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd
+        )
+    except FileNotFoundError as exc:
+        raise _backup_failure("E_BACKUP_VERIFY", f"run-owned directory {name} does not exist") from exc
+    except OSError as exc:
+        raise _backup_failure(
+            "E_PATH_SPECIAL_FILE", f"run-owned directory {name} is not a real directory: {exc.strerror}"
+        ) from exc
+    try:
+        os.fchmod(descriptor, BACKUP_DIRECTORY_MODE)
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def _run_directory_chain(root_fd: int, parts: tuple[str, ...]) -> Iterator[int]:
+    """Create/open a bounded run-owned directory chain through pinned descriptors."""
+    if not parts:
+        yield root_fd
+        return
+    with _run_child_directory(root_fd, parts[0]) as child_fd:
+        with _run_directory_chain(child_fd, parts[1:]) as deep_fd:
+            yield deep_fd
+
+
+@contextlib.contextmanager
+def _pinned_child_regular_file(
+    parent_fd: int, name: str, *, artifact: str, before: os.stat_result
+) -> Iterator[tuple[int, os.stat_result]]:
+    """Open one regular child relative to its pinned parent descriptor.
+
+    A final symlink, a special file and a hard-linked regular file are refused
+    with the stable path codes, and the fstat of the descriptor must match the
+    immediately preceding no-follow stat, so nothing is ever read through a link
+    or through a multiply-linked inode.
+    """
+    if stat.S_ISLNK(before.st_mode):
+        raise _backup_failure("E_PATH_FINAL_SYMLINK_UNSAFE", f"{artifact} is a symlink and is never followed")
+    if not stat.S_ISREG(before.st_mode):
+        raise _backup_failure("E_PATH_SPECIAL_FILE", f"{artifact} is not a regular file")
+    if before.st_nlink != 1:
+        raise _backup_failure("E_PATH_HARDLINK_UNSAFE", f"{artifact} is a hard-linked regular file")
+    try:
+        # O_NONBLOCK is a no-op for regular files and keeps a FIFO swap between
+        # the stat above and this open from blocking forever.
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent_fd
+        )
+    except OSError as exc:
+        raise _backup_failure(_path_code(exc), f"{artifact} cannot be opened no-follow: {exc.strerror}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not _same_inode(before, opened) or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise _backup_failure("E_ARTIFACT_IDENTITY_CHANGED", f"{artifact} identity changed between stat and open")
+        yield descriptor, opened
+    finally:
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def _pinned_child_directory(
+    parent_fd: int, name: str, *, artifact: str, before: os.stat_result
+) -> Iterator[tuple[int, os.stat_result]]:
+    """Open one directory child relative to its pinned parent descriptor."""
+    if stat.S_ISLNK(before.st_mode):
+        raise _backup_failure("E_PATH_FINAL_SYMLINK_UNSAFE", f"{artifact} is a symlink and is never followed")
+    if not stat.S_ISDIR(before.st_mode):
+        raise _backup_failure("E_PATH_SPECIAL_FILE", f"{artifact} is not a directory")
+    try:
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd
+        )
+    except OSError as exc:
+        raise _backup_failure(_path_code(exc), f"{artifact} cannot be opened no-follow: {exc.strerror}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not _same_inode(before, opened) or not stat.S_ISDIR(opened.st_mode):
+            raise _backup_failure("E_ARTIFACT_IDENTITY_CHANGED", f"{artifact} identity changed between stat and open")
+        yield descriptor, opened
+    finally:
+        os.close(descriptor)
+
+
+def _bounded_child_listing(parent_fd: int, *, artifact: str) -> tuple[tuple[str, os.stat_result], ...]:
+    """A bounded, deterministic no-follow listing of one pinned directory."""
+    try:
+        names = sorted(os.listdir(parent_fd), key=os.fsencode)
+    except OSError as exc:
+        raise _backup_failure(_path_code(exc), f"{artifact} cannot be listed: {exc.strerror}") from exc
+    if len(names) > MAX_PARENT_ENTRIES:
+        raise _backup_failure(
+            "E_BACKUP_VERIFY", f"{artifact} has more than {MAX_PARENT_ENTRIES} entries; the listing is unbounded"
+        )
+    listing: list[tuple[str, os.stat_result]] = []
+    for child in names:
+        try:
+            listing.append((child, os.stat(child, dir_fd=parent_fd, follow_symlinks=False)))
+        except OSError as exc:
+            raise _backup_failure(
+                _path_code(exc), f"{artifact}/{child} cannot be inspected: {exc.strerror}"
+            ) from exc
+    return tuple(listing)
+
+
+def _listing_digest(listing: tuple[tuple[str, os.stat_result], ...]) -> str:
+    """The identity digest of a directory listing.
+
+    Deliberately built from the deterministic fields only: ``st_atime`` moves
+    when the very files being copied are read, so it is not part of any
+    directory identity here.
+    """
+    return _digest(
+        [
+            [name, stat.S_IFMT(info.st_mode), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+            for name, info in listing
+        ]
+    )
+
+
+def _stage_regular_file(
+    source_fd: int,
+    opened: os.stat_result,
+    staging_fd: int,
+    staged_name: str,
+    *,
+    artifact: str,
+) -> tuple[str, os.stat_result]:
+    """Stream one regular file into the staging area, fsync it, and verify it.
+
+    The source is read in ``IDENTITY_READ_CHUNK`` bounded chunks until exactly
+    the size observed on its descriptor has been consumed and hashed, then
+    fstat'ed AFTER on the SAME descriptor: a short read, a growth, a truncation
+    or any device/inode/size/mtime change is refused instead of being published
+    as the whole file. The staged copy is then re-opened through its own pinned
+    descriptor and re-digested with the same streaming reader, so a partial or
+    mutated copy cannot reach a published name.
+    """
+    try:
+        descriptor = os.open(
+            staged_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            BACKUP_FILE_MODE,
+            dir_fd=staging_fd,
+        )
+    except FileExistsError as exc:
+        raise _backup_failure("E_BACKUP_COLLISION", f"{artifact} already has a staged copy") from exc
+    except OSError as exc:
+        raise _backup_failure("E_BACKUP_VERIFY", f"{artifact} cannot be staged: {exc.strerror}") from exc
+    try:
+        os.fchmod(descriptor, BACKUP_FILE_MODE)
+        digest = hashlib.sha256()
+        written = 0
+        remaining = opened.st_size
+        while remaining > 0:
+            chunk = os.read(source_fd, min(IDENTITY_READ_CHUNK, remaining))
+            if not chunk:
+                raise _backup_failure(
+                    "E_BACKUP_VERIFY", f"{artifact} returned a short read; the copy is not the whole file"
+                )
+            digest.update(chunk)
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(descriptor, chunk[offset:])
+            written += len(chunk)
+            remaining -= len(chunk)
+        if os.read(source_fd, 1):
+            raise _backup_failure("E_BACKUP_VERIFY", f"{artifact} grew while it was being copied")
+        os.fsync(descriptor)
+    except OSError as exc:
+        code = "E_INSUFFICIENT_SPACE" if exc.errno == errno.ENOSPC else "E_BACKUP_VERIFY"
+        raise _backup_failure(
+            code, f"{artifact} could not be copied into the run directory: {exc.strerror}"
+        ) from exc
+    finally:
+        os.close(descriptor)
+    after = os.fstat(source_fd)
+    if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise _backup_failure("E_ARTIFACT_IDENTITY_CHANGED", f"{artifact} changed while it was being copied")
+    if written != opened.st_size:
+        raise _backup_failure("E_BACKUP_VERIFY", f"{artifact} copied {written} of {opened.st_size} bytes")
+    staged_digest, staged_stat = _verify_pinned_regular_file(staging_fd, staged_name, artifact=artifact)
+    if staged_digest != digest.hexdigest() or staged_stat.st_size != opened.st_size:
+        raise _backup_failure("E_BACKUP_VERIFY", f"{artifact} staged copy does not match the source digest")
+    # Durability before publication: the staged bytes and their directory entry
+    # are on disk before any name can resolve to them.
+    os.fsync(staging_fd)
+    return staged_digest, staged_stat
+
+
+def _verify_pinned_regular_file(
+    directory_fd: int, name: str, *, artifact: str
+) -> tuple[str, os.stat_result]:
+    """Re-open a run-owned regular file through its pinned descriptor and verify it.
+
+    The digest is the SAME streaming, size-bounded, looped fd-relative read used
+    for every identity in this module; the bounded 64 KiB readers are never used
+    for it (routing-matrix residual F7). The entry must be a single-link regular
+    file and it must carry the run-owned 0600 mode.
+    """
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+    except OSError as exc:
+        raise _backup_failure(
+            "E_BACKUP_VERIFY", f"{artifact} cannot be reopened for verification: {exc.strerror}"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise _backup_failure("E_BACKUP_VERIFY", f"{artifact} is not a single-link regular file")
+        digest, refusal = _streamed_digest(descriptor, opened, artifact=artifact)
+        if refusal is not None:
+            raise _backup_failure("E_BACKUP_VERIFY", f"{artifact} identity unproven: {refusal.message}")
+        if stat.S_IMODE(opened.st_mode) != BACKUP_FILE_MODE:
+            raise _backup_failure("E_BACKUP_VERIFY", f"{artifact} is not mode 0600")
+        return str(digest), opened
+    finally:
+        os.close(descriptor)
+
+
+def _publish_staged(
+    staging_fd: int, destination_fd: int, staged_name: str, destination_name: str, *, artifact: str
+) -> None:
+    """Publish a verified staged file: atomic, and never over an existing one.
+
+    ``os.link`` inside one filesystem is the no-overwrite publication DETAIL 10.1
+    requires: an existing backup makes it fail with EEXIST instead of being
+    silently replaced, and because the published name appears only when the link
+    succeeds, no partial file is ever visible under it. The staged name is then
+    unlinked, so the published entry is a plain ``nlink == 1`` regular file.
+    """
+    try:
+        os.link(
+            staged_name,
+            destination_name,
+            src_dir_fd=staging_fd,
+            dst_dir_fd=destination_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError as exc:
+        raise _backup_failure(
+            "E_BACKUP_COLLISION", f"{artifact} is already backed up and is never overwritten"
+        ) from exc
+    except OSError as exc:
+        raise _backup_failure("E_BACKUP_VERIFY", f"{artifact} could not be published: {exc.strerror}") from exc
+    os.unlink(staged_name, dir_fd=staging_fd)
+    os.fsync(destination_fd)
+
+
+def _verify_published(
+    destination_fd: int, destination_name: str, *, expected_digest: str, artifact: str
+) -> None:
+    """Re-read a published backup through its pinned descriptor and compare it."""
+    digest, _info = _verify_pinned_regular_file(destination_fd, destination_name, artifact=artifact)
+    if digest != expected_digest:
+        raise _backup_failure("E_BACKUP_VERIFY", f"{artifact} published copy does not match the source digest")
+
+
+def _absent_backup_entry(label: str, path: str) -> BackupEntry:
+    """The explicit absence record DETAIL 10.1 requires instead of a silent skip."""
+    return BackupEntry(
+        artifact=label,
+        source_path=str(path),
+        run_relative_path=None,
+        kind="absent",
+        present=False,
+        digest_scope="",
+    )
+
+
+def _legacy_projection_paths(plan: MigrationPlan) -> frozenset[str]:
+    """The exact lexical paths of the plan's own legacy projections."""
+    return frozenset(identity.lexical_path for identity in plan.legacy_projections)
+
+
+def _backup_regular_file(
+    parent_fd: int,
+    name: str,
+    before: os.stat_result,
+    source_path: Path,
+    run_dir: Path,
+    run_fd: int,
+    run_device: int,
+    label: str,
+    budget: list[int],
+) -> tuple[BackupEntry, ...]:
+    """Copy and verify exactly one regular file into the run-owned backup area."""
+    _require_same_device(run_device, before.st_dev, artifact=label)
+    _take_backup_slot(budget, label)
+    published_name = _backup_entry_name(label)
+    with _pinned_child_regular_file(parent_fd, name, artifact=label, before=before) as (
+        descriptor,
+        opened,
+    ):
+        staged_name = _staged_file_name()
+        with _staging_directory(run_dir) as (staging_fd, _staging_path):
+            digest, staged_stat = _stage_regular_file(
+                descriptor, opened, staging_fd, staged_name, artifact=label
+            )
+            with _run_child_directory(run_fd, BACKUP_DIRECTORY_NAME) as backup_fd:
+                _publish_staged(staging_fd, backup_fd, staged_name, published_name, artifact=label)
+                _verify_published(
+                    backup_fd, published_name, expected_digest=digest, artifact=label
+                )
+    return (
+        BackupEntry(
+            artifact=label,
+            source_path=str(source_path),
+            run_relative_path=f"{BACKUP_DIRECTORY_NAME}/{published_name}",
+            kind="regular_file",
+            present=True,
+            digest_scope="content",
+            sha256=digest,
+            size=opened.st_size,
+            mode=stat.S_IMODE(opened.st_mode),
+            device=opened.st_dev,
+            inode=opened.st_ino,
+        ),
+    )
+
+
+def _stage_tree(
+    source_fd: int,
+    staging_fd: int,
+    *,
+    label: str,
+    source_path: Path,
+    parts: tuple[str, ...],
+    depth: int,
+    budget: list[int],
+    directories: list[dict[str, Any]],
+    files: list[dict[str, Any]],
+) -> tuple[tuple[str, os.stat_result], ...]:
+    """Stage one directory subtree and return its bounded child listing.
+
+    The walk never follows a link and never crosses a device: each child is
+    inspected through the pinned descriptor of its parent, and a refusal is
+    raised BEFORE anything is published, so the published backup area is
+    untouched by a refused tree (no partial mirror, no target swap). The listing
+    is re-read after the walk and must be identical, so a directory that changed
+    underneath the walk is ``E_ARTIFACT_IDENTITY_CHANGED`` instead of a copy
+    that silently mixes two states.
+    """
+    if depth > MAX_BACKUP_DEPTH:
+        raise _backup_failure("E_BACKUP_VERIFY", f"{label} exceeds the backup depth bound")
+    listing = _bounded_child_listing(source_fd, artifact=label)
+    for name, info in listing:
+        child_parts = (*parts, name)
+        child_artifact = f"{label}/{'/'.join(child_parts)}"
+        child_source = source_path / name
+        if stat.S_ISLNK(info.st_mode):
+            raise _backup_failure(
+                "E_PATH_FINAL_SYMLINK_UNSAFE",
+                f"{child_artifact} is a symlink inside a backed-up directory and is never followed",
+            )
+        if stat.S_ISDIR(info.st_mode):
+            _take_backup_slot(budget, child_artifact)
+            with _pinned_child_directory(
+                source_fd, name, artifact=child_artifact, before=info
+            ) as (child_fd, child_opened):
+                descendants = _stage_tree(
+                    child_fd,
+                    staging_fd,
+                    label=label,
+                    source_path=child_source,
+                    parts=child_parts,
+                    depth=depth + 1,
+                    budget=budget,
+                    directories=directories,
+                    files=files,
+                )
+            directories.append(
+                {
+                    "parts": child_parts,
+                    "artifact": child_artifact,
+                    "source_path": str(child_source),
+                    "stat": child_opened,
+                    "digest": _listing_digest(descendants),
+                }
+            )
+        elif stat.S_ISREG(info.st_mode):
+            _take_backup_slot(budget, child_artifact)
+            if info.st_nlink != 1:
+                raise _backup_failure(
+                    "E_PATH_HARDLINK_UNSAFE", f"{child_artifact} is a hard-linked regular file"
+                )
+            staged_name = _staged_file_name()
+            with _pinned_child_regular_file(
+                source_fd, name, artifact=child_artifact, before=info
+            ) as (descriptor, child_opened):
+                digest, staged_stat = _stage_regular_file(
+                    descriptor, child_opened, staging_fd, staged_name, artifact=child_artifact
+                )
+            files.append(
+                {
+                    "parts": child_parts,
+                    "artifact": child_artifact,
+                    "staged": staged_name,
+                    "digest": digest,
+                    "stat": child_opened,
+                    "staged_stat": staged_stat,
+                }
+            )
+        else:
+            raise _backup_failure(
+                "E_PATH_SPECIAL_FILE", f"{child_artifact} is neither a regular file nor a directory"
+            )
+    if _listing_digest(_bounded_child_listing(source_fd, artifact=label)) != _listing_digest(listing):
+        raise _backup_failure("E_ARTIFACT_IDENTITY_CHANGED", f"{label} changed while it was being backed up")
+    return listing
+
+
+def _publish_tree(
+    run_fd: int,
+    entry_name: str,
+    directories: list[dict[str, Any]],
+    files: list[dict[str, Any]],
+    staging_fd: int,
+) -> None:
+    """Publish a fully staged subtree with atomic no-overwrite creates."""
+    with _run_child_directory(run_fd, BACKUP_DIRECTORY_NAME) as backup_fd:
+        with _run_child_directory(backup_fd, entry_name) as root_fd:
+            for record in sorted(directories, key=lambda item: len(item["parts"])):
+                with _run_directory_chain(root_fd, record["parts"]) as destination_fd:
+                    os.fsync(destination_fd)
+            for record in files:
+                with _run_directory_chain(root_fd, record["parts"][:-1]) as parent_fd:
+                    _publish_staged(
+                        staging_fd,
+                        parent_fd,
+                        record["staged"],
+                        record["parts"][-1],
+                        artifact=record["artifact"],
+                    )
+                    _verify_published(
+                        parent_fd,
+                        record["parts"][-1],
+                        expected_digest=record["digest"],
+                        artifact=record["artifact"],
+                    )
+            for record in sorted(directories, key=lambda item: -len(item["parts"])):
+                with _run_directory_chain(root_fd, record["parts"]) as destination_fd:
+                    os.fsync(destination_fd)
+            os.fsync(root_fd)
+
+
+def _backup_directory_tree(
+    parent_fd: int,
+    name: str,
+    before: os.stat_result,
+    source_path: Path,
+    run_dir: Path,
+    run_fd: int,
+    run_device: int,
+    label: str,
+    budget: list[int],
+) -> tuple[BackupEntry, ...]:
+    """Mirror one directory tree without following any link (DETAIL 10.1)."""
+    _require_same_device(run_device, before.st_dev, artifact=label)
+    _take_backup_slot(budget, label)
+    entry_name = _backup_entry_name(label)
+    directories: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
+    with _pinned_child_directory(parent_fd, name, artifact=label, before=before) as (
+        source_fd,
+        opened,
+    ):
+        with _staging_directory(run_dir) as (staging_fd, _staging_path):
+            listing = _stage_tree(
+                source_fd,
+                staging_fd,
+                label=label,
+                source_path=source_path,
+                parts=(),
+                depth=1,
+                budget=budget,
+                directories=directories,
+                files=files,
+            )
+            _publish_tree(run_fd, entry_name, directories, files, staging_fd)
+    entries = [
+        BackupEntry(
+            artifact=label,
+            source_path=str(source_path),
+            run_relative_path=f"{BACKUP_DIRECTORY_NAME}/{entry_name}",
+            kind="directory",
+            present=True,
+            digest_scope="listing",
+            sha256=_listing_digest(listing),
+            mode=stat.S_IMODE(opened.st_mode),
+            device=opened.st_dev,
+            inode=opened.st_ino,
+        )
+    ]
+    entries.extend(
+        BackupEntry(
+            artifact=record["artifact"],
+            source_path=record["source_path"],
+            run_relative_path=(
+                f"{BACKUP_DIRECTORY_NAME}/{entry_name}/{'/'.join(record['parts'])}"
+            ),
+            kind="directory",
+            present=True,
+            digest_scope="listing",
+            sha256=record["digest"],
+            mode=stat.S_IMODE(record["stat"].st_mode),
+            device=record["stat"].st_dev,
+            inode=record["stat"].st_ino,
+        )
+        for record in directories
+    )
+    entries.extend(
+        BackupEntry(
+            artifact=record["artifact"],
+            source_path=str(source_path / Path(*record["parts"])),
+            run_relative_path=(
+                f"{BACKUP_DIRECTORY_NAME}/{entry_name}/{'/'.join(record['parts'])}"
+            ),
+            kind="regular_file",
+            present=True,
+            digest_scope="content",
+            sha256=record["digest"],
+            size=record["stat"].st_size,
+            mode=stat.S_IMODE(record["stat"].st_mode),
+            device=record["stat"].st_dev,
+            inode=record["stat"].st_ino,
+        )
+        for record in files
+    )
+    return tuple(entries)
+
+
+def _backup_link_entry(
+    parent_fd: int,
+    name: str,
+    before: os.stat_result,
+    source_path: Path,
+    run_fd: int,
+    run_device: int,
+    label: str,
+    budget: list[int],
+) -> tuple[BackupEntry, ...]:
+    """Back up a final legacy symlink as a NEW raw link entry (DETAIL 10.1).
+
+    Only the exact raw ``readlink`` string is read and recreated under the
+    run-owned ``link-entries`` directory: the referent is NEVER opened,
+    enumerated, hashed, copied, modified or validated as a store. The published
+    entry is created with ``symlink`` itself -- an atomic no-overwrite create,
+    so an existing entry is ``E_BACKUP_COLLISION`` -- and it is then re-read and
+    compared byte for byte with the raw string it must carry.
+    """
+    _require_same_device(run_device, before.st_dev, artifact=label)
+    _take_backup_slot(budget, label)
+    entry_name = _backup_entry_name(label)
+    try:
+        raw_target = os.readlink(name, dir_fd=parent_fd)
+    except OSError as exc:
+        raise _backup_failure(
+            _path_code(exc), f"{label} raw link string cannot be read: {exc.strerror}"
+        ) from exc
+    with _run_child_directory(run_fd, BACKUP_DIRECTORY_NAME) as backup_fd:
+        with _run_child_directory(backup_fd, BACKUP_LINK_ENTRIES_NAME) as link_fd:
+            try:
+                os.symlink(raw_target, entry_name, dir_fd=link_fd)
+            except FileExistsError as exc:
+                raise _backup_failure(
+                    "E_BACKUP_COLLISION", f"{label} already has a link entry and is never overwritten"
+                ) from exc
+            except OSError as exc:
+                raise _backup_failure(
+                    "E_BACKUP_VERIFY", f"{label} link entry cannot be created: {exc.strerror}"
+                ) from exc
+            os.fsync(link_fd)
+            try:
+                published = os.readlink(entry_name, dir_fd=link_fd)
+            except OSError as exc:
+                raise _backup_failure(
+                    "E_BACKUP_VERIFY", f"{label} link entry cannot be re-read: {exc.strerror}"
+                ) from exc
+            if published != raw_target:
+                raise _backup_failure(
+                    "E_BACKUP_VERIFY", f"{label} link entry does not carry the exact raw link string"
+                )
+    return (
+        BackupEntry(
+            artifact=label,
+            source_path=str(source_path),
+            run_relative_path=f"{BACKUP_DIRECTORY_NAME}/{BACKUP_LINK_ENTRIES_NAME}/{entry_name}",
+            kind="symlink",
+            present=True,
+            digest_scope="",
+            mode=stat.S_IMODE(before.st_mode),
+            raw_link_target=raw_target,
+        ),
+    )
+
+
+def _backup_path(
+    plan: MigrationPlan,
+    label: str,
+    path: Path,
+    run_dir: Path,
+    run_fd: int,
+    run_device: int,
+    budget: list[int],
+) -> tuple[BackupEntry, ...]:
+    """Back up one artifact path, dispatching on the kind it really is.
+
+    The kind is decided by the filesystem through the pinned no-follow
+    descriptor of the path's parent, never by the caller or by the plan: a
+    regular file and a directory are copied, an entry that is one of the plan's
+    OWN legacy projections is recorded as a raw link entry when it is a symlink,
+    an absent entry is recorded explicitly, and every other symlink, special
+    file or hard-linked regular file is refused.
+    """
+    candidate = Path(path)
+    legacy_paths = _legacy_projection_paths(plan)
+    try:
+        with storage_lock.open_directory_nofollow(candidate.parent) as parent_fd:
+            try:
+                before = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return (_absent_backup_entry(label, str(candidate)),)
+            if stat.S_ISLNK(before.st_mode):
+                if str(candidate) not in legacy_paths:
+                    raise _backup_failure(
+                        "E_PATH_FINAL_SYMLINK_UNSAFE",
+                        f"{label} is a symlink that is not one of the plan's legacy projections;"
+                        " it is never followed",
+                    )
+                return _backup_link_entry(
+                    parent_fd, candidate.name, before, candidate, run_fd, run_device, label, budget
+                )
+            if stat.S_ISDIR(before.st_mode):
+                return _backup_directory_tree(
+                    parent_fd,
+                    candidate.name,
+                    before,
+                    candidate,
+                    run_dir,
+                    run_fd,
+                    run_device,
+                    label,
+                    budget,
+                )
+            if stat.S_ISREG(before.st_mode):
+                return _backup_regular_file(
+                    parent_fd,
+                    candidate.name,
+                    before,
+                    candidate,
+                    run_dir,
+                    run_fd,
+                    run_device,
+                    label,
+                    budget,
+                )
+            raise _backup_failure(
+                "E_PATH_SPECIAL_FILE", f"{label} is neither a regular file nor a directory"
+            )
+    except storage_lock.StorageLockError as exc:
+        if exc.code == "E_PATH_ABSENT":
+            return (_absent_backup_entry(label, str(candidate)),)
+        raise _backup_failure(
+            exc.code, f"{label} path chain is not a no-follow real path"
+        ) from exc
+
+
+def backup_artifact(
+    plan: MigrationPlan, label: str, path: Path, *, run_dir: Path | None = None
+) -> tuple[BackupEntry, ...]:
+    """Back up exactly one plan artifact into the run-owned backup area.
+
+    ``label`` is the plan's artifact label (``target:graph``, ``target:vector``,
+    ``legacy:<index>``) and only names the run-owned destination; the KIND is
+    always decided by the filesystem through pinned no-follow descriptors. An
+    absent entry is recorded explicitly, and nothing inside the run directory is
+    ever overwritten.
+    """
+    run = _backup_run_directory(plan) if run_dir is None else Path(run_dir)
+    _prepare_run_directory(run, plan.request.run_id)
+    bounded_label = _bounded_str(label, field_name="backup.label", max_bytes=256)
+    budget: list[int] = [0]
+    with storage_lock.open_directory_nofollow(run) as run_fd:
+        run_device = os.fstat(run_fd).st_dev
+        return _backup_path(
+            plan, bounded_label, Path(path), run, run_fd, run_device, budget
+        )
+
+
+def graph_lock_creation_record(plan: MigrationPlan, locks: Any = None) -> dict[str, Any]:
+    """Record whether THIS run created an absent graph lock, and its exact entry.
+
+    DETAIL 10.1: the held lock inode is never replaced, and a graph lock this
+    migration CREATED must be removable after unlock. The identity is therefore
+    taken from the LOCK OWNER's own descriptor
+    (``MaintenanceStorageLocks.graph_lock_identity``) and never from a fresh path
+    walk that a swap could redirect, so post-unlock cleanup
+    (``storage_lock.remove_created_lock_entry``) removes exactly what this run
+    created. ``created`` False means the entry pre-existed and cleanup must
+    leave it in place.
+    """
+    record: dict[str, Any] = {
+        "path": str(Path(plan.layout.graph_lock_path)),
+        "run_id": plan.request.run_id,
+        "created": False,
+        "device": None,
+        "inode": None,
+        "mode": None,
+        "nlink": None,
+        "held": False,
+    }
+    if locks is None:
+        return record
+    identity = locks.graph_lock_identity
+    if identity is None:
+        return record
+    record.update(
+        {
+            "created": bool(locks.graph_lock_created),
+            "device": identity.st_dev,
+            "inode": identity.st_ino,
+            "mode": stat.S_IMODE(identity.st_mode),
+            "nlink": identity.st_nlink,
+            "held": True,
+        }
+    )
+    return record
+
+
+def _backup_sqlite_record(plan: MigrationPlan, run_dir: Path) -> dict[str, Any]:
+    """The SQL source is preserved in place and covered by the S2-03 snapshot.
+
+    DETAIL 10.1: the safety snapshot uses ``sqlite3.Connection.backup``, never a
+    file copy, so this stage does NOT copy the database file, its WAL or its
+    SHM. When the run already holds the S2-03 snapshot, its identity is recorded
+    and the snapshot itself is never rewritten or replaced here.
+    """
+    snapshot = Path(run_dir) / SNAPSHOT_DIR_NAME / SNAPSHOT_DB_NAME
+    record: dict[str, Any] = {
+        "path": plan.source_sql.lexical_path,
+        "action": plan.sql_action,
+        "api": SNAPSHOT_API,
+        "snapshot": None,
+    }
+    if os.path.lexists(snapshot):
+        record["snapshot"] = asdict(_inventory(snapshot, artifact="backup:snapshot"))
+    return record
+
+
+def _write_run_report(run_dir: Path, run_fd: int, payload: Mapping[str, Any]) -> str:
+    """Durably publish the run's backup report, never over an existing one.
+
+    Staged, fsync'ed, verified and then linked into place, exactly like every
+    other run-owned artifact: a pre-existing report is ``E_BACKUP_COLLISION``
+    (a run id is never reused), and a failure leaves no report at all.
+    """
+    blob = _canonical_bytes(payload)
+    if len(blob) > MAX_MANIFEST_BYTES:
+        raise _backup_failure("E_BACKUP_VERIFY", f"the backup report exceeds {MAX_MANIFEST_BYTES} bytes")
+    staged = _staged_file_name()
+    try:
+        with _staging_directory(run_dir) as (staging_fd, _staging_path):
+            descriptor = os.open(
+                staged,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                BACKUP_FILE_MODE,
+                dir_fd=staging_fd,
+            )
+            try:
+                os.fchmod(descriptor, BACKUP_FILE_MODE)
+                written = 0
+                while written < len(blob):
+                    written += os.write(descriptor, blob[written:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(staging_fd)
+            digest, _info = _verify_pinned_regular_file(staging_fd, staged, artifact="backup report")
+            if digest != hashlib.sha256(blob).hexdigest():
+                raise _backup_failure("E_BACKUP_VERIFY", "the backup report does not match what was staged")
+            _publish_staged(staging_fd, run_fd, staged, BACKUP_REPORT_NAME, artifact="backup report")
+    except OSError as exc:
+        code = "E_INSUFFICIENT_SPACE" if exc.errno == errno.ENOSPC else "E_BACKUP_VERIFY"
+        raise _backup_failure(code, f"the backup report could not be written: {exc.strerror}") from exc
+    return digest
+
+
+def create_run_backup(plan: MigrationPlan, *, locks: Any = None) -> RunBackup:
+    """Back up every regular artifact and final legacy link entry of one plan.
+
+    DETAIL 9.1/10.1, run-owned and immutable:
+
+    * the destination is the plan's own ``<data_root>/.cmms-migrations/<run-id>/``
+      (mode 0700, created only here and only once -- a run id that already owns a
+      backup report is ``E_BACKUP_COLLISION`` and is never reused);
+    * every target the plan inventoried is backed up by KIND: a regular file is
+      copied and verified, a directory is mirrored recursively without following
+      a link, and a legacy projection is recorded as its exact raw link entry;
+    * the SQL source is NOT copied (the S2-03 ``sqlite3.Connection.backup``
+      snapshot is the safety copy): only its record is written, and the snapshot
+      already present in the run directory is recorded and left untouched;
+    * the graph lock is never replaced: the creation record of the lock stage is
+      carried into the report so post-unlock cleanup can remove exactly what this
+      run created;
+    * the whole result is written as one durable, bounded, mode-0600
+      ``backup-report.json`` inside the run directory, and nothing in the run
+      directory is ever overwritten.
+    """
+    run_dir = _backup_run_directory(plan)
+    _prepare_run_directory(run_dir, plan.request.run_id)
+    report_target = run_dir / BACKUP_REPORT_NAME
+    if os.path.lexists(report_target):
+        raise _backup_failure(
+            "E_BACKUP_COLLISION", "this run id already owns a backup report; a run id is never reused"
+        )
+    budget: list[int] = [0]
+    entries: list[BackupEntry] = []
+    with storage_lock.open_directory_nofollow(run_dir) as run_fd:
+        run_device = os.fstat(run_fd).st_dev
+        for label in ("graph", "vector"):
+            identity = plan.targets.get(label)
+            if identity is None:
+                continue
+            entries.extend(
+                _backup_path(
+                    plan,
+                    f"target:{label}",
+                    Path(identity.lexical_path),
+                    run_dir,
+                    run_fd,
+                    run_device,
+                    budget,
+                )
+            )
+        for index, identity in enumerate(plan.legacy_projections):
+            entries.extend(
+                _backup_path(
+                    plan,
+                    f"legacy:{index}",
+                    Path(identity.lexical_path),
+                    run_dir,
+                    run_fd,
+                    run_device,
+                    budget,
+                )
+            )
+        sqlite_record = _backup_sqlite_record(plan, run_dir)
+        graph_lock = graph_lock_creation_record(plan, locks)
+        coordination = {
+            label: asdict(plan.targets[label]) if label in plan.targets else None
+            for label in _COORDINATION_TARGET_LABELS
+        }
+        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload: dict[str, Any] = {
+            "schema_version": BACKUP_REPORT_SCHEMA_VERSION,
+            "run_id": _validate_run_id(plan.request.run_id),
+            "created_at": created_at,
+            "entries": [asdict(entry) for entry in entries],
+            "sqlite": sqlite_record,
+            "coordination": coordination,
+            "graph_lock": dict(graph_lock),
+        }
+        digest = _digest(payload)
+        payload["digest"] = digest
+        _write_run_report(run_dir, run_fd, payload)
+    return RunBackup(
+        run_id=plan.request.run_id,
+        run_dir=str(run_dir),
+        report_path=str(report_target),
+        entries=tuple(entries),
+        sqlite=sqlite_record,
+        graph_lock=dict(graph_lock),
+        digest=digest,
+        created_at=created_at,
+    )
 
 
 def _require_mutation_preconditions(
