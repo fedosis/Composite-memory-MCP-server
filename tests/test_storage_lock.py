@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fcntl
+import importlib
 import multiprocessing
 import os
 import stat
@@ -183,3 +185,203 @@ def test_s1_directory_swap_is_detected_without_entering_link(tmp_path, monkeypat
         with open_directory_nofollow(before / "must-not-exist", create=True):
             pass
     assert list(target.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# S2-04 -- lifetime ownership of every lock, the applicable graph lock without
+#          inode replacement, and the complete /proc writer inventory
+#
+# Every node below that references a symbol which does not exist at the card's
+# parent commit is a labelled MISSING-CAPABILITY node: it fails at BASE with
+# AttributeError naming the absent symbol, never with a collection ImportError,
+# because every new import happens inside the test body. The behavioural nodes
+# for the same contract live in tests/test_profile_migration.py and drive the
+# already-approved public entrypoint surface.
+# ---------------------------------------------------------------------------
+
+
+def _s204_storage_lock():
+    return importlib.import_module("memory_server.storage_lock")
+
+
+def _s204_own_namespace() -> str:
+    return os.readlink("/proc/self/ns/mnt")
+
+
+def _s204_upgraded_holder(root: str, ready, release) -> None:
+    lock = RuntimeStorageLock.acquire(Path(root), timeout=3)
+    ready.put(os.getpid())
+    release.wait(8)
+    lock.release()
+
+
+def _s204_fake_proc(
+    proc_root: Path,
+    pid: int,
+    fds: dict[int, str],
+    *,
+    namespace: str,
+    uid: int,
+    readable: bool = True,
+) -> Path:
+    entry = proc_root / str(pid)
+    (entry / "ns").mkdir(parents=True)
+    (entry / "fd").mkdir()
+    (entry / "status").write_text(f"Name:\tsynthetic\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    (entry / "ns" / "mnt").symlink_to(namespace)
+    for descriptor, label in fds.items():
+        (entry / "fd" / str(descriptor)).symlink_to(label)
+    if not readable:
+        os.chmod(entry / "fd", 0o000)
+    return entry
+
+
+def test_s204_graph_lock_is_held_without_inode_replacement_and_never_unlinked(tmp_path: Path) -> None:
+    module = _s204_storage_lock()
+    graph = tmp_path / "graph.lock"
+    graph.write_bytes(b"")
+    inode = os.lstat(graph).st_ino
+    locks = module.MaintenanceStorageLocks.acquire([tmp_path], timeout=1, graph_lock_path=graph)
+    competing = os.open(graph, os.O_RDWR)
+    try:
+        assert os.lstat(graph).st_ino == inode
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(competing)
+        locks.release()
+    assert os.lstat(graph).st_ino == inode
+    assert graph.exists()
+
+
+def test_s204_release_is_refused_inside_a_critical_section_and_retains_protection(tmp_path: Path) -> None:
+    module = _s204_storage_lock()
+    lock_path = tmp_path / ".cmms-storage.lock"
+    locks = module.MaintenanceStorageLocks.acquire([tmp_path], timeout=1)
+    inode = os.lstat(lock_path).st_ino
+    locks.begin_critical_section()
+    with pytest.raises(StorageLockError) as unsafe:
+        locks.release()
+    assert unsafe.value.code == "E_LOCK_RELEASE_UNSAFE"
+    assert locks.held is True
+    with pytest.raises(StorageLockError) as competitor:
+        module.MaintenanceStorageLocks.acquire([tmp_path], timeout=0.05)
+    assert competitor.value.code == "E_LOCK_TIMEOUT"
+    locks.end_critical_section()
+    locks.release()
+    assert locks.released is True
+    locks.release()
+    assert os.lstat(lock_path).st_ino == inode
+    successor = module.MaintenanceStorageLocks.acquire([tmp_path], timeout=1)
+    try:
+        assert os.lstat(lock_path).st_ino == inode
+    finally:
+        successor.release()
+
+
+def test_s204_proc_inventory_matches_raw_labels_without_following_a_referent(tmp_path: Path) -> None:
+    module = _s204_storage_lock()
+    proc = tmp_path / "proc"
+    referent = tmp_path / "legacy-referent"
+    referent.mkdir()
+    link = tmp_path / "lancedb"
+    link.symlink_to(referent, target_is_directory=True)
+    database = tmp_path / "memory.db"
+    database.write_bytes(b"db")
+    _s204_fake_proc(
+        proc,
+        4242,
+        {3: str(link), 4: str(database), 5: "socket:[1]"},
+        namespace=_s204_own_namespace(),
+        uid=os.getuid(),
+    )
+    _s204_fake_proc(
+        proc,
+        4243,
+        {3: "socket:[2]"},
+        namespace="mnt:[999999]",
+        uid=0,
+        readable=False,
+    )
+    (proc / "locks").write_text("")
+    inventory = module.scan_writer_inventory(
+        {"legacy_referent": str(link), "source": str(database)},
+        proc_root=proc,
+        exclude_pids=(os.getpid(),),
+    )
+    assert inventory.covered is True
+    assert inventory.code is None
+    raw = {record.raw_label for record in inventory.records}
+    assert raw == {str(link), str(database)}
+    assert str(referent) not in raw
+    assert inventory.excluded_foreign_namespace == 1
+    assert inventory.excluded_foreign_credential == 0
+    os.chmod(proc / "4243" / "fd", 0o700)
+
+
+def test_s204_incomplete_same_namespace_coverage_fails_closed(tmp_path: Path) -> None:
+    module = _s204_storage_lock()
+    proc = tmp_path / "proc"
+    _s204_fake_proc(
+        proc,
+        5150,
+        {3: "socket:[9]"},
+        namespace=_s204_own_namespace(),
+        uid=os.getuid(),
+        readable=False,
+    )
+    (proc / "locks").write_text("")
+    inventory = module.scan_writer_inventory(
+        {"source": str(tmp_path / "memory.db")}, proc_root=proc, exclude_pids=(os.getpid(),)
+    )
+    assert inventory.covered is False
+    assert inventory.code == "E_WRITER_STATE_UNKNOWN"
+    assert inventory.gaps
+    assert any("descriptor table of pid 5150" in gap for gap in inventory.gaps)
+    os.chmod(proc / "5150" / "fd", 0o700)
+
+
+def test_s204_missing_proc_root_is_unsupported_and_fails_closed(tmp_path: Path) -> None:
+    module = _s204_storage_lock()
+    inventory = module.scan_writer_inventory(
+        {"source": str(tmp_path / "memory.db")}, proc_root=tmp_path / "absent"
+    )
+    assert inventory.covered is False
+    assert inventory.code == "E_WRITER_INVENTORY_UNSUPPORTED"
+
+
+def test_s204_real_upgraded_shared_holder_is_reported_and_stays_unsignalled(tmp_path: Path) -> None:
+    module = _s204_storage_lock()
+    lock_path = tmp_path / ".cmms-storage.lock"
+    ready: multiprocessing.Queue[int] = multiprocessing.Queue()
+    release = multiprocessing.Event()
+    proc = multiprocessing.Process(target=_s204_upgraded_holder, args=(str(tmp_path), ready, release))
+    proc.start()
+    child = None
+    try:
+        child = ready.get(timeout=6)
+        inventory = module.scan_writer_inventory(
+            {"root_lock": str(lock_path)},
+            lock_label_keys=("root_lock",),
+            proc_root="/proc",
+            exclude_pids=(os.getpid(),),
+        )
+        assert inventory.covered is True
+        holders = inventory.upgraded_holders
+        assert [record.pid for record in holders] == [child]
+        assert holders[0].raw_label == str(lock_path)
+        assert inventory.legacy_writers == ()
+        table = module.read_lock_table(proc_root="/proc")
+        assert any(
+            record.pid == child and record.kind == "flock" and record.mode == "read" for record in table
+        )
+        with pytest.raises(StorageLockError) as timeout:
+            module.MaintenanceStorageLocks.acquire([tmp_path], timeout=0.2)
+        assert timeout.value.code == "E_LOCK_TIMEOUT"
+        assert proc.is_alive()
+    finally:
+        release.set()
+        proc.join(8)
+        if proc.is_alive():
+            proc.terminate()
+    assert proc.exitcode == 0

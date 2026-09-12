@@ -55,6 +55,31 @@ engine slices):
   copying the database file, its WAL or its SHM.
 
 Still planner-only: every mutating entrypoint fails closed.
+
+Slice S2-04 adds the mixed-version maintenance preconditions and lifetime
+ownership of every lock:
+
+* ``apply`` / ``resume`` / ``rollback`` each call ``validate_mutation_preconditions``
+  independently -- intent, a bounded and timestamped attestation digest, a FRESH
+  replan (a caller's stale plan is ``E_PLAN_STALE``), and sidecar/path/disk
+  checks recomputed from that replan. No entrypoint inherits another's validated
+  state, and nothing is mutated before every check has passed;
+* the writer state is inventoried from ``/proc``: every other process's raw
+  descriptor labels (matched WITHOUT following any referent, so a legacy symlink
+  is matched as the raw link string) plus the system-wide advisory lock table. An
+  old pre-upgrade writer is ``E_OLD_WRITER_ACTIVE``, a live upgraded runtime
+  ``E_WRITER_ACTIVE``, an incomplete inventory ``E_WRITER_STATE_UNKNOWN`` and a
+  missing inventory source ``E_WRITER_INVENTORY_UNSUPPORTED``; nothing is ever
+  signalled;
+* identity AND hash stability of the source, its sidecars and the projections is
+  proven across the quiet interval (2 s under tests, 5 s for the CLI);
+* ``acquire_maintenance_locks`` locks every source/target root exclusively in
+  canonical sorted order and holds the applicable graph lock without inode
+  replacement. The lock object owns its descriptors for its whole lifetime: a
+  release is refused inside an open critical section and the lock entry is never
+  unlinked, so the resource stays protected after the lock is dropped;
+* the prequalified bounded SQLite transaction probe runs last, on the fresh
+  identities only.
 """
 from __future__ import annotations
 
@@ -68,10 +93,11 @@ import shutil
 import sqlite3
 import stat
 import sys
+import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Literal, Mapping, cast, get_args
+from typing import Any, Callable, Iterable, Literal, Mapping, cast, get_args
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -118,6 +144,16 @@ _SIDECAR_CODES = {
 IDENTITY_READ_CHUNK = 1 << 20
 MAX_IDENTITY_BYTES = 1 << 36
 MAX_INVENTORY_ENTRIES = 64
+
+# S2-04 maintenance bounds. The quiet interval is the DETAIL 6.3 step 11 window
+# (2 s under tests, 5 s for the CLI); the attestation and the lock-root set are
+# bounded so no operator input can drive unbounded work or memory.
+QUIET_INTERVAL_SECONDS_TESTS = 2.0
+QUIET_INTERVAL_SECONDS_CLI = 5.0
+MAX_QUIET_INTERVAL_SECONDS = 60.0
+MAX_ATTESTATION_BYTES = 512
+MAX_MAINTENANCE_ROOTS = 16
+DEFAULT_PROC_ROOT = storage_lock.PROC_ROOT_DEFAULT
 MAX_SQLITE_TABLES = 64
 SQLITE_COUNT_CAP = 100_000
 DISK_MARGIN_RATIO = 1.25
@@ -2198,6 +2234,370 @@ def plan_profile_migration(request: MigrationRequest) -> MigrationPlan:
     )
 
 
+_MAINTENANCE_PROCESS_CLASSES = (
+    "hermes-profile-runtime",
+    "standalone-runtime",
+    "legacy-memory-server",
+)
+
+
+def _plan_identity_digest(plan: MigrationPlan) -> str:
+    """Canonical identity digest of one plan's source, sidecars and targets.
+
+    Two plans of the same unchanged artifacts share this digest whatever their
+    request fields were; any identity, size, mtime or content change moves it,
+    which is exactly the staleness test of DETAIL 6.3 step 4.
+    """
+    return _digest(
+        {
+            "source": asdict(plan.source_sql),
+            "sidecars": {
+                suffix: asdict(identity) for suffix, identity in plan.source_sidecars.items()
+            },
+            "targets": {label: asdict(identity) for label, identity in plan.targets.items()},
+            "config_digest": plan.config_digest,
+        }
+    )
+
+
+@dataclass(frozen=True)
+class StopAttestation:
+    """Bounded, recorded stop attestation (DETAIL 6.3 step 3)."""
+
+    value_bytes: int
+    digest: str
+    recorded_at: str
+    roots: tuple[str, ...]
+    process_classes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MutationPreconditions:
+    """Everything apply/resume/rollback must prove before any target mutation."""
+
+    mode: str
+    roots: tuple[str, ...]
+    graph_lock_path: str
+    attestation: StopAttestation
+    plan_digest: str | None
+    replan_digest: str
+    quiet_interval: float
+    probe: Mapping[str, Any]
+    stability: Mapping[str, Any]
+    writer_state: Mapping[str, Any]
+
+
+def _running_under_pytest() -> bool:
+    return "pytest" in sys.modules
+
+
+def resolve_quiet_interval(explicit: float | None = None) -> float:
+    """DETAIL 6.3 step 11: 2 s by default under tests, 5 s for the CLI.
+
+    An explicit value always wins (it is what an operator or a caller passes);
+    otherwise the default is the test default only when this interpreter really
+    has pytest loaded, so a CLI process can never silently take the short
+    interval.
+    """
+    if explicit is None:
+        return QUIET_INTERVAL_SECONDS_TESTS if _running_under_pytest() else QUIET_INTERVAL_SECONDS_CLI
+    value = float(explicit)
+    if not math.isfinite(value) or value < 0 or value > MAX_QUIET_INTERVAL_SECONDS:
+        raise ValueError("E_QUIET_INTERVAL_INVALID")
+    return value
+
+
+def record_stop_attestation(attestation: Any, *, roots: Iterable[Path]) -> StopAttestation:
+    """Bound, digest and timestamp ``--attest-runtimes-stopped``; never store it raw."""
+    if not isinstance(attestation, str) or not attestation.strip():
+        raise ValueError("E_STOP_ATTESTATION_REQUIRED")
+    payload = attestation.encode("utf-8")
+    if len(payload) > MAX_ATTESTATION_BYTES or b"\x00" in payload:
+        raise ValueError("E_ATTESTATION_UNBOUNDED")
+    canonical_roots = tuple(
+        sorted({str(_canonical_root(Path(root))) for root in roots}, key=lambda value: os.fsencode(value))
+    )
+    if len(canonical_roots) > MAX_MAINTENANCE_ROOTS:
+        raise ValueError("E_ATTESTATION_UNBOUNDED")
+    return StopAttestation(
+        len(payload),
+        hashlib.sha256(payload).hexdigest(),
+        datetime.now(timezone.utc).isoformat(),
+        canonical_roots,
+        _MAINTENANCE_PROCESS_CLASSES,
+    )
+
+
+def _canonical_root(path: Path) -> Path:
+    value = os.path.expanduser(os.fspath(path))
+    if not value or "\x00" in value:
+        raise ValueError("E_PATH_INVALID")
+    return Path(os.path.abspath(os.path.normpath(value)))
+
+
+def maintenance_lock_roots(plan: MigrationPlan) -> tuple[Path, ...]:
+    """The source and target roots of DETAIL 6.3 step 8, sorted lexically.
+
+    Canonicalised and deduplicated first, so two spellings of one root can never
+    produce two locks and the acquisition order is stable across machines.
+    """
+    candidates: list[Path] = [Path(plan.layout.data_root)]
+    if plan.request.target_root is not None:
+        candidates.append(Path(plan.request.target_root))
+    vector = plan.layout.vector.local_path
+    if vector is not None:
+        # The vector store may be a symlink to another filesystem (this
+        # deployment's live layout is exactly that). A symlink is never a lock
+        # root -- the lock entry must live in a real directory -- so the lock
+        # goes into the store's parent and the entry itself is never followed.
+        candidates.append(Path(vector).parent)
+    candidates.append(Path(plan.layout.graph_snapshot_path).parent)
+    candidates.append(Path(plan.layout.graph_lock_path).parent)
+    canonical = {_canonical_root(candidate) for candidate in candidates}
+    return tuple(sorted(canonical, key=lambda path: os.fsencode(str(path))))
+
+
+def _writer_labels(plan: MigrationPlan) -> tuple[dict[str, str], tuple[str, ...]]:
+    """RAW label strings to look for in other processes' descriptor tables.
+
+    Every value is the exact string the kernel prints for the entry -- the lock
+    entries, the source and its sidecars, the graph snapshot, the vector store
+    and a legacy link's recorded referent string. Nothing here is resolved, so a
+    legacy referent that is itself a symlink is matched as the raw string and is
+    never followed.
+    """
+    labels: dict[str, str] = {
+        "root_lock": str(Path(plan.layout.root_lock_path)),
+        "graph_lock": str(Path(plan.layout.graph_lock_path)),
+    }
+    labels["source"] = plan.source_sql.lexical_path
+    for suffix, identity in plan.source_sidecars.items():
+        labels[f"sidecar{suffix}"] = identity.lexical_path
+    labels["graph_snapshot"] = str(Path(plan.layout.graph_snapshot_path))
+    vector = plan.layout.vector.local_path
+    if vector is not None:
+        labels["vector"] = str(Path(vector))
+    for index, identity in enumerate(plan.legacy_projections):
+        if identity.kind == "absent":
+            continue
+        labels[f"legacy_link{index}"] = identity.lexical_path
+        if identity.raw_link_target:
+            labels[f"legacy_referent{index}"] = identity.raw_link_target
+    return labels, ("root_lock", "graph_lock")
+
+
+def _writer_inventory(
+    plan: MigrationPlan,
+    *,
+    proc_root: str | Path = DEFAULT_PROC_ROOT,
+    exclude_pids: Iterable[int] = (),
+) -> storage_lock.WriterInventory:
+    labels, lock_keys = _writer_labels(plan)
+    return storage_lock.scan_writer_inventory(
+        labels,
+        lock_label_keys=lock_keys,
+        proc_root=proc_root,
+        exclude_pids=(os.getpid(), *exclude_pids),
+    )
+
+
+def _writer_state_report(inventory: storage_lock.WriterInventory) -> dict[str, Any]:
+    return {
+        "covered": inventory.covered,
+        "code": inventory.code,
+        "scanned_pids": inventory.scanned_pids,
+        "excluded_foreign_namespace": inventory.excluded_foreign_namespace,
+        "excluded_foreign_credential": inventory.excluded_foreign_credential,
+        "gaps": list(inventory.gaps),
+        "legacy_writers": [asdict(record) for record in inventory.legacy_writers],
+        "upgraded_holders": [asdict(record) for record in inventory.upgraded_holders],
+        "upgraded_writers": [asdict(record) for record in inventory.upgraded_writers],
+        "lock_records": [asdict(record) for record in inventory.lock_records],
+    }
+
+
+def _require_fresh_sidecar_path_and_disk_checks(plan: MigrationPlan) -> None:
+    """DETAIL 6.3 steps 5-7, recomputed from the FRESH plan.
+
+    A caller-supplied plan is never trusted for these: they are re-derived from
+    the replan that just happened, so an entrypoint cannot inherit another
+    invocation's evidence.
+    """
+    if plan.source_sql.kind == "absent":
+        raise ValueError("E_SOURCE_SQL_REQUIRED")
+    if plan.source_sql.kind != "regular_file":
+        raise ValueError("E_SOURCE_SQL_NOT_REGULAR")
+    for suffix in _SIDECAR_SUFFIXES:
+        identity = plan.source_sidecars.get(suffix)
+        if identity is not None and identity.kind != "absent":
+            raise ValueError(_SIDECAR_CODES[suffix])
+    data_root = str(_canonical_root(Path(plan.layout.data_root)))
+    manifest_path = str(
+        _canonical_root(
+            Path(plan.layout.data_root) / RUN_DIRECTORY_NAME / plan.request.run_id / MANIFEST_FILE_NAME
+        )
+    )
+    if manifest_path != data_root and not manifest_path.startswith(data_root.rstrip("/") + "/"):
+        raise ValueError("E_MANIFEST_PATH_ESCAPE")
+    available, _ = _available_bytes(Path(plan.layout.data_root))
+    if available is None or plan.required_bytes is None:
+        raise ValueError("E_INSUFFICIENT_SPACE")
+    if available < plan.required_bytes * DISK_MARGIN_RATIO:
+        raise ValueError("E_INSUFFICIENT_SPACE")
+
+
+def _observed_identity(path: Path, artifact: str) -> dict[str, Any]:
+    return asdict(_inventory(Path(path), artifact=artifact))
+
+
+def _observe_across_quiet_interval(
+    plan: MigrationPlan, interval: float
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Identity AND hash stability of every watched artifact across the interval."""
+    watched: list[tuple[str, Path]] = [("source", Path(plan.source_sql.lexical_path))]
+    for suffix, identity in plan.source_sidecars.items():
+        watched.append((f"sidecar{suffix}", Path(identity.lexical_path)))
+    watched.append(("graph_snapshot", Path(plan.layout.graph_snapshot_path)))
+    vector = plan.layout.vector.local_path
+    if vector is not None:
+        watched.append(("vector", Path(vector)))
+    before = {label: _observed_identity(path, label) for label, path in watched}
+    time.sleep(interval)
+    after = {label: _observed_identity(path, label) for label, path in watched}
+    changed = tuple(sorted(label for label in before if before[label] != after[label]))
+    return {
+        "quiet_interval_seconds": interval,
+        "artifacts": list(before),
+        "before": before,
+        "after": after,
+        "changed": list(changed),
+        "sha256_before": {label: value.get("sha256") for label, value in before.items()},
+        "sha256_after": {label: value.get("sha256") for label, value in after.items()},
+    }, changed
+
+
+def _qualify_maintenance_probe(plan: MigrationPlan) -> dict[str, Any]:
+    report, diagnostics = _qualify_transaction_probe(
+        Path(plan.source_sql.lexical_path),
+        source_identity=plan.source_sql,
+        sidecars=plan.source_sidecars,
+    )
+    payload = dict(report)
+    payload["diagnostics"] = [item.code for item in diagnostics]
+    return payload
+
+
+def validate_mutation_preconditions(
+    request: MigrationRequest,
+    *,
+    plan: MigrationPlan | None = None,
+    proc_root: str | Path = DEFAULT_PROC_ROOT,
+    quiet_interval: float | None = None,
+    exclude_pids: Iterable[int] = (),
+) -> MutationPreconditions:
+    """Validate every precondition of DETAIL 6.3 before any artifact is mutated.
+
+    Called independently by ``apply``, ``resume`` and ``rollback`` -- and by any
+    later engine stage -- so no entrypoint inherits another's validated state:
+
+    1. intent: mode, exact canonical target confirmation and the ``--apply`` rule
+       (the approved S2/S0 checks, unchanged);
+    2. a bounded attestation: non-blank, size-bounded, digested and timestamped,
+       with the affected roots and the listed process classes recorded;
+    3. the replan: a FRESH ``plan_profile_migration`` of the current no-follow
+       identities. A caller-supplied plan whose identity digest no longer matches
+       is ``E_PLAN_STALE`` -- a stale plan is never trusted;
+    4. sidecars, paths and disk recomputed from that fresh plan;
+    5. the complete ``/proc`` descriptor and lock inventory: an old writer
+       ``E_OLD_WRITER_ACTIVE``, a live upgraded runtime ``E_WRITER_ACTIVE``, an
+       incomplete or unreadable inventory ``E_WRITER_STATE_UNKNOWN`` and a
+       missing inventory source ``E_WRITER_INVENTORY_UNSUPPORTED`` all fail
+       closed, and no process is ever signalled;
+    6. identity AND hash stability of every watched artifact across the quiet
+       interval (2 s under tests, 5 s for the CLI); any change is
+       ``E_SOURCE_CHANGED``;
+    7. the prequalified bounded SQLite transaction probe; anything unproven is
+       ``E_SQLITE_PROBE_UNSAFE``.
+
+    Ordering note: DETAIL 6.3 lists the probe (10), the interval (11) and the
+    inventory (12). This function runs the inventory before the interval and the
+    probe last, so detection happens strictly earlier and the only step that
+    takes a writable handle on the source is the last one; nothing is weakened.
+    """
+    _require_mutation_preconditions(request, plan)
+    fresh = plan_profile_migration(request)
+    roots = maintenance_lock_roots(fresh)
+    attestation = record_stop_attestation(request.stop_attestation, roots=roots)
+    replan_digest = _plan_identity_digest(fresh)
+    plan_digest = _plan_identity_digest(plan) if plan is not None else None
+    if plan_digest is not None and plan_digest != replan_digest:
+        raise ValueError("E_PLAN_STALE")
+    _require_fresh_sidecar_path_and_disk_checks(fresh)
+    inventory = _writer_inventory(fresh, proc_root=proc_root, exclude_pids=exclude_pids)
+    if not inventory.covered:
+        raise ValueError(inventory.code or "E_WRITER_STATE_UNKNOWN")
+    if inventory.legacy_writers:
+        raise ValueError("E_OLD_WRITER_ACTIVE")
+    if inventory.upgraded_writers:
+        raise ValueError("E_WRITER_ACTIVE")
+    interval = resolve_quiet_interval(quiet_interval)
+    stability, changed = _observe_across_quiet_interval(fresh, interval)
+    if changed:
+        raise ValueError("E_SOURCE_CHANGED")
+    probe = _qualify_maintenance_probe(fresh)
+    if not probe.get("qualified"):
+        raise ValueError("E_SQLITE_PROBE_UNSAFE")
+    return MutationPreconditions(
+        mode=request.mode,
+        roots=tuple(str(root) for root in roots),
+        graph_lock_path=str(Path(fresh.layout.graph_lock_path)),
+        attestation=attestation,
+        plan_digest=plan_digest,
+        replan_digest=replan_digest,
+        quiet_interval=interval,
+        probe=probe,
+        stability=stability,
+        writer_state=_writer_state_report(inventory),
+    )
+
+
+def acquire_maintenance_locks(
+    plan: MigrationPlan,
+    *,
+    timeout: float = storage_lock.DEFAULT_LOCK_TIMEOUT,
+    proc_root: str | Path = DEFAULT_PROC_ROOT,
+    exclude_pids: Iterable[int] = (),
+) -> storage_lock.MaintenanceStorageLocks:
+    """DETAIL 6.3 steps 8-9 plus the mixed-version writer re-check.
+
+    Every source/target root is locked exclusively in canonical sorted order and
+    the applicable graph lock is held without inode replacement. While holding
+    them the writer inventory is repeated, so a writer that appeared between the
+    pure checks and the lock is still fatal. The returned object owns every
+    descriptor for its whole lifetime: ``release`` is refused inside an open
+    critical section (``E_LOCK_RELEASE_UNSAFE``) and never unlinks the lock
+    entry, so the resource stays protected after the lock is dropped. On any
+    refusal the locks taken so far are released before the error propagates.
+    """
+    locks = storage_lock.MaintenanceStorageLocks.acquire(
+        maintenance_lock_roots(plan),
+        timeout=timeout,
+        graph_lock_path=Path(plan.layout.graph_lock_path),
+    )
+    try:
+        inventory = _writer_inventory(plan, proc_root=proc_root, exclude_pids=exclude_pids)
+        if not inventory.covered:
+            raise storage_lock.StorageLockError(inventory.code or "E_WRITER_STATE_UNKNOWN")
+        if inventory.legacy_writers:
+            raise storage_lock.StorageLockError("E_OLD_WRITER_ACTIVE")
+        if inventory.upgraded_writers:
+            raise storage_lock.StorageLockError("E_WRITER_ACTIVE")
+    except BaseException:
+        locks.release()
+        raise
+    return locks
+
+
 def _prepare_run_directory(run_dir: Path, run_id: str) -> None:
     """Create or re-assert the run directory: named after run_id, mode 0700.
 
@@ -2285,8 +2685,15 @@ def _require_mutation_preconditions(
 
 
 def apply_profile_migration(plan: MigrationPlan) -> MigrationManifest:
-    """Reject apply until the migration engine is implemented."""
-    _require_mutation_preconditions(plan.request, plan)
+    """Independently validate every maintenance precondition, then refuse.
+
+    Each entrypoint re-validates the intent, the bounded attestation, a FRESH
+    replan and the sidecars/paths/disk on its own; nothing is inherited from the
+    caller's plan beyond the identity the staleness check compares against. The
+    engine itself is still unimplemented, so the refusal is raised after the
+    preconditions and before any lock or artifact is created.
+    """
+    validate_mutation_preconditions(plan.request, plan=plan)
     raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
 
 
@@ -2381,14 +2788,14 @@ def append_manifest_event(path: Path, event: Mapping[str, Any]) -> MigrationMani
 def resume_profile_migration(
     manifest_path: Path, request: MigrationRequest
 ) -> MigrationManifest:
-    """Reject resume until continuation is implemented."""
-    _require_mutation_preconditions(request)
+    """Reject resume until continuation is implemented, after its own checks."""
+    validate_mutation_preconditions(request)
     raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
 
 
 def rollback_profile_migration(
     manifest_path: Path, request: MigrationRequest
 ) -> MigrationManifest:
-    """Reject rollback until restore/quarantine is implemented."""
-    _require_mutation_preconditions(request)
+    """Reject rollback until restore/quarantine is implemented, after its own checks."""
+    validate_mutation_preconditions(request)
     raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
