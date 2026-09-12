@@ -8,9 +8,11 @@ wired into a runtime path yet, and none of these functions touches a store.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
-from typing import AbstractSet, Literal, Mapping, Sequence
+from pathlib import Path
+from typing import AbstractSet, Any, Literal, Mapping, Sequence
 from uuid import NAMESPACE_DNS, uuid5
 
 from sqlalchemy.engine import make_url
@@ -29,12 +31,23 @@ class CanonicalProjectionRecord:
 
 
 @dataclass(frozen=True)
+class EmbeddingPlan:
+    backend: str
+    eligible_records: int
+    batches: int
+    digest: str
+    network: bool = False
+
+
+@dataclass(frozen=True)
 class RebuildResult:
     eligible_counts: Mapping[str, int]
     vector_ids_digest: str
     graph_nodes_digest: str
     graph_edges_digest: str
     completed_batches: int
+    plan: EmbeddingPlan | None = None
+    vector_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -259,9 +272,139 @@ def _lstat_exists(path: str) -> bool:
     return True
 
 
-async def rebuild_projections(*args, **kwargs) -> RebuildResult:
-    """Rebuild vector/graph projections from canonical SQL (later slice)."""
-    return RebuildResult({}, id_digest(set()), id_digest(set()), id_digest(set()), 0)
+def embedding_plan_digest(records: Sequence[CanonicalProjectionRecord]) -> str:
+    """Digest the ordered canonical ID domain used by dry-run and apply."""
+    ordered = sorted((f"{record.record_type}:{record.record_id}" for record in records))
+    return hashlib.sha256("\n".join(ordered).encode()).hexdigest()
+
+
+def _checkpoint_write(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+async def _staged_ids(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    import lancedb
+
+    db = await __import__("asyncio").to_thread(lancedb.connect, str(path))
+    names = await __import__("asyncio").to_thread(db.table_names)
+    if "memories" not in names:
+        return set()
+    table = await __import__("asyncio").to_thread(db.open_table, "memories")
+    rows = await __import__("asyncio").to_thread(table.to_arrow)
+    return {str(value) for value in rows.column("id").to_pylist()}
+
+
+async def rebuild_projections(
+    snapshot_url: str,
+    *,
+    staging_vector_path: str | Path,
+    staging_graph_path: str | Path,
+    embedder: Any | None = None,
+    backend: str = "local",
+    allow_network: bool = False,
+    vector_size: int = 384,
+    batch_size: int = 32,
+    checkpoint_path: str | Path | None = None,
+    resume: bool = False,
+    embedding_plan_digest: str | None = None,
+    dry_run: bool = False,
+) -> RebuildResult:
+    """Build empty staged vector/graph projections with resumable checkpoints."""
+    if batch_size <= 0 or vector_size <= 0:
+        raise ValueError("batch_size and vector_size must be positive")
+    if backend == "remote" and not allow_network:
+        raise PermissionError("remote embedding requires explicit allow-network")
+    records = [record async for record in iter_canonical_projection_records(snapshot_url, batch_size=batch_size)]
+    plan = EmbeddingPlan(backend, len(records), (len(records) + batch_size - 1) // batch_size,
+                         embedding_plan_digest_fn(records), backend == "remote")
+    if dry_run:
+        return RebuildResult({}, "", "", "", 0, plan, ())
+    if embedder is None or not callable(getattr(embedder, "embed_batch", None)):
+        raise RuntimeError("embedding assets are unavailable")
+    if embedding_plan_digest is None:
+        raise ValueError("E_EMBEDDING_PLAN_DIGEST_REQUIRED")
+    if embedding_plan_digest != plan.digest:
+        raise ValueError("E_EMBEDDING_PLAN_STALE")
+    checkpoint = Path(checkpoint_path) if checkpoint_path else None
+    completed_ids: list[str] = []
+    completed_batches = 0
+    if resume and checkpoint and checkpoint.exists():
+        state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        completed_ids = [str(value) for value in state.get("staged_ids", [])]
+        if state.get("plan_digest") != plan.digest:
+            raise ValueError("E_EMBEDDING_PLAN_STALE")
+        if state.get("id_digest") != id_digest(set(completed_ids)):
+            raise ValueError("E_BATCH_DIGEST_MISMATCH")
+        actual_ids = await _staged_ids(Path(staging_vector_path))
+        expected_vector_ids = {
+            map_projection_record(record).point_id
+            for record in records
+            if f"{record.record_type}:{record.record_id}" in completed_ids
+            and record.record_type in {"fact", "belief"}
+        }
+        if actual_ids != expected_vector_ids:
+            raise ValueError("E_STAGED_IDS_MISMATCH")
+        completed_batches = int(state.get("completed_batches", 0))
+    vector_path = Path(staging_vector_path)
+    graph_path = Path(staging_graph_path)
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    provider = LanceDBProvider(db_path=str(vector_path), vector_size=vector_size)
+    try:
+        for offset in range(len(completed_ids), len(records), batch_size):
+            batch = records[offset : offset + batch_size]
+            try:
+                vectors = embedder.embed_batch([vector_text(record) for record in batch])
+                if len(vectors) != len(batch) or any(len(vector) != vector_size for vector in vectors):
+                    raise ValueError("E_EMBEDDING_DIMENSION")
+                points = [
+                    {"id": map_projection_record(record).point_id, "vector": vector,
+                     "payload": map_projection_record(record).payload}
+                    for record, vector in zip(batch, vectors)
+                    if record.record_type in {"fact", "belief"}
+                ]
+                if points:
+                    await provider.upsert_batch(points)
+            except Exception:
+                if checkpoint:
+                    _checkpoint_write(checkpoint, {"status": "resumable", "plan_digest": plan.digest,
+                        "staged_ids": completed_ids, "id_digest": id_digest(set(completed_ids)),
+                        "count": len(completed_ids), "completed_batches": completed_batches})
+                raise
+            completed_ids.extend(f"{record.record_type}:{record.record_id}" for record in batch)
+            completed_batches += 1
+            if checkpoint:
+                _checkpoint_write(checkpoint, {"status": "resumable", "plan_digest": plan.digest,
+                    "last_completed_key": [batch[-1].record_type, batch[-1].record_id],
+                    "staged_ids": completed_ids, "id_digest": id_digest(set(completed_ids)),
+                    "count": len(completed_ids), "completed_batches": completed_batches})
+        graph = build_shared_projection_graph(records)
+        graph.save_snapshot(graph_path)
+        vector_ids = tuple(sorted(await _staged_ids(vector_path)))
+        nodes_digest, edges_digest = graph_id_digests(graph)
+        if checkpoint:
+            _checkpoint_write(checkpoint, {"status": "complete", "plan_digest": plan.digest,
+                "last_completed_key": [records[-1].record_type, records[-1].record_id] if records else None,
+                "staged_ids": completed_ids, "id_digest": id_digest(set(completed_ids)),
+                "count": len(completed_ids), "completed_batches": completed_batches})
+        return RebuildResult({record.record_type: sum(r.record_type == record.record_type for r in records)
+                              for record in records}, id_digest(set(vector_ids)), nodes_digest,
+                             edges_digest, completed_batches, plan, vector_ids)
+    finally:
+        close = getattr(provider, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
+
+def embedding_plan_digest_fn(records: Sequence[CanonicalProjectionRecord]) -> str:
+    return embedding_plan_digest(records)
 
 
 async def verify_staged_projections(*args, **kwargs) -> ProjectionVerification:

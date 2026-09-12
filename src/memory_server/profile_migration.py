@@ -3916,6 +3916,14 @@ def create_run_backup(plan: MigrationPlan, *, locks: Any = None) -> RunBackup:
     )
 
 
+def acknowledge_embedding_plan(request: MigrationRequest, plan: MigrationPlan) -> None:
+    """Require the exact dry-run embedding digest before mutation or resume."""
+    if not request.embedding_plan_digest:
+        raise ValueError("E_EMBEDDING_PLAN_DIGEST_REQUIRED")
+    if request.embedding_plan_digest != plan.embedding.digest:
+        raise ValueError("E_EMBEDDING_PLAN_STALE")
+
+
 def _require_mutation_preconditions(
     request: MigrationRequest, plan: MigrationPlan | None = None
 ) -> None:
@@ -3926,10 +3934,7 @@ def _require_mutation_preconditions(
     if request.mode == "dry-run":
         raise ValueError("E_APPLY_MODE_REQUIRED")
     if plan is not None:
-        if not request.embedding_plan_digest:
-            raise ValueError("E_EMBEDDING_PLAN_DIGEST_REQUIRED")
-        if request.embedding_plan_digest != plan.embedding.digest:
-            raise ValueError("E_EMBEDDING_PLAN_STALE")
+        acknowledge_embedding_plan(request, plan)
     if plan is not None and plan.blockers:
         raise ValueError(plan.blockers[0].code)
 
