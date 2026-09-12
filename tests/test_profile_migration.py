@@ -29,6 +29,7 @@ from urllib.parse import quote
 import pytest
 
 import memory_server.profile_migration as profile_migration
+import memory_server.projection_rebuild as projection_rebuild
 from memory_server.profile_migration import (
     ArtifactIdentity,
     MigrationManifest,
@@ -41,6 +42,79 @@ from memory_server.profile_migration import (
     resume_profile_migration,
     rollback_profile_migration,
 )
+from memory_server.projection_rebuild import CanonicalProjectionRecord
+
+
+def _s301_records() -> list[CanonicalProjectionRecord]:
+    return [
+        CanonicalProjectionRecord("decision", "d1", "index_decision", {
+            "choice": "Pick Caddy", "reason": "safe", "context": "Widget", "lifecycle_state": "active",
+        }),
+        CanonicalProjectionRecord("decision", "d2", "index_decision", {
+            "choice": "pick caddy", "reason": "same", "context": "Widget", "lifecycle_state": "active",
+        }),
+        CanonicalProjectionRecord("fact", "f1", "index_fact", {
+            "subject": "Widget", "predicate": "uses", "object": "Caddy", "source": "s", "lifecycle_state": "active",
+        }),
+    ]
+
+
+def test_s301_positive_later_fact_context_has_one_decides_edge() -> None:
+    graph = projection_rebuild.build_shared_projection_graph(_s301_records())
+    edges = [
+        edge
+        for targets in graph._edges.values()
+        for group in targets.values()
+        for edge in group
+        if edge.relation == "decides"
+    ]
+    assert len(edges) == 1
+    assert (edges[0].source_id, edges[0].target_id, edges[0].relation) == (
+        "decision-pick-caddy", "widget", "decides"
+    )
+
+
+def test_s301_negative_unmatched_context_creates_no_target_or_edge() -> None:
+    records = [CanonicalProjectionRecord("decision", "d1", "index_decision", {
+        "choice": "Pick Caddy", "reason": "safe", "context": "Missing", "lifecycle_state": "active",
+    })]
+    graph = projection_rebuild.build_shared_projection_graph(records)
+    assert graph.get_node("missing") is None
+    assert [
+        edge
+        for targets in graph._edges.values()
+        for group in targets.values()
+        for edge in group
+        if edge.relation == "decides"
+    ] == []
+
+
+def test_s301_mapping_is_order_independent_for_ids_types_and_edge_digest() -> None:
+    forward = projection_rebuild.build_shared_projection_graph(_s301_records())
+    reverse = projection_rebuild.build_shared_projection_graph(list(reversed(_s301_records())))
+    def node_keys(graph):
+        return {(node.id, node.type) for node in graph.get_all_nodes()}
+
+    def edge_keys(graph):
+        return {
+            (edge.source_id, edge.target_id, edge.relation)
+            for targets in graph._edges.values()
+            for group in targets.values()
+            for edge in group
+        }
+
+    assert node_keys(forward) == node_keys(reverse)
+    assert edge_keys(forward) == edge_keys(reverse)
+    assert projection_rebuild.graph_id_digests(forward) == projection_rebuild.graph_id_digests(reverse)
+
+
+def test_s301_exact_vector_mapping() -> None:
+    mapped = projection_rebuild.map_projection_record(_s301_records()[-1])
+    assert mapped.vector_text == "Widget uses Caddy"
+    assert mapped.payload == {
+        "subject": "Widget", "predicate": "uses", "object": "Caddy",
+        "source": "s", "memory_type": "fact",
+    }
 
 
 def _seed_source_sql(home: Path) -> Path:
