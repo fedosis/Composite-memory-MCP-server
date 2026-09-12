@@ -1,5 +1,8 @@
 """Tests for SQLite provider (Card 003)."""
 
+import ast
+import os
+import re
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -370,12 +373,56 @@ class TestReceiptCRUD:
 # write-lock probe plus the immutable read-only snapshot path only. These nodes
 # run against a provider-WRITTEN, cleanly closed database (a real
 # runtime-shaped source: WAL-mode header with the sidecars removed by the last
-# clean close) and against a synthetic sidecar-free source. Accessors are
-# shape-tolerant so that the filed RED on the parent commit is a behavioural
-# assertion failure.
+# clean close) and against a synthetic sidecar-free source.
+#
+# CLASSIFICATION OF THE FILED PRE-FIX RED (S2-03 fix round, review F2): the
+# accessors are shape-tolerant and return ``({}, [])`` on a module that lacks the
+# S2-03 API, so the filed RED failures here are SENTINEL missing-capability
+# results, never behavioural proof. Labelled in
+# S2-03_EVIDENCE/S2-03_FIX1_RED_RELABEL.md.
 # ---------------------------------------------------------------------------
 
-S203_HEAD_REVISION = "7a1b2c3d4e5f"
+
+def _s203_tree_head_revision() -> str:
+    """This tree's real Alembic head, from BOTH configured version locations.
+
+    Review F1: the S2-03 literal mirrored the production constant
+    (``7a1b2c3d4e5f``), which is an INTERIOR node of the merged Alembic DAG, so
+    no node in the card could detect that the real head is ``0005``. Deriving it
+    here from ``alembic.ini``'s two ``version_locations`` keeps this file honest
+    without importing alembic (a dev-only extra).
+    """
+    tree_root = Path(profile_migration.__file__).resolve().parents[2]
+    ini_text = (tree_root / "alembic.ini").read_text(encoding="utf-8")
+    match = re.search(r"^version_locations\s*=\s*(.+)$", ini_text, re.MULTILINE)
+    assert match is not None, "alembic.ini has no version_locations"
+    revisions: dict = {}
+    for location in match.group(1).strip().split(os.pathsep):
+        for revision_file in sorted(Path(location.replace("%(here)s", str(tree_root))).glob("*.py")):
+            found: dict = {}
+            for node in ast.parse(revision_file.read_text(encoding="utf-8")).body:
+                names = []
+                if isinstance(node, ast.Assign):
+                    names = [(t.id, node.value) for t in node.targets if isinstance(t, ast.Name)]
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    names = [(node.target.id, node.value)]
+                for name, value in names:
+                    if name in {"revision", "down_revision"} and value is not None:
+                        found[name] = ast.literal_eval(value)
+            assert isinstance(found.get("revision"), str), revision_file
+            revisions[found["revision"]] = found.get("down_revision")
+    parents = set()
+    for down in revisions.values():
+        if isinstance(down, str):
+            parents.add(down)
+        elif isinstance(down, (tuple, list)):
+            parents.update(item for item in down if isinstance(item, str))
+    heads = set(revisions) - parents
+    assert len(heads) == 1, heads
+    return next(iter(heads))
+
+
+S203_HEAD_REVISION = _s203_tree_head_revision()
 
 
 def _s203_get(report, *path):
