@@ -6105,8 +6105,10 @@ async def test_s304_dry_run_is_embedder_free_and_digest_is_independent(tmp_path:
         dry_run=True,
     )
     assert report.plan.backend == "local"
-    assert report.plan.eligible_records == 4
+    assert report.plan.eligible_records == 2
     assert report.plan.batches == 2
+    assert report.plan.estimated_cost == 2
+    assert report.plan.estimator == "vector-records"
     assert report.plan.digest == hashlib.sha256("belief:b1\ndecision:d1\nfact:f1\nskill:s1".encode()).hexdigest()
     assert embedder.calls == 0
     assert not (tmp_path / "vectors").exists()
@@ -6261,3 +6263,151 @@ async def test_s304_remote_backend_uses_local_fake_http_endpoint(tmp_path: Path)
     finally:
         server.shutdown()
         server.server_close()
+
+
+class _S304PartialEmbedder(_CountingEmbedder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_on_second = True
+        self.text_batches: list[list[str]] = []
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self.text_batches.append(list(texts))
+        if self.fail_on_second and self.calls == 1:
+            self.calls += 1
+            raise RuntimeError("quota-on-second-batch")
+        return super().embed_batch(texts)
+
+
+def _s304_plan_digest(records: list[CanonicalProjectionRecord]) -> str:
+    return projection_rebuild.embedding_plan_digest(records)
+
+
+async def _s304_make_partial_checkpoint(tmp_path: Path) -> tuple[Path, _S304PartialEmbedder, str]:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+    records = [record async for record in projection_rebuild.iter_canonical_projection_records(
+        f"sqlite+aiosqlite:///{db_path}", batch_size=2
+    )]
+    embedder = _S304PartialEmbedder()
+    checkpoint = tmp_path / "checkpoint.json"
+    with pytest.raises(RuntimeError, match="quota-on-second-batch"):
+        await projection_rebuild.rebuild_projections(
+            f"sqlite+aiosqlite:///{db_path}", staging_vector_path=tmp_path / "vectors",
+            staging_graph_path=tmp_path / "graph.json", embedder=embedder, vector_size=4,
+            batch_size=2, checkpoint_path=checkpoint, embedding_plan_digest=_s304_plan_digest(records),
+        )
+    state = json.loads(checkpoint.read_text())
+    assert state["last_completed_key"] == ["decision", "d1"]
+    return checkpoint, embedder, f"sqlite+aiosqlite:///{db_path}"
+
+
+@pytest.mark.asyncio
+async def test_s304_resume_tampered_id_digest_refuses(tmp_path: Path) -> None:
+    checkpoint, embedder, snapshot_url = await _s304_make_partial_checkpoint(tmp_path)
+    state = json.loads(checkpoint.read_text())
+    state["id_digest"] = "0" * 64
+    checkpoint.write_text(json.dumps(state))
+    embedder.fail_on_second = False
+    with pytest.raises(ValueError, match="E_BATCH_DIGEST_MISMATCH"):
+        await projection_rebuild.rebuild_projections(
+            snapshot_url, staging_vector_path=tmp_path / "vectors", staging_graph_path=tmp_path / "graph.json",
+            embedder=embedder, vector_size=4, batch_size=2, checkpoint_path=checkpoint, resume=True,
+            embedding_plan_digest=projection_rebuild.embedding_plan_digest(
+                [
+                    record
+                    async for record in projection_rebuild.iter_canonical_projection_records(snapshot_url, batch_size=2)
+                ]
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_s304_resume_staged_id_mismatch_refuses(tmp_path: Path) -> None:
+    checkpoint, embedder, snapshot_url = await _s304_make_partial_checkpoint(tmp_path)
+    state = json.loads(checkpoint.read_text())
+    state["staged_ids"] = ["belief:b1", "fact:f1"]
+    state["id_digest"] = projection_rebuild.id_digest(set(state["staged_ids"]))
+    checkpoint.write_text(json.dumps(state))
+    embedder.fail_on_second = False
+    with pytest.raises(ValueError, match="E_STAGED_IDS_MISMATCH"):
+        await projection_rebuild.rebuild_projections(
+            snapshot_url, staging_vector_path=tmp_path / "vectors", staging_graph_path=tmp_path / "graph.json",
+            embedder=embedder, vector_size=4, batch_size=2, checkpoint_path=checkpoint, resume=True,
+            embedding_plan_digest=projection_rebuild.embedding_plan_digest(
+                [
+                    record
+                    async for record in projection_rebuild.iter_canonical_projection_records(snapshot_url, batch_size=2)
+                ]
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_s304_resume_plan_digest_drift_refuses(tmp_path: Path) -> None:
+    checkpoint, embedder, snapshot_url = await _s304_make_partial_checkpoint(tmp_path)
+    state = json.loads(checkpoint.read_text())
+    state["plan_digest"] = "1" * 64
+    checkpoint.write_text(json.dumps(state))
+    embedder.fail_on_second = False
+    records = [
+        record
+        async for record in projection_rebuild.iter_canonical_projection_records(snapshot_url, batch_size=2)
+    ]
+    with pytest.raises(ValueError, match="E_EMBEDDING_PLAN_STALE"):
+        await projection_rebuild.rebuild_projections(
+            snapshot_url, staging_vector_path=tmp_path / "vectors", staging_graph_path=tmp_path / "graph.json",
+            embedder=embedder, vector_size=4, batch_size=2, checkpoint_path=checkpoint, resume=True,
+            embedding_plan_digest=_s304_plan_digest(records),
+        )
+
+
+@pytest.mark.asyncio
+async def test_s304_resume_partial_embeds_only_remaining_batches(tmp_path: Path) -> None:
+    checkpoint, embedder, snapshot_url = await _s304_make_partial_checkpoint(tmp_path)
+    first_calls = embedder.calls
+    embedder.fail_on_second = False
+    records = [
+        record
+        async for record in projection_rebuild.iter_canonical_projection_records(snapshot_url, batch_size=2)
+    ]
+    result = await projection_rebuild.rebuild_projections(
+        snapshot_url, staging_vector_path=tmp_path / "vectors", staging_graph_path=tmp_path / "graph.json",
+        embedder=embedder, vector_size=4, batch_size=2, checkpoint_path=checkpoint, resume=True,
+        embedding_plan_digest=_s304_plan_digest(records),
+    )
+    assert first_calls == 2
+    assert embedder.calls == 3
+    assert embedder.text_batches[-1] == ["A is B"]
+    assert result.completed_batches == 2
+
+
+@pytest.mark.asyncio
+async def test_s304_apply_requires_embedding_plan_digest(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+    with pytest.raises(ValueError, match="E_EMBEDDING_PLAN_DIGEST_REQUIRED"):
+        await projection_rebuild.rebuild_projections(
+            f"sqlite+aiosqlite:///{db_path}", staging_vector_path=tmp_path / "vectors",
+            staging_graph_path=tmp_path / "graph.json", embedder=_CountingEmbedder(),
+            vector_size=4, batch_size=2,
+        )
+
+
+@pytest.mark.asyncio
+async def test_s304_remote_allow_path_uses_confined_synthetic_embedder(tmp_path: Path) -> None:
+    db_path = tmp_path / "snapshot.db"
+    _seed_s301_snapshot(db_path)
+    records = [record async for record in projection_rebuild.iter_canonical_projection_records(
+        f"sqlite+aiosqlite:///{db_path}", batch_size=4
+    )]
+    embedder = _CountingEmbedder()
+    result = await projection_rebuild.rebuild_projections(
+        f"sqlite+aiosqlite:///{db_path}", staging_vector_path=tmp_path / "vectors",
+        staging_graph_path=tmp_path / "graph.json", embedder=embedder, backend="remote",
+        allow_network=True, vector_size=4, batch_size=4, embedding_plan_digest=_s304_plan_digest(records),
+    )
+    assert result.plan.network is True
+    assert result.plan.eligible_records == 2
+    assert embedder.calls == 1
+    assert len(result.vector_ids) == 2
