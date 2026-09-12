@@ -14,7 +14,8 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Mapping
 
 from memory_server.paths import (
     StorageLayout,
@@ -22,6 +23,7 @@ from memory_server.paths import (
     StorageResolutionInputs,
     ValueOrigin,
     cmms_repo_root,
+    resolve_sqlite_location,
     resolve_storage_layout,
 )
 from memory_server.settings import get_settings
@@ -47,6 +49,26 @@ _ENV_LANCEDB_PATH = "MEMORY_SERVER_LANCEDB_PATH"
 _ENV_GRAPH_PATH = "MEMORY_SERVER_GRAPH_SNAPSHOT_PATH"
 _ENV_QDRANT = "MEMORY_SERVER_QDRANT_LOCATION"
 _ENV_COLLECTION = "MEMORY_SERVER_VECTOR_COLLECTION"
+
+_ORIGIN_ENV = {
+    "path": _ENV_PATH,
+    "db_url": _ENV_DB_URL,
+    "max_facts": _ENV_MAX_FACTS,
+    "storage_mode": _ENV_STORAGE_MODE,
+    "data_root": _ENV_DATA_ROOT,
+    "vector_backend": _ENV_VECTOR_BACKEND,
+    "lancedb_path": _ENV_LANCEDB_PATH,
+    "graph_snapshot_path": _ENV_GRAPH_PATH,
+    "qdrant_location": _ENV_QDRANT,
+    "vector_collection": _ENV_COLLECTION,
+    "llm_base_url": _ENV_LLM_BASE_URL,
+}
+
+_LEGACY_ENV = {
+    "vector_backend": "MEMORY_VECTOR_BACKEND",
+    "graph_snapshot_path": "MEMORY_GRAPH_SNAPSHOT_PATH",
+    "qdrant_location": "MEMORY_QDRANT_URL",
+}
 
 
 def _env_str(name: str) -> str | None:
@@ -100,9 +122,13 @@ def _env_overrides(use_env: bool) -> dict[str, Any]:
             "writer_flush_interval": None,
             "writer_max_batch": None,
             "llm_base_url": None,
-            "storage_mode": None, "data_root": None, "vector_backend": None,
-            "lancedb_path": None, "graph_snapshot_path": None,
-            "qdrant_location": None, "vector_collection": None,
+            "storage_mode": None,
+            "data_root": None,
+            "vector_backend": None,
+            "lancedb_path": None,
+            "graph_snapshot_path": None,
+            "qdrant_location": None,
+            "vector_collection": None,
         }
     return {
         "path": _env_str(_ENV_PATH),
@@ -111,13 +137,45 @@ def _env_overrides(use_env: bool) -> dict[str, Any]:
         "writer_flush_interval": _env_float(_ENV_WRITER_FLUSH_INTERVAL),
         "writer_max_batch": _env_int(_ENV_WRITER_MAX_BATCH),
         "llm_base_url": _env_str(_ENV_LLM_BASE_URL),
-        "storage_mode": _env_str(_ENV_STORAGE_MODE), "data_root": _env_str(_ENV_DATA_ROOT),
-        "vector_backend": _env_str(_ENV_VECTOR_BACKEND) or _env_str("MEMORY_VECTOR_BACKEND"),
+        "storage_mode": _env_str(_ENV_STORAGE_MODE),
+        "data_root": _env_str(_ENV_DATA_ROOT),
+        "vector_backend": _env_str(_ENV_VECTOR_BACKEND),
         "lancedb_path": _env_str(_ENV_LANCEDB_PATH),
-        "graph_snapshot_path": _env_str(_ENV_GRAPH_PATH) or _env_str("MEMORY_GRAPH_SNAPSHOT_PATH"),
-        "qdrant_location": _env_str(_ENV_QDRANT) or _env_str("MEMORY_QDRANT_URL"),
+        "graph_snapshot_path": _env_str(_ENV_GRAPH_PATH),
+        "qdrant_location": _env_str(_ENV_QDRANT),
         "vector_collection": _env_str(_ENV_COLLECTION),
+        "legacy": {key: _env_str(value) for key, value in _LEGACY_ENV.items()},
     }
+
+
+@dataclass(frozen=True)
+class StorageEnvSnapshot:
+    """One immutable, normalized view of storage-related configuration."""
+
+    path: str | None = None
+    db_url: str | None = None
+    storage_mode: str | None = None
+    data_root: str | None = None
+    vector_backend: str | None = None
+    lancedb_path: str | None = None
+    graph_snapshot_path: str | None = None
+    qdrant_location: str | None = None
+    vector_collection: str | None = None
+    values: Mapping[str, str | None] = field(default_factory=dict)
+    origins: Mapping[str, ValueOrigin] = field(default_factory=dict)
+
+
+def _choose(name: str, yaml: Any, env: dict[str, Any], default: Any) -> tuple[Any, ValueOrigin]:
+    value = env.get(name)
+    if value is not None:
+        return value, ValueOrigin("env", _ORIGIN_ENV.get(name))
+    value = yaml if yaml is not None and yaml != "" else None
+    if value is not None:
+        return value, ValueOrigin("yaml")
+    value = env.get("legacy", {}).get(name)
+    if value is not None:
+        return value, ValueOrigin("legacy_env", _LEGACY_ENV.get(name))
+    return default, ValueOrigin("default")
 
 
 def _coerce_max_facts(value: Any, default: int) -> int:
@@ -184,7 +242,13 @@ class HermesPluginConfig:
     llm_base_url: str | None = None
     storage_mode: str = "profile"
     data_root: str = "."
+    vector_backend: str = "lancedb"
+    lancedb_path: str = "data/lancedb"
+    graph_snapshot_path: str = "data/graph.json"
+    qdrant_location: str = ":memory:"
+    vector_collection: str = "memories"
     storage_origins: dict[str, ValueOrigin] = field(default_factory=dict)
+    storage_snapshot: StorageEnvSnapshot = field(default_factory=StorageEnvSnapshot)
 
     @classmethod
     def from_dict(
@@ -197,118 +261,137 @@ class HermesPluginConfig:
 
         Falls back to env vars when config keys are missing. An empty
         ``path`` (or an empty/absent ``MEMORY_SERVER_PATH``) defaults to the
-        CMMS repo root so every profile shares the same data directory.
+        CMMS repo root for import compatibility.
         ``use_env=False`` skips environment overrides (used by doctor to
         validate the raw config value).
         """
         data = data or {}
         env = _env_overrides(use_env=use_env)
-
+        if use_env and (env.get("storage_mode") is not None or env.get("data_root") is not None):
+            if env.get("storage_mode") is None:
+                raise StorageLayoutError(
+                    "E_SHARED_ROOT_REQUIRED",
+                    "MEMORY_SERVER_STORAGE_MODE is required with MEMORY_SERVER_DATA_ROOT",
+                )
+            if env.get("data_root") is None:
+                raise StorageLayoutError(
+                    "E_SHARED_ROOT_REQUIRED",
+                    "MEMORY_SERVER_DATA_ROOT is required with MEMORY_SERVER_STORAGE_MODE",
+                )
+        settings = get_settings() if use_env else None
+        defaults = {
+            "db_url": str(settings.db_url) if settings else "sqlite+aiosqlite:///data/memory.db",
+            "vector_backend": getattr(settings, "vector_backend", "lancedb") if settings else "lancedb",
+            "lancedb_path": str(getattr(settings, "lancedb_path", "data/lancedb")) if settings else "data/lancedb",
+            "graph_snapshot_path": str(getattr(settings, "graph_snapshot_path", "data/graph.json"))
+            if settings
+            else "data/graph.json",
+            "qdrant_location": getattr(settings, "qdrant_location", ":memory:") if settings else ":memory:",
+            "vector_collection": getattr(settings, "vector_collection", "memories") if settings else "memories",
+        }
+        selected: dict[str, Any] = {}
+        origins: dict[str, ValueOrigin] = {}
+        for key, default in defaults.items():
+            selected[key], origins[key] = _choose(key, data.get(key), env, default)
+            if origins[key].kind == "default" and settings is not None:
+                origins[key] = ValueOrigin("settings")
+        origins["sqlite"] = origins["db_url"]
+        origins["vector"] = origins["vector_backend"]
+        origins["graph"] = origins["graph_snapshot_path"]
+        selected["path"], path_origin = _choose("path", data.get("path"), env, str(cmms_repo_root()))
+        origins["path"] = path_origin
+        selected["max_facts"], origins["max_facts"] = _choose("max_facts", data.get("max_facts"), env, 5)
+        selected["llm_base_url"], origins["llm_base_url"] = _choose("llm_base_url", data.get("llm_base_url"), env, None)
+        selected["storage_mode"], origins["mode"] = _choose("storage_mode", data.get("storage_mode"), env, "profile")
+        selected["data_root"], origins["root"] = _choose("data_root", data.get("data_root"), env, ".")
+        origins["storage_mode"] = origins["mode"]
+        origins["data_root"] = origins["root"]
+        selected["vector_backend"] = str(selected["vector_backend"])
+        snapshot_values = MappingProxyType(
+            {
+                key: selected.get(key)
+                for key in (
+                    "path",
+                    "db_url",
+                    "storage_mode",
+                    "data_root",
+                    "vector_backend",
+                    "lancedb_path",
+                    "graph_snapshot_path",
+                    "qdrant_location",
+                    "vector_collection",
+                )
+            }
+        )
+        snapshot_origins = MappingProxyType(dict(origins))
+        snapshot = StorageEnvSnapshot(
+            **{k: selected.get(k) for k in StorageEnvSnapshot.__dataclass_fields__ if k not in {"values", "origins"}},
+            values=snapshot_values,
+            origins=snapshot_origins,
+        )
         writer_cfg = WriterConfig.from_dict(data.get("writer", {}) or {})
         if env["writer_flush_interval"] is not None:
             writer_cfg.flush_interval = env["writer_flush_interval"]
+        elif env.get("legacy", {}).get("writer_flush_interval") is not None:
+            writer_cfg.flush_interval = env["legacy"]["writer_flush_interval"]
         if env["writer_max_batch"] is not None:
             writer_cfg.max_batch = env["writer_max_batch"]
+        elif env.get("legacy", {}).get("writer_max_batch") is not None:
+            writer_cfg.max_batch = env["legacy"]["writer_max_batch"]
 
-        env_path = env["path"]
-        config_path = data.get("path")
-        if env_path:
-            cmms_path, source = env_path, "env"
-        elif config_path:
-            cmms_path, source = config_path, "config"
+        if selected["path"]:
+            cmms_path = str(selected["path"])
+            source = "config" if path_origin.kind == "yaml" else path_origin.kind
         else:
             cmms_path, source = str(cmms_repo_root()), "default"
 
         return cls(
-            db_url=env["db_url"] or data.get("db_url") or str(get_settings().db_url),
+            db_url=selected["db_url"],
             cmms_path=cmms_path,
             cmms_path_source=source,
             writer=writer_cfg,
-            max_facts=_coerce_max_facts(
-                env["max_facts"] if env["max_facts"] is not None
-                else data.get("max_facts"),
-                5,
-            ),
+            max_facts=_coerce_max_facts(selected["max_facts"], 5),
             extraction_mode=data.get("extraction_mode"),
             llm_model=data.get("llm_model"),
             llm_timeout_seconds=data.get("llm_timeout_seconds"),
             llm_max_input_chars=data.get("llm_max_input_chars"),
             llm_confidence_gate=data.get("llm_confidence_gate"),
-            llm_base_url=(
-                env["llm_base_url"] or data.get("llm_base_url")
-            ),
-            storage_mode=env["storage_mode"] or data.get("storage_mode") or "profile",
-            data_root=env["data_root"] or data.get("data_root") or ".",
-            storage_origins={
-                "mode": ValueOrigin(
-                    "env" if env["storage_mode"] else "yaml" if "storage_mode" in data else "default",
-                    _ENV_STORAGE_MODE if env["storage_mode"] else None,
-                ),
-                "root": ValueOrigin(
-                    "env" if env["data_root"] else "yaml" if "data_root" in data else "default",
-                    _ENV_DATA_ROOT if env["data_root"] else None,
-                ),
-            },
+            llm_base_url=selected["llm_base_url"],
+            storage_mode=selected["storage_mode"],
+            data_root=selected["data_root"],
+            vector_backend=selected["vector_backend"],
+            lancedb_path=selected["lancedb_path"],
+            graph_snapshot_path=selected["graph_snapshot_path"],
+            qdrant_location=selected["qdrant_location"],
+            vector_collection=selected["vector_collection"],
+            storage_origins=origins,
+            storage_snapshot=snapshot,
         )
 
     @classmethod
     def from_env(cls) -> HermesPluginConfig:
         """Create config from environment variables only."""
-        env = _env_overrides(use_env=True)
-        if env["path"]:
-            cmms_path, source = env["path"], "env"
-        else:
-            cmms_path, source = str(cmms_repo_root()), "default"
-        return cls(
-            db_url=env["db_url"] or str(get_settings().db_url),
-            cmms_path=cmms_path,
-            cmms_path_source=source,
-            writer=WriterConfig(
-                flush_interval=(
-                    env["writer_flush_interval"]
-                    if env["writer_flush_interval"] is not None
-                    else 5.0
-                ),
-                max_batch=(
-                    env["writer_max_batch"]
-                    if env["writer_max_batch"] is not None
-                    else 50
-                ),
-            ),
-            max_facts=(
-                env["max_facts"] if env["max_facts"] is not None else 5
-            ),
-            llm_base_url=env["llm_base_url"],
-            storage_mode=env["storage_mode"] or "profile",
-            data_root=env["data_root"] or ".",
-        )
+        return cls.from_dict({}, use_env=True)
 
     def validate_shared_root(self, expected: str | None = None) -> None:
-        """Assert cmms_path points at the shared CMMS repo root.
-
-        Raises ValueError if the configured path is set to anything other
-        than the CMMS repository root — per-profile paths fragment the
-        vector index and graph snapshot. Used by doctor/install validation.
-        """
+        """Compatibility wrapper for validating the installation path."""
         if not self.cmms_path:
             return
-        expected_root = Path(expected or str(cmms_repo_root())).resolve()
-        configured = Path(self.cmms_path).resolve()
-        if configured != expected_root:
+        try:
+            self.validate_installation_path(expected or str(cmms_repo_root()))
+        except ValueError as exc:
             raise ValueError(
                 "memory.providers.memory_server.path must point at the shared "
-                f"CMMS repo root ({expected_root}), got {configured}. "
-                "Per-profile data dirs fragment the LanceDB index and graph."
-            )
+                f"CMMS repo root ({Path(expected or str(cmms_repo_root())).resolve()}), "
+                f"got {Path(self.cmms_path).resolve()}."
+            ) from exc
 
     def validate_installation_path(self, expected: str | None = None) -> None:
         """Validate installation/import path only; it is not a data root."""
         if expected is not None and Path(self.cmms_path).absolute() != Path(expected).absolute():
             raise ValueError(f"installation path mismatch: {self.cmms_path}")
 
-    def resolve_storage_layout(
-        self, *, hermes_home: str, settings: "Settings", native: bool = True
-    ) -> StorageLayout:
+    def resolve_storage_layout(self, *, hermes_home: str, settings: "Settings", native: bool = True) -> StorageLayout:
         """Freeze the storage layout once; pure, performs no I/O.
 
         ``profile`` (native default) requires a non-blank ``hermes_home`` and
@@ -321,35 +404,64 @@ class HermesPluginConfig:
         """
         mode = self.storage_mode
         if mode not in ("profile", "shared", "standalone"):
-            raise StorageLayoutError(
-                "E_STORAGE_MODE_INVALID", f"invalid storage mode: {mode!r}"
-            )
+            raise StorageLayoutError("E_STORAGE_MODE_INVALID", f"invalid storage mode: {mode!r}")
         profile_home: str | None = None
         if mode == "profile":
             if not native or not (hermes_home or "").strip():
-                raise StorageLayoutError(
-                    "E_HERMES_HOME_REQUIRED", "profile mode requires hermes_home"
-                )
+                raise StorageLayoutError("E_HERMES_HOME_REQUIRED", "profile mode requires hermes_home")
             profile_home = hermes_home
-        return resolve_storage_layout(StorageResolutionInputs(
-            mode=mode,
-            profile_home=profile_home,
-            data_root=self.data_root,
-            sqlite_url=self.db_url,
-            vector_backend=getattr(settings, "vector_backend", "lancedb"),
-            lancedb_path=getattr(settings, "lancedb_path", "data/lancedb"),
-            graph_snapshot_path=getattr(settings, "graph_snapshot_path", "data/graph.json"),
-            qdrant_location=getattr(settings, "qdrant_location", ":memory:"),
-            vector_collection=getattr(settings, "vector_collection", "memories"),
-            origins=self.storage_origins,
-        ))
+        defaults = {
+            "db_url": type(self).db_url,
+            "vector_backend": type(self).vector_backend,
+            "lancedb_path": type(self).lancedb_path,
+            "graph_snapshot_path": type(self).graph_snapshot_path,
+            "qdrant_location": type(self).qdrant_location,
+            "vector_collection": type(self).vector_collection,
+        }
+        fallback = {}
+        origins = dict(self.storage_origins)
+        for key, default in defaults.items():
+            current = getattr(self, key)
+            # from_dict already captured env/YAML/Settings/default exactly once.
+            # Direct dataclass construction may use the supplied Settings fallback.
+            if key in origins:
+                fallback[key] = current
+            elif current != default:
+                fallback[key] = current
+                origins[key] = ValueOrigin("yaml", key)
+            else:
+                fallback[key] = getattr(settings, key, current)
+                origins[key] = ValueOrigin("settings", key)
+        origins["sqlite"] = origins["db_url"]
+        origins["vector"] = origins["vector_backend"]
+        origins["graph"] = origins["graph_snapshot_path"]
+        data_root = self.data_root
+        if (
+            mode == "standalone"
+            and data_root == "."
+            and origins.get("root", ValueOrigin("default")).kind in {"default", "settings"}
+        ):
+            data_root = None
+        return resolve_storage_layout(
+            StorageResolutionInputs(
+                mode=mode,
+                profile_home=profile_home,
+                data_root=data_root,
+                sqlite_url=fallback["db_url"],
+                vector_backend=fallback["vector_backend"],
+                lancedb_path=fallback["lancedb_path"],
+                graph_snapshot_path=fallback["graph_snapshot_path"],
+                qdrant_location=fallback["qdrant_location"],
+                vector_collection=fallback["vector_collection"],
+                origins=origins,
+                installation_path=self.cmms_path or None,
+            )
+        )
 
     def resolve_db_url(self, hermes_home: str) -> str:
         """Resolve the database URL without filesystem side effects."""
-        if self.db_url.startswith("sqlite+aiosqlite:///"):
-            path_part = self.db_url[len("sqlite+aiosqlite:///"):]
-            if not path_part.startswith("/"):
-                # Relative path — resolve against hermes_home
-                resolved = Path(hermes_home) / path_part
-                return f"sqlite+aiosqlite:///{resolved}"
-        return self.db_url
+        return resolve_sqlite_location(
+            self.db_url,
+            data_root=Path(hermes_home),
+            origin=self.storage_origins.get("sqlite", ValueOrigin("default")),
+        ).effective_url

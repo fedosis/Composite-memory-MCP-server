@@ -14,10 +14,25 @@ The module deliberately uses only API that exists at baseline ``da1cd0e``
 real store providers), so the same file can be executed against a clean
 baseline checkout to record the mandatory behavioral RED.
 """
+
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import pytest
+
+from memory_server.paths import (
+    StorageLayoutError,
+    StorageResolutionInputs,
+    ValueOrigin,
+    classify_artifact_nofollow,
+    inspect_component_chain_nofollow,
+    resolve_sqlite_location,
+    resolve_storage_layout,
+    serialize_layout_redacted,
+    validate_write_target,
+)
 from memory_server.plugins.hermes.provider import HermesProvider
 
 
@@ -25,7 +40,7 @@ def _sqlite_path(provider: HermesProvider) -> Path:
     assert provider._provider is not None
     prefix = "sqlite+aiosqlite:///"
     assert provider._provider._url.startswith(prefix)
-    return Path(provider._provider._url[len(prefix):])
+    return Path(provider._provider._url[len(prefix) :])
 
 
 def _contained(path: Path, root: Path) -> bool:
@@ -36,9 +51,7 @@ def _contained(path: Path, root: Path) -> bool:
     return True
 
 
-def test_real_provider_keeps_all_store_paths_inside_each_profile(
-    tmp_path: Path, synthetic_storage_env
-) -> None:
+def test_real_provider_keeps_all_store_paths_inside_each_profile(tmp_path: Path, synthetic_storage_env) -> None:
     """One install path must not make two profiles share projections."""
     env = synthetic_storage_env
     env.assert_injection()
@@ -149,3 +162,359 @@ def test_native_provider_legacy_in_memory_config_initializes_like_baseline(
     assert provider._provider is None
     assert provider._writer is None
     assert provider._shut_down is True
+
+
+# S1 resolver contracts use only synthetic temporary roots.  They deliberately
+# exercise lstat-based inspection rather than provider mocks.
+def test_s1_nofollow_chain_reports_link_without_following(tmp_path: Path) -> None:
+    anchor = tmp_path / "home"
+    anchor.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = anchor / "link"
+    link.symlink_to(outside, target_is_directory=True)
+    assert classify_artifact_nofollow(link) == "symlink"
+    identities = inspect_component_chain_nofollow(link, anchor=anchor)
+    assert identities[-1].kind == "symlink"
+    assert identities[-1].raw_link_target == str(outside)
+    assert not any(identity.lexical_path == str(outside) for identity in identities)
+
+
+def test_s1_symlink_parent_is_rejected(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (home / "data").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(StorageResolutionInputs(profile_home=home, data_root="data"))
+    assert error.value.code == "E_PATH_SYMLINK_PARENT"
+
+
+def test_s1_profile_home_must_exist_and_be_real_directory(tmp_path: Path) -> None:
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(StorageResolutionInputs(profile_home=tmp_path / "missing"))
+    assert error.value.code == "E_HERMES_HOME_REQUIRED"
+    target = tmp_path / "file"
+    target.write_text("x")
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(StorageResolutionInputs(profile_home=target))
+    assert error.value.code == "E_HERMES_HOME_REQUIRED"
+
+
+def test_s1_profile_root_and_external_root_policy(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    layout = resolve_storage_layout(StorageResolutionInputs(profile_home=home, data_root="nested"))
+    assert layout.data_root == home / "nested"
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(StorageResolutionInputs(profile_home=home, data_root=tmp_path / "other"))
+    assert error.value.code == "E_PROFILE_ROOT_EXTERNAL"
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared_layout = resolve_storage_layout(StorageResolutionInputs(mode="shared", data_root=shared))
+    assert shared_layout.mode == "shared"
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(
+            StorageResolutionInputs(mode="shared", data_root=shared, lancedb_path=tmp_path / "split")
+        )
+    assert error.value.code == "E_SHARED_SPLIT_LAYOUT"
+
+
+def test_s1_sqlite_forms_preserve_query_and_memory(tmp_path: Path) -> None:
+    origin = ValueOrigin("yaml", "db_url")
+    relative = resolve_sqlite_location(
+        "sqlite+aiosqlite:///data/memory.db?timeout=5", data_root=tmp_path, origin=origin
+    )
+    assert relative.local_path == tmp_path / "data/memory.db"
+    assert relative.effective_url == "sqlite+aiosqlite:///" + str(tmp_path / "data/memory.db") + "?timeout=5"
+    absolute = resolve_sqlite_location("sqlite:////var/tmp/memory.db?mode=ro", data_root=tmp_path, origin=origin)
+    assert absolute.local_path == Path("/var/tmp/memory.db")
+    assert absolute.query == "mode=ro"
+    assert resolve_sqlite_location("sqlite+aiosqlite://", data_root=tmp_path, origin=origin).kind == "memory"
+    remote = resolve_sqlite_location("postgresql://db/app?password=secret", data_root=tmp_path, origin=origin)
+    assert remote.kind == "remote" and remote.effective_url == "postgresql://db/app?password=secret"
+    file_uri = resolve_sqlite_location("file:/tmp/existing.db?mode=ro", data_root=tmp_path, origin=origin)
+    assert file_uri.kind == "file_uri" and file_uri.effective_url == "file:/tmp/existing.db?mode=ro"
+
+
+def test_s1_qdrant_profile_fails_closed(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(
+            StorageResolutionInputs(profile_home=home, vector_backend="qdrant", qdrant_location="http://qdrant:6333")
+        )
+    assert error.value.code == "E_QDRANT_PROFILE_NAMESPACE_UNDEFINED"
+    layout = resolve_storage_layout(
+        StorageResolutionInputs(
+            mode="shared", data_root=home, vector_backend="qdrant", qdrant_location="http://qdrant:6333"
+        )
+    )
+    assert layout.vector.kind == "remote"
+
+
+def test_s1_layout_origins_are_snapshot_and_serialization_is_redacted(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    origins = {"sqlite": ValueOrigin("env", "MEMORY_SERVER_DB_URL")}
+    layout = resolve_storage_layout(
+        StorageResolutionInputs(
+            profile_home=home, origins=origins, sqlite_url="sqlite:///data/memory.db?api_key=secret&mode=ro"
+        )
+    )
+    origins["new"] = ValueOrigin("yaml", "new")
+    assert "new" not in layout.origins
+    report = serialize_layout_redacted(layout)
+    assert "secret" not in str(report)
+    assert "api_key" in str(report)
+
+
+def test_s1_write_target_rejects_root_and_symlink(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    layout = resolve_storage_layout(StorageResolutionInputs(profile_home=home))
+    with pytest.raises(StorageLayoutError) as error:
+        validate_write_target(layout, layout.data_root)
+    assert error.value.code == "E_FORBIDDEN_TARGET_ROOT"
+    link = home / "link"
+    link.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(StorageLayoutError) as error:
+        validate_write_target(layout, link)
+    assert error.value.code == "E_PATH_FINAL_SYMLINK_UNSAFE"
+
+
+@pytest.mark.parametrize("mode", ["bogus", "PROFILE", "sharedish"])
+def test_s1_invalid_storage_mode_is_rejected(tmp_path: Path, mode: str) -> None:
+    with pytest.raises(StorageLayoutError, match="unsupported storage mode") as error:
+        resolve_storage_layout(StorageResolutionInputs(mode=mode, data_root=tmp_path))  # type: ignore[arg-type]
+    assert error.value.code == "E_STORAGE_MODE_INVALID"
+
+
+def test_s1_blank_home_and_blank_sqlite_are_distinct_contracts(tmp_path: Path) -> None:
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(StorageResolutionInputs(profile_home=""))
+    assert error.value.code == "E_HERMES_HOME_REQUIRED"
+    location = resolve_sqlite_location("", data_root=tmp_path, origin=ValueOrigin("yaml", "db_url"))
+    assert location.kind == "memory" and location.local_path is None
+
+
+def test_s1_sqlite_uri_filename_is_opaque_and_shape_preserved(tmp_path: Path) -> None:
+    url = "sqlite+aiosqlite:///file:memory.db?uri=true&cache=shared"
+    location = resolve_sqlite_location(url, data_root=tmp_path, origin=ValueOrigin("yaml", "db_url"))
+    assert location.kind == "file_uri"
+    assert location.local_path is None
+    assert location.effective_url == url
+
+
+def test_s1_shared_root_missing_tail_is_allowed_but_standalone_relative_is_not(tmp_path: Path) -> None:
+    shared = tmp_path / "missing" / "tail"
+    layout = resolve_storage_layout(StorageResolutionInputs(mode="shared", data_root=shared))
+    assert layout.data_root == shared
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(StorageResolutionInputs(mode="standalone", data_root="relative"))
+    assert error.value.code == "E_STANDALONE_ROOT_RELATIVE"
+
+
+def test_s1_profile_explicit_external_overrides_are_legacy_compatible(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    external = tmp_path / "legacy"
+    origin = ValueOrigin("yaml", "legacy_path")
+    layout = resolve_storage_layout(
+        StorageResolutionInputs(
+            profile_home=home,
+            lancedb_path=external / "vectors",
+            graph_snapshot_path=external / "graph.json",
+            sqlite_url=f"sqlite+aiosqlite:////{str(external / 'db.sqlite').lstrip('/')}",
+            origins={"vector": origin, "graph": origin, "sqlite": origin},
+        )
+    )
+    assert layout.vector.local_path == external / "vectors"
+    assert layout.graph_snapshot_path == external / "graph.json"
+    assert "legacy-split-layout" in " ".join(layout.compatibility)
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(
+            StorageResolutionInputs(
+                mode="shared", data_root=home, lancedb_path=external / "vectors", origins={"vector": origin}
+            )
+        )
+    assert error.value.code == "E_SHARED_SPLIT_LAYOUT"
+
+
+def test_s1_sqlite_final_symlink_and_special_are_not_accepted(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside.db"
+    outside.write_text("x")
+    link = home / "link.db"
+    link.symlink_to(outside)
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(StorageResolutionInputs(profile_home=home, sqlite_url="sqlite+aiosqlite:///link.db"))
+    assert error.value.code == "E_PATH_FINAL_SYMLINK_UNSAFE"
+
+
+def test_s1_redaction_removes_qdrant_userinfo_and_query(tmp_path: Path) -> None:
+    layout = resolve_storage_layout(
+        StorageResolutionInputs(
+            mode="shared",
+            data_root=tmp_path,
+            vector_backend="qdrant",
+            qdrant_location="https://user:pass@qdrant.invalid:6333/api?api_key=secret&tenant=x",
+        )
+    )
+    report = serialize_layout_redacted(layout)
+    assert "user" not in str(report) and "pass" not in str(report)
+    assert "secret" not in str(report)
+
+
+def test_s1_write_target_rejects_special_and_hardlink(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    layout = resolve_storage_layout(StorageResolutionInputs(profile_home=home))
+    regular = home / "regular"
+    regular.write_text("x")
+    hard = home / "hard"
+    hard.hardlink_to(regular)
+    with pytest.raises(StorageLayoutError) as error:
+        validate_write_target(layout, hard)
+    assert error.value.code == "E_PATH_HARDLINK_UNSAFE"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "data/memory.db-wal",
+        "data/memory.db-shm",
+        "data/memory.db-journal",
+        "data/graph.json.lock",
+        ".cmms-storage.lock",
+    ],
+)
+def test_s1_parent_rejects_unsafe_sidecar_before_runtime_io(tmp_path, name):
+    home = tmp_path / "profile"
+    (home / "data").mkdir(parents=True)
+    outside = tmp_path / "external"
+    outside.write_bytes(b"sentinel")
+    (home / name).symlink_to(outside)
+    with pytest.raises(StorageLayoutError):
+        resolve_storage_layout(StorageResolutionInputs(profile_home=home))
+    assert outside.read_bytes() == b"sentinel"
+
+
+@pytest.mark.parametrize("url", ["sqlite+aiosqlite:///../escape.db", "sqlite:///../../escape.db"])
+def test_s1_parent_relative_sql_escape_is_never_legacy(tmp_path, url):
+    with pytest.raises(StorageLayoutError):
+        resolve_storage_layout(
+            StorageResolutionInputs(
+                profile_home=tmp_path, sqlite_url=url, origins={"sqlite": ValueOrigin("yaml", "db_url")}
+            )
+        )
+
+
+def test_s1_parent_external_sql_symlink_is_fatal(tmp_path):
+    home = tmp_path / "profile"
+    home.mkdir()
+    target = tmp_path / "target.db"
+    target.write_bytes(b"sentinel")
+    link = tmp_path / "legacy.db"
+    link.symlink_to(target)
+    with pytest.raises(StorageLayoutError):
+        resolve_storage_layout(
+            StorageResolutionInputs(
+                profile_home=home,
+                sqlite_url=f"sqlite+aiosqlite:///{link}",
+                origins={"sqlite": ValueOrigin("yaml", "db_url")},
+            )
+        )
+
+
+def test_s1_parent_regular_absolute_overrides_warn_without_disabling(tmp_path):
+    home = tmp_path / "profile"
+    home.mkdir()
+    layout = resolve_storage_layout(
+        StorageResolutionInputs(
+            profile_home=home,
+            sqlite_url=f"sqlite+aiosqlite:///{tmp_path / 'db'}",
+            lancedb_path=tmp_path / "vectors",
+            graph_snapshot_path=tmp_path / "graph",
+            origins={key: ValueOrigin("yaml", key) for key in ("sqlite", "vector", "graph")},
+        )
+    )
+    assert set(layout.compatibility) == {
+        "legacy-split-layout:sqlite",
+        "legacy-split-layout:vector",
+        "legacy-split-layout:graph",
+    }
+    assert layout.unavailable_projections == frozenset()
+
+
+def test_s1_parent_classification_does_not_follow_parent(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "file").write_text("sentinel")
+    link = tmp_path / "link"
+    link.symlink_to(external)
+    with pytest.raises(StorageLayoutError):
+        classify_artifact_nofollow(link / "file")
+
+
+def test_s1_parent_runtime_relative_root_uses_one_layout(synthetic_storage_env, monkeypatch):
+    from memory_server.plugins.hermes import provider as module
+
+    home = synthetic_storage_env.root / "home"
+    home.mkdir()
+    provider = HermesProvider()
+    try:
+        provider.initialize("s1-root", hermes_home=str(home), config={"data_root": "nested"})
+        layout = provider._storage_layout
+        assert layout.sqlite.local_path == home / "nested/data/memory.db"
+        synthetic_storage_env.assert_provider_synthetic(provider, profile_home=home)
+
+        def no_settings():
+            raise AssertionError("late settings read after layout frozen")
+
+        monkeypatch.setattr(module, "get_settings", no_settings)
+        assert module._resolve_cmms_data_path(provider, "data/graph.json") == layout.graph_snapshot_path
+        assert module._resolve_cmms_data_path(provider, "data/lancedb") == layout.vector.local_path
+        with pytest.raises(ValueError):
+            module._resolve_cmms_data_path(provider, "../escape")
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("projection", ["vector", "graph"])
+def test_s1_parent_final_link_degraded_startup_preserves_entry(synthetic_storage_env, projection):
+    from memory_server.plugins.hermes import provider as module
+
+    home = synthetic_storage_env.root / "home"
+    (home / "data").mkdir(parents=True)
+    external = synthetic_storage_env.root / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_bytes(b"do-not-touch")
+    link = home / ("data/lancedb" if projection == "vector" else "data/graph.json")
+    link.symlink_to(external)
+    before = (link.lstat().st_ino, os.readlink(link), sentinel.read_bytes(), sorted(external.iterdir()))
+    provider = HermesProvider()
+    try:
+        provider.initialize("s1-link", hermes_home=str(home))
+        synthetic_storage_env.assert_provider_synthetic(provider, profile_home=home)
+        assert provider._outbox_task is None and provider._outbox_worker is None
+        with pytest.raises(RuntimeError, match="E_PROJECTION_UNAVAILABLE"):
+            module._run_async(
+                module._get_vector_provider(provider) if projection == "vector" else module._get_graph(provider)
+            )
+        result = provider.handle_tool_call("remember", {"subject": "s1", "predicate": "owns", "object": projection})
+        assert "error" not in result.lower(), result
+
+        async def pending():
+            from sqlalchemy import text
+
+            async with provider._provider.engine.connect() as conn:
+                return (await conn.execute(text("SELECT status FROM outbox_entries"))).scalars().all()
+
+        assert module._run_async(pending()) == ["pending"]
+    finally:
+        provider.shutdown()
+    assert before == (link.lstat().st_ino, os.readlink(link), sentinel.read_bytes(), sorted(external.iterdir()))

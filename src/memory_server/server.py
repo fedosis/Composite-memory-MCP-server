@@ -35,6 +35,7 @@ from memory_server.paths import (
     StorageLayout,
     StorageResolutionInputs,
     resolve_storage_layout,
+    validate_write_target,
 )
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.sqlite_provider import SQLiteProvider
@@ -45,7 +46,7 @@ from memory_server.services.lifecycle_service import (
     LifecycleTransitionRequest,
 )
 from memory_server.settings import get_openai_api_key, get_settings
-from memory_server.storage_lock import RuntimeStorageLock
+from memory_server.storage_lock import RuntimeStorageLock, open_directory_nofollow
 
 if TYPE_CHECKING:
     from memory_server.providers.embedding_provider import EmbeddingProvider
@@ -74,14 +75,25 @@ _storage_layout: StorageLayout | None = None
 _outbox_task: asyncio.Task | None = None
 
 
+_storage_settings = None
+_storage_cleanup_failed = False
+
+
+def _get_storage_settings():
+    global _storage_settings
+    if _storage_settings is None:
+        _storage_settings = get_settings()
+    return _storage_settings
+
+
 def _get_storage_layout() -> StorageLayout:
     global _storage_layout
     if _storage_layout is None:
-        settings = get_settings()
         import os
+        settings = _get_storage_settings()
         explicit = os.environ.get("MEMORY_SERVER_DATA_ROOT")
         _storage_layout = resolve_storage_layout(StorageResolutionInputs(
-            mode="standalone", data_root=explicit, sqlite_url=settings.db_url,
+            mode="standalone", data_root=explicit or None, sqlite_url=settings.db_url,
             vector_backend=settings.vector_backend, lancedb_path=settings.lancedb_path,
             graph_snapshot_path=settings.graph_snapshot_path, qdrant_location=settings.qdrant_location,
             vector_collection=settings.vector_collection,
@@ -89,48 +101,87 @@ def _get_storage_layout() -> StorageLayout:
     return _storage_layout
 
 
+def _ensure_storage_ready() -> StorageLayout:
+    global _root_lock
+    if _storage_cleanup_failed:
+        raise RuntimeError("storage cleanup failed; retry shutdown before initialization")
+    layout = _get_storage_layout()
+    if _root_lock is None:
+        _root_lock = RuntimeStorageLock.acquire(layout.data_root, timeout=5.0)
+    return layout
+
+
+def _prepare_store(path: Path) -> None:
+    layout = _ensure_storage_ready()
+    validate_write_target(layout, path)
+    with open_directory_nofollow(path.parent, create=True):
+        validate_write_target(layout, path)
+
+
+async def _shutdown_storage() -> None:
+    """Retain the root lock on any unverified task/resource close; retryable."""
+    global _outbox_task, _outbox_worker, _provider, _root_lock, _storage_layout
+    global _qdrant, _lancedb, _embedder, _graph, _router, _graph_router, _hybrid_router
+    global _storage_settings, _storage_cleanup_failed
+    _storage_cleanup_failed = True
+    if _outbox_worker is not None:
+        _outbox_worker.stop()
+    if _outbox_task is not None:
+        task = _outbox_task
+        if not task.done():
+            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        except asyncio.CancelledError:
+            if not task.done():
+                raise
+        except Exception:
+            if not task.done():
+                raise
+        if not task.done():
+            raise RuntimeError("outbox termination unverified; root lock retained")
+        _outbox_task = None
+    # Worker uses the provider engine; dispose once, only after all projections.
+    _outbox_worker = None
+    if _qdrant is not None:
+        await _qdrant.close()
+        _qdrant = None
+    if _lancedb is not None:
+        await _lancedb.close()
+        _lancedb = None
+    if _embedder is not None:
+        close = getattr(_embedder, "close", None)
+        if close is not None:
+            import inspect
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        _embedder = None
+    _graph = _router = _graph_router = _hybrid_router = None
+    if _provider is not None:
+        await _provider.close()
+        _provider = None
+    if _root_lock is not None:
+        _root_lock.release()
+        _root_lock = None
+    _storage_layout = None
+    _storage_settings = None
+    _storage_cleanup_failed = False
+
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
-    """FastMCP lifespan: start providers + outbox worker on boot, stop gracefully on shutdown."""
-    global _outbox_task, _outbox_worker, _provider, _root_lock
-    # --- Startup ---
-    logger.info("Starting Composite Memory MCP Server...")
-    layout = _get_storage_layout()
-    _root_lock = RuntimeStorageLock.acquire(layout.data_root, timeout=5.0)
-    provider = await _get_provider()
-    worker = await _get_outbox_worker()
-
-    # Start background polling task (only in lifespan — tests use process_all_pending directly)
-    if _outbox_task is None or _outbox_task.done():
-        _outbox_task = asyncio.create_task(worker.run())
-        logger.info("Outbox worker background task started")
-
-    logger.info("Server initialized — provider ready, outbox worker started")
-
-    yield {"provider": provider, "outbox_worker": worker}
-
-    # --- Shutdown ---
-    logger.info("Shutting down Composite Memory MCP Server...")
-
-    if _outbox_task and not _outbox_task.done():
-        _outbox_task.cancel()
-        try:
-            await _outbox_task
-        except asyncio.CancelledError:
-            pass
-        logger.info("Outbox worker task stopped")
-
-    if _outbox_worker:
-        await _outbox_worker.close()
-        logger.info("Outbox worker connection closed")
-
-    if _provider:
-        await _provider.close()
-        logger.info("SQLite provider connection closed")
-    if _root_lock:
-        _root_lock.release()
-        _root_lock = None
+    """Own all store handles until deterministic final cleanup, even on errors."""
+    global _outbox_task
+    _ensure_storage_ready()
+    try:
+        provider = await _get_provider()
+        worker = await _get_outbox_worker()
+        if _outbox_task is None or _outbox_task.done():
+            _outbox_task = asyncio.create_task(worker.run())
+        yield {"provider": provider, "outbox_worker": worker}
+    finally:
+        await _shutdown_storage()
 
 
 mcp = FastMCP("CompositeMemoryServer", lifespan=lifespan)
@@ -140,11 +191,18 @@ async def _get_provider() -> SQLiteProvider:
     """Get or create the SQLiteProvider singleton."""
     global _provider
     if _provider is None:
+        layout = _ensure_storage_ready()
+        if layout.sqlite.local_path is not None:
+            _prepare_store(layout.sqlite.local_path)
         _provider = SQLiteProvider(
-            url=_get_sqlite_db_url(),
-            busy_timeout_ms=get_settings().sqlite_busy_timeout_ms,
+            url=layout.sqlite.effective_url,
+            busy_timeout_ms=_get_storage_settings().sqlite_busy_timeout_ms,
         )
-        await _provider.initialize()
+        try:
+            await _provider.initialize()
+        except BaseException:
+            await _shutdown_storage()
+            raise
     return _provider
 
 
@@ -164,10 +222,14 @@ async def _get_lancedb_provider() -> LanceDBProvider:
     if _lancedb is None:
         from memory_server.providers.lancedb_provider import LanceDBProvider
 
-        settings = get_settings()
+        settings = _get_storage_settings()
+        layout = _ensure_storage_ready()
+        if layout.vector.local_path is None:
+            raise RuntimeError("local vector path unavailable")
+        _prepare_store(layout.vector.local_path)
         _lancedb = LanceDBProvider(
             db_path=str(_get_storage_layout().vector.local_path),
-            table=settings.vector_collection,
+            table=_get_storage_layout().vector.collection,
             metric=settings.vector_metric,
             vector_size=settings.vector_size,
         )
@@ -180,12 +242,13 @@ async def _get_qdrant_provider() -> QdrantProvider:
     if _qdrant is None:
         from memory_server.providers.qdrant_provider import QdrantProvider
 
-        settings = get_settings()
+        settings = _get_storage_settings()
+        _ensure_storage_ready()
         _qdrant = QdrantProvider(
-            location=settings.qdrant_location,
+            location=_get_storage_layout().vector.qdrant_location,
             port=settings.qdrant_port,
             prefer_grpc=settings.qdrant_prefer_grpc,
-            collection=settings.vector_collection,
+            collection=_get_storage_layout().vector.collection,
             vector_size=settings.vector_size,
             distance=settings.vector_metric,
         )
@@ -199,7 +262,7 @@ def _get_vector_provider():
     legacy alias / MEMORY_SERVER_VECTOR_BACKEND canonical): 'lancedb' (default)
     or 'qdrant'.
     """
-    backend = get_settings().vector_backend
+    backend = _get_storage_layout().vector.backend
     if backend == "qdrant":
         return _get_qdrant_provider()
     return _get_lancedb_provider()
@@ -218,7 +281,7 @@ def _build_embedder():
         SentenceTransformerEmbeddingProvider,
     )
 
-    settings = get_settings()
+    settings = _get_storage_settings()
     if settings.embedding_provider == "openai":
         return OpenAIEmbeddingProvider(
             model=settings.openai_embedding_model,
@@ -296,7 +359,7 @@ async def _get_outbox_worker() -> OutboxWorker:
         if _embedder is None:
             _embedder = _build_embedder()
 
-        settings = get_settings()
+        settings = _get_storage_settings()
         _outbox_worker = OutboxWorker(
             engine=provider.engine,
             qdrant=vector_provider,
@@ -516,7 +579,7 @@ async def _get_graph_router() -> GraphRouter:
         _graph = await _get_graph()
         _graph_router = GraphRouter(
             graph=_graph,
-            max_path_depth=get_settings().graph_max_path_depth,
+            max_path_depth=_get_storage_settings().graph_max_path_depth,
         )
     return _graph_router
 
@@ -525,7 +588,10 @@ async def _get_graph() -> SimpleGraph:
     """Get or create the shared graph singleton, loading a snapshot if present."""
     global _graph
     if _graph is None:
-        _graph = SimpleGraph(snapshot_path=_get_graph_snapshot_path())
+        layout = _ensure_storage_ready()
+        _prepare_store(layout.graph_snapshot_path)
+        validate_write_target(layout, layout.graph_lock_path)
+        _graph = SimpleGraph(snapshot_path=layout.graph_snapshot_path)
         _graph.load_snapshot()
     return _graph
 

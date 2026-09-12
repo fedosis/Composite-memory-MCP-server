@@ -39,6 +39,13 @@ from memory_server.providers.lancedb_provider import LanceDBProvider
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.settings import get_settings as real_get_settings
 
+
+@pytest.fixture(autouse=True)
+def _s1_synthetic_provider_environment(synthetic_storage_env, monkeypatch):
+    synthetic_storage_env.assert_injection()
+    # Preserve identity assertions in existing wiring tests that saved an alias.
+    monkeypatch.setitem(globals(), "real_get_settings", lambda: synthetic_storage_env.settings)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -1023,11 +1030,11 @@ def test_fp_init_step_failure_rolls_back(tmp_path, monkeypatch, fpoint):
 
         monkeypatch.setattr(provider_mod, "get_settings", _raise_settings)
     elif fpoint == "db-url-resolution":
-        def _raise_dburl(self, hermes_home):
+        def _raise_dburl(self, **kwargs):
             raise RuntimeError("fp-dburl")
 
         monkeypatch.setattr(
-            provider_mod.HermesPluginConfig, "resolve_db_url", _raise_dburl
+            provider_mod.HermesPluginConfig, "resolve_storage_layout", _raise_dburl
         )
     elif fpoint == "resolver":
         def _raise_resolver(cfg, settings):
@@ -1583,3 +1590,95 @@ def test_shutdown_twice_harmless(tmp_path, monkeypatch):
     assert provider._extractor_runtime is None
     assert provider._llm_extractor is None
     assert len([e for e in log if e[0] == "dispose"]) == 1
+
+
+@pytest.fixture
+def s1_server(synthetic_storage_env, monkeypatch):
+    from memory_server import server
+    monkeypatch.setattr(server, "get_settings", lambda: synthetic_storage_env.settings)
+    for name in (
+        "_provider", "_qdrant", "_lancedb", "_embedder", "_router", "_graph", "_graph_router",
+        "_hybrid_router", "_outbox_worker", "_outbox_task", "_storage_layout", "_root_lock",
+    ):
+        monkeypatch.setattr(server, name, None)
+    monkeypatch.setattr(server, "_storage_settings", None, raising=False)
+    monkeypatch.setattr(server, "_storage_cleanup_failed", False, raising=False)
+    yield server
+    # Always release test-owned resources, even on RED: live loops cannot escape.
+    task = server._outbox_task
+    if task is not None and not task.done():
+        task.cancel()
+    if server._root_lock is not None:
+        server._root_lock.release()
+        server._root_lock = None
+
+
+@pytest.mark.asyncio
+async def test_s1_standalone_lifespan_exception_closes_all_handles(s1_server, synthetic_storage_env):
+    server = s1_server
+    # Precreate a clean parent so the RED assertion exercises teardown itself.
+    (synthetic_storage_env.root / "data").mkdir()
+    vector = None
+    try:
+        with pytest.raises(RuntimeError, match="body-failure"):
+            async with server.lifespan(server.mcp):
+                layout = server._get_storage_layout()
+                assert layout.profile_home is None
+                assert layout.data_root == synthetic_storage_env.root
+                vector = server._lancedb
+                assert vector is not None
+                raise RuntimeError("body-failure")
+        assert server._root_lock is None
+        assert server._provider is None
+        assert server._outbox_task is None
+        assert server._lancedb is None
+    finally:
+        if server._outbox_task is not None:
+            server._outbox_task.cancel()
+            await asyncio.gather(server._outbox_task, return_exceptions=True)
+        if vector is not None:
+            await vector.close()
+        if server._provider is not None:
+            await server._provider.close()
+
+
+@pytest.mark.asyncio
+async def test_s1_standalone_lazy_provider_creates_validated_parent_and_holds_lock(s1_server, synthetic_storage_env):
+    from memory_server.storage_lock import MaintenanceStorageLocks, StorageLockError
+    server = s1_server
+    try:
+        provider = await server._get_provider()
+        assert provider._url == server._get_storage_layout().sqlite.effective_url
+        with pytest.raises(StorageLockError):
+            MaintenanceStorageLocks.acquire([synthetic_storage_env.root], timeout=0)
+        assert server._root_lock is not None
+    finally:
+        if server._provider is not None:
+            await server._provider.close()
+
+
+@pytest.mark.asyncio
+async def test_s1_standalone_vector_consumes_frozen_layout(s1_server, synthetic_storage_env, monkeypatch):
+    server = s1_server
+    frozen = server._get_storage_layout()
+    def forbid():
+        raise AssertionError("late Settings path read")
+    monkeypatch.setattr(server, "get_settings", forbid)
+    vector = await server._get_vector_provider()
+    try:
+        assert str(vector._db_path) == str(frozen.vector.local_path)
+    finally:
+        await vector.close()
+
+
+@pytest.mark.asyncio
+async def test_s1_standalone_graph_router_consumes_frozen_settings(s1_server, monkeypatch):
+    server = s1_server
+    frozen = server._get_storage_settings()
+
+    def forbid():
+        raise AssertionError("late Settings read")
+
+    monkeypatch.setattr(server, "get_settings", forbid)
+    router = await server._get_graph_router()
+    assert router._max_path_depth == frozen.graph_max_path_depth

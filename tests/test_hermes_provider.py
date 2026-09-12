@@ -27,6 +27,18 @@ from memory_server.plugins.hermes.provider import HermesProvider, _run_async
 from memory_server.providers.embedding_provider import MockEmbeddingProvider
 
 
+@pytest.fixture(autouse=True)
+def _s1_synthetic_provider_environment(request, monkeypatch):
+    if request.cls is not None and request.cls.__name__ == "TestHermesPluginConfig":
+        return
+    env = request.getfixturevalue("synthetic_storage_env")
+    env.assert_injection()
+    # A frozen synthetic Settings object has no cache to invalidate.
+    from memory_server.settings import get_settings
+    monkeypatch.setattr(get_settings, "cache_clear", lambda: None, raising=False)
+
+
+
 class TestHermesProviderLifecycle:
     """Test the MemoryProvider lifecycle contract."""
 
