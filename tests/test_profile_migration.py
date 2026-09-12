@@ -15,6 +15,8 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, cast
@@ -627,8 +629,83 @@ def test_s2_config_digest_is_nonsecret_storage_identity(tmp_path: Path, syntheti
         MigrationRequest(home, source_sql=db_path, confirm_target="SECRET-B", stop_attestation="SECRET-B")
     )
 
+    other_home = tmp_path / "other-home"
+    other_db = _seed_source_sql(other_home)
+    plan_c = plan_profile_migration(
+        MigrationRequest(
+            other_home, source_sql=other_db, confirm_target="SECRET-A", stop_attestation="SECRET-A"
+        )
+    )
+
     assert re.fullmatch(r"[0-9a-f]{64}", plan_a.config_digest)
     assert plan_a.request.run_id != plan_b.request.run_id
     assert plan_a.config_digest == plan_b.config_digest
     assert "SECRET" not in plan_a.config_digest
     assert hashlib.sha256(b"SECRET-A").hexdigest() != plan_a.config_digest
+    # Everything above is satisfied by a degenerate constant digest; a different
+    # non-secret storage identity must produce a different digest.
+    assert re.fullmatch(r"[0-9a-f]{64}", plan_c.config_digest)
+    assert plan_c.config_digest != plan_a.config_digest
+
+
+def test_s2_load_manifest_refuses_non_regular_manifest_path_without_blocking(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """A non-regular manifest path is refused instead of blocking the reader.
+
+    ``os.open(O_RDONLY)`` on a FIFO with no writer blocks until a writer opens
+    it, so the ``S_ISREG`` refusal in ``_read_bounded_manifest_bytes`` is only
+    reachable when that open is non-blocking (``O_NONBLOCK``, a no-op for
+    regular files). The read therefore runs in a child process under a hard
+    ``subprocess`` timeout: a regression that reintroduces the blocking open
+    makes this node FAIL on the timeout instead of hanging the suite.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    run_dir = _s2_run_dir(tmp_path)
+    fifo = run_dir / "manifest.json"
+    os.mkfifo(fifo, 0o600)
+    assert stat.S_ISFIFO(os.lstat(fifo).st_mode)
+
+    # The child reads the module under test from the same source tree, so the
+    # node cannot silently exercise a stale installed copy.
+    module_path = Path(profile_migration.__file__).resolve()
+    tree_root = module_path.parents[2]
+    child_env = dict(os.environ)
+    child_env["PYTHONPATH"] = os.pathsep.join((str(tree_root / "src"), str(tree_root)))
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    child_source = (
+        "import sys\n"
+        "from memory_server.profile_migration import load_manifest\n"
+        "try:\n"
+        "    load_manifest(sys.argv[1])\n"
+        "except ValueError as exc:\n"
+        "    print('REFUSED:' + str(exc))\n"
+        "    raise SystemExit(0)\n"
+        "print('LOADED')\n"
+        "raise SystemExit(3)\n"
+    )
+
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", child_source, str(fifo)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=child_env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "load_manifest blocked on a FIFO manifest path: no refusal within 15s "
+            "(the read-side open must be non-blocking)"
+        )
+
+    assert child.returncode == 0, f"stdout={child.stdout!r} stderr={child.stderr!r}"
+    assert child.stdout.startswith("REFUSED:"), child.stdout
+    assert "E_MANIFEST_TAMPERED" in child.stdout, child.stdout
+    # The refusal came from the regular-file check, not from anything having
+    # opened the FIFO for writing.
+    assert stat.S_ISFIFO(os.lstat(fifo).st_mode)
