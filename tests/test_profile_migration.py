@@ -19,7 +19,9 @@ import sqlite3
 import stat
 import subprocess
 import sys
-from dataclasses import asdict
+import time
+from dataclasses import asdict, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, cast
 from urllib.parse import quote
@@ -2078,3 +2080,310 @@ def test_s203_snapshot_refuses_a_special_file_at_the_run_artifact_path(
 
     assert "E_PATH_SPECIAL_FILE" in _s203_codes(diagnostics)
     assert _s203_section(report, "snapshot", "created") is False
+
+
+# ---------------------------------------------------------------------------
+# S2-04 -- mixed-version maintenance preconditions and lock lifetime ownership
+#
+# The BEHAVIOURAL nodes below drive only the already-approved public surface
+# (`apply_profile_migration` / `resume_profile_migration` /
+# `rollback_profile_migration` / `plan_profile_migration`), so they fail at the
+# card's parent commit for a behavioural reason -- the entrypoint reaches the
+# unimplemented-engine gate instead of the new fail-closed code -- and never
+# with a collection ImportError. Nodes that reference a symbol introduced by
+# this card import it inside the body and are labelled MISSING-CAPABILITY.
+# ---------------------------------------------------------------------------
+
+
+def _s204_request(home: Path, db_path: Path, **fields: Any) -> MigrationRequest:
+    fields.setdefault("stop_attestation", "maintenance-ticket")
+    return MigrationRequest(
+        home,
+        source_sql=db_path,
+        confirm_target=str(home),
+        **fields,
+    )
+
+
+def _s204_planned_request(home: Path, db_path: Path, **fields: Any):
+    request = _s204_request(home, db_path, mode="apply", **fields)
+    digest = plan_profile_migration(request).embedding.digest
+    confirmed = replace(request, embedding_plan_digest=digest)
+    return confirmed, plan_profile_migration(confirmed)
+
+
+def _s204_old_writer(database: str, ready, release) -> None:
+    connection = sqlite3.connect(database, isolation_level=None)
+    connection.execute("BEGIN IMMEDIATE")
+    ready.put(os.getpid())
+    release.wait(10)
+    connection.rollback()
+    connection.close()
+
+
+def _s204_late_writer(database: str, delay: float) -> None:
+    time.sleep(delay)
+    for _ in range(3):
+        connection = sqlite3.connect(database)
+        connection.execute("insert into facts(id) values ('late')")
+        connection.commit()
+        connection.close()
+        time.sleep(1.0)
+
+
+def test_s204_missing_attestation_is_refused_by_every_entrypoint_independently(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request = _s204_request(home, db_path, stop_attestation=None)
+    apply_request = replace(request, mode="apply")
+    plan = plan_profile_migration(apply_request)
+    manifest_path = home / ".cmms-migrations" / request.run_id / "manifest.json"
+    with pytest.raises(ValueError, match="E_STOP_ATTESTATION_REQUIRED"):
+        apply_profile_migration(plan)
+    with pytest.raises(ValueError, match="E_STOP_ATTESTATION_REQUIRED"):
+        resume_profile_migration(manifest_path, replace(request, mode="resume"))
+    with pytest.raises(ValueError, match="E_STOP_ATTESTATION_REQUIRED"):
+        rollback_profile_migration(manifest_path, replace(request, mode="rollback"))
+
+
+def test_s204_apply_refuses_a_source_changed_since_it_was_planned(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path)
+    assert request.mode == "apply"
+    connection = sqlite3.connect(db_path)
+    connection.execute("insert into facts(id) values ('changed')")
+    connection.commit()
+    connection.close()
+    before = _tree_snapshot(home)
+    with pytest.raises(ValueError, match="E_PLAN_STALE"):
+        apply_profile_migration(plan)
+    assert _tree_snapshot(home) == before
+
+
+def test_s204_apply_refuses_an_unbounded_stop_attestation(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path, stop_attestation="x" * 4096)
+    assert (request.stop_attestation or "") == "x" * 4096
+    with pytest.raises(ValueError, match="E_ATTESTATION_UNBOUNDED"):
+        apply_profile_migration(plan)
+
+
+def test_s204_apply_detects_a_real_old_sqlite_writer_and_never_signals_it(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    import multiprocessing
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path)
+    ready: multiprocessing.Queue[int] = multiprocessing.Queue()
+    release = multiprocessing.Event()
+    proc = multiprocessing.Process(target=_s204_old_writer, args=(str(db_path), ready, release))
+    proc.start()
+    try:
+        child = ready.get(timeout=8)
+        assert child != os.getpid()
+        with pytest.raises(ValueError, match="E_OLD_WRITER_ACTIVE"):
+            apply_profile_migration(plan)
+        assert proc.is_alive()
+    finally:
+        release.set()
+        proc.join(10)
+        if proc.is_alive():
+            proc.terminate()
+    assert proc.exitcode == 0
+
+
+def test_s204_apply_detects_a_source_written_during_the_quiet_interval(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    import multiprocessing
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path)
+    proc = multiprocessing.Process(target=_s204_late_writer, args=(str(db_path), 1.5))
+    proc.start()
+    try:
+        with pytest.raises(ValueError, match="E_SOURCE_CHANGED"):
+            apply_profile_migration(plan)
+    finally:
+        proc.join(12)
+        if proc.is_alive():
+            proc.terminate()
+    assert proc.exitcode == 0
+
+
+def test_s204_every_entrypoint_replans_independently_without_inherited_state(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path)
+    calls: list[str] = []
+    original = profile_migration.plan_profile_migration
+
+    def counting(candidate: MigrationRequest):
+        calls.append(candidate.mode)
+        return original(candidate)
+
+    monkeypatch.setattr(profile_migration, "plan_profile_migration", counting)
+    manifest_path = home / ".cmms-migrations" / request.run_id / "manifest.json"
+    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+        apply_profile_migration(plan)
+    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+        resume_profile_migration(manifest_path, replace(request, mode="resume"))
+    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+        rollback_profile_migration(manifest_path, replace(request, mode="rollback"))
+    assert calls == ["apply", "resume", "rollback"]
+
+
+def test_s204_preconditions_record_a_bounded_attestation_digest_and_time(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    record = profile_migration.record_stop_attestation
+    validate = profile_migration.validate_mutation_preconditions
+    attestation = record("maintenance-ticket", roots=(home,))
+    assert attestation.digest == hashlib.sha256(b"maintenance-ticket").hexdigest()
+    assert attestation.value_bytes == len(b"maintenance-ticket")
+    parsed = datetime.fromisoformat(attestation.recorded_at)
+    assert parsed.tzinfo is not None
+    assert attestation.process_classes
+    with pytest.raises(ValueError, match="E_ATTESTATION_UNBOUNDED"):
+        record("x" * 4096, roots=(home,))
+    with pytest.raises(ValueError, match="E_STOP_ATTESTATION_REQUIRED"):
+        record("   ", roots=(home,))
+    request, plan = _s204_planned_request(home, db_path)
+    preconditions = validate(request, plan=plan)
+    assert preconditions.attestation.digest == attestation.digest
+    assert preconditions.attestation.recorded_at
+    assert preconditions.quiet_interval == 2.0
+    assert preconditions.probe["qualified"] is True
+    assert preconditions.writer_state["covered"] is True
+
+
+def test_s204_unknown_and_unsupported_writer_states_fail_closed(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path)
+    validate = profile_migration.validate_mutation_preconditions
+    with pytest.raises(ValueError, match="E_WRITER_INVENTORY_UNSUPPORTED"):
+        validate(request, plan=plan, proc_root=tmp_path / "absent-proc")
+
+
+def test_s204_maintenance_locks_cover_every_root_and_hold_the_graph_lock(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    import fcntl
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    request, plan = _s204_planned_request(home, db_path)
+    acquire = profile_migration.acquire_maintenance_locks
+    locks = acquire(plan, timeout=2)
+    graph = Path(plan.layout.graph_lock_path)
+    graph_inode = os.lstat(graph).st_ino
+    competing = os.open(graph, os.O_RDWR)
+    try:
+        assert list(locks.roots) == sorted(locks.roots, key=lambda item: os.fsencode(str(item)))
+        assert locks.released is False
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(competing)
+        locks.release()
+    assert os.lstat(graph).st_ino == graph_inode
+    assert graph.exists()
+    assert locks.released is True
+
+
+def test_s204_a_symlinked_vector_store_is_never_a_lock_root(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+    external = tmp_path / "external-lancedb"
+    external.mkdir()
+    vector = home / "data" / "lancedb"
+    vector.symlink_to(external, target_is_directory=True)
+    request, plan = _s204_planned_request(home, db_path)
+    assert plan.layout.vector.local_path is not None
+    acquire = profile_migration.acquire_maintenance_locks
+    locks = acquire(plan, timeout=2)
+    try:
+        roots = [str(root) for root in locks.roots]
+        assert all(os.path.islink(root) is False for root in roots)
+        assert str(vector) not in roots
+        assert str(vector.parent) in roots
+    finally:
+        locks.release()
+    assert external.is_dir()
+
+
+def test_s204_quiet_interval_is_two_seconds_under_pytest_and_five_in_a_cli_process(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    resolve = profile_migration.resolve_quiet_interval
+    assert resolve() == 2.0
+    assert resolve(3.5) == 3.5
+    tree = Path(profile_migration.__file__).resolve().parents[2]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import memory_server.profile_migration as m; print(m.resolve_quiet_interval())",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PYTHONPATH": f"{tree / 'src'}:{tree}",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "5.0"
+
+
+def test_s204_the_implementation_never_signals_a_process() -> None:
+    import memory_server.storage_lock as storage_lock_module
+
+    for path in (profile_migration.__file__, storage_lock_module.__file__):
+        source = Path(path).read_text()
+        for forbidden in ("os.kill", "import signal", "signal.SIG", "send_signal", "subprocess"):
+            assert forbidden not in source, f"{path} references {forbidden}"
