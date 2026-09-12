@@ -709,3 +709,606 @@ def test_s2_load_manifest_refuses_non_regular_manifest_path_without_blocking(
     # The refusal came from the regular-file check, not from anything having
     # opened the FIFO for writing.
     assert stat.S_ISFIFO(os.lstat(fifo).st_mode)
+
+
+# ---------------------------------------------------------------------------
+# S2-02 -- mutation-free no-follow inventory and raw/effective config report
+#
+# Every node below addresses a behaviour the pre-fix planner does not have:
+# configured data root selection, RAW-YAML canonical SQL selection with the
+# environment reported separately, ``sql_action``, legacy candidates with their
+# exact RAW link string, disk margin 1.25, the WAL/SHM/journal presence matrix
+# with stable codes, the sidecar-gated immutable read-only probe, streaming
+# identity digests (never the bounded 64 KiB reader), and the no-follow
+# run-directory path chain. Accessors are shape-tolerant so that the filed RED
+# on the parent commit is a behavioural assertion failure and never a
+# collection ``ImportError``.
+# ---------------------------------------------------------------------------
+
+_S202_CONFIG_BLOCK: dict[str, Any] = {
+    "storage_mode": "profile",
+    "data_root": ".",
+    "db_url": "sqlite+aiosqlite:///data/memory.db",
+    "vector_backend": "lancedb",
+    "lancedb_path": "data/lancedb",
+    "graph_snapshot_path": "data/graph.json",
+}
+
+
+def _s202_request(profile_home: Path, **fields: Any) -> MigrationRequest:
+    """Request restricted to the fields THIS checkout understands.
+
+    The pre-fix dataclass has no ``raw_config``/``raw_config_path`` field.
+    Dropping the unknown field keeps the module importable, so the filed RED is
+    a behavioural assertion failure, never a collection error.
+    """
+    import dataclasses as _dataclasses
+
+    accepted = {item.name for item in _dataclasses.fields(MigrationRequest)}
+    known = {key: value for key, value in fields.items() if key in accepted}
+    return MigrationRequest(profile_home, **known)
+
+
+def _s202_report(plan: Any) -> dict[str, Any]:
+    """The dry-run report mapping, or an empty mapping on the pre-fix planner."""
+    report = getattr(plan, "report", None)
+    return dict(report) if isinstance(report, Mapping) else {}
+
+
+def _s202_section(plan: Any, *path: str) -> Any:
+    """Nested report lookup that yields ``{}`` for anything the plan lacks.
+
+    Shape-tolerant on purpose: on the pre-fix planner every lookup resolves to
+    ``{}`` so the filed RED is an assertion failure, never a KeyError/ImportError.
+    """
+    current: Any = _s202_report(plan)
+    for key in path:
+        if not isinstance(current, Mapping) or key not in current:
+            return {}
+        current = current[key]
+    return current
+
+
+def _s202_codes(plan: Any) -> list[str]:
+    return [item.code for item in plan.blockers]
+
+
+def _s202_seed_db_at(path: Path) -> Path:
+    """Create a real sidecar-free SQLite database at exactly ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute("create table facts(id text)")
+    connection.execute("insert into facts values('one')")
+    connection.commit()
+    connection.close()
+    return path
+
+
+def _s202_seed_sized_db(path: Path, minimum_bytes: int) -> Path:
+    """A valid SQLite database comfortably larger than ``minimum_bytes``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute("create table facts(id text, body blob)")
+    connection.execute("insert into facts values('one', zeroblob(?))", (max(minimum_bytes - 4096, 0),))
+    connection.commit()
+    connection.close()
+    assert path.stat().st_size > minimum_bytes
+    return path
+
+
+def _s202_external_link(tmp_path: Path, home: Path, name: str = "lancedb") -> Path:
+    """Plant a final symlink where a profile-local projection is expected."""
+    external = tmp_path / f"external-{name}"
+    external.mkdir()
+    (external / "victim.bin").write_bytes(b"VICTIM")
+    (home / "data").mkdir(parents=True, exist_ok=True)
+    (home / "data" / name).symlink_to(external, target_is_directory=True)
+    return external
+
+
+def test_s202_configured_data_root_selects_the_canonical_root(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    configured = home / "profile-data"
+    db_path = _s202_seed_db_at(configured / "data" / "memory.db")
+
+    plan = plan_profile_migration(
+        _s202_request(home, configured_data_root=str(configured), raw_config=_S202_CONFIG_BLOCK)
+    )
+
+    assert plan.layout.data_root == configured
+    assert plan.layout.profile_home == home
+    # The canonical SQL is selected under the configured root, not under the
+    # profile home the pre-fix planner hardcoded.
+    assert plan.source_sql.lexical_path == str(configured / "data" / "memory.db")
+    assert plan.source_sql.sha256 is not None
+    assert "E_SOURCE_SQL_REQUIRED" not in _s202_codes(plan)
+    assert db_path.read_bytes() == db_path.read_bytes()
+
+
+def test_s202_raw_yaml_selects_canonical_sql_and_env_is_reported_separately(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    canonical = _s202_seed_db_at(home / "custom" / "canonical.db")
+    monkeypatch.setenv("MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///env/other.db?token=SECRET")
+    raw = dict(_S202_CONFIG_BLOCK, db_url="sqlite+aiosqlite:///custom/canonical.db")
+
+    plan = plan_profile_migration(_s202_request(home, raw_config=raw))
+
+    # The RAW YAML layer selects the canonical SQL; env never re-selects it.
+    assert plan.source_sql.lexical_path == str(canonical)
+    report = _s202_report(plan)
+    assert report.get("source_sql_origin") == "raw_config"
+    config = report.get("config", {})
+    assert config.get("raw", {}).get("db_url") == "sqlite+aiosqlite:///custom/canonical.db"
+    assert str(config.get("env", {}).get("db_url", "")).startswith("sqlite+aiosqlite:///env/other.db")
+    assert config.get("divergence") == ["db_url"]
+    assert config.get("settings_consulted") is False
+    # No unredacted sensitive URI value is emitted.
+    assert "SECRET" not in json.dumps(report, sort_keys=True)
+
+
+def test_s202_sql_action_is_preserve_in_place(tmp_path: Path, synthetic_storage_env) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+
+    assert getattr(plan, "sql_action", None) == "preserve_in_place"
+    assert _s202_report(plan).get("sql_action") == "preserve_in_place"
+    operations = [(item.operation, item.artifact, item.path) for item in plan.planned_operations]
+    assert ("snapshot", "sqlite", str(db_path)) in operations
+    # SQLite is never a projection publication target in this strategy.
+    assert all(not (operation == "publish" and artifact == "sqlite") for operation, artifact, _ in operations)
+
+
+def test_s202_legacy_projection_link_is_inventory_only_with_raw_link_string(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+    external = _s202_external_link(tmp_path, home)
+    before = _tree_snapshot(external)
+
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path, raw_config=_S202_CONFIG_BLOCK))
+
+    legacy = list(plan.legacy_projections)
+    assert len(legacy) == 1
+    assert legacy[0].kind == "symlink"
+    # The EXACT raw link string, never a resolved referent.
+    assert legacy[0].raw_link_target == str(external)
+    assert legacy[0].sha256 is None
+    dispositions = _s202_report(plan).get("legacy_projections", [])
+    assert [item.get("disposition") for item in dispositions] == ["preserve-only; not imported"]
+    assert [item.get("raw_link_target") for item in dispositions] == [str(external)]
+    # The referent tree was inventoried, never traversed, never imported.
+    assert _tree_snapshot(external) == before
+    assert "E_LEGACY_PROJECTION_IMPORT_FORBIDDEN" not in _s202_codes(plan)
+
+
+def test_s202_disk_margin_is_reported_and_unknown_space_blocks(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil as _shutil
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_sized_db(home / "data" / "memory.db", 200_000)
+
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    assert plan.required_bytes is not None and plan.required_bytes >= db_path.stat().st_size
+    assert plan.available_bytes is not None and plan.available_bytes > 0
+    assert _s202_section(plan, "disk", "margin_ratio") == 1.25
+    assert _s202_section(plan, "disk", "within_margin") is True
+    assert "E_INSUFFICIENT_SPACE" not in _s202_codes(plan)
+
+    tight = type("_Usage", (), {"free": 1, "used": 0, "total": 1})()
+    monkeypatch.setattr(_shutil, "disk_usage", lambda path: tight)
+    squeezed = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    assert "E_INSUFFICIENT_SPACE" in _s202_codes(squeezed)
+    assert _s202_section(squeezed, "disk", "within_margin") is False
+    monkeypatch.undo()
+
+    def _unprovable(path: str) -> Any:
+        raise OSError(errno.EACCES, "free space unprovable")
+
+    monkeypatch.setattr(_shutil, "disk_usage", _unprovable)
+    unknown = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    monkeypatch.undo()
+    # Unknown free space stays a blocker, never a guess.
+    assert unknown.available_bytes is None
+    assert "E_INSUFFICIENT_SPACE" in _s202_codes(unknown)
+
+
+def test_s202_sidecar_presence_matrix_uses_stable_codes(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+    # Zero-length WAL and a MISSING SHM: presence is what blocks, not content.
+    (home / "data" / "memory.db-wal").write_bytes(b"")
+
+    wal_plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    codes = _s202_codes(wal_plan)
+    assert "E_SQLITE_WAL_ACTIVE" in codes
+    assert "E_SQLITE_SHM_AMBIGUOUS" in codes
+    sidecars = _s202_section(wal_plan, "sidecars")
+    assert sidecars == {
+        "wal_present": True,
+        "wal_size": 0,
+        "shm_present": False,
+        "journal_present": False,
+    }
+    # A present sidecar closes the SQLite probe entirely.
+    assert _s202_section(wal_plan, "sqlite", "open_policy") == "sidecars_present_no_open"
+
+    # A rollback journal has its own stable code (never the SHM code).
+    (home / "data" / "memory.db-journal").write_bytes(b"")
+    journal_plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    assert "E_SQLITE_HOT_JOURNAL" in _s202_codes(journal_plan)
+    assert _s202_section(journal_plan, "sidecars", "journal_present") is True
+
+
+def test_s202_sidecar_presence_performs_no_sqlite_open_at_all(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+    (home / "data" / "memory.db-shm").write_bytes(b"")
+
+    opened: list[Any] = []
+    real_connect = sqlite3.connect
+
+    def _counting_connect(*args: Any, **kwargs: Any) -> Any:
+        opened.append(args)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", _counting_connect)
+    before = _tree_snapshot(home)
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    monkeypatch.undo()
+
+    assert opened == []
+    assert _s202_section(plan, "sqlite", "opened") is False
+    assert _s202_section(plan, "sqlite", "open_policy") == "sidecars_present_no_open"
+    assert _s202_section(plan, "sqlite", "schema") == "unknown"
+    assert _s202_section(plan, "sqlite", "integrity") == "unknown"
+    assert _s202_section(plan, "sqlite", "uri") is None
+    assert _tree_snapshot(home) == before
+
+
+def test_s202_sidecar_free_source_runs_encoded_immutable_readonly_probe(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    # A space in the path proves the URI is percent-encoded.
+    db_path = _s202_seed_db_at(home / "data" / "my memory.db")
+    before = _tree_snapshot(home)
+
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+
+    assert _s202_section(plan, "sqlite", "opened") is True
+    assert _s202_section(plan, "sqlite", "open_policy") == "sidecars_absent_immutable_ro"
+    assert _s202_section(plan, "sqlite", "schema") == "known"
+    assert _s202_section(plan, "sqlite", "integrity") == "ok"
+    assert "facts" in tuple(_s202_section(plan, "sqlite", "tables"))
+    assert _s202_section(plan, "sqlite", "counts", "facts") == 1
+    uri = str(_s202_section(plan, "sqlite", "uri"))
+    assert uri.startswith("file:")
+    assert uri.endswith("?mode=ro&immutable=1")
+    assert "my%20memory.db" in uri
+    assert " " not in uri
+    assert _s202_section(plan, "invariance", "artifacts") == "ok"
+    # The probe is side-effect free: no bytes, no entries changed.
+    assert _tree_snapshot(home) == before
+
+
+def test_s202_probe_refuses_when_a_sibling_entry_appears_mid_probe(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+    real_connect = sqlite3.connect
+    state = {"injected": False}
+
+    def _injecting_connect(*args: Any, **kwargs: Any) -> Any:
+        connection = real_connect(*args, **kwargs)
+        if not state["injected"]:
+            state["injected"] = True
+            # Real filesystem mutation of a sibling sidecar entry while the
+            # optional probe is open.
+            (db_path.parent / (db_path.name + "-journal")).write_bytes(b"")
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", _injecting_connect)
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    monkeypatch.undo()
+
+    assert state["injected"] is True
+    assert "E_SQLITE_PROBE_UNSAFE" in _s202_codes(plan)
+    assert _s202_section(plan, "sqlite", "open_policy") == "sidecars_absent_immutable_ro"
+    # A difference disables the optimization: report unknown, never guess.
+    assert _s202_section(plan, "sqlite", "schema") == "unknown"
+    assert _s202_section(plan, "sqlite", "integrity") == "unknown"
+    assert _s202_section(plan, "invariance", "artifacts") == "failed"
+
+
+def test_s202_identity_digest_covers_bytes_beyond_64k(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    from memory_server.storage_lock import read_regular_file_nofollow
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_sized_db(home / "data" / "memory.db", 200_000)
+
+    first = plan_profile_migration(_s202_request(home, source_sql=db_path)).source_sql.sha256
+    assert first is not None
+    with db_path.open("r+b") as handle:
+        handle.seek(150_000)
+        handle.write(b"\xff")
+    second = plan_profile_migration(_s202_request(home, source_sql=db_path)).source_sql.sha256
+
+    assert second is not None and second != first
+    # The bounded 64 KiB reader cannot see that byte at all (residual F7).
+    bounded = read_regular_file_nofollow(db_path)
+    assert len(bounded) <= 65536
+    assert hashlib.sha256(bounded).hexdigest() != second
+
+
+def test_s202_shrinking_source_mid_read_is_refused_not_truncated(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_sized_db(home / "data" / "memory.db", 200_000)
+    real_read = os.read
+    state = {"hit": False}
+
+    def _truncating_read(descriptor: int, size: int) -> bytes:
+        if not state["hit"]:
+            try:
+                target = os.readlink(f"/proc/self/fd/{descriptor}")
+            except OSError:
+                target = ""
+            if target == str(db_path):
+                state["hit"] = True
+                os.ftruncate(descriptor, 0)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(os, "read", _truncating_read)
+    try:
+        plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    finally:
+        monkeypatch.undo()
+
+    assert state["hit"] is True
+    # A short read must never be silently digested as the whole file.
+    assert plan.source_sql.sha256 is None
+    assert "E_ARTIFACT_IDENTITY_CHANGED" in _s202_codes(plan)
+
+
+def test_s202_run_directory_chain_symlink_is_refused_without_traversal(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+    external = tmp_path / "external-runs"
+    external.mkdir()
+    (external / "planted.bin").write_bytes(b"PLANTED")
+    (home / ".cmms-migrations").symlink_to(external, target_is_directory=True)
+    before = _tree_snapshot(external)
+
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+
+    assert "E_PATH_SYMLINK_PARENT" in _s202_codes(plan)
+    # The planted referent was never traversed and nothing was created in it.
+    assert _tree_snapshot(external) == before
+    assert sorted(path.name for path in external.iterdir()) == ["planted.bin"]
+    assert not (external / plan.request.run_id).exists()
+
+
+def test_s202_existing_lock_is_inspected_readonly(tmp_path: Path, synthetic_storage_env) -> None:
+    from memory_server.storage_lock import MaintenanceStorageLocks
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+
+    absent = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    assert absent.lock_availability == "unknown"
+    assert not (home / ".cmms-storage.lock").exists()
+
+    locks = MaintenanceStorageLocks.acquire([home])
+    try:
+        held = plan_profile_migration(_s202_request(home, source_sql=db_path))
+        assert not (home / ".cmms-storage.lock").is_symlink()
+    finally:
+        locks.release()
+
+    assert held.lock_availability == "held"
+    assert "E_WRITER_ACTIVE" in _s202_codes(held)
+    released = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    assert released.lock_availability == "available"
+
+
+def test_s202_plan_is_mutation_free_including_listings(
+    tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket as _socket
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+    (home / "data" / "memory.db-wal").write_bytes(b"wal-bytes")
+    _s202_external_link(tmp_path, home, name="lancedb")
+    # A config file larger than the bounded 64 KiB reader.
+    (home / "config.yaml").write_bytes(b"memory:\n  providers: {}\n" + b"# pad line\n" * 12000)
+    before = _tree_snapshot(home)
+    assert not (home / ".cmms-migrations").exists()
+
+    def _no_socket(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("dry-run opened a network socket")
+
+    monkeypatch.setattr(_socket, "socket", _no_socket, raising=False)
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path, raw_config=_S202_CONFIG_BLOCK))
+    monkeypatch.undo()
+
+    assert _tree_snapshot(home) == before
+    assert not (home / ".cmms-migrations").exists()
+    assert not (home / ".cmms-storage.lock").exists()
+    assert plan.embedding.network is False
+
+
+def test_s202_hardlinked_config_file_is_refused_and_inventoried_nofollow(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+    victim = tmp_path / "victim.yaml"
+    payload = b"memory:\n  providers:\n    memory_server:\n      path: /install\n"
+    victim.write_bytes(payload)
+    os.link(victim, home / "config.yaml")
+
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+
+    assert "E_PATH_HARDLINK_UNSAFE" in _s202_codes(plan)
+    assert _s202_section(plan, "config_file", "kind") == "regular_file"
+    assert _s202_section(plan, "config_file", "sha256") is None
+    assert victim.read_bytes() == payload
+
+
+def test_s202_external_and_overlapping_targets_are_refused(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    from memory_server.paths import StorageLayoutError
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_db_at(home / "data" / "memory.db")
+
+    # StorageLayoutError carries its stable code in .code (str() is the message).
+    with pytest.raises(StorageLayoutError) as external:
+        plan_profile_migration(
+            _s202_request(
+                home,
+                configured_data_root=str(tmp_path / "outside"),
+                raw_config=_S202_CONFIG_BLOCK,
+            )
+        )
+    assert external.value.code == "E_PROFILE_ROOT_EXTERNAL"
+
+    overlapping = dict(_S202_CONFIG_BLOCK, graph_snapshot_path="data/lancedb")
+    with pytest.raises(StorageLayoutError) as overlap:
+        plan_profile_migration(_s202_request(home, raw_config=overlapping, source_sql=db_path))
+    assert overlap.value.code == "E_PATH_OVERLAP"
+
+
+def test_s202_report_is_json_serializable_and_bounded(tmp_path: Path, synthetic_storage_env) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+
+    home = tmp_path / "home"
+    db_path = _s202_seed_sized_db(home / "data" / "memory.db", 100_000)
+    # A config file larger than the bounded 64 KiB reader: its identity digest
+    # must come from the streaming fd-relative read, not from a truncated one.
+    (home / "config.yaml").write_bytes(b"memory:\n  providers: {}\n" + b"# pad line\n" * 12000)
+
+    plan = plan_profile_migration(_s202_request(home, source_sql=db_path))
+    report = _s202_report(plan)
+
+    assert report.get("schema_version") == 1
+    assert report.get("mode") == "dry-run"
+    assert report.get("strategy") == "rebuild-from-profile-sql"
+    for key in (
+        "source_sql",
+        "source_sidecars",
+        "sidecars",
+        "legacy_projections",
+        "target",
+        "path_checks",
+        "config",
+        "config_file",
+        "parents",
+        "collisions",
+        "sqlite",
+        "disk",
+        "invariance",
+        "lock_availability",
+        "planned_operations",
+        "runtime_stop_instructions",
+        "proposed_manifest_path",
+        "warnings",
+        "blockers",
+    ):
+        assert key in report, key
+    encoded = json.dumps(report, sort_keys=True)
+    assert len(encoded) < 200_000
+    assert report["proposed_manifest_path"] == str(
+        home / ".cmms-migrations" / plan.request.run_id / "manifest.json"
+    )
+    # The config FILE identity is a real streaming digest, not a truncated one.
+    assert _s202_section(plan, "config_file", "kind") == "regular_file"
+    assert (home / "config.yaml").stat().st_size > 65536
+    assert re.fullmatch(r"[0-9a-f]{64}", str(_s202_section(plan, "config_file", "sha256")))

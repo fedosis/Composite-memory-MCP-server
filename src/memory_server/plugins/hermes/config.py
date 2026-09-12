@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping
+from urllib.parse import urlsplit
 
 from memory_server.paths import (
     StorageLayout,
@@ -30,6 +31,10 @@ from memory_server.settings import get_settings
 
 if TYPE_CHECKING:
     from memory_server.settings import Settings
+
+# Query keys whose value is a secret and must never be printed (DETAIL 4.3).
+_SECRET_QUERY_WORDS = ("token", "key", "secret", "password", "credential")
+_REDACTED = "<redacted>"
 
 # Env vars that this config block resolves itself. Extraction/LLM tuning
 # values (MEMORY_SERVER_LLM_MODEL etc.) are deliberately NOT part of the
@@ -176,6 +181,171 @@ def _choose(name: str, yaml: Any, env: dict[str, Any], default: Any) -> tuple[An
     if value is not None:
         return value, ValueOrigin("legacy_env", _LEGACY_ENV.get(name))
     return default, ValueOrigin("default")
+
+
+# ------------------------------------------------- raw/effective config report
+# S2-02 (DETAIL 3.2/11.1/11.2). The storage keys whose value decides the
+# canonical SQL and every local store path.
+def _redacted_url_text(url: str) -> str:
+    """Redact secrets from a configured URL while keeping its exact spelling.
+
+    Only userinfo and secret-looking query VALUES are replaced (DETAIL 4.3);
+    every other byte of the configured spelling survives. ``paths._redact_url``
+    rebuilds through ``urlunsplit``, which collapses one slash of a
+    ``scheme:///relative`` SQLite URL because the netloc is empty, so the report
+    redacts in place instead of reformatting.
+    """
+    parts = urlsplit(url)
+    if not parts.scheme:
+        return url
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    rebuilt = f"{parts.scheme}://{netloc}{parts.path}"
+    if parts.query:
+        # Split the RAW query text so every non-secret parameter keeps its exact
+        # configured spelling; only secret-looking values are replaced.
+        segments = []
+        for segment in parts.query.split("&"):
+            key, separator, _ = segment.partition("=")
+            if any(word in key.lower() for word in _SECRET_QUERY_WORDS):
+                segments.append(f"{key}{separator or '='}{_REDACTED}")
+            else:
+                segments.append(segment)
+        rebuilt += "?" + "&".join(segments)
+    if parts.fragment:
+        rebuilt += f"#{parts.fragment}"
+    return rebuilt
+
+
+_STORAGE_REPORT_KEYS = (
+    "db_url",
+    "storage_mode",
+    "data_root",
+    "vector_backend",
+    "lancedb_path",
+    "graph_snapshot_path",
+    "qdrant_location",
+    "vector_collection",
+)
+
+# The RAW layer's own defaults. They are restated here (never read from
+# ``Settings``) because the raw report must be produced with zero environment
+# reads and zero ``Settings``/``.env`` access.
+_STORAGE_REPORT_DEFAULTS: dict[str, str] = {
+    "db_url": "sqlite+aiosqlite:///data/memory.db",
+    "storage_mode": "profile",
+    "data_root": ".",
+    "vector_backend": "lancedb",
+    "lancedb_path": "data/lancedb",
+    "graph_snapshot_path": "data/graph.json",
+    "qdrant_location": ":memory:",
+    "vector_collection": "memories",
+}
+
+
+@dataclass(frozen=True)
+class StorageConfigReport:
+    """Raw YAML, environment and effective storage configuration in one view.
+
+    ``raw`` is resolved with ``use_env=False``: zero environment reads and zero
+    ``Settings``/``.env`` access, so it is exactly what the config FILE (or its
+    default) selects — this is the layer the migration planner uses to pick the
+    canonical SQL, which removes any source-autodetection ambiguity. ``env`` is
+    the environment snapshot, reported SEPARATELY and never folded into ``raw``.
+    ``effective`` is the value the runtime would select (canonical env wins over
+    YAML, YAML over a deployed legacy alias, then the raw default).
+
+    ``settings_consulted`` is False by contract: this report never reads
+    ``Settings``/``.env``, so an ``effective`` origin of ``default`` can still be
+    overridden by the Settings layer at runtime.
+    """
+
+    raw: Mapping[str, str | None]
+    raw_origins: Mapping[str, str]
+    env: Mapping[str, str | None]
+    env_origins: Mapping[str, str | None]
+    effective: Mapping[str, str | None]
+    effective_origins: Mapping[str, str]
+    divergence: tuple[str, ...]
+    canonical_sqlite_url: str
+    settings_consulted: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        """JSON-friendly view; URL-ish values are redacted, never secret."""
+
+        def _redacted(values: Mapping[str, str | None]) -> dict[str, str | None]:
+            return {
+                key: _redacted_url_text(value) if isinstance(value, str) and "://" in value else value
+                for key, value in values.items()
+            }
+
+        return {
+            "raw": _redacted(self.raw),
+            "raw_origins": dict(self.raw_origins),
+            "env": _redacted(self.env),
+            "env_origins": dict(self.env_origins),
+            "effective": _redacted(self.effective),
+            "effective_origins": dict(self.effective_origins),
+            "divergence": list(self.divergence),
+            "canonical_sqlite_url": (
+                _redacted_url_text(self.canonical_sqlite_url)
+                if "://" in self.canonical_sqlite_url
+                else self.canonical_sqlite_url
+            ),
+            "settings_consulted": self.settings_consulted,
+        }
+
+
+def build_storage_config_report(
+    raw_data: dict[str, Any] | None = None,
+    *,
+    include_env: bool = True,
+) -> StorageConfigReport:
+    """Build the raw/effective storage configuration report (S2-02).
+
+    ``include_env=False`` performs ZERO environment reads — ``_env_overrides``
+    short-circuits before touching ``os.environ`` — and is the mode migration
+    and doctor use to select the canonical SQL from the raw config file with no
+    autodetection ambiguity. ``include_env=True`` additionally snapshots the
+    environment into the SEPARATE ``env`` view.
+    """
+    data = raw_data or {}
+    raw_config = HermesPluginConfig.from_dict(data, use_env=False)
+    env = _env_overrides(use_env=include_env) if include_env else _env_overrides(use_env=False)
+    raw: dict[str, str | None] = {}
+    raw_origins: dict[str, str] = {}
+    env_values: dict[str, str | None] = {}
+    env_origins: dict[str, str | None] = {}
+    effective: dict[str, str | None] = {}
+    effective_origins: dict[str, str] = {}
+    for key in _STORAGE_REPORT_KEYS:
+        candidate = getattr(raw_config, key)
+        raw[key] = None if candidate is None else str(candidate)
+        raw_origins[key] = raw_config.storage_origins.get(key, ValueOrigin("default")).kind
+        from_env = env.get(key)
+        env_values[key] = None if from_env is None else str(from_env)
+        env_origins[key] = _ORIGIN_ENV.get(key)
+        selected, origin = _choose(key, data.get(key), env, _STORAGE_REPORT_DEFAULTS[key])
+        effective[key] = None if selected is None else str(selected)
+        effective_origins[key] = origin.kind
+    divergence = tuple(
+        sorted(
+            key
+            for key in _STORAGE_REPORT_KEYS
+            if env_values[key] is not None and env_values[key] != raw[key]
+        )
+    )
+    return StorageConfigReport(
+        raw=MappingProxyType(raw),
+        raw_origins=MappingProxyType(raw_origins),
+        env=MappingProxyType(env_values),
+        env_origins=MappingProxyType(env_origins),
+        effective=MappingProxyType(effective),
+        effective_origins=MappingProxyType(effective_origins),
+        divergence=divergence,
+        canonical_sqlite_url=str(raw_config.db_url),
+    )
 
 
 def _coerce_max_facts(value: Any, default: int) -> int:
