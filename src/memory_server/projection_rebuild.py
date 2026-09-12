@@ -8,9 +8,13 @@ wired into a runtime path yet, and none of these functions touches a store.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from typing import AbstractSet, Literal, Mapping, Sequence
 from uuid import NAMESPACE_DNS, uuid5
+
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.router.graph_router import GraphRouter
@@ -197,7 +201,7 @@ async def iter_canonical_projection_records(snapshot_url: str, *, batch_size: in
     import json
 
     from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
+
 
     tables = {
         "belief": ("beliefs", "index_belief"),
@@ -205,9 +209,25 @@ async def iter_canonical_projection_records(snapshot_url: str, *, batch_size: in
         "fact": ("facts", "index_fact"),
         "skill": ("skills", "index_skill"),
     }
-    if snapshot_url.startswith("sqlite+aiosqlite:///") and ":memory:" not in snapshot_url:
-        database = snapshot_url.removeprefix("sqlite+aiosqlite:///")
-        snapshot_url = f"sqlite+aiosqlite:///file:{database}?mode=ro&immutable=1&uri=true"
+    url = make_url(snapshot_url)
+    if url.drivername == "sqlite+aiosqlite" and url.database and ":memory:" not in url.database:
+        database = url.database
+        if database.startswith("file:"):
+            database = database.removeprefix("file:")
+        if not database.startswith("/"):
+            raise ValueError(f"snapshot URL is not a local file database: {snapshot_url!r}")
+        sidecars = (f"{database}-wal", f"{database}-shm")
+        has_sidecars = any(_lstat_exists(path) for path in sidecars)
+        query = dict(url.query)
+        query.update(mode="ro", uri="true")
+        if has_sidecars:
+            query.pop("immutable", None)
+        else:
+            query["immutable"] = "1"
+        url = url.set(database=f"file:{database}", query=query)
+        snapshot_url = url.render_as_string(hide_password=False)
+    elif url.drivername != "sqlite+aiosqlite":
+        raise ValueError(f"snapshot URL cannot be opened read-only: unsupported driver {url.drivername!r}")
     engine = create_async_engine(snapshot_url)
     rows: list[CanonicalProjectionRecord] = []
     try:
@@ -228,6 +248,15 @@ async def iter_canonical_projection_records(snapshot_url: str, *, batch_size: in
     for offset in range(0, len(ordered), batch_size):
         for record in ordered[offset : offset + batch_size]:
             yield record
+
+
+def _lstat_exists(path: str) -> bool:
+    """Return whether a sidecar exists without following symlinks."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 async def rebuild_projections(*args, **kwargs) -> RebuildResult:
