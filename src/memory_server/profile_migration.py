@@ -4072,8 +4072,9 @@ def resume_profile_migration(
     3. at or after ``publishing`` each artifact's target/staging/quarantine triad
        is classified against the run's OWN event history. A contradiction between
        that chain and the disk, a duplicated sequence, or a missing required entry
-       is ``E_PUBLICATION_AMBIGUOUS`` / ``E_RESUME_TRIAD_INCOMPLETE`` -- never a
-       guess, never a repair;
+       is ``E_PUBLICATION_AMBIGUOUS`` / ``E_RESUME_TRIAD_INCOMPLETE``, and a staged
+       entry that is no longer the identity the run recorded is
+       ``E_RESUME_STAGING_CHANGED`` -- never a guess, never a repair;
     4. when EXACTLY ONE next operation remains, the refusal is that operation's own
        gate: ``E_STAGED_VERIFICATION_CAPABILITY_MISSING`` while the verification
        seam reports no implemented capability, and ``E_MIGRATION_NOT_IMPLEMENTED``
@@ -4199,6 +4200,12 @@ ARTIFACT_STAGING_NAMES: Mapping[str, str] = {"vector": "lancedb", "graph": "grap
 QUARANTINE_DIRECTORY_NAME = "quarantine"
 QUARANTINE_PREPUBLISH_NAME = "prepublish"
 GRAPH_LOCK_MANIFEST_FIELD = "graph_lock"
+# The `prestate_revalidated` payload carries the staged identity THIS run verified,
+# by the position-independent key field set (`_identity_key`) and never by
+# filename: a caller's identity names the caller's path, while a resume observes
+# the entry's own basename, so only a path-free field set can compare the two.
+# ADDITIVE: `staged_digest` and every other payload key are unchanged.
+PUBLICATION_PAYLOAD_STAGED_IDENTITY = "staged_identity_key"
 
 
 @dataclass(frozen=True)
@@ -4805,6 +4812,16 @@ def publish_artifact(
                 "observed_kind": observed.kind,
                 "pinned_digest": _digest(asdict(pinned)),
                 "staged_digest": _digest(asdict(staged_identity)),
+                # ADDED (S2-07 fix round 1, review F-1): the staged identity's
+                # position-independent key field set, so a resume can compare the
+                # entry it OBSERVES with the entry THIS run verified. `staged_digest`
+                # stays as it is -- it digests the caller's identity object, whose
+                # `lexical_path` is the caller's path, so it can never be compared
+                # with an observed identity's whole-object digest.
+                PUBLICATION_PAYLOAD_STAGED_IDENTITY: {
+                    "fields": list(_IDENTITY_KEY_FIELDS),
+                    "values": list(_identity_key(staged_identity)),
+                },
             }
             events.append(PublicationEvent(label, PUBLICATION_EVENT_REVALIDATED, revalidated))
             _record_publication_event(manifest_path, label, PUBLICATION_EVENT_REVALIDATED, revalidated)
@@ -5213,6 +5230,53 @@ def _publication_records(
     return tuple(names), tuple(payloads)
 
 
+def _recorded_staging_identity(payload: Mapping[str, Any]) -> tuple[Any, ...] | None:
+    """The staged identity the run recorded at ``prestate_revalidated``, or None.
+
+    The record is honoured only when it names EXACTLY the module's own
+    position-independent key field set (``_IDENTITY_KEY_FIELDS``); anything else
+    carries nothing comparable and is reported as such instead of being guessed at.
+    No lexical path takes part on either side of the comparison.
+    """
+    recorded = payload.get(PUBLICATION_PAYLOAD_STAGED_IDENTITY)
+    if not isinstance(recorded, Mapping):
+        return None
+    if list(recorded.get("fields", ())) != list(_IDENTITY_KEY_FIELDS):
+        return None
+    values = recorded.get("values")
+    if not isinstance(values, (list, tuple)) or len(values) != len(_IDENTITY_KEY_FIELDS):
+        return None
+    return tuple(values)
+
+
+def _require_resume_staged_identity(
+    payload: Mapping[str, Any], observed_staging: ArtifactIdentity, *, artifact: str
+) -> str:
+    """DETAIL 10.5's STAGED class: the run's own record against the DISK.
+
+    ``E_RESUME_SOURCE_CHANGED``, ``E_RESUME_CONFIG_CHANGED`` and every backed-up
+    entry are confirmed against the run's own durable record; this is the same
+    confirmation for the staged entry that the next recorded operation would
+    publish, and it is the ONE reference a resume can trust: at resume time the
+    caller can only reconstruct the staged identity by observing the same entry,
+    so its own identity is self-referential.
+
+    Returns where the confirmed identity came from -- ``record`` when the run's
+    record carried the key, ``unrecorded`` when it did not -- so the caller can
+    REPORT what could not be confirmed instead of implying that it was.
+    """
+    recorded = _recorded_staging_identity(payload)
+    if recorded is None:
+        return "unrecorded"
+    if _identity_key(observed_staging) != recorded:
+        raise _publication_failure(
+            "E_RESUME_STAGING_CHANGED",
+            f"{artifact}'s staged entry is not the identity the run recorded when it "
+            "revalidated its prestate",
+        )
+    return "record"
+
+
 def _classify_artifact(
     manifest: MigrationManifest,
     plan: MigrationPlan,
@@ -5284,6 +5348,14 @@ def _classify_artifact(
                 "E_RESUME_TRIAD_INCOMPLETE",
                 f"{label} has no staged entry to publish, which its own record requires",
             )
+        # position == 0 is the ONE arm with nothing to compare against: the run has
+        # recorded no `prestate_revalidated` yet, so it holds no staged identity at
+        # all and this class cannot be confirmed here. That arm's behaviour is left
+        # unchanged ON PURPOSE (review F-1; the same limitation class as F-7).
+        if position >= 1:
+            detail["staged_identity_source"] = _require_resume_staged_identity(
+                payloads[0], observed_staging, artifact=label
+            )
         if quarantine_present:
             raise _publication_failure(
                 "E_PUBLICATION_AMBIGUOUS",
@@ -5312,6 +5384,9 @@ def _classify_artifact(
                 "E_RESUME_TRIAD_INCOMPLETE",
                 f"{label} has no staged entry to publish, which its own record requires",
             )
+        detail["staged_identity_source"] = _require_resume_staged_identity(
+            payloads[0], observed_staging, artifact=label
+        )
         if quarantined_recorded:
             if not quarantine_present:
                 raise _manifest_failure(
@@ -5330,7 +5405,12 @@ def _classify_artifact(
                     "E_PUBLICATION_AMBIGUOUS",
                     f"{label}'s own record pins one prestate and quarantines another",
                 )
-            detail["digest_bound"] = _is_bounded_digest(quarantined_digest)
+            # RENAMED (S2-07 fix round 1, review F-2): this is a pure
+            # WELL-FORMEDNESS check of the quarantined digest, True for any
+            # syntactically valid digest. It used to be published as
+            # `digest_bound`, which named a BINDING comparison that lives further
+            # down this function; the name now says what it is.
+            detail["quarantine_digest_bounded"] = _is_bounded_digest(quarantined_digest)
             state = RESUME_TRIAD_PRESTATE_QUARANTINED
         else:
             if quarantine_present:
@@ -5381,7 +5461,10 @@ def _classify_artifact(
         # The run's own record digests the identity object ITS CALLER passed to
         # `publish_artifact`, while an observed identity carries the entry's own
         # basename. Where the two agree the binding is exact; where they do not,
-        # that is REPORTED instead of being mistaken for a refusal.
+        # that is REPORTED instead of being mistaken for a refusal. `digest_bound`
+        # is ONLY this binding comparison -- the quarantined digest's
+        # well-formedness check is reported separately, as
+        # `quarantine_digest_bounded` (S2-07 fix round 1, review F-2).
         detail["digest_bound"] = _digest(asdict(observed_target)) == published_digest
         if position == len(sequence):
             state = RESUME_TRIAD_COMPLETE
@@ -5416,8 +5499,10 @@ def classify_publication_triads(
     Each artifact's recorded events are read through the shipped
     ``publication_events_from_manifest`` view and independently re-derived from
     the same chain, so the two can never disagree silently. A refusal is a stable
-    ``E_PUBLICATION_AMBIGUOUS`` (not single-valued) or ``E_RESUME_TRIAD_INCOMPLETE``
-    (a required entry is missing) -- there is no "best guess" branch.
+    ``E_PUBLICATION_AMBIGUOUS`` (not single-valued), ``E_RESUME_TRIAD_INCOMPLETE``
+    (a required entry is missing) or ``E_RESUME_STAGING_CHANGED`` (the staged entry
+    is no longer the identity the run itself recorded) -- there is no "best guess"
+    branch.
     """
     recorded: dict[str, tuple[str, ...]] = {}
     payloads: dict[str, tuple[Mapping[str, Any], ...]] = {}
@@ -5468,6 +5553,9 @@ def classify_resume(manifest_path: Path, request: MigrationRequest) -> ResumeOut
     * ``E_RESUME_SOURCE_CHANGED`` / ``E_RESUME_CONFIG_CHANGED`` /
       ``E_RESUME_BACKUP_CHANGED`` / ``E_RESUME_BACKUP_MISSING`` -- a duplicated
       precondition moved under the run;
+    * ``E_RESUME_STAGING_CHANGED`` -- the staged entry the next recorded operation
+      would publish is no longer the identity the run recorded when it revalidated
+      its prestate (confirmed only where the run HAS such a record);
     * ``E_PUBLICATION_AMBIGUOUS`` / ``E_RESUME_TRIAD_INCOMPLETE`` -- the triad is
       not single-valued, or an entry the run's own record requires is missing.
 
