@@ -743,9 +743,15 @@ def apply_profile_migration(plan: MigrationPlan) -> MigrationManifest:
 
 
 def _read_bounded_manifest_bytes(target: Path) -> bytes:
-    """Read at most ``MAX_MANIFEST_BYTES`` from a no-follow regular file."""
+    """Read at most ``MAX_MANIFEST_BYTES`` from a no-follow regular file.
+
+    The open is ``O_NONBLOCK`` because a FIFO (or another special file) at the
+    manifest path would otherwise block the ``O_RDONLY`` open until a writer
+    appears, which would make the regular-file refusal below unreachable. It is
+    a no-op for regular files, so the bounded read itself is unaffected.
+    """
     try:
-        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         raise
     except OSError as exc:
