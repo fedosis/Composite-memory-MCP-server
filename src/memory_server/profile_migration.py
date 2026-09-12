@@ -131,6 +131,37 @@ Slice S2-06 adds the forward state machine and the per-artifact publication
 Wiring the stage into ``apply``/``resume``/``rollback`` is NOT part of this
 slice: those entrypoints keep raising ``E_MIGRATION_NOT_IMPLEMENTED`` until
 S3-06, and the ordering must not be bypassed.
+
+Slice S2-08 adds the rollback entrypoint (DETAIL 9.3's rollback event chain,
+DETAIL 10.6 steps 1-10), and it is the ONLY thing that changes about that
+sentence:
+
+* ``rollback_profile_migration`` repeats every maintenance precondition, re-confirms
+  the run's own durable records (run id, source identity, the run-path collision and
+  the backup report with every recorded entry) and then checks the
+  CURRENT TARGET IDENTITY of each publication artifact against the identity the run's
+  OWN publication recorded (the S2-07 ``staged_identity_key``), never against the
+  fresh plan: where the record carries no comparable identity the rollback REFUSES
+  (``E_ROLLBACK_IDENTITY_MISSING``) instead of inferring equality
+  (routing-matrix R-4; owner S3-06);
+* the ``config_digest`` re-confirmation of DETAIL 10.5 is deliberately NOT repeated
+  by rollback: DETAIL 10.6's guard list does not include it, and the run's OWN
+  publication legitimately changes the redacted layout when a legacy symlinked vector
+  store is replaced by the staged directory, so that digest can never match after a
+  publication (measured; see the entrypoint's docstring);
+* the run-created current artifact is renamed into a UNIQUE
+  ``quarantine/failed-current/`` entry and never deleted, a recorded prior absence is
+  left absent, and the recorded pre-state is copied from the RETAINED backup into a
+  unique verified run-owned ``restore/`` staging entry that is then renamed into the
+  vacant target -- a prior symlink by its exact raw ``readlink`` string, verified by
+  ``lstat`` + ``readlink`` only, its referent never touched;
+* the rollback records its OWN durable chain (``rollback.locked``,
+  ``rollback.current_quarantined``, ``rollback.prestate_restored``,
+  ``rollback.verified``, ``rolled_back``), fsyncs the parents of every rename,
+  reopens and verifies the restored entries, and on ANY failure retains every copy,
+  records ``rollback_failed`` with the stable cause, and never retries destructively.
+* ``apply`` and ``resume`` are byte-unchanged and stay fail-closed: rollback publishes
+  nothing and needs no staged verification, so the capability gate is untouched.
 """
 from __future__ import annotations
 
@@ -4092,12 +4123,13 @@ def resume_profile_migration(
     return outcome
 
 
-def rollback_profile_migration(
-    manifest_path: Path, request: MigrationRequest
-) -> MigrationManifest:
-    """Reject rollback until restore/quarantine is implemented, after its own checks."""
-    validate_mutation_preconditions(request)
-    raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
+# Slice S2-08 moved `rollback_profile_migration` to the S2-08 section at the bottom
+# of this module: its restore primitives reuse the S2-05/S2-06/S2-07 helpers defined
+# below it. This also supersedes, FOR ROLLBACK ONLY, the sentence further down that
+# the public `rollback` stays fail-closed until S3-06: rollback publishes nothing and
+# restores a pre-state the run already backed up, so it needs no staged verification
+# and does not touch that gate -- while `apply` and `resume` stay fail-closed exactly
+# as they are.
 
 
 # ---------------------------------------------------------------------------
@@ -5612,3 +5644,808 @@ def classify_resume(manifest_path: Path, request: MigrationRequest) -> ResumeOut
         tolerated_blockers=tolerated,
         manifest=manifest,
     )
+
+
+# ---------------------------------------------------------------------------
+# S2-08 -- rollback to the exact pre-state with a retained diagnostic quarantine
+# (DETAIL 9.3's separate rollback event chain; DETAIL 10.6 steps 1-10).
+#
+# Three promises, and every fail-closed branch below exists to keep one of them:
+#
+# 1. THE RECORD DECIDES, THE DISK IS CHECKED. Nothing is inferred from the fresh
+#    plan. The CURRENT TARGET IDENTITY is checked against the run's OWN durable
+#    record -- the S2-07 `staged_identity_key` payload the publication wrote when it
+#    revalidated its prestate -- and the ORIGINAL pre-state against the run's OWN
+#    backup report. Where the record carries no comparable identity the rollback
+#    REFUSES (`E_ROLLBACK_IDENTITY_MISSING`) instead of inferring equality from the
+#    live plan, because `manifest.target_identities_before` is still unpopulated in
+#    this project (routing-matrix R-4; owner S3-06).
+#
+# 2. NOTHING IS DELETED. The run-created current artifact is renamed into a UNIQUE
+#    `quarantine/failed-current/` entry (its name carries a fresh random suffix, so
+#    a repeat cannot collide with a retained copy); the pre-state is restored from
+#    the retained backup through a freshly verified run-owned staging entry; and the
+#    backup, the run's own prepublish quarantine, the SQLite source, the legacy
+#    stores and every unrelated config entry are only ever READ. A failed step
+#    retains every copy, records `rollback_failed` and is never retried
+#    automatically.
+#
+# 3. A RESTORE IS COPIED, VERIFIED AND RENAMED -- NEVER MOVED. A regular file and a
+#    directory are streamed from the backup copy into a UNIQUE run-owned
+#    `restore/` staging entry, verified THERE, and only then renamed into the vacant
+#    target on the same filesystem; a prior symlink is created at the staging name
+#    with the exact raw `readlink` string and verified by `lstat` + `readlink` only.
+#
+# Honest limits, disclosed rather than worked around:
+#
+# * A DIRECTORY's identity is not its contents in this project's model
+#   (`_observed_entry_identity` records a directory as kind/device/inode/mode with
+#   size/mtime/sha256 = None), so a restored directory is verified at that identity
+#   level AND, for every regular file inside it, against the digest the run's own
+#   backup report recorded for that child path. That is a CONTENT check of the files
+#   and NOT a recursive directory digest; no recursive digest is invented here
+#   (routing-matrix R-6/O-3; residual owner: the next writer of this seam / S3-06).
+# * Rollback does NOT need the staged-verification seam and does not ask it: it
+#   restores a pre-state the run already backed up and it publishes nothing, so the
+#   capability gate that keeps `apply`/`resume` from claiming a verified publication
+#   is untouched by this slice.
+# * `apply` and `resume` remain fail-closed exactly as S2-06/S2-07 left them; wiring
+#   the publication engine into them is still S3-06's deliverable.
+#
+# The rollback chain is recorded as EVENTS at the run's recording checkpoint, with
+# the chain step as the event OPERATION -- the representation the manifest schema
+# admits (the chain values are not forward checkpoints, and `status` carries only
+# `rolled_back` / `rollback_failed`), and the same way the per-artifact publication
+# steps are recorded. Existing events are never rewritten.
+# ---------------------------------------------------------------------------
+
+ROLLBACK_RESTORE_DIRECTORY_NAME = "restore"
+QUARANTINE_FAILED_CURRENT_NAME = "failed-current"
+ROLLBACK_EVENT_LOCKED = "rollback.locked"
+ROLLBACK_EVENT_CURRENT_QUARANTINED = "rollback.current_quarantined"
+ROLLBACK_EVENT_PRESTATE_RESTORED = "rollback.prestate_restored"
+ROLLBACK_EVENT_VERIFIED = "rollback.verified"
+ROLLBACK_EVENT_ROLLED_BACK = "rolled_back"
+ROLLBACK_EVENT_FAILED = "rollback.failed"
+ROLLBACK_EVENT_CHAIN: tuple[str, ...] = (
+    ROLLBACK_EVENT_LOCKED,
+    ROLLBACK_EVENT_CURRENT_QUARANTINED,
+    ROLLBACK_EVENT_PRESTATE_RESTORED,
+    ROLLBACK_EVENT_VERIFIED,
+    ROLLBACK_EVENT_ROLLED_BACK,
+)
+ROLLBACK_ACTION_NONE = "none"
+ROLLBACK_ACTION_RESTORE_ONLY = "restore_only"
+ROLLBACK_ACTION_QUARANTINE_AND_RESTORE = "quarantine_and_restore"
+ROLLBACK_CODE_TERMINAL = "E_ROLLBACK_TERMINAL"
+ROLLBACK_CODE_RUN_MISMATCH = "E_ROLLBACK_RUN_MISMATCH"
+ROLLBACK_CODE_TARGET_DRIFT = "E_ROLLBACK_TARGET_DRIFT"
+ROLLBACK_CODE_IDENTITY_MISSING = "E_ROLLBACK_IDENTITY_MISSING"
+ROLLBACK_CODE_BACKUP_MISMATCH = "E_ROLLBACK_BACKUP_MISMATCH"
+ROLLBACK_CODE_UNSAFE_PARENT = "E_ROLLBACK_UNSAFE_PARENT"
+ROLLBACK_CODE_VERIFY_FAILED = "E_ROLLBACK_VERIFY_FAILED"
+# The SAME backup guard a resume repeats, reported under this card's own code.
+_ROLLBACK_BACKUP_REFUSALS = frozenset({"E_RESUME_BACKUP_CHANGED", "E_RESUME_BACKUP_MISSING"})
+
+
+def _rollback_failure(code: str, detail: str = "") -> ValueError:
+    """A stable, fail-closed rollback refusal; never a silent partial restore."""
+    return ValueError(f"{code}: {detail}" if detail else code)
+
+
+def _rollback_entry_name(label: str, *, unique: bool = False) -> str:
+    """A bounded run-owned name; ``unique`` appends a fresh random suffix.
+
+    The unique form is what makes a diagnostic quarantine entry (and a restore
+    staging entry) incapable of colliding with a copy an earlier attempt retained:
+    a rollback never overwrites what it, or a previous attempt, kept.
+    """
+    local = _backup_entry_name(label)[: MAX_BACKUP_NAME_BYTES - 33]
+    return f"{local}-{uuid4().hex}" if unique else local
+
+
+def _rollback_backup_entries(
+    run_dir: Path, manifest: MigrationManifest
+) -> dict[str, Mapping[str, Any]]:
+    """Confirm the run's OWN backup report, then return it keyed by its labels.
+
+    The confirmation is the SAME guard a resume repeats (`_resume_backup_state`:
+    report self-digest, run id and every recorded entry's size/digest against the copy
+    it describes) reused instead of duplicated; its stable refusal is reported under
+    this card's own backup-mismatch code, with the underlying code preserved in the
+    message. The returned entries are what the restore binds against: one record per
+    artifact plus one per child of a backed-up directory tree.
+    """
+    try:
+        _resume_backup_state(Path(run_dir), manifest)
+    except ValueError as exc:
+        code = str(exc).split(":", 1)[0]
+        if code in _ROLLBACK_BACKUP_REFUSALS:
+            raise _rollback_failure(ROLLBACK_CODE_BACKUP_MISMATCH, f"{code}: {exc}") from exc
+        raise
+    report_path = Path(run_dir) / BACKUP_REPORT_NAME
+    if not os.path.lexists(report_path):
+        # `_resume_backup_state` above has already accepted a run that has passed no
+        # checkpoint requiring a report, so there is no recorded pre-state at all --
+        # every artifact then refuses on its missing identity, below.
+        return {}
+    payload = json.loads(_read_bounded_manifest_bytes(report_path).decode("utf-8"))
+    raw = payload.get("entries")
+    if not isinstance(raw, (list, tuple)) or len(raw) > MAX_BACKUP_ENTRIES:
+        raise _rollback_failure(
+            ROLLBACK_CODE_BACKUP_MISMATCH, "the backup report lists no bounded entries"
+        )
+    entries: dict[str, Mapping[str, Any]] = {}
+    for entry in raw:
+        if isinstance(entry, Mapping) and isinstance(entry.get("artifact"), str):
+            entries[str(entry["artifact"])] = entry
+    return entries
+
+
+def _rollback_artifact_records(
+    entries: Mapping[str, Mapping[str, Any]], label: str
+) -> tuple[Mapping[str, Any] | None, dict[str, Mapping[str, Any]]]:
+    """One artifact's pre-state record and the records of its recorded children."""
+    root_label = f"target:{label}"
+    descendants = {
+        key[len(root_label) + 1 :]: entry
+        for key, entry in entries.items()
+        if key.startswith(root_label + "/")
+    }
+    return entries.get(root_label), descendants
+
+
+def _rollback_target_identity(parent: Path, name: str, *, artifact: str) -> ArtifactIdentity:
+    """The no-follow identity of a target entry, or the UNSAFE PARENT Stop.
+
+    The parent is opened ``O_DIRECTORY | O_NOFOLLOW`` through its whole chain: an
+    intermediate symlink, a non-directory or a missing path is this card's
+    ``E_ROLLBACK_UNSAFE_PARENT`` and is never traversed. A final symlink is recorded
+    by its exact raw link string and never followed; an absent target is ``absent``,
+    which the decision below interprets rather than treats as an error.
+    """
+    try:
+        with storage_lock.open_directory_nofollow(parent) as parent_fd:
+            return _observed_entry_identity(parent_fd, name, artifact=artifact)
+    except storage_lock.StorageLockError as exc:
+        raise _rollback_failure(
+            ROLLBACK_CODE_UNSAFE_PARENT,
+            f"{artifact} target parent is not a no-follow real directory ({exc.code})",
+        ) from exc
+
+
+def _rollback_prestate_matches(observed: ArtifactIdentity, entry: Mapping[str, Any] | None) -> bool:
+    """Is the target entry still the UNTOUCHED pre-state the backup recorded?
+
+    An absent record matches only an absent entry. A regular file is compared by
+    device/inode/size/digest/mode and a directory by device/inode/mode; a directory's
+    CONTENTS are not covered by this project's identity model (R-6/O-3) and this
+    comparison does not pretend otherwise. A symlink is compared by its exact raw link
+    string only.
+    """
+    if entry is None:
+        return False
+    kind = entry.get("kind")
+    if kind == "absent":
+        return observed.kind == "absent"
+    if observed.kind != kind:
+        return False
+    if kind == "regular_file":
+        return (
+            observed.device == entry.get("device")
+            and observed.inode == entry.get("inode")
+            and observed.size == entry.get("size")
+            and observed.sha256 == entry.get("sha256")
+            and observed.mode is not None
+            and stat.S_IMODE(observed.mode) == entry.get("mode")
+        )
+    if kind == "directory":
+        return (
+            observed.device == entry.get("device")
+            and observed.inode == entry.get("inode")
+            and observed.mode is not None
+            and stat.S_IMODE(observed.mode) == entry.get("mode")
+        )
+    if kind == "symlink":
+        return observed.raw_link_target == entry.get("raw_link_target")
+    return False
+
+
+def _rollback_restored_matches(observed: ArtifactIdentity, entry: Mapping[str, Any]) -> bool:
+    """Is a RESTORED entry the recorded pre-state (a copy cannot keep the inode)?
+
+    DETAIL 10.6 restores by COPYING a verified backup copy and renaming it in, so the
+    device/inode of the original pre-state cannot and must not be required here; the
+    CONTENT (size + streamed sha256 for a regular file), the KIND and the MODE are.
+    """
+    kind = entry.get("kind")
+    if kind == "absent":
+        return observed.kind == "absent"
+    if observed.kind != kind:
+        return False
+    if kind == "regular_file":
+        return (
+            observed.size == entry.get("size")
+            and observed.sha256 == entry.get("sha256")
+            and observed.mode is not None
+            and stat.S_IMODE(observed.mode) == entry.get("mode")
+        )
+    if kind == "directory":
+        return observed.mode is not None and stat.S_IMODE(observed.mode) == entry.get("mode")
+    if kind == "symlink":
+        return observed.raw_link_target == entry.get("raw_link_target")
+    return False
+
+
+@dataclass(frozen=True)
+class RollbackDecision:
+    """What rollback will do to ONE artifact, decided from the run's own record."""
+
+    artifact: str
+    target_path: str
+    action: str
+    recorded_target_identity: str
+    prestate_kind: str
+
+
+@dataclass(frozen=True)
+class RollbackStep:
+    """One artifact's decision plus the run's own records the decision rests on."""
+
+    decision: RollbackDecision
+    prestate: Mapping[str, Any] | None
+    descendants: Mapping[str, Mapping[str, Any]]
+    recorded_identity: tuple[Any, ...] | None = None
+
+
+def _decide_rollback_artifact(
+    label: str,
+    pinned: ArtifactIdentity,
+    names: tuple[str, ...],
+    recorded: tuple[Any, ...] | None,
+    prestate: Mapping[str, Any] | None,
+    observed: ArtifactIdentity,
+) -> RollbackDecision:
+    """Decide ONE artifact's rollback from the run's OWN record and the disk.
+
+    "Matches the recorded staged identity" means the entry at the target IS the entry
+    this run published (a rename preserves it, so device/inode/mode/size/mtime/digest
+    all still match the record the publication wrote), and that is the POSITIVE fact
+    every decision is based on -- never the event prefix alone, because a publication
+    whose rename landed without its event is exactly the crash state a rollback exists
+    for. What follows from it:
+
+    * a positively identified run-created entry is quarantined and the pre-state is
+      restored (`quarantine_and_restore`);
+    * a VACANT target whose recorded pre-state was not absent is restored
+      (`restore_only`) -- the state an interrupted earlier attempt leaves, and the
+      crash state between the quarantine and the publish rename;
+    * a target that is provably still the untouched pre-state is left alone (`none`)
+      -- unless the run's own record also claims it published this artifact, which the
+      disk contradicts (`E_ROLLBACK_TARGET_DRIFT`);
+    * anything else is a Stop -- `E_ROLLBACK_TARGET_DRIFT` when the target is neither
+      of the two recorded entries, and `E_ROLLBACK_IDENTITY_MISSING` when the record
+      carries no comparable staged identity at all, so the CURRENT target identity
+      CANNOT be checked against a durable reference (R-4/O-2: refuse, never infer from
+      the fresh plan, never treat an unrecorded entry as confirmed).
+    """
+    if prestate is None:
+        raise _rollback_failure(
+            ROLLBACK_CODE_IDENTITY_MISSING,
+            f"the run's own backup report records nothing for {label}, so its ORIGINAL identity is "
+            "unknown and the entry at the target cannot be checked against any durable reference",
+        )
+    identity = _digest(recorded) if recorded is not None else ""
+    kind = str(prestate.get("kind"))
+    if recorded is not None and _identity_key(observed) == recorded:
+        return RollbackDecision(
+            label, pinned.lexical_path, ROLLBACK_ACTION_QUARANTINE_AND_RESTORE, identity, kind
+        )
+    if observed.kind == "absent":
+        action = ROLLBACK_ACTION_NONE if kind == "absent" else ROLLBACK_ACTION_RESTORE_ONLY
+        return RollbackDecision(label, pinned.lexical_path, action, identity, kind)
+    if _rollback_prestate_matches(observed, prestate):
+        if PUBLICATION_EVENT_STAGING_PUBLISHED in names:
+            raise _rollback_failure(
+                ROLLBACK_CODE_TARGET_DRIFT,
+                f"{label} is at its recorded pre-state although the run's own record records that it "
+                "published this artifact",
+            )
+        return RollbackDecision(label, pinned.lexical_path, ROLLBACK_ACTION_NONE, identity, kind)
+    if recorded is None:
+        raise _rollback_failure(
+            ROLLBACK_CODE_IDENTITY_MISSING,
+            f"the run's own record carries no comparable staged identity for {label}, so the entry at "
+            f"{pinned.lexical_path} cannot be checked against a durable reference",
+        )
+    raise _rollback_failure(
+        ROLLBACK_CODE_TARGET_DRIFT,
+        f"the entry at {pinned.lexical_path} is neither the identity this run published nor its "
+        "recorded pre-state",
+    )
+
+
+def _observe_rollback_steps(
+    plan: MigrationPlan, manifest: MigrationManifest, entries: Mapping[str, Mapping[str, Any]]
+) -> tuple[RollbackStep, ...]:
+    """Observe every target no-follow and decide -- this function MUTATES NOTHING.
+
+    Every Stop of this card is raised here, before the first rename: an unsafe parent
+    chain, a drifted target, a missing recorded identity. Everything is read through
+    pinned no-follow descriptors and the run's own durable records.
+    """
+    steps: list[RollbackStep] = []
+    for label in PUBLICATION_ARTIFACTS:
+        pinned = plan.targets.get(label)
+        if pinned is None:
+            raise _rollback_failure(
+                ROLLBACK_CODE_IDENTITY_MISSING, f"the plan records no {label} target to roll back"
+            )
+        _names, payloads = _publication_records(manifest, label)
+        recorded = _recorded_staging_identity(payloads[0]) if payloads else None
+        names, _payloads = _publication_records(manifest, label)
+        prestate, descendants = _rollback_artifact_records(entries, label)
+        target = Path(pinned.lexical_path)
+        observed = _rollback_target_identity(target.parent, target.name, artifact=label)
+        steps.append(
+            RollbackStep(
+                decision=_decide_rollback_artifact(label, pinned, names, recorded, prestate, observed),
+                prestate=prestate,
+                descendants=descendants,
+                recorded_identity=recorded,
+            )
+        )
+    return tuple(steps)
+
+
+def _append_rollback_event(
+    manifest_path: Path,
+    step: str,
+    payload: Mapping[str, Any],
+    *,
+    status: str | None = None,
+    failure: Mapping[str, Any] | None = None,
+) -> MigrationManifest:
+    """Append ONE step of the rollback chain durably, with optional terminal state.
+
+    The event is appended through the SAME in-memory chain helper the forward state
+    machine uses, so an existing event is never rewritten and the sequence number, the
+    previous-event link and the canonical body digest are derived in exactly one
+    place; the terminal status and a recorded failure travel in the SAME atomic
+    manifest write as the event that caused them.
+    """
+    updated = _append_event_to_manifest(
+        load_manifest(Path(manifest_path)), PUBLICATION_EVENT_CHECKPOINT, step, payload
+    )
+    if status is not None:
+        updated = replace(updated, status=cast(RunStatus, status))
+    if failure is not None:
+        updated = replace(updated, failure=dict(failure))
+    _write_manifest(Path(manifest_path), updated)
+    return load_manifest(Path(manifest_path))
+
+
+def _record_rollback_failure(manifest_path: Path, code: str, step: str, message: str) -> None:
+    """Record `rollback_failed` and its stable cause WITHOUT masking the real error."""
+    failure = {"code": code[:128], "step": step[:128], "message": message[:512]}
+    with contextlib.suppress(Exception):
+        _append_rollback_event(
+            manifest_path,
+            ROLLBACK_EVENT_FAILED,
+            {"code": failure["code"], "step": failure["step"]},
+            status="rollback_failed",
+            failure=failure,
+        )
+
+
+def _quarantine_current_rollback(
+    run_fd: int, target_parent_fd: int, target: Path, artifact: str, expected: tuple[Any, ...]
+) -> str:
+    """DETAIL 10.6 step 4: rename the CURRENT entry into a UNIQUE diagnostic quarantine.
+
+    The entry is re-observed no-follow immediately before the rename and must still be
+    the identity the decision was made from, so a swap that happened in between is
+    refused instead of quarantining a stranger. ``quarantine/failed-current`` is
+    run-owned, mode 0700, and the entry name carries a fresh random suffix, so nothing
+    a previous attempt retained can be overwritten. Both parents are fsynced.
+    """
+    with _run_child_directory(run_fd, QUARANTINE_DIRECTORY_NAME) as quarantine_fd:
+        with _run_child_directory(quarantine_fd, QUARANTINE_FAILED_CURRENT_NAME) as failed_fd:
+            entry_name = _rollback_entry_name(artifact, unique=True)
+            observed = _observed_entry_identity(target_parent_fd, target.name, artifact=artifact)
+            if _identity_key(observed) != expected:
+                raise _rollback_failure(
+                    ROLLBACK_CODE_TARGET_DRIFT,
+                    f"{artifact} changed between the rollback decision and its quarantine",
+                )
+            _rename_entry(target_parent_fd, target.name, failed_fd, entry_name, artifact=artifact)
+            _fsync_pair(target_parent_fd, failed_fd)
+    return f"{QUARANTINE_DIRECTORY_NAME}/{QUARANTINE_FAILED_CURRENT_NAME}/{entry_name}"
+
+
+def _rollback_backup_location(run_dir: Path, entry: Mapping[str, Any], artifact: str) -> Path:
+    """The retained backup copy one pre-state record names, never a caller path."""
+    relative = _validate_run_relative_path(
+        entry.get("run_relative_path"), field_name=f"rollback {artifact} run_relative_path"
+    )
+    return Path(run_dir) / relative
+
+
+def _stage_restored_tree(
+    backup_root: Path,
+    staged_root_fd: int,
+    *,
+    artifact: str,
+    descendants: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """Copy a backed-up directory into the run-owned staging entry and verify it.
+
+    The walk is the S2-05 ``_stage_tree`` (pinned no-follow descriptors, a stable
+    listing re-checked after the walk, no interior symlink ever followed) into a FRESH
+    staging directory, and every regular file it staged is then bound to the digest
+    the run's OWN backup report recorded for that child path -- the content check a
+    directory copy can honestly make, since this project has no recursive directory
+    digest. The assembled tree is returned as its relative paths.
+    """
+    directories: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
+    budget: list[int] = [0]
+    with storage_lock.open_directory_nofollow(backup_root) as backup_root_fd:
+        _stage_tree(
+            backup_root_fd,
+            staged_root_fd,
+            label=f"rollback:{artifact}",
+            source_path=backup_root,
+            parts=(),
+            depth=1,
+            budget=budget,
+            directories=directories,
+            files=files,
+        )
+    staged: list[str] = []
+    for record in directories:
+        parts = tuple(record["parts"])
+        recorded_directory = descendants.get("/".join(parts))
+        if recorded_directory is None or recorded_directory.get("kind") != "directory":
+            raise _rollback_failure(
+                ROLLBACK_CODE_IDENTITY_MISSING,
+                f"the backup of {artifact} holds the directory {'/'.join(parts)}, which the run's own "
+                "report does not record as a directory",
+            )
+        with _run_directory_chain(staged_root_fd, parts[:-1]) as parent_fd:
+            os.chmod(
+                parts[-1], int(recorded_directory.get("mode") or BACKUP_DIRECTORY_MODE), dir_fd=parent_fd
+            )
+        staged.append("/".join(parts))
+    for record in files:
+        parts = tuple(record["parts"])
+        relative = "/".join(parts)
+        recorded_file = descendants.get(relative)
+        if recorded_file is None or recorded_file.get("kind") != "regular_file":
+            raise _rollback_failure(
+                ROLLBACK_CODE_IDENTITY_MISSING,
+                f"the backup of {artifact} holds {relative}, which the run's own report does not record "
+                "as a regular file",
+            )
+        if (
+            str(recorded_file.get("sha256")) != str(record["digest"])
+            or recorded_file.get("size") != record["stat"].st_size
+        ):
+            raise _rollback_failure(
+                ROLLBACK_CODE_BACKUP_MISMATCH,
+                f"the retained backup copy of {artifact}/{relative} does not match the digest the run "
+                "recorded for it",
+            )
+        with _run_directory_chain(staged_root_fd, parts[:-1]) as parent_fd:
+            _rename_entry(staged_root_fd, str(record["staged"]), parent_fd, parts[-1], artifact=artifact)
+            os.chmod(parts[-1], int(recorded_file.get("mode") or BACKUP_FILE_MODE), dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        staged.append(relative)
+    return staged
+
+
+def _restore_prestate(
+    run_dir: Path, step: RollbackStep, restore_fd: int, target_parent_fd: int, target: Path
+) -> dict[str, Any]:
+    """DETAIL 10.6 steps 5-7: restore ONE recorded pre-state from the retained backup.
+
+    A regular file and a directory are copied from the backup copy into a UNIQUE
+    run-owned ``restore/`` staging entry (verified THERE, at 0600/0700 while it is
+    staged) and only then renamed into the vacant target; a prior symlink is created at
+    the staging name with the EXACT raw ``readlink`` string the run recorded and
+    renamed in the same way; a recorded absence leaves the target vacant. The backup
+    copy is only ever READ, and both parents of the final rename are fsynced.
+    """
+    artifact = step.decision.artifact
+    entry = step.prestate
+    if entry is None or entry.get("kind") == "absent":
+        return {"artifact": artifact, "kind": "absent", "restored": False, "staging": None}
+    kind = str(entry.get("kind"))
+    backup_path = _rollback_backup_location(run_dir, entry, artifact)
+    staged_name = _rollback_entry_name(artifact, unique=True)
+    if kind == "regular_file":
+        digest = ""
+        source_size = -1
+        try:
+            with storage_lock.open_directory_nofollow(backup_path.parent) as backup_parent_fd:
+                before = os.stat(backup_path.name, dir_fd=backup_parent_fd, follow_symlinks=False)
+                with _pinned_child_regular_file(
+                    backup_parent_fd, backup_path.name, artifact=f"rollback:{artifact}", before=before
+                ) as (descriptor, opened):
+                    digest, _staged = _stage_regular_file(
+                        descriptor, opened, restore_fd, staged_name, artifact=f"rollback:{artifact}"
+                    )
+                    source_size = opened.st_size
+        except storage_lock.StorageLockError as exc:
+            raise _rollback_failure(
+                ROLLBACK_CODE_BACKUP_MISMATCH,
+                f"the retained backup of {artifact} cannot be read ({exc.code})",
+            ) from exc
+        if digest != entry.get("sha256") or source_size != entry.get("size"):
+            raise _rollback_failure(
+                ROLLBACK_CODE_BACKUP_MISMATCH,
+                f"the staged restore of {artifact} does not match the digest the run recorded",
+            )
+        os.chmod(staged_name, int(entry.get("mode") or BACKUP_FILE_MODE), dir_fd=restore_fd)
+        os.fsync(restore_fd)
+        _rename_entry(restore_fd, staged_name, target_parent_fd, target.name, artifact=artifact)
+        _fsync_pair(target_parent_fd, restore_fd)
+        return {"artifact": artifact, "kind": kind, "restored": True, "staging": staged_name}
+    if kind == "directory":
+        with _run_child_directory(restore_fd, staged_name) as staged_root_fd:
+            staged_identity = os.fstat(staged_root_fd)
+            entries = _stage_restored_tree(
+                backup_path, staged_root_fd, artifact=artifact, descendants=step.descendants
+            )
+        os.chmod(staged_name, int(entry.get("mode") or BACKUP_DIRECTORY_MODE), dir_fd=restore_fd)
+        os.fsync(restore_fd)
+        _rename_entry(restore_fd, staged_name, target_parent_fd, target.name, artifact=artifact)
+        _fsync_pair(target_parent_fd, restore_fd)
+        return {
+            "artifact": artifact,
+            "kind": kind,
+            "restored": True,
+            "staging": staged_name,
+            "staged_inode": staged_identity.st_ino,
+            "entries": len(entries),
+        }
+    if kind == "symlink":
+        raw = entry.get("raw_link_target")
+        if not isinstance(raw, str):
+            raise _rollback_failure(
+                ROLLBACK_CODE_IDENTITY_MISSING,
+                f"the run's record of {artifact} carries no raw link string",
+            )
+        try:
+            retained = os.readlink(backup_path)
+        except OSError as exc:
+            raise _rollback_failure(
+                ROLLBACK_CODE_BACKUP_MISMATCH,
+                f"the retained link entry of {artifact} cannot be read",
+            ) from exc
+        if retained != raw:
+            raise _rollback_failure(
+                ROLLBACK_CODE_BACKUP_MISMATCH,
+                f"the retained link entry of {artifact} does not carry the raw string the run recorded",
+            )
+        try:
+            os.symlink(raw, staged_name, dir_fd=restore_fd)
+        except OSError as exc:
+            raise _rollback_failure(
+                ROLLBACK_CODE_VERIFY_FAILED,
+                f"the restore staging link of {artifact} cannot be created",
+            ) from exc
+        os.fsync(restore_fd)
+        if os.readlink(staged_name, dir_fd=restore_fd) != raw:
+            raise _rollback_failure(
+                ROLLBACK_CODE_VERIFY_FAILED,
+                f"the restore staging link of {artifact} does not carry the raw string it must",
+            )
+        _rename_entry(restore_fd, staged_name, target_parent_fd, target.name, artifact=artifact)
+        _fsync_pair(target_parent_fd, restore_fd)
+        return {"artifact": artifact, "kind": kind, "restored": True, "staging": staged_name}
+    raise _rollback_failure(
+        ROLLBACK_CODE_IDENTITY_MISSING,
+        f"the run recorded no restorable kind for {artifact}: {kind!r}",
+    )
+
+
+def _verify_restored(step: RollbackStep, observation: Mapping[str, Any], target: Path) -> dict[str, Any]:
+    """DETAIL 10.6 step 8: verify what was restored, or refuse with all copies kept.
+
+    A restored regular file is reopened no-follow and must carry the recorded size,
+    streamed SHA-256 and mode; a restored directory must be the very entry that was
+    staged (its identity -- with its files already digest-bound above); a restored
+    symlink is verified by ``lstat`` + ``readlink`` ONLY, so its referent is neither
+    opened nor validated as a store. Any mismatch is ``E_ROLLBACK_VERIFY_FAILED`` and
+    nothing is deleted, because DETAIL 10.6 step 10 retains every copy and forbids a
+    destructive automatic retry.
+    """
+    artifact = step.decision.artifact
+    entry = step.prestate or {}
+    kind = str(entry.get("kind"))
+    observed = _rollback_target_identity(target.parent, target.name, artifact=artifact)
+    if kind == "directory":
+        if observed.kind != "directory" or observed.inode != observation.get("staged_inode"):
+            raise _rollback_failure(
+                ROLLBACK_CODE_VERIFY_FAILED,
+                f"the restored {artifact} directory is not the entry that was staged and verified",
+            )
+        return {"artifact": artifact, "kind": kind, "inode": observed.inode, "mode": observed.mode}
+    if not _rollback_restored_matches(observed, entry):
+        raise _rollback_failure(
+            ROLLBACK_CODE_VERIFY_FAILED,
+            f"the restored {artifact} does not match the pre-state the run recorded",
+        )
+    return {
+        "artifact": artifact,
+        "kind": kind,
+        "size": observed.size,
+        "digest": observed.sha256 or "",
+    }
+
+
+def _execute_rollback(
+    manifest_path: Path,
+    manifest: MigrationManifest,
+    run_dir: Path,
+    steps: tuple[RollbackStep, ...],
+) -> MigrationManifest:
+    """Perform the decided rollback and record its own durable chain (DETAIL 10.6).
+
+    Order: ``rollback.locked``; quarantine every positively identified run-created
+    entry into its unique diagnostic quarantine; ``rollback.current_quarantined``;
+    restore every recorded pre-state from the retained backup through a freshly
+    verified staging entry; ``rollback.prestate_restored``; verify what was restored;
+    ``rollback.verified``; ``rolled_back`` with the terminal status. On ANY failure
+    once the chain has started the copies are retained and `rollback_failed` is
+    recorded, then the original error is re-raised -- no destructive automatic retry
+    happens anywhere in this function.
+    """
+    _append_rollback_event(
+        manifest_path,
+        ROLLBACK_EVENT_LOCKED,
+        {"run_id": manifest.run_id, "artifacts": [step.decision.artifact for step in steps]},
+    )
+    current = ROLLBACK_EVENT_LOCKED
+    try:
+        with storage_lock.open_directory_nofollow(run_dir) as run_fd:
+            with _run_child_directory(run_fd, ROLLBACK_RESTORE_DIRECTORY_NAME) as restore_fd:
+                current = ROLLBACK_EVENT_CURRENT_QUARANTINED
+                quarantined: list[dict[str, Any]] = []
+                for step in steps:
+                    if step.decision.action != ROLLBACK_ACTION_QUARANTINE_AND_RESTORE:
+                        continue
+                    target = Path(step.decision.target_path)
+                    if step.recorded_identity is None:
+                        raise _rollback_failure(
+                            ROLLBACK_CODE_IDENTITY_MISSING,
+                            f"{step.decision.artifact} has no recorded identity to quarantine",
+                        )
+                    with storage_lock.open_directory_nofollow(target.parent) as target_parent_fd:
+                        quarantined.append(
+                            {
+                                "artifact": step.decision.artifact,
+                                "path": _quarantine_current_rollback(
+                                    run_fd,
+                                    target_parent_fd,
+                                    target,
+                                    step.decision.artifact,
+                                    step.recorded_identity,
+                                ),
+                            }
+                        )
+                _append_rollback_event(
+                    manifest_path, ROLLBACK_EVENT_CURRENT_QUARANTINED, {"quarantined": quarantined}
+                )
+                current = ROLLBACK_EVENT_PRESTATE_RESTORED
+                restorations: list[tuple[RollbackStep, dict[str, Any]]] = []
+                for step in steps:
+                    if step.decision.action == ROLLBACK_ACTION_NONE:
+                        continue
+                    target = Path(step.decision.target_path)
+                    with storage_lock.open_directory_nofollow(target.parent) as target_parent_fd:
+                        restorations.append(
+                            (step, _restore_prestate(run_dir, step, restore_fd, target_parent_fd, target))
+                        )
+                _append_rollback_event(
+                    manifest_path,
+                    ROLLBACK_EVENT_PRESTATE_RESTORED,
+                    {"restored": [observation for _step, observation in restorations]},
+                )
+                current = ROLLBACK_EVENT_VERIFIED
+                verified = [
+                    _verify_restored(step, observation, Path(step.decision.target_path))
+                    for step, observation in restorations
+                ]
+                _append_rollback_event(manifest_path, ROLLBACK_EVENT_VERIFIED, {"verified": verified})
+    except BaseException as exc:
+        _record_rollback_failure(manifest_path, str(exc).split(":", 1)[0], current, str(exc))
+        raise
+    return _append_rollback_event(
+        manifest_path,
+        ROLLBACK_EVENT_ROLLED_BACK,
+        {"artifacts": [step.decision.artifact for step in steps]},
+        status="rolled_back",
+    )
+
+
+def rollback_profile_migration(
+    manifest_path: Path, request: MigrationRequest
+) -> MigrationManifest:
+    """Restore a stopped run's exact pre-state, retaining every copy (DETAIL 10.6).
+
+    Rollback is an ACTION entrypoint, so it repeats EVERYTHING itself: the shared
+    ``validate_mutation_preconditions`` set (intent, exact canonical target, the
+    bounded attestation, a FRESH replan, the sidecar/path/disk checks recomputed from
+    it, the ``/proc`` writer inventory, the identity-and-hash stability interval and
+    the bounded SQLite transaction probe), then the run's own durable records -- run id
+    (``E_ROLLBACK_RUN_MISMATCH``), source identity, the tolerated run-path collision,
+    and the backup report with every recorded entry (a mismatch is
+    ``E_ROLLBACK_BACKUP_MISMATCH``) -- then DECIDES read-only, so a refusal has no
+    filesystem side effect at all, and only then takes the SAME maintenance locks the
+    engine takes, so both destructive renames -- and the no-follow re-observation that
+    precedes each of them -- happen under the run's own locks.
+
+    DELIBERATE DEVIATION FROM THE RESUME SET, disclosed: the ``config_digest``
+    re-confirmation of DETAIL 10.5 is NOT repeated here. DETAIL 10.6's guard list (its
+    steps 1-2) is manifest/hash chain, backup hashes, apply flag, exact target, stop
+    attestation and all locks/probes, and the digest is not among them; more
+    importantly, the run's OWN publication legitimately invalidates it in the legacy
+    layout, where the redacted layout of a symlinked vector store carries
+    ``compatibility: ["legacy-split-layout:vector"]`` and
+    ``unavailable_projections: ["vector"]`` and the publication replaces that symlink
+    with a real staged directory. Measured on this tree with
+    ``S2-08_EVIDENCE/gate_tmp/s208_probe_config_digest.py``:
+    ``CONFIG_DIGEST_EQUAL=False`` for two roots that differ only in that respect. A
+    rollback that refused there could never roll back the very layout acceptance 4
+    names, so the source identity is still re-confirmed and the digest is not.
+
+    Before anything moves, the CURRENT TARGET IDENTITY of every publication artifact
+    is checked no-follow against the identity the run's own publication recorded, and
+    the recorded pre-state against the backup report; this card's Stops are raised
+    there (unsafe parent; target drift, including a record that claims a publication
+    the disk does not show; and a missing durable identity, which is REFUSED rather
+    than inferred from the fresh plan). Only then does the rollback quarantine the
+    run-created current artifact into a unique diagnostic quarantine, copy the recorded
+    pre-state from the retained backup into a unique verified staging entry and rename
+    it into the vacant target, fsync the parents, verify the restored entries and
+    append the ``rollback.locked -> rollback.current_quarantined ->
+    rollback.prestate_restored -> rollback.verified -> rolled_back`` chain with
+    ``status=rolled_back``.
+
+    A run whose own record already reports a completed rollback is refused
+    (``E_ROLLBACK_TERMINAL``): this entrypoint is a restore, never a status no-op, and
+    a terminal run is not silently re-processed. On any failure once the chain has
+    started, every copy is retained, ``rollback_failed`` and the stable cause are
+    recorded in the same manifest write, and the error is raised -- there is no
+    automatic destructive retry, and a refused rollback that never moved anything
+    leaves the manifest byte-identical.
+    """
+    validate_mutation_preconditions(request)
+    manifest = _load_resume_manifest(manifest_path)
+    if manifest.run_id != request.run_id:
+        raise _rollback_failure(ROLLBACK_CODE_RUN_MISMATCH, "the manifest belongs to another run id")
+    if manifest.status == "rolled_back":
+        raise _rollback_failure(
+            ROLLBACK_CODE_TERMINAL,
+            "the run's own durable record already reports a completed rollback",
+        )
+    plan = plan_profile_migration(request)
+    _require_resume_source_identity(plan, manifest)
+    _require_resume_plan(plan)
+    run_dir = _backup_run_directory(plan)
+    entries = _rollback_backup_entries(run_dir, manifest)
+    # The read-only decision runs BEFORE the locks on purpose: the lock stage CREATES
+    # its lock entries and by design never unlinks them, so a refusal that decided
+    # first has NO filesystem side effect at all -- which is the property this card's
+    # refusal path owes. Nothing is weakened by the order: the lock stage re-runs the
+    # ENTIRE mixed-version writer inventory under the acquisition, and every entry that
+    # is about to move is re-observed no-follow immediately before its rename, inside
+    # the locked section.
+    steps = _observe_rollback_steps(plan, manifest, entries)
+    locks = acquire_maintenance_locks(plan)
+    try:
+        return _execute_rollback(manifest_path, manifest, run_dir, steps)
+    finally:
+        locks.release()

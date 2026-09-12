@@ -202,7 +202,13 @@ def test_rollback_refuses_unfinished_migration_without_mutating_manifest(
     manifest_path = home / ".cmms-migrations" / request.run_id / "manifest.json"
     _write_manifest_for_entrypoint(manifest_path, plan)
     before = _tree_snapshot(home)
-    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+    # S2-08 moved this boundary and this leg is updated for it, not weakened: at this
+    # slice rollback is an ACTION entrypoint that reads the run's own durable records,
+    # so a run whose report records no original artifact identity is refused with THIS
+    # card's own Stop instead of the slice-level "not implemented". What this node
+    # exists for -- rollback refuses AND leaves the tree byte-identical -- is
+    # unchanged and still asserted below on a real tree.
+    with pytest.raises(ValueError, match="E_ROLLBACK_IDENTITY_MISSING"):
         rollback_profile_migration(manifest_path, request)
     assert _tree_snapshot(home) == before
 
@@ -2258,7 +2264,12 @@ def test_s204_every_entrypoint_replans_independently_without_inherited_state(
     # inherits nothing from the caller -- is asserted by `calls` below.
     with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
         resume_profile_migration(manifest_path, replace(request, mode="resume"))
-    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+    # S2-08 moved this leg too, in the same way and for the same reason: rollback now
+    # repeats its own preconditions and reads the run's own manifest, so with no
+    # manifest at all it refuses with the manifest code rather than the slice-level
+    # "not implemented". The property this node exists for -- every entrypoint replans
+    # for ITSELF, on its own mode, and inherits nothing -- is asserted by `calls` below.
+    with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
         rollback_profile_migration(manifest_path, replace(request, mode="rollback"))
     assert calls == ["apply", "resume", "rollback"]
 
@@ -3580,11 +3591,14 @@ def test_s206_the_public_entrypoints_stay_fail_closed_while_the_seam_is_a_stub(
 ) -> None:
     """CONTROL (passes on BOTH sides): no false end-to-end success is claimable.
 
-    acceptance 1 and 5: `apply`/`resume`/`rollback` stay non-success while the
-    verification seam is the S0 stub, they touch nothing, and they do not start
-    to proceed even when the seam DOES report an implemented capability -- the
-    general `apply` stays closed until S3-06 and this card must not bypass that
-    ordering (routing-matrix S2-06 split_further / the card's ordering note).
+    acceptance 1 and 5: while the verification seam is the S0 stub, `apply` and
+    `resume` stay non-success and they do not start to proceed even when the seam DOES
+    report an implemented capability -- the general `apply` stays closed until S3-06
+    and no card may bypass that ordering (routing-matrix S2-06 split_further / the
+    card's ordering note). The rollback leg asserted here is its absent-manifest
+    refusal on a real tree: S2-08 did NOT put rollback behind this gate, because
+    rollback publishes nothing and restores a pre-state the run already backed up, so
+    no slice-level "not implemented" applies to it any more.
     """
     import memory_server.projection_rebuild as projection_rebuild
 
@@ -3595,22 +3609,22 @@ def test_s206_the_public_entrypoints_stay_fail_closed_while_the_seam_is_a_stub(
     live = tmp_path / "run" / plan.request.run_id / "manifest.json"
     before = _tree_snapshot(tmp_path)
 
-    entrypoints = (
-        ("apply_profile_migration", (plan,)),
-        ("rollback_profile_migration", (live, request)),
-    )
+    entrypoints = (("apply_profile_migration", (plan,)),)
     for name, args in entrypoints:
         with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
             getattr(profile_migration, name)(*args)
 
-    # S2-07 moved ONE leg of this boundary and this node is updated for it, not
-    # weakened: `resume` now repeats the preconditions and reads the run's own
-    # manifest, so an absent manifest is refused with its own stable code instead
-    # of the slice-level "not implemented". What this node exists to pin is
-    # unchanged and still asserted below -- resume is non-success and touches
-    # nothing -- and it still classifies nothing it cannot read.
+    # S2-07 and S2-08 moved ONE leg of this boundary each and this node is updated for
+    # them, not weakened: `resume` repeats the preconditions and reads the run's own
+    # manifest, and so does `rollback` at S2-08 -- the latter because it restores a
+    # pre-state the run already backed up and publishes nothing, so it needs no staged
+    # verification and does not touch the gate `apply` waits on. What this node exists
+    # to pin is unchanged and still asserted below: neither entrypoint is a success,
+    # neither touches anything, and neither classifies a run it cannot read.
     with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
         profile_migration.resume_profile_migration(live, request)
+    with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
+        profile_migration.rollback_profile_migration(live, request)
 
     monkeypatch.setattr(projection_rebuild, "STAGED_VERIFICATION_IMPLEMENTED", True, raising=False)
     with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
@@ -4957,3 +4971,574 @@ def test_s207_resume_refuses_a_staged_entry_that_is_not_the_identity_the_run_rec
 
     assert file_state["live"].read_bytes() == file_manifest_bytes
     assert staged_file.exists(), "a refusal must not delete the entry it refused to publish"
+
+
+# ---------------------------------------------------------------------------
+# S2-08 -- rollback to the exact pre-state with a retained diagnostic quarantine
+# (DETAIL 9.3's rollback event chain, DETAIL 10.6's ten steps).
+#
+# PRE-FIX CLASSIFICATION OF THIS SECTION (filed with the RED in S2-08_EVIDENCE):
+# every node below drives the REAL `rollback_profile_migration` entrypoint on a
+# REAL stopped run produced by the shipped backup (`create_run_backup`) and
+# publication (`publish_artifact`) primitives. At BASE that entrypoint DOES exist
+# and refuses with `E_MIGRATION_NOT_IMPLEMENTED` after its own precondition pass
+# (the S2-07 tree has it at `profile_migration.py:4095-4100`), so every node here
+# fails at BASE with a WRONG REFUSAL CAUSE or a missing restore -- a behavioural
+# failure, never a collection ImportError, never a TypeError/KeyError raised by a
+# helper of this file, and never `pytest.fail`. The single GUARD node
+# (`test_s208_the_rollback_entrypoint_repeats_the_apply_guards`) PASSES at BASE by
+# design, because the BASE entrypoint already validates those guards; it is
+# labelled GUARD and is NOT counted as a RED.
+#
+# Honest limit of the pre-state comparison (R-6/O-3, disclosed in the SUMMARY):
+# `_s208_tree` records a directory's mode and its CHILDREN's own no-follow
+# identity/bytes, so a directory pre-state is compared by its children's content
+# and NOT by a recursive directory digest -- this project's identity model has no
+# directory content digest (`_observed_entry_identity` carries size/mtime/sha256
+# = None for a directory), and this card does not widen it.
+# ---------------------------------------------------------------------------
+
+S208_QUARANTINE_FAILED_NAME = "failed-current"
+S208_RESTORE_NAME = "restore"
+S208_ROLLBACK_CHAIN: tuple[str, ...] = (
+    "rollback.locked",
+    "rollback.current_quarantined",
+    "rollback.prestate_restored",
+    "rollback.verified",
+    "rolled_back",
+)
+S208_FAILED_EVENT = "rollback.failed"
+S208_PAYLOADS: dict[str, bytes] = {
+    "vector": b"S208-PUBLISHED-VECTOR" * 4,
+    "graph": b'{"s208": "published"}\n',
+}
+
+
+def _s208_request(plan: Any, **overrides: Any) -> Any:
+    """The plan's own request, in ROLLBACK mode (the entrypoint's own guard)."""
+    return replace(plan.request, mode="rollback", **overrides)
+
+
+def _s208_tree(root: Path) -> tuple[tuple[str, str, int, bytes | None], ...]:
+    """A NO-FOLLOW description of one entry: relpath, kind, mode and real bytes.
+
+    A symlink is recorded by its exact raw target string and is never traversed
+    (``rglob`` does not follow a symlinked directory), an absent entry is its own
+    explicit record, and a directory contributes its children's entries -- there is
+    no recursive directory content digest anywhere in this project (R-6/O-3), so
+    none is invented here either.
+    """
+    if not os.path.lexists(root):
+        return (("", "absent", 0, None),)
+    info = os.lstat(root)
+    if stat.S_ISLNK(info.st_mode):
+        return (("", "symlink:" + os.readlink(root), stat.S_IMODE(info.st_mode), None),)
+    if stat.S_ISREG(info.st_mode):
+        return (("", "regular_file", stat.S_IMODE(info.st_mode), root.read_bytes()),)
+    assert stat.S_ISDIR(info.st_mode), "the fixture root is not a regular entry"
+    entries: list[tuple[str, str, int, bytes | None]] = [
+        ("", "directory", stat.S_IMODE(info.st_mode), None)
+    ]
+    for path in sorted(root.rglob("*")):
+        child = os.lstat(path)
+        relative = str(path.relative_to(root))
+        if stat.S_ISLNK(child.st_mode):
+            entries.append((relative, "symlink:" + os.readlink(path), stat.S_IMODE(child.st_mode), None))
+        elif stat.S_ISDIR(child.st_mode):
+            entries.append((relative, "directory", stat.S_IMODE(child.st_mode), None))
+        elif stat.S_ISREG(child.st_mode):
+            entries.append((relative, "regular_file", stat.S_IMODE(child.st_mode), path.read_bytes()))
+        else:
+            entries.append((relative, "special", stat.S_IMODE(child.st_mode), None))
+    return tuple(entries)
+
+
+def _s208_backup_entries(run_dir: Path) -> dict[str, Any]:
+    """The run's OWN backup report, keyed by its recorded artifact label."""
+    report = json.loads(
+        (run_dir / profile_migration.BACKUP_REPORT_NAME).read_text(encoding="utf-8")
+    )
+    return {str(entry["artifact"]): entry for entry in report["entries"]}
+
+
+def _s208_publish(plan: Any, artifact: str, staged: Path, run_dir: Path, live: Path | None) -> Any:
+    """publish_artifact(...) against the REAL plan, with the REAL staged identity."""
+    return profile_migration.publish_artifact(
+        plan, artifact, staged_identity=_s206_identity(staged), run_dir=run_dir, manifest_path=live
+    )
+
+
+def _s208_run(
+    tmp_path: Path, *, legacy: bool = True, publish: tuple[str, ...] = ("vector",), live: bool = True
+) -> dict[str, Any]:
+    """A REAL stopped run: real pre-state, real backup, real per-artifact publication.
+
+    ``legacy`` selects the vector pre-state (a final symlink vs a directory),
+    ``publish`` names the artifacts the shipped ``publish_artifact`` primitive
+    really swapped into place, and ``live`` False drives that publication WITHOUT a
+    manifest, so the run's own record carries no publication event at all.
+    """
+    if legacy:
+        home, db_path, referent = _s205_legacy_home(tmp_path)
+    else:
+        home, db_path = _s205_home(tmp_path)
+        referent = home / "data" / "lancedb"
+    request, plan = _s205_legacy_plan(home, db_path)
+    run_dir = _s206_run_dir(home, plan)
+    assert profile_migration.create_run_backup(plan) is not None, "no backup stage exists at this commit"
+    manifest_path = _s207_write_manifest(plan, run_dir) if live else None
+    targets = {label: Path(plan.targets[label].lexical_path) for label in ("vector", "graph")}
+    prestates = {label: _s208_tree(targets[label]) for label in ("vector", "graph")}
+    staging = {label: _s207_stage(run_dir, label, S208_PAYLOADS[label]) for label in ("vector", "graph")}
+    for label in publish:
+        assert (
+            _s208_publish(plan, label, staging[label], run_dir, manifest_path) is not None
+        ), "no per-artifact publication primitive exists at this commit"
+    published = {label: _s208_tree(targets[label]) for label in ("vector", "graph")}
+    return {
+        "home": home,
+        "db_path": db_path,
+        "referent": referent,
+        "plan": plan,
+        "request": _s208_request(plan),
+        "run_dir": run_dir,
+        "manifest_path": manifest_path,
+        "targets": targets,
+        "prestates": prestates,
+        "published": published,
+        "staging": staging,
+    }
+
+
+def _s208_failed_current(run_dir: Path) -> list[Path]:
+    """Every entry of the run-owned ``quarantine/failed-current`` diagnostic area."""
+    parent = run_dir / profile_migration.QUARANTINE_DIRECTORY_NAME / S208_QUARANTINE_FAILED_NAME
+    if not parent.exists():
+        return []
+    return sorted(parent.iterdir())
+
+
+def _s208_open_spy(monkeypatch: pytest.MonkeyPatch, root: Path) -> list[str]:
+    """Record every ``os.open`` path, then open for real (a transparent spy)."""
+    seen: list[str] = []
+    real_open = os.open
+
+    def _open(path: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append(str(path))
+        try:
+            seen.append(os.path.realpath(str(path)))
+        except OSError:
+            pass
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _open)
+    return seen
+
+
+def _s208_opens_touching(seen: list[str], root: Path) -> list[str]:
+    """Which recorded open paths name ``root`` or anything inside it."""
+    literal = str(root)
+    resolved = os.path.realpath(root)
+    return [
+        item
+        for item in seen
+        if item == literal
+        or item.startswith(literal + os.sep)
+        or item == resolved
+        or item.startswith(resolved + os.sep)
+    ]
+
+
+def test_s208_a_real_rollback_restores_the_exact_raw_symlink_prestate_and_retains_every_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """ROLLBACK of a published SYMLINK pre-state: exact raw target, referent untouched.
+
+    DETAIL 10.6 steps 3-6 and 9: the CURRENT target identity is checked against the
+    run's own durable record, the run-created directory is quarantined (never
+    deleted), the prior symlink is restored from the retained backup as its EXACT
+    raw target created at a run-owned staging name and renamed into the vacant
+    target, and the original backup, the run's prepublish quarantine and the SQLite
+    and legacy trees are all retained.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=True, publish=("vector",))
+    target = state["targets"]["vector"]
+    run_dir = state["run_dir"]
+    referent = state["referent"]
+    referent_before = _s208_tree(referent)
+    sqlite_before = state["db_path"].read_bytes()
+    backup_link = run_dir / "backup" / "link-entries" / "vector"
+    assert backup_link.is_symlink(), "the shipped backup did not record the raw link entry"
+    raw_prestate = os.readlink(backup_link)
+
+    seen = _s208_open_spy(monkeypatch, referent)
+    returned = rollback_profile_migration(state["manifest_path"], state["request"])
+
+    assert returned.status == "rolled_back"
+    assert returned.checkpoint == "publishing"
+    # The pre-state is back, exactly: the same raw link string, nothing followed.
+    assert _s208_tree(target) == state["prestates"]["vector"], "the prior symlink was not restored exactly"
+    assert os.readlink(target) == raw_prestate
+    assert not os.path.islink(referent)
+    assert _s208_tree(referent) == referent_before, "the referent was touched"
+    assert _s208_opens_touching(seen, referent) == [], "the referent was opened"
+    # The run-created artifact is quarantined, never deleted, byte for byte.
+    failed = _s208_failed_current(run_dir)
+    assert len(failed) == 1, "the run-created current artifact was not quarantined exactly once"
+    assert _s208_tree(failed[0]) == state["published"]["vector"]
+    assert re.fullmatch(r"vector-[0-9a-f]{32}", failed[0].name), "the diagnostic quarantine name is not unique"
+    # Everything else is retained untouched.
+    assert state["db_path"].read_bytes() == sqlite_before, "the SQLite store was touched"
+    assert _s208_tree(state["targets"]["graph"]) == state["prestates"]["graph"]
+    retained = run_dir / profile_migration.QUARANTINE_DIRECTORY_NAME / profile_migration.QUARANTINE_PREPUBLISH_NAME
+    retained_links = [path for path in retained.iterdir() if os.path.islink(path)]
+    assert [os.readlink(path) for path in retained_links] == [raw_prestate]
+    assert backup_link.is_symlink() and os.readlink(backup_link) == raw_prestate, "the original backup was lost"
+    assert (run_dir / profile_migration.BACKUP_REPORT_NAME).exists()
+    # The durable rollback chain, appended to the run's own record.
+    assert _s207_operations(state["manifest_path"]) == [
+        *(f"vector.{name}" for name in S206_PUBLISHED_SEQUENCE),
+        *S208_ROLLBACK_CHAIN,
+    ]
+
+
+def test_s208_a_regular_backup_is_copied_to_a_unique_staging_entry_verified_and_renamed(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """acceptance 3: the REGULAR backup is copied, verified and renamed; original kept.
+
+    The restored regular file must be the pre-state byte for byte (mode included),
+    the run-created replacement must be retained in the diagnostic quarantine, the
+    restore staging entry must be uniquely named and gone (it was renamed into the
+    vacant target), and the ORIGINAL BACKUP COPY must still hold the PRE-state
+    bytes -- which is what proves the restore was made from it and not left in place.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=False, publish=("graph",))
+    target = state["targets"]["graph"]
+    run_dir = state["run_dir"]
+    original = state["prestates"]["graph"]
+
+    returned = rollback_profile_migration(state["manifest_path"], state["request"])
+
+    assert returned.status == "rolled_back"
+    assert _s208_tree(target) == original, "the regular pre-state was not restored byte for byte"
+    assert os.lstat(target).st_size == len(original[0][3] or b"")
+    failed = _s208_failed_current(run_dir)
+    assert len(failed) == 1
+    assert _s208_tree(failed[0]) == state["published"]["graph"]
+    assert re.fullmatch(r"graph-[0-9a-f]{32}", failed[0].name)
+    backup_copy = run_dir / "backup" / "graph.json"
+    assert backup_copy.read_bytes() == (original[0][3] or b""), "the original backup is no longer the pre-state"
+    staging_area = run_dir / S208_RESTORE_NAME
+    assert staging_area.is_dir(), "the rollback owns no restore staging area"
+    assert [path.name for path in staging_area.iterdir()] == [], "the unique staging entry was not renamed away"
+
+
+def test_s208_a_prior_absence_is_restored_to_absence_after_quarantining_only_the_run_created_entry(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """acceptance 2 / DETAIL 10.6 step 7: a prior absence is restored to absence."""
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path, _external = _s205_legacy_home(tmp_path)
+    (home / "data" / "graph.json").unlink()
+    request, plan = _s205_legacy_plan(home, db_path)
+    assert plan.targets["graph"].kind == "absent"
+    run_dir = _s206_run_dir(home, plan)
+    assert profile_migration.create_run_backup(plan) is not None
+    live = _s207_write_manifest(plan, run_dir)
+    target = home / "data" / "graph.json"
+    staged = _s207_stage(run_dir, "graph", b'{"s208": "was-absent"}\n')
+    assert _s208_publish(plan, "graph", staged, run_dir, live) is not None
+    assert target.read_bytes() == b'{"s208": "was-absent"}\n'
+    published = _s208_tree(target)
+
+    returned = rollback_profile_migration(live, _s208_request(plan))
+
+    assert returned.status == "rolled_back"
+    assert not os.path.lexists(target), "a prior absence was not restored to absence"
+    failed = _s208_failed_current(run_dir)
+    assert len(failed) == 1
+    assert _s208_tree(failed[0]) == published, "only the exact run-created entry may be quarantined"
+
+
+def test_s208_the_current_target_identity_is_checked_and_drift_is_refused_before_anything_moves(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """acceptance 1 / the card's Stop: target drift is refused, retaining all copies.
+
+    The run's own record pins the identity of the entry it published (the S2-07
+    `staged_identity_key` payload key). A DIFFERENT entry is put at the target name
+    -- a real rename over the vacant name, so the filesystem cannot hand the freed
+    inode back -- and the rollback must refuse with the drift code instead of
+    quarantining a stranger.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=False, publish=("graph",))
+    target = state["targets"]["graph"]
+    run_dir = state["run_dir"]
+    manifest_before = state["manifest_path"].read_bytes()
+    backup_before = _s208_tree(run_dir / "backup")
+
+    replacement = state["home"] / "drifted-graph.json"
+    replacement.write_bytes(b'{"drifted": true}\n')
+    moved = state["home"] / "published-graph-moved-away.json"
+    os.replace(target, moved)
+    os.replace(replacement, target)
+    assert _s208_tree(target) != state["published"]["graph"]
+
+    with pytest.raises(ValueError, match="E_ROLLBACK_TARGET_DRIFT"):
+        rollback_profile_migration(state["manifest_path"], state["request"])
+
+    assert state["manifest_path"].read_bytes() == manifest_before, "a refusal rewrote the run's record"
+    assert _s208_tree(target) == _s208_tree(replacement) or target.read_bytes() == b'{"drifted": true}\n'
+    assert _s208_failed_current(run_dir) == [], "a refused rollback quarantined something"
+    assert _s208_tree(run_dir / "backup") == backup_before
+    assert moved.exists(), "a refused rollback deleted the entry it refused to act on"
+
+
+def test_s208_a_missing_recorded_target_identity_is_refused_rather_than_inferred(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """acceptance 1 + R-4/O-2: no durable comparable identity ⇒ refuse, never infer.
+
+    The run's record here really claims a publication for `graph` but carries no
+    comparable staged identity key at its `prestate_revalidated` event (the
+    publication was driven without a manifest and the events were then appended
+    without the key through the shipped `append_manifest_event`). The target does
+    not hold the pre-state, so the rollback cannot check the CURRENT TARGET
+    IDENTITY against a durable reference and must REFUSE -- never fall back to the
+    fresh plan, and never treat the unrecorded entry as confirmed.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=False, publish=("graph",), live=False)
+    run_dir = state["run_dir"]
+    live = _s207_write_manifest(state["plan"], run_dir)
+    append_manifest_event(
+        live,
+        {
+            "checkpoint": "publishing",
+            "operation": "graph.prestate_revalidated",
+            "payload": {"pinned_kind": "regular_file", "observed_kind": "regular_file"},
+        },
+    )
+    append_manifest_event(
+        live,
+        {
+            "checkpoint": "publishing",
+            "operation": "graph.staging_published",
+            "payload": {"path_present": True},
+        },
+    )
+    assert _s208_tree(state["targets"]["graph"]) != state["prestates"]["graph"]
+    manifest_before = live.read_bytes()
+
+    with pytest.raises(ValueError, match="E_ROLLBACK_IDENTITY_MISSING"):
+        rollback_profile_migration(live, state["request"])
+
+    assert live.read_bytes() == manifest_before
+    assert _s208_failed_current(run_dir) == []
+
+
+def test_s208_a_backup_hash_mismatch_is_refused_before_anything_moves(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """the card's Stop: a backup hash mismatch refuses with nothing mutated.
+
+    The run's own report is rewritten so that its SELF-digest still validates and
+    only one regular-file entry's recorded sha256 stops matching the copy it
+    describes -- exactly the mismatch the guard exists for.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=False, publish=("graph",))
+    run_dir = state["run_dir"]
+    report_path = run_dir / profile_migration.BACKUP_REPORT_NAME
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    entries = [entry for entry in payload["entries"] if entry["artifact"] == "target:graph"]
+    assert entries and entries[0]["present"] is True
+    entries[0]["sha256"] = "0" * 64
+    body = {key: value for key, value in payload.items() if key != "digest"}
+    payload["digest"] = profile_migration._digest(body)
+    report_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    manifest_before = state["manifest_path"].read_bytes()
+    published = _s208_tree(state["targets"]["graph"])
+
+    with pytest.raises(ValueError, match="E_ROLLBACK_BACKUP_MISMATCH"):
+        rollback_profile_migration(state["manifest_path"], state["request"])
+
+    assert state["manifest_path"].read_bytes() == manifest_before
+    assert _s208_tree(state["targets"]["graph"]) == published
+    assert _s208_failed_current(run_dir) == []
+
+
+def test_s208_a_failed_restore_rename_retains_every_copy_and_records_rollback_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """acceptance 5 / DETAIL 10.6 step 10: a failed step retains all copies, no retry.
+
+    The SECOND real ``os.rename`` of the rollback is the restore rename (the first is
+    the diagnostic quarantine). It is injected to fail, so the published entry is
+    already retained in the diagnostic quarantine and the restore has not happened:
+    the run must record `rollback_failed`, keep every copy, and never retry.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=True, publish=("vector",))
+    run_dir = state["run_dir"]
+    target = state["targets"]["vector"]
+    published = _s208_tree(target)
+    real_rename = os.rename
+    seen: list[int] = []
+
+    def _fail_the_second(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        seen.append(1)
+        if len(seen) == 2:
+            raise OSError(errno.EIO, "injected rollback restore rename failure")
+        return real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", _fail_the_second)
+    with pytest.raises(ValueError, match="E_PUBLICATION_RENAME_FAILED"):
+        rollback_profile_migration(state["manifest_path"], state["request"])
+    monkeypatch.setattr(os, "rename", real_rename)
+
+    assert len(seen) == 2 and seen == [1, 1], "the rollback renamed more than the two steps it performed"
+    recorded = load_manifest(state["manifest_path"])
+    assert recorded.status == "rollback_failed"
+    assert (recorded.failure or {}).get("code") == "E_PUBLICATION_RENAME_FAILED"
+    failed = _s208_failed_current(run_dir)
+    assert len(failed) == 1 and _s208_tree(failed[0]) == published, "the quarantined copy was not retained"
+    assert not os.path.lexists(target), "the failed restore left something at the target"
+    retained = run_dir / profile_migration.QUARANTINE_DIRECTORY_NAME / profile_migration.QUARANTINE_PREPUBLISH_NAME
+    assert any(os.path.islink(path) for path in retained.iterdir()), "the run's own quarantine was not retained"
+    assert (run_dir / "backup" / "link-entries" / "vector").is_symlink(), "the original backup was lost"
+    assert _s207_operations(state["manifest_path"]) == [
+        *(f"vector.{name}" for name in S206_PUBLISHED_SEQUENCE),
+        "rollback.locked",
+        "rollback.current_quarantined",
+        S208_FAILED_EVENT,
+    ]
+
+
+def test_s208_a_failed_restore_verification_retains_every_copy_without_an_automatic_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """acceptance 5: the reopen verifies the restored regular artifact; failure keeps all.
+
+    The injected fault calls the REAL restore rename and then appends bytes to the
+    file it just put in place, so the verification genuinely reads different bytes.
+    The rollback must refuse with the verification code, keep the diagnostic
+    quarantine, the original backup and the restored (now unverified) copy, and must
+    NOT swap anything again.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=False, publish=("graph",))
+    run_dir = state["run_dir"]
+    target = state["targets"]["graph"]
+    published = state["published"]["graph"]
+    target_parent = os.path.realpath(target.parent)
+    real_rename = os.rename
+    restore_renames: list[int] = []
+
+    def _corrupt_after_the_restore_rename(source: Any, destination: Any, *args: Any, **kwargs: Any) -> Any:
+        outcome = real_rename(source, destination, *args, **kwargs)
+        descriptor = kwargs.get("dst_dir_fd")
+        if (
+            destination == target.name
+            and descriptor is not None
+            and os.path.realpath(f"/proc/self/fd/{descriptor}") == target_parent
+        ):
+            restore_renames.append(1)
+            with target.open("ab") as handle:
+                handle.write(b"CORRUPTED-AFTER-THE-RESTORE-RENAME")
+        return outcome
+
+    monkeypatch.setattr(os, "rename", _corrupt_after_the_restore_rename)
+    with pytest.raises(ValueError, match="E_ROLLBACK_VERIFY_FAILED"):
+        rollback_profile_migration(state["manifest_path"], state["request"])
+    monkeypatch.setattr(os, "rename", real_rename)
+
+    assert restore_renames == [1], "the rollback retried the destructive swap"
+    recorded = load_manifest(state["manifest_path"])
+    assert recorded.status == "rollback_failed"
+    assert (recorded.failure or {}).get("code") == "E_ROLLBACK_VERIFY_FAILED"
+    assert target.read_bytes() != (state["prestates"]["graph"][0][3] or b"")
+    assert b"CORRUPTED-AFTER" in target.read_bytes()
+    assert (run_dir / "backup" / "graph.json").read_bytes() == (state["prestates"]["graph"][0][3] or b"")
+    failed = _s208_failed_current(run_dir)
+    assert len(failed) == 1 and _s208_tree(failed[0]) == published
+    assert _s207_operations(state["manifest_path"]) == [
+        *(f"graph.{name}" for name in S206_PUBLISHED_SEQUENCE),
+        "rollback.locked",
+        "rollback.current_quarantined",
+        "rollback.prestate_restored",
+        S208_FAILED_EVENT,
+    ]
+
+
+def test_s208_the_rollback_chain_and_the_parent_fsyncs_of_a_restored_artifact_are_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """DETAIL 9.3/10.6 steps 8-9: the rollback chain, the fsyncs and the reopen.
+
+    The REAL ``os.fsync`` calls are observed, so the claim is about the descriptors
+    the rollback actually fsynced: the target parent, the diagnostic quarantine
+    directory and the run-owned restore staging directory all appear.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=False, publish=("graph",))
+    run_dir = state["run_dir"]
+    fsynced = _s206_fsync_spy(monkeypatch)
+
+    returned = rollback_profile_migration(state["manifest_path"], state["request"])
+
+    assert returned.status == "rolled_back"
+    assert _s207_operations(state["manifest_path"]) == [
+        *(f"graph.{name}" for name in S206_PUBLISHED_SEQUENCE),
+        *S208_ROLLBACK_CHAIN,
+    ]
+    parents = {
+        os.path.realpath(str(state["targets"]["graph"].parent)),
+        os.path.realpath(
+            str(run_dir / profile_migration.QUARANTINE_DIRECTORY_NAME / S208_QUARANTINE_FAILED_NAME)
+        ),
+        os.path.realpath(str(run_dir / S208_RESTORE_NAME)),
+    }
+    assert parents <= set(fsynced), "a parent of a rollback rename was never fsynced"
+
+
+def test_s208_the_rollback_entrypoint_repeats_the_apply_guards(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """GUARD (PASSES at BASE by design): rollback repeats the apply guards itself.
+
+    Intent, exact canonical target, attestation and the apply flag are re-validated
+    by the entrypoint on its own; nothing is inherited from the run that produced the
+    manifest. This node is NOT a RED -- the BASE entrypoint already validates these --
+    it pins that the rollback slice did not drop them.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s208_run(tmp_path, legacy=True, publish=("vector",))
+    tree_before = _s208_tree(state["home"])
+
+    with pytest.raises(ValueError, match="E_STOP_ATTESTATION_REQUIRED"):
+        rollback_profile_migration(
+            state["manifest_path"], replace(state["request"], stop_attestation=None)
+        )
+    with pytest.raises(ValueError, match="E_CONFIRM_TARGET_MISMATCH"):
+        rollback_profile_migration(
+            state["manifest_path"], replace(state["request"], confirm_target=str(state["home"] / "elsewhere"))
+        )
+    with pytest.raises(ValueError, match="E_APPLY_MODE_REQUIRED"):
+        rollback_profile_migration(state["manifest_path"], replace(state["request"], mode="dry-run"))
+
+    assert _s208_tree(state["home"]) == tree_before, "a refused rollback mutated the tree"
