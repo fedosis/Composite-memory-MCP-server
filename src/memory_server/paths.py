@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from dataclasses import dataclass, field
@@ -10,12 +11,31 @@ from types import MappingProxyType
 from typing import Literal, Mapping, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import prometheus_client
+
+from memory_server.evaluation.metrics import metrics_registry
+
 StorageMode = Literal["profile", "shared", "standalone"]
 StoreKind = Literal["sqlite", "lancedb", "qdrant_remote", "qdrant_memory", "graph"]
 ArtifactKind = Literal["absent", "regular_file", "directory", "symlink", "special"]
 OriginKind = Literal["default", "settings", "yaml", "env", "legacy_env"]
 
 _DEFAULT_SQLITE_URL = "sqlite+aiosqlite:///data/memory.db"
+
+_LAYOUT_ERROR_CODES = (
+    "E_ARTIFACT_IDENTITY_CHANGED", "E_FORBIDDEN_TARGET_ROOT", "E_HERMES_HOME_REQUIRED",
+    "E_PATH_FINAL_SYMLINK_UNSAFE", "E_PATH_HARDLINK_UNSAFE", "E_PATH_OUTSIDE_ROOT",
+    "E_PATH_OVERLAP", "E_PATH_SPECIAL_FILE", "E_PATH_SYMLINK_PARENT", "E_PROFILE_ROOT_EXTERNAL",
+    "E_QDRANT_PROFILE_NAMESPACE_UNDEFINED", "E_SHARED_ROOT_REQUIRED", "E_SHARED_ROOT_RELATIVE",
+    "E_SHARED_SPLIT_LAYOUT", "E_STANDALONE_ROOT_RELATIVE", "E_STORAGE_MODE_INVALID",
+    "E_VECTOR_BACKEND_INVALID",
+)
+_layout_validation_failures = prometheus_client.Counter(
+    "cmms_layout_validation_failures_total", "Storage layout validation failures", ["code"], registry=metrics_registry
+)
+_layout_validation_failure_children = {
+    code: _layout_validation_failures.labels(code=code) for code in _LAYOUT_ERROR_CODES
+}
 
 
 class StorageLayoutError(ValueError):
@@ -24,6 +44,9 @@ class StorageLayoutError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+        child = _layout_validation_failure_children.get(code)
+        if child is not None:
+            child.inc()
 
 
 @dataclass(frozen=True)
@@ -410,8 +433,14 @@ def _redact_url(url: str, *, redact_all_query: bool = False) -> str:
 
 
 def serialize_layout_redacted(layout: StorageLayout) -> dict[str, object]:
+    profile_hash = hashlib.sha256(str(layout.profile_home or layout.data_root).encode()).hexdigest()[:16]
+    root_policy = {"profile": "profile-owned", "shared": "explicit-shared", "standalone": "standalone"}[layout.mode]
     return {
         "mode": layout.mode,
+        "profile_hash": profile_hash,
+        "root_policy": root_policy,
+        "store_kind": {"sqlite": layout.sqlite.kind, "vector": layout.vector.backend, "graph": "snapshot"},
+        "origins": {key: value.kind for key, value in layout.origins.items()},
         "profile_home": str(layout.profile_home) if layout.profile_home else None,
         "data_root": str(layout.data_root),
         "sqlite": _redact_url(layout.sqlite.effective_url),

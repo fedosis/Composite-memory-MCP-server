@@ -21,6 +21,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import prometheus_client
+from storage.outbox import OutboxRepository
+
+from memory_server.evaluation.metrics import metrics_registry
 from memory_server.paths import (
     StorageLayout,
     StorageLayoutError,
@@ -41,6 +45,20 @@ from memory_server.settings import get_openai_api_key, get_settings
 from memory_server.storage_lock import RuntimeStorageLock, open_directory_nofollow
 
 logger = logging.getLogger(__name__)
+
+_outbox_pending = prometheus_client.Gauge(
+    "cmms_outbox_pending", "Pending outbox entries", registry=metrics_registry
+)
+_outbox_failed = prometheus_client.Gauge(
+    "cmms_outbox_failed", "Failed outbox entries", registry=metrics_registry
+)
+
+
+async def _update_outbox_metrics(provider: "HermesProvider") -> None:
+    async with await provider._provider._get_session() as session:
+        repository = OutboxRepository(session)
+        _outbox_pending.set(await repository.get_pending_count())
+        _outbox_failed.set(await repository.get_failed_count())
 
 PROJECTION_MIGRATION_HINT = "Run `memory-server migrate-profile-storage` to rebuild unavailable projections."
 
@@ -1784,6 +1802,7 @@ class HermesProvider:
 
     async def _handle_metrics(self) -> str:
         from memory_server.evaluation.metrics import generate_latest
+        await _update_outbox_metrics(self)
         return generate_latest().decode("utf-8")
 
     async def _handle_set_belief(

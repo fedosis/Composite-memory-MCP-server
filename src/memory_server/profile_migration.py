@@ -171,6 +171,7 @@ import contextlib
 import errno
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -187,7 +188,10 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, cast, ge
 from urllib.parse import quote
 from uuid import uuid4
 
+import prometheus_client
+
 from memory_server import projection_rebuild, storage_lock
+from memory_server.evaluation.metrics import metrics_registry
 from memory_server.paths import (
     ArtifactKind,
     StorageLayout,
@@ -198,6 +202,38 @@ from memory_server.paths import (
     resolve_storage_layout,
     serialize_layout_redacted,
 )
+
+logger = logging.getLogger(__name__)
+_migration_runs = prometheus_client.Counter(
+    "cmms_migration_runs_total",
+    "Terminal profile migration runs",
+    ["state", "strategy"],
+    registry=metrics_registry,
+)
+_MIGRATION_TERMINAL_STATES = frozenset({"complete", "failed", "rolled_back", "rollback_failed"})
+
+
+def _manifest_observability_totals(artifacts: Mapping[str, Any]) -> tuple[int, int]:
+    counts = bytes_total = 0
+    for value in artifacts.values():
+        if isinstance(value, Mapping):
+            nested_counts, nested_bytes = _manifest_observability_totals(value)
+            counts += nested_counts
+            bytes_total += nested_bytes
+        elif isinstance(value, list):
+            nested_counts, nested_bytes = _manifest_observability_totals(
+                {str(i): item for i, item in enumerate(value)}
+            )
+            counts += nested_counts
+            bytes_total += nested_bytes
+    if isinstance(artifacts.get("count"), int):
+        counts += artifacts["count"]
+    if isinstance(artifacts.get("size"), int):
+        bytes_total += artifacts["size"]
+    if isinstance(artifacts.get("bytes"), int):
+        bytes_total += artifacts["bytes"]
+    return counts, bytes_total
+
 
 MigrationStrategy = Literal["rebuild-from-profile-sql"]
 MigrationMode = Literal["dry-run", "apply", "resume", "rollback"]
@@ -2915,6 +2951,7 @@ def _write_manifest(path: Path, manifest: MigrationManifest) -> None:
     unlinked on an error path.
     """
     target = Path(path)
+    started = time.perf_counter()
     payload = _encode_manifest(manifest)
     run_dir = target.parent
     _prepare_run_directory(run_dir, manifest.run_id)
@@ -2936,6 +2973,25 @@ def _write_manifest(path: Path, manifest: MigrationManifest) -> None:
         os.close(descriptor)
     os.replace(temp, target)
     _fsync_directory(run_dir)
+    counts, bytes_total = _manifest_observability_totals(manifest.artifacts)
+    event = manifest.events[-1] if manifest.events else None
+    if manifest.status in _MIGRATION_TERMINAL_STATES:
+        _migration_runs.labels(state=manifest.status, strategy=manifest.strategy).inc()
+    logger.info(
+        "cmms.migration %s",
+        json.dumps(
+            {
+                "run_id": manifest.run_id,
+                "checkpoint": manifest.checkpoint,
+                "artifact_operation": event.operation if event else "manifest_write",
+                "counts": counts,
+                "bytes": bytes_total,
+                "elapsed": time.perf_counter() - started,
+                "manifest_path": f"<redacted>/{target.name}",
+            },
+            sort_keys=True,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
