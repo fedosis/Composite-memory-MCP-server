@@ -2908,6 +2908,41 @@ def test_s204_apply_detects_a_real_old_sqlite_writer_and_never_signals_it(
     assert proc.exitcode == 0
 
 
+def _s204_graph_writer(database: str, ready, release) -> None:
+    """Hold a real graph descriptor while the maintenance root lock is free."""
+    handle = open(database, "rb")
+    ready.put(os.getpid())
+    release.wait(10)
+    handle.close()
+
+
+def test_s204_apply_rejects_a_real_graph_active_writer_after_root_lock_success(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    import multiprocessing
+
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path = _s205_home(tmp_path)
+    request, plan = _s204_planned_request(home, db_path)
+    graph = Path(plan.layout.graph_snapshot_path)
+    ready: multiprocessing.Queue[int] = multiprocessing.Queue()
+    release = multiprocessing.Event()
+    proc = multiprocessing.Process(target=_s204_graph_writer, args=(str(graph), ready, release))
+    proc.start()
+    try:
+        assert ready.get(timeout=8) != os.getpid()
+        with pytest.raises(ValueError, match="E_OLD_WRITER_ACTIVE"):
+            apply_profile_migration(plan)
+        assert proc.is_alive()
+    finally:
+        release.set()
+        proc.join(10)
+        if proc.is_alive():
+            proc.terminate()
+    assert proc.exitcode == 0
+
+
 def test_s204_apply_detects_a_source_written_during_the_quiet_interval(
     tmp_path: Path, synthetic_storage_env
 ) -> None:
@@ -8960,3 +8995,98 @@ def test_s306_the_event_coverage_ledger_is_the_fault_injection_inventory() -> No
         "graph.staging_published",
         "graph.parent_fsynced",
     }
+
+
+def test_s205_corrupt_sqlite_snapshot_is_refused_with_integrity_code(tmp_path: Path) -> None:
+    source = tmp_path / "corrupt.db"
+    _seed_s301_snapshot(source)
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "INSERT INTO facts VALUES (?, ?, ?, ?, ?, ?)",
+            ("corrupt", "X" * 100_000, "is", "Y", "s", "active"),
+        )
+        connection.commit()
+    payload = bytearray(source.read_bytes())
+    payload[4096] ^= 0xFF
+    source.write_bytes(payload)
+
+    verification, diagnostics = profile_migration._qualify_sqlite(
+        source,
+        profile_migration._inventory(source, artifact="source"),
+        {
+            suffix: profile_migration._inventory(Path(str(source) + suffix), artifact=f"sidecar{suffix}")
+            for suffix in ("-wal", "-shm", "-journal")
+        },
+    )
+    assert verification["integrity"] == "failed"
+    assert any(item.code == "E_SQLITE_INTEGRITY" for item in diagnostics)
+
+
+def test_s205_publication_sees_unchanged_target_until_durable_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _s306_state(tmp_path, monkeypatch)
+    before_vector = _s208_tree(state["vector_path"])
+    before_graph = state["graph_path"].read_bytes()
+    real_publish = profile_migration.publish_artifact
+    observed: list[bool] = []
+
+    def publish(*args: Any, **kwargs: Any) -> Any:
+        artifact = args[1]
+        assert (state["run_dir"] / profile_migration.BACKUP_REPORT_NAME).is_file()
+        if artifact == "vector":
+            assert _s208_tree(state["vector_path"]) == before_vector
+        else:
+            assert state["graph_path"].read_bytes() == before_graph
+        observed.append(True)
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(profile_migration, "publish_artifact", publish)
+    manifest = _s306_apply(state["plan"], embedder=_s306_embedder())
+    assert manifest.checkpoint == "complete"
+    assert observed == [True, True]
+
+
+@pytest.mark.parametrize(
+    "suffix,code",
+    (("-wal", "E_SQLITE_WAL_ACTIVE"), ("-shm", "E_SQLITE_SHM_AMBIGUOUS"), ("-journal", "E_SQLITE_HOT_JOURNAL")),
+)
+def test_s203_source_and_legacy_matrix_stays_byte_exact_on_sidecar_refusal(
+    tmp_path: Path, suffix: str, code: str
+) -> None:
+    home, db_path = _s205_home(tmp_path)
+    sidecar = Path(str(db_path) + suffix)
+    sidecar.write_bytes(b"sidecar-marker")
+    before = _tree_snapshot(home / "data")
+    request = _s204_request(home, db_path, mode="apply")
+    initial = plan_profile_migration(request)
+    confirmed = replace(request, embedding_plan_digest=initial.embedding.digest)
+    plan = plan_profile_migration(confirmed)
+    with pytest.raises(ValueError, match=code):
+        apply_profile_migration(plan)
+    assert _tree_snapshot(home / "data") == before
+
+
+@pytest.mark.parametrize(
+    "event", ("prestate_revalidated", "prestate_quarantined", "staging_published", "parent_fsynced")
+)
+def test_s306_symlink_referent_is_exact_at_each_injected_publication_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    synthetic_storage_env,
+    event: str,
+) -> None:
+    synthetic_storage_env.assert_injection()
+    state = _s306_state(tmp_path, monkeypatch, symlinked=True)
+    referent_before = _tree_snapshot(state["external"])
+    raw_target = os.readlink(state["vector_path"])
+    _s306_fail_event(monkeypatch, "vector", event)
+    with pytest.raises(ValueError, match=S306_INJECTED):
+        _s306_apply(state["plan"], embedder=_s306_embedder())
+    assert _tree_snapshot(state["external"]) == referent_before
+    monkeypatch.undo()
+    rollback = profile_migration.rollback_profile_migration(state["live"], state["request"])
+    assert rollback is not None
+    assert state["vector_path"].is_symlink()
+    assert os.readlink(state["vector_path"]) == raw_target
+    assert _tree_snapshot(state["external"]) == referent_before
