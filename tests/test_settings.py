@@ -402,6 +402,15 @@ class TestPrecedenceContextB:
             "llm_max_input_chars",
             "llm_confidence_gate",
             "llm_base_url",
+            "storage_mode",
+            "data_root",
+            "vector_backend",
+            "lancedb_path",
+            "graph_snapshot_path",
+            "qdrant_location",
+            "vector_collection",
+            "storage_origins",
+            "storage_snapshot",
         }
         assert set(config.__dataclass_fields__) == expected
 
@@ -640,6 +649,10 @@ def _reset_server_singletons():
     server_module._hybrid_router = None
     server_module._outbox_worker = None
     server_module._outbox_task = None
+    server_module._storage_settings = None
+    server_module._storage_layout = None
+    server_module._root_lock = None
+    server_module._storage_cleanup_failed = False
 
 
 class TestServerWiring:
@@ -667,7 +680,9 @@ class TestServerWiring:
             "MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///custom.db"
         )
         get_settings.cache_clear()
-        assert server_module._get_sqlite_db_url() == "sqlite+aiosqlite:///custom.db"
+        layout = server_module._get_storage_layout()
+        assert layout.sqlite.configured_url == "sqlite+aiosqlite:///custom.db"
+        assert layout.sqlite.effective_url.endswith("/custom.db")
 
     def test_graph_snapshot_path_env_override(self, monkeypatch, tmp_path):
         import memory_server.server as server_module
