@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1225,19 +1226,24 @@ class TestServerOutboxIntegration:
 
     async def test_migration_creates_outbox_table(self, tmp_path: Path):
         """Verify an online Alembic upgrade creates outbox_entries."""
-        project_dir = os.path.join(os.path.dirname(__file__), "..")
+        project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         gate_tmp = Path(os.environ.get("GATE_TMP", str(tmp_path)))
         gate_tmp.mkdir(parents=True, exist_ok=True)
         db_path = gate_tmp / f"tmp_outbox_migration_{uuid.uuid4().hex}.db"
         ini_path = gate_tmp / f"tmp_outbox_migration_{uuid.uuid4().hex}.ini"
         with open(os.path.join(project_dir, "alembic.ini"), encoding="utf-8") as stream:
-            ini_text = stream.read().replace("sqlite:///memory.db", f"sqlite:///{db_path}")
+            ini_text = (
+                stream.read()
+                .replace("%(here)s/alembic", os.path.join(project_dir, "alembic"))
+                .replace("%(here)s/migrations/versions", os.path.join(project_dir, "migrations", "versions"))
+                .replace("sqlite:///memory.db", f"sqlite:///{db_path}")
+            )
         with open(ini_path, "w", encoding="utf-8") as stream:
             stream.write(ini_text)
 
         try:
             result = subprocess.run(
-                ["alembic", "-c", ini_path, "upgrade", "head"],
+                [sys.executable, "-m", "alembic", "-c", str(ini_path), "upgrade", "head"],
                 cwd=project_dir,
                 capture_output=True,
                 text=True,

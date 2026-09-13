@@ -1361,3 +1361,29 @@ class TestHermesPluginConfig:
         """Empty cmms_path (direct construction) is allowed by validation."""
         config = HermesPluginConfig()
         config.validate_shared_root()  # no raise
+
+
+def test_combined_provider_layout_missing_home_lifecycle_and_tools(synthetic_storage_env):
+    """One real provider proves frozen layout, pre-I/O home guard, and retained API."""
+    home = synthetic_storage_env.root / "combined"
+    home.mkdir()
+    provider = HermesProvider()
+    with pytest.raises(Exception) as missing:
+        provider.initialize("missing-home", config={"db_url": "sqlite+aiosqlite:///data/memory.db"})
+    assert missing.value.code == "E_HERMES_HOME_REQUIRED"
+    assert provider._provider is None
+    provider.initialize("combined", hermes_home=str(home))
+    try:
+        synthetic_storage_env.assert_provider_synthetic(provider, profile_home=home)
+        assert provider._storage_layout.data_root == home
+        assert provider._provider is not None
+        assert provider._writer is not None
+        assert {schema["name"] for schema in provider.get_tool_schemas()} == {
+            "ping", "search", "remember", "get_context", "learn", "semantic_search",
+            "graph_search", "route", "audit", "metrics", "set_belief", "get_belief",
+            "resolve_conflict", "reflect",
+        }
+        assert provider.is_available() is True
+    finally:
+        provider.shutdown()
+    assert provider.is_available() is False
