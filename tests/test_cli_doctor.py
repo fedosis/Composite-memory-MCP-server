@@ -76,6 +76,39 @@ class TestDoDoctor:
         home.mkdir(parents=True, exist_ok=True)
         (home / "config.yaml").write_text(text)
 
+    def test_s5_02c_missing_path_uses_explicit_default_and_is_ok(self, tmp_path):
+        """A missing installation path uses the documented default without
+        changing profile-owned storage placement or causing a doctor error.
+        """
+        from memory_server.cli import _doctor_report
+
+        self.cfg(
+            tmp_path,
+            "memory:\n  providers:\n    memory_server:\n"
+            "      plugin: memory_server.plugins.hermes.provider.HermesProvider\n",
+        )
+        row = _doctor_report(str(tmp_path), env={})["profiles"][0]
+        assert row["status"] == "OK"
+        assert row["code"] is None
+        assert row["canonical_origins"]["installation"] == "default"
+        out = []
+        assert _do_doctor(str(tmp_path), out=out.append) == 0
+        assert out == ["OK default: layout is coherent"]
+
+    def test_s5_02c_non_cmms_profile_is_skipped_cleanly(self, tmp_path):
+        """A home without the CMMS provider is not reported as a CMMS
+        diagnostic and therefore remains a clean doctor result.
+        """
+        from memory_server.cli import _doctor_report
+
+        self.cfg(tmp_path, "model:\n  default: x\n")
+        report = _doctor_report(str(tmp_path), env={})
+        assert report["status"] == "OK"
+        assert report["profiles"] == []
+        out = []
+        assert _do_doctor(str(tmp_path), out=out.append) == 0
+        assert out == []
+
     def test_s402_matrix(self, tmp_path, monkeypatch):
         from memory_server.cli import _doctor_report
 
