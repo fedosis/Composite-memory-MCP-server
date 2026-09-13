@@ -1,0 +1,29 @@
+diff --git a/tests/test_outbox.py b/tests/test_outbox.py
+index 9e6326f..056296f 100644
+--- a/tests/test_outbox.py
++++ b/tests/test_outbox.py
+@@ -40,9 +40,14 @@ from memory_server.router.graph_router import GraphRouter
+ # =============================================================================
+ 
+ 
++def _sandbox_tmp_root(fallback: Path) -> Path:
++    """Return the certified writable scratch root when one is configured."""
++    return Path(os.environ.get("GATE_TMP", str(fallback)))
++
++
+ def _make_engine_and_factory(root: Path | None = None):
+     """Create a unique file-based SQLite engine + session factory."""
+-    root = root or Path(os.environ.get("GATE_TMP", ".pytest-tmp"))
++    root = _sandbox_tmp_root(root or Path(".pytest-tmp"))
+     root.mkdir(parents=True, exist_ok=True)
+     db_path = root / f"test_outbox_{uuid.uuid4().hex[:16]}.db"
+     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+@@ -1227,7 +1232,7 @@ class TestServerOutboxIntegration:
+     async def test_migration_creates_outbox_table(self, tmp_path: Path):
+         """Verify an online Alembic upgrade creates outbox_entries."""
+         project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+-        gate_tmp = Path(os.environ.get("GATE_TMP", str(tmp_path)))
++        gate_tmp = _sandbox_tmp_root(tmp_path)
+         gate_tmp.mkdir(parents=True, exist_ok=True)
+         db_path = gate_tmp / f"tmp_outbox_migration_{uuid.uuid4().hex}.db"
+         ini_path = gate_tmp / f"tmp_outbox_migration_{uuid.uuid4().hex}.ini"
