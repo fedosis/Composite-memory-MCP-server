@@ -575,16 +575,22 @@ def _migration_dry_run_payload(plan: MigrationPlan, request: MigrationRequest) -
     """Return the library-owned DETAIL 8 report without recreating its schema."""
     report = getattr(plan, "report", None)
     if isinstance(report, dict) and report:
-        return dict(report)
+        payload = dict(report)
+        payload["run_id"] = request.run_id
+        payload["profile_home"] = str(request.profile_home)
+        payload["embedding"] = plan.embedding
+        return payload
     # Compatibility for small callers that construct a pre-S2 test double.
     return {
         "schema_version": 1,
         "run_id": request.run_id,
+        "profile_home": str(request.profile_home),
         "mode": "dry-run",
         "strategy": request.strategy,
         "source_sql": plan.source_sql.__dict__,
         "target": {"root": str(plan.layout.data_root)},
         "lock_availability": plan.lock_availability,
+        "embedding": plan.embedding,
         "warnings": [warning.__dict__ for warning in plan.warnings],
         "blockers": [blocker.__dict__ for blocker in plan.blockers],
         "planned_operations": [operation.__dict__ for operation in plan.planned_operations],
@@ -612,6 +618,11 @@ def _migration_human_output(result: dict) -> list[str]:
     lines = [f"mode: {result.get('mode', result.get('status', 'unknown'))}"]
     if result.get("strategy"):
         lines.append(f"strategy: {result['strategy']}")
+    if result.get("mode") == "dry-run":
+        if result.get("run_id"):
+            lines.append(f"run_id: {result['run_id']}")
+        if result.get("proposed_manifest_path"):
+            lines.append(f"proposed_manifest_path: {result['proposed_manifest_path']}")
     if result.get("blockers"):
         lines.append(f"blockers: {len(result['blockers'])}")
     if result.get("warnings"):

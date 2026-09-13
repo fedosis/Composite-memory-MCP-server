@@ -166,11 +166,17 @@ def test_s4_03_dry_run_payload_is_the_library_report() -> None:
 def test_s4_03_json_switch_and_human_output_are_distinct(tmp_path: Path) -> None:
     from typer.testing import CliRunner
 
-    plan = type("Plan", (), {"report": {
-        "schema_version": 1, "run_id": "r", "mode": "dry-run",
-        "strategy": "rebuild-from-profile-sql", "blockers": [],
-    }})()
-    request = type("Request", (), {})()
+    plan = type("Plan", (), {
+        "report": {
+            "schema_version": 1, "run_id": "r", "mode": "dry-run",
+            "strategy": "rebuild-from-profile-sql", "blockers": [],
+            "proposed_manifest_path": "/target/.cmms-migrations/r/manifest.json",
+        },
+        "embedding": {"digest": "d"},
+    })()
+    request = type("Request", (), {
+        "run_id": "r", "profile_home": tmp_path,
+    })()
     monkey = pytest.MonkeyPatch()
     monkey.setattr(cli, "plan_profile_migration", lambda _request: plan)
     monkey.setattr(cli, "MigrationRequest", lambda *args, **kwargs: request)
@@ -180,10 +186,41 @@ def test_s4_03_json_switch_and_human_output_are_distinct(tmp_path: Path) -> None
         machine = runner.invoke(cli.app, ["migrate-profile-storage", "--hermes-home", str(tmp_path), "--json"])
         assert human.exit_code == 0
         assert "mode: dry-run" in human.stdout
+        assert "run_id: r" in human.stdout
+        assert "proposed_manifest_path: /target/.cmms-migrations/r/manifest.json" in human.stdout
         assert json.loads(machine.stdout)["mode"] == "dry-run"
         assert human.stdout != machine.stdout
     finally:
         monkey.undo()
+
+
+def test_s4_03_dry_run_dispatches_request_and_embedding_fields() -> None:
+    embedding = type("Embedding", (), {"backend": "lancedb", "digest": "digest-r1"})()
+    plan = type("Plan", (), {
+        "report": {"mode": "dry-run", "target": {"root": "/target", "vector": "/vec"}},
+        "embedding": embedding,
+    })()
+    request = type("Request", (), {"run_id": "r1", "profile_home": Path("/home/profile")})()
+    payload = cli._migration_dry_run_payload(cast(Any, plan), cast(Any, request))
+    assert payload["run_id"] == "r1"
+    assert payload["profile_home"] == "/home/profile"
+    assert payload["embedding"] is embedding
+    assert payload["embedding"].digest == "digest-r1"
+
+
+def test_s4_03_digest_from_dry_run_is_accepted_by_apply(tmp_path: Path) -> None:
+    home, source = _s403_cli_home(tmp_path)
+    run_id = "dddddddddddddddddddddddddddddddd"
+    dry = _s403_cli(home, "--source-sql", str(source), "--run-id", run_id, "--json")
+    assert dry.returncode == 0
+    digest = json.loads(dry.stdout)["embedding"]["digest"]
+    applied = _s403_cli(
+        home, "--source-sql", str(source), "--run-id", run_id, "--apply",
+        "--confirm-target", str(home), "--attest-runtimes-stopped", "ticket",
+        "--confirm-embedding-plan", digest, "--json",
+    )
+    assert applied.returncode != 2
+    assert "E_EMBEDDING_PLAN_DIGEST_REQUIRED" not in applied.stdout
 
 
 def test_s4_03_resume_forwards_embedding_and_network_flags(tmp_path: Path) -> None:
