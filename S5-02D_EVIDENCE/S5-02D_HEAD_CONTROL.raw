@@ -1,5 +1,0 @@
-[sandbox-runner] abi=8 handled_fs=0xffff handled_net=0x3 applied=15 skipped_missing=[] deny_network=True
-[sandbox-runner] self-test deny=EACCES_DENIED allow=READ_OK
-...............................................                          [100%]
-47 passed in 7.63s
-PRODUCER_EXIT=0
