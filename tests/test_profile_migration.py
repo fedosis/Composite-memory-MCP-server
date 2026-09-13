@@ -3726,8 +3726,11 @@ def test_s206_the_s0_stub_seam_reports_no_capability_and_the_gate_stays_shut(
     accept -- the S0 stub's own behaviour, kept here as a live adversary. The clause
     is UNCHANGED and is proven on both seams: the gate reads the seam's CAPABILITY
     REPORT and never its return value. R-S305-c is closed by this retarget -- the
-    forged object is CONSUMED (it is the probe's own return value) instead of
-    sitting dead beside the assertion.
+    forged verdict is CONSUMED as the PROBE'S OWN RETURN VALUE inside
+    `_StubShapedSeam.verify_staged_projections` (the class below), which this
+    capability report calls. POST-APPROVAL CORRECTION (F-6): the dead local
+    `forged = ProjectionVerification(True)` that used to sit beside the assertion
+    here has been DELETED; the class's own inline construction is the consumption.
     """
     import asyncio
 
@@ -3753,9 +3756,10 @@ def test_s206_the_s0_stub_seam_reports_no_capability_and_the_gate_stays_shut(
     assert seam_verdict.valid is False, seam_verdict.errors
 
     # A verdict that CLAIMS valid=True, returned by a seam that cannot qualify
-    # itself, opens nothing: every gated transition stays refused.
-    forged = projection_rebuild.ProjectionVerification(True)
-    assert forged.valid is True
+    # itself, opens nothing: every gated transition stays refused. The forged
+    # verdict is constructed INSIDE `_StubShapedSeam` and is that seam's own probe
+    # return value (R-S305-c); POST-APPROVAL CORRECTION (F-6) deleted the dead
+    # `forged = ProjectionVerification(True)` local that used to sit here.
     unqualified = report(_StubShapedSeam)
     assert unqualified.implemented is False, unqualified
     assert unqualified.basis == "unimplemented"
@@ -3916,9 +3920,12 @@ def test_s206_the_engine_primitives_are_not_wired_into_the_public_entrypoints(
     deliverable, so the boundary has moved and the node pins the NEW one, which is
     exactly F7's re-anchoring request (carry-in R2): the public `apply` really does
     reach the backup stage and the forward state machine and really does create the
-    run directory. It still does NOT reach the publication primitive, because the
-    run cannot earn `staged_verified` without a real verifiable source -- which is
-    the ordering the card must not bypass.
+    run directory. It also never reaches the publication primitive, because this
+    fixture's run dies at the SQLite snapshot stage (`E_SQLITE_SCHEMA`) -- but that
+    is NOT asserted here any more: with THIS fixture such an assertion could not
+    fail (see the POST-APPROVAL CORRECTION (F-4) marker in the body), so the
+    ordering is pinned by `test_s306_publication_requires_staged_verified_evidence`
+    and by the E2E node instead.
     """
     env = synthetic_storage_env
     env.assert_injection()
@@ -3945,9 +3952,14 @@ def test_s206_the_engine_primitives_are_not_wired_into_the_public_entrypoints(
 
     assert "create_run_backup" in reached, "the public apply never reached the backup stage"
     assert "advance_manifest_checkpoint" in reached, "the forward state machine was never driven"
-    assert "publish_artifact" not in reached, (
-        "the publication primitive was reached before `staged_verified` was earned"
-    )
+    # POST-APPROVAL CORRECTION (F-4): `assert "publish_artifact" not in reached` used
+    # to sit here and was DROPPED. With THIS fixture it could not fail: the run dies
+    # at `E_SQLITE_SCHEMA`, two checkpoints before any publication could be attempted,
+    # so no production mutation reaches it (the reviewer's R4 mutant kills the R4
+    # node and leaves this one green). Re-anchoring needs a fixture that walks a run
+    # to the publication boundary -- E2E-scale new work, out of scope for a
+    # post-approval correction round. The property is pinned by
+    # `test_s306_publication_requires_staged_verified_evidence` and the E2E node.
     assert _s306_run_dir(home, plan).exists()
 
 
@@ -7785,16 +7797,15 @@ def test_s306_the_real_seam_qualifies_itself_and_opens_every_gated_transition() 
 def test_s306_the_gate_still_refuses_a_seam_that_never_reports_a_capability() -> None:
     """The OTHER half of the gate: an unqualified seam opens nothing.
 
-    R-S305-c: the `forged` verdict is CONSUMED here -- it is the probe's own
-    return value -- instead of sitting unused next to the assertion. A seam that
-    answers `ProjectionVerification(True)` to an input a real verifier cannot
-    accept reports NO capability, exactly like the S0 stub did, and every gated
-    transition stays refused. The negative-probe channel is pinned as a live
-    channel too (a seam that REFUSES the probe qualifies).
+    R-S305-c: the forged verdict is CONSUMED as the probe's own return value inside
+    `_StubShapedSeam.verify_staged_projections` (called by the capability report
+    below), not mirrored by a dead local. POST-APPROVAL CORRECTION (F-6): the
+    `forged = ProjectionVerification(True)` local that used to sit here unused has
+    been DELETED. A seam that answers `ProjectionVerification(True)` to an input a
+    real verifier cannot accept reports NO capability, exactly like the S0 stub
+    did, and every gated transition stays refused. The negative-probe channel is
+    pinned as a live channel too (a seam that REFUSES the probe qualifies).
     """
-
-    forged = projection_rebuild.ProjectionVerification(True)
-    assert forged.valid is True
 
     report = profile_migration.staged_verification_capability
     unqualified = report(_StubShapedSeam)
