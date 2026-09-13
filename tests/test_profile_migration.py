@@ -34,6 +34,7 @@ import pytest
 import memory_server.cli as cli
 import memory_server.profile_migration as profile_migration
 import memory_server.projection_rebuild as projection_rebuild
+from memory_server.plugins.hermes.config import build_storage_config_report
 from memory_server.profile_migration import (
     ArtifactIdentity,
     MigrationManifest,
@@ -1285,6 +1286,36 @@ def test_s2_persist_failure_after_replace_keeps_the_new_manifest_complete(
     assert live.read_bytes() != before
     assert load_manifest(live).completed_steps == ["planned", "locked"]
     assert [path.name for path in run_dir.iterdir() if path.name != "manifest.json"] == []
+
+
+def test_s4_04_config_digest_derivation_stays_compatible_with_base(tmp_path: Path, synthetic_storage_env) -> None:
+    env = synthetic_storage_env
+    env.assert_injection()
+    env.assert_not_live(tmp_path, label="migration root")
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
+
+    plan = plan_profile_migration(
+        MigrationRequest(home, source_sql=db_path, confirm_target="SECRET", stop_attestation="SECRET")
+    )
+
+    report = profile_migration.serialize_layout_redacted(plan.layout)
+    stable_keys = (
+        "mode", "profile_home", "data_root", "sqlite", "vector", "graph",
+        "compatibility", "unavailable_projections",
+    )
+    stable_layout = {key: report[key] for key in stable_keys}
+    config_report = build_storage_config_report(dict(plan.request.raw_config or {}), include_env=True)
+    expected_identity = {
+        "strategy": plan.request.strategy,
+        "profile_home": str(plan.request.profile_home),
+        "layout": stable_layout,
+        "source_sql_origin": "request",
+        "raw_config": config_report.as_dict().get("raw", {}),
+        "effective_config": config_report.as_dict().get("effective", {}),
+        "config_divergence": list(config_report.as_dict().get("divergence", ())),
+    }
+    assert plan.config_digest == profile_migration._digest(expected_identity)
 
 
 def test_s2_config_digest_is_nonsecret_storage_identity(tmp_path: Path, synthetic_storage_env) -> None:
