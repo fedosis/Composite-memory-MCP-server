@@ -1865,7 +1865,7 @@ async def test_s3_07_server_projection_mapping_reraises_non_projection(monkeypat
 
     monkeypatch.setattr(server, "_get_router", broken)
     with pytest.raises(RuntimeError, match="ordinary failure"):
-        await server._get_router()
+        await server.semantic_search_tool(query="x")
 
 
 
