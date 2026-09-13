@@ -42,6 +42,20 @@ from memory_server.storage_lock import RuntimeStorageLock, open_directory_nofoll
 
 logger = logging.getLogger(__name__)
 
+PROJECTION_MIGRATION_HINT = "Run `memory-server migrate-profile-storage` to rebuild unavailable projections."
+
+
+def _projection_error(exc: BaseException) -> str | None:
+    """Return the stable public payload for a projection-unavailable failure."""
+    message = str(exc)
+    if not message.startswith("E_PROJECTION_UNAVAILABLE"):
+        return None
+    return json.dumps({
+        "error": "E_PROJECTION_UNAVAILABLE",
+        "message": message,
+        "hint": PROJECTION_MIGRATION_HINT,
+    })
+
 # ---------------------------------------------------------------------------
 # Background event loop — one per process, reused across sessions.
 # ---------------------------------------------------------------------------
@@ -1533,6 +1547,9 @@ class HermesProvider:
             result = _run_async(handler(**args), timeout=60.0)
             return result if isinstance(result, str) else json.dumps(result)
         except Exception as exc:
+            projection_error = _projection_error(exc)
+            if projection_error is not None:
+                return projection_error
             logger.exception("HermesProvider: tool call '%s' failed", tool_name)
             return json.dumps({"error": str(exc), "tool": tool_name})
 

@@ -17,6 +17,7 @@ baseline checkout to record the mandatory behavioral RED.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from memory_server.paths import (
     serialize_layout_redacted,
     validate_write_target,
 )
-from memory_server.plugins.hermes.provider import HermesProvider
+from memory_server.plugins.hermes.provider import HermesProvider, _run_async
 
 
 def _sqlite_path(provider: HermesProvider) -> Path:
@@ -613,3 +614,66 @@ def test_synthetic_harness_child_process_inherits_only_synthetic_home(synthetic_
         assert str(Path(value).resolve()).startswith(root), (
             f"child {key}={value} is outside the synthetic root {root}"
         )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("semantic_search", {"query": "missing"}),
+        ("graph_search", {"query": "missing"}),
+        ("route", {"query": "missing"}),
+        ("audit", {}),
+    ],
+)
+def test_projection_tools_return_stable_migration_error(synthetic_storage_env, tool_name, args):
+    """Projection-dependent provider tools never turn degradation into success."""
+    home = synthetic_storage_env.root / "home"
+    (home / "data").mkdir(parents=True)
+    external = synthetic_storage_env.root / "external"
+    external.mkdir()
+    unavailable = {"graph"} if tool_name == "graph_search" else {"vector"}
+    if tool_name == "audit":
+        unavailable = {"vector", "graph"}
+    for projection in unavailable:
+        link = home / ("data/lancedb" if projection == "vector" else "data/graph.json")
+        link.symlink_to(external, target_is_directory=True)
+    provider = HermesProvider()
+    try:
+        provider.initialize("s3-07-tools", hermes_home=str(home))
+        result = json.loads(provider.handle_tool_call(tool_name, args))
+        assert result["error"] == "E_PROJECTION_UNAVAILABLE"
+        assert result["hint"] == "Run `memory-server migrate-profile-storage` to rebuild unavailable projections."
+        assert result["message"].startswith("E_PROJECTION_UNAVAILABLE:")
+        assert result not in (None, [], "")
+    finally:
+        provider.shutdown()
+
+
+def test_degraded_provider_write_commits_sql_and_pending_outbox(synthetic_storage_env):
+    """The real remember path remains durable while projection workers are absent."""
+    home = synthetic_storage_env.root / "home"
+    (home / "data").mkdir(parents=True)
+    external = synthetic_storage_env.root / "external"
+    external.mkdir()
+    (home / "data/graph.json").symlink_to(external, target_is_directory=True)
+    provider = HermesProvider()
+    try:
+        provider.initialize("s3-07-write", hermes_home=str(home))
+        result = json.loads(provider.handle_tool_call("remember", {
+            "subject": "degraded", "predicate": "writes", "object": "safely",
+        }))
+        assert result["fact"]["subject"] == "degraded"
+
+        async def inspect_rows():
+            from sqlalchemy import text
+            async with provider._provider.engine.connect() as conn:
+                facts = (await conn.execute(text("SELECT subject FROM facts"))).scalars().all()
+                statuses = (await conn.execute(text("SELECT status FROM outbox_entries"))).scalars().all()
+                return facts, statuses
+
+        facts, statuses = _run_async(inspect_rows())
+        assert facts == ["degraded"]
+        assert statuses == ["pending"]
+        assert provider._outbox_worker is None and provider._outbox_task is None
+    finally:
+        provider.shutdown()
