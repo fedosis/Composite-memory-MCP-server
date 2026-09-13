@@ -349,3 +349,37 @@ working-directory defaults unless `MEMORY_SERVER_DATA_ROOT` is supplied.
 Existing escaping projection symlinks are never followed: startup is
 degraded-safe and vector/graph recall remains unavailable until migration.
 
+### Migration and recovery operator procedure
+
+Inventory source, target, graph, legacy, and symlink artifacts with `lstat`/no-follow
+enumeration; do not follow symlink entries. SQLite is the source of truth and
+`rebuild-from-profile-sql` rebuilds projections rather than partitioning or
+importing mixed legacy stores. Legacy projections are `preserve-only; not imported`.
+
+Before apply, run doctor and the default dry-run against a synthetic or explicitly
+approved operator home. Review source/target identities, schema and integrity
+(or `unknown`), `lock_availability: unknown`, disk margin, embedding backend and
+estimated duration/records/batches. The dry-run does not call the embedder, use
+network, create locks, write configuration, or create a manifest. Remote
+embedding requires explicit network/API-cost authorization and the exact resume
+plan digest; disclose backend availability, duration, network, quota, and API
+cost before approval.
+
+If any WAL/SHM/journal entry is present or ambiguous, BLOCK apply until a normal
+external shutdown makes the database clean. Never manually checkpoint. Never
+delete WAL/SHM. Never copy WAL/SHM. Stop every mixed-version runtime and
+independently verify it stopped before recording the bounded attestation. The
+migration command never stops or restarts services.
+
+Apply backs up/quarantines existing target entries and preserves source and
+legacy identities. Replacement and rollback are no-write-through operations:
+final symlink entries are restored as link entries without touching their
+referents. On failure retain the manifest, backup, staging, and quarantine;
+resume only with a fresh attestation and the exact embedding resume digest.
+
+After exit 0 inspect `complete`, hashes, counts, and projection verification.
+The operator edits YAML separately only after verified data. Start one profile,
+verify the structured `cmms.storage_layout` event and projection health, then
+roll out the remaining profiles. Root-lock-only protection is complete only
+after full rollout.
+

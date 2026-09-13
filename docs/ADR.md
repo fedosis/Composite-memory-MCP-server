@@ -878,3 +878,8 @@ one profile root and never uses the installation checkout for data placement.
 Sharing is explicit and requires a shared mode plus absolute root. Migration
 rebuilds from profile SQL, never imports mixed legacy projections, and is
 backup-backed, dry-run-first, resumable, and rollback-capable.
+
+A.6 bounded divergence carried forward: rebuild creates the "decides" edge
+whenever BOTH endpoints exist in the eligible corpus, which can include edges
+the runtime incremental path would have dropped; runtime/outbox semantics are
+unchanged.

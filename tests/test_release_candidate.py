@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+import sys
 import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 RELEASE_VERSION = "0.12.0b1"
 
 
@@ -110,19 +112,32 @@ def test_manifest_in_includes_changelog():
     assert "include CHANGELOG.md" in manifest
 
 
-def test_sdist_contains_changelog():
+def test_sdist_contains_changelog(tmp_path):
     """Build and verify the sdist tarball actually carries CHANGELOG.md."""
+    import os
+    import shutil
     import subprocess
     import sys
     import tarfile
 
+    import pytest
+
+    if os.environ.get("CMMS_SANDBOX_APPROVED") == "1" or not os.access(ROOT, os.W_OK):
+        pytest.skip("sdist build writes outside the certified read-only gate")
+
+    build_root = tmp_path / "project"
+    shutil.copytree(
+        ROOT,
+        build_root,
+        ignore=shutil.ignore_patterns(".git", ".venv", "dist", "*.egg-info", "__pycache__"),
+    )
     subprocess.run(
-        [sys.executable, "-m", "build", "--sdist"],
-        cwd=ROOT,
+        [sys.executable, "-m", "build", "--sdist", "--no-isolation"],
+        cwd=build_root,
         capture_output=True,
         check=True,
     )
-    sdists = sorted(ROOT.glob("dist/*.tar.gz"))
+    sdists = sorted((build_root / "dist").glob("*.tar.gz"))
     assert sdists, "no sdist found after build"
     with tarfile.open(str(sdists[-1])) as tf:
         names = tf.getnames()
@@ -156,3 +171,122 @@ def test_ci_clean_wheel_smoke_exercises_serve_startup():
     assert "asyncio.wait_for(main(), timeout=15)" in ci
     assert "cwd=tmpdir" in ci
     assert 'await session.call_tool("ping", arguments={})' in ci
+
+
+def test_s405_documented_cli_flags_are_registered_by_the_real_app():
+    from inspect import signature
+
+    from memory_server.cli import doctor, migrate_profile_storage
+
+    doctor_flags = {param.name for param in signature(doctor).parameters.values()}
+    migrate_flags = {param.name for param in signature(migrate_profile_storage).parameters.values()}
+    assert {"hermes_home", "json_output"} <= doctor_flags
+    assert {
+        "hermes_home", "source_sql", "target_root", "strategy", "run_id", "apply",
+        "confirm_target", "attest_runtimes_stopped", "confirm_embedding_plan",
+        "allow_network_embedding", "resume", "rollback", "json_output",
+    } <= migrate_flags
+    usage = _read_text("docs/USAGE.md")
+    for flag in (
+        "--hermes-home", "--source-sql", "--target-root", "--strategy", "--run-id",
+        "--apply", "--confirm-target", "--attest-runtimes-stopped",
+        "--confirm-embedding-plan", "--allow-network-embedding", "--resume", "--rollback", "--json",
+    ):
+        assert flag in usage
+
+
+def test_s405_exit_code_table_matches_committed_mapping():
+    from memory_server.profile_migration import EXIT_CODE_CONDITIONS, exit_code_for_diagnostic
+
+    usage = _read_text("docs/USAGE.md")
+    expected = {
+        0: "doctor fully OK; side-effect-free dry-run with no blockers; apply/resume complete; rollback verified",
+        1: "doctor WARN/ERROR or dry-run/precondition blocker before mutation",
+        2: "Typer/CLI usage error",
+        3: "apply/resume failed after run directory/manifest creation; manifest is resumable or rollback-capable",
+        4: "rollback failed or publication ambiguity requires manual escalation",
+        5: "invalid/tampered/unknown manifest",
+        6: "lock/runtime-writer state cannot be proven safe",
+    }
+    assert set(EXIT_CODE_CONDITIONS) == set(range(7))
+    assert exit_code_for_diagnostic("E_PATH_OUTSIDE_ROOT") == 1
+    assert exit_code_for_diagnostic("CLI_USAGE", phase="usage") == 2
+    assert exit_code_for_diagnostic("E_MIGRATION_STAGE_FAILED", phase="apply") == 3
+    assert exit_code_for_diagnostic("E_PUBLICATION_AMBIGUOUS", phase="rollback") == 4
+    assert exit_code_for_diagnostic("E_MANIFEST_TAMPERED", phase="manifest") == 5
+    assert exit_code_for_diagnostic("E_LOCK_ENTRY_UNSAFE", phase="lock") == 6
+    for code, text in expected.items():
+        assert f"`{code}`" in usage
+        assert text in usage
+
+
+def test_s405_documented_json_shape_is_owned_by_cli_payload_builder():
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from memory_server.cli import _migration_dry_run_payload
+    from memory_server.profile_migration import EmbeddingPlan, MigrationRequest
+
+    request = MigrationRequest(Path("/synthetic/hermes"), run_id="a" * 32)
+    plan = SimpleNamespace(
+        report={
+            "schema_version": 1,
+            "mode": "dry-run",
+            "strategy": "rebuild-from-profile-sql",
+            "lock_availability": "unknown",
+        },
+        embedding=EmbeddingPlan(digest="b" * 64),
+        layout=SimpleNamespace(data_root=Path("/synthetic/data")),
+    )
+    payload = _migration_dry_run_payload(plan, request)
+    assert {
+        "schema_version", "mode", "strategy", "lock_availability", "run_id", "profile_home", "embedding"
+    } <= payload.keys()
+    usage = _read_text("docs/USAGE.md")
+    keys = (
+        "schema_version", "mode", "strategy", "source_sql", "target", "lock_availability",
+        "embedding", "warnings", "blockers", "planned_operations", "proposed_manifest_path",
+    )
+    for key in keys:
+        assert f'"{key}"' in usage
+
+
+def test_s405_adr_records_a6_bounded_rebuild_divergence_verbatim():
+    adr = _read_text("docs/ADR.md")
+    record = (
+        'rebuild creates the "decides" edge whenever BOTH endpoints exist in the eligible corpus, '
+        'which can include edges the runtime incremental path would have dropped; '
+        'runtime/outbox semantics are unchanged.'
+    )
+    assert " ".join(record.split()) in " ".join(adr.split())
+
+
+def test_s405_operator_docs_pin_n2_n3_and_safe_stop_obligations():
+    paths = ("docs/INTEGRATION.md", "docs/USAGE.md", "README.md", "CHANGELOG.md")
+    docs = "\n".join(_read_text(path) for path in paths)
+    for phrase in (
+        "WAL/SHM/journal", "Never manually checkpoint", "Never delete WAL/SHM", "Never copy WAL/SHM",
+        "degraded-safe", "recall is unavailable until migration", "without following them",
+        "independently verified stopped", "root locks are complete only after full rollout",
+        "lock_availability: unknown", "preserve-only; not imported", "API cost",
+    ):
+        assert phrase.lower() in docs.lower()
+
+
+def test_s405_docs_do_not_expose_live_home_or_secret_configuration():
+    paths = ("docs/ADR.md", "docs/INTEGRATION.md", "docs/USAGE.md", "README.md", "CHANGELOG.md")
+    docs = "\n".join(_read_text(path) for path in paths)
+    assert "/home/shtorm" not in docs
+    assert "BEGIN PRIVATE KEY" not in docs
+    assert "api_key:" not in docs.lower()
+    assert "password:" not in docs.lower()
+
+
+def test_s405_manifest_states_and_recovery_claims_match_code_contract():
+    from memory_server.profile_migration import _CHECKPOINTS, _RUN_STATUSES
+
+    usage = _read_text("docs/USAGE.md")
+    for state in _CHECKPOINTS | _RUN_STATUSES:
+        assert f"`{state}`" in usage
+    for phrase in ("quarantine", "source preservation", "resume digest", "config_digest", "rolled_back"):
+        assert phrase.lower() in usage.lower()

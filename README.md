@@ -818,3 +818,17 @@ See [AUTHORS.md](AUTHORS.md) for contributor and attribution information.
 Native Hermes profiles own their SQLite, vector, graph, and lock paths below
 `HERMES_HOME` by default. See [the integration guide](docs/INTEGRATION.md) and
 [usage migration procedure](docs/USAGE.md).
+
+### Migration safety warning
+
+SQLite is authoritative; vector and graph stores are rebuildable projections.
+Native profile/shared/standalone paths are explicit, and remote Qdrant
+namespace ambiguity fails closed. An escaping projection symlink is inspected
+without following it: startup is degraded-safe and recall is unavailable until
+migration. Apply is never run with WAL/SHM/journal sidecars; only a normal
+external shutdown may clear them. Never manually checkpoint, delete, or copy
+those sidecars. Stop every mixed-version runtime and independently verify it
+stopped before attestation. Dry-run `lock_availability: unknown` and unknown
+schema/cost are blockers, not approvals. Migration preserves source and legacy
+artifacts, uses no-write-through backup/quarantine/rollback, and the operator
+edits configuration only after verified data. See [the exact CLI contract](docs/USAGE.md).

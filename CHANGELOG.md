@@ -185,4 +185,20 @@ vector symlink is deliberately not followed; vector recall is unavailable
 until explicit migration. Non-empty SQLite WAL/SHM blocks migration apply;
 only a clean external runtime shutdown may checkpoint it.
 
+### S4-05 operator documentation reconciliation
+
+The migration documentation now matches the committed CLI and implementation:
+SQLite remains the source of truth; `rebuild-from-profile-sql` rebuilds rather
+than partitions; legacy projections are preserve-only; and an escaping vector
+symlink deliberately leaves recall unavailable until migration. Apply is blocked
+by WAL/SHM/journal until normal external shutdown; operators must not manually
+checkpoint, delete, or copy sidecars. Mixed-version runtimes must all be
+stopped and independently verified before attestation. Dry-run unknown
+lock/schema/cost values are not approval, and embedding backend availability,
+duration, network, quota, and API-cost authorization are explicit. Backup,
+quarantine, resume, and rollback preserve source and avoid writing through
+symlinks. Configuration activation remains a separate operator step after data
+verification. See [USAGE.md](docs/USAGE.md) for exact flags, JSON shape,
+manifest states, and exit codes `0`–`6`.
+
 
