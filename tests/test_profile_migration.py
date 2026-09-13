@@ -245,6 +245,124 @@ def test_s4_03_resume_overrides_and_attestation_are_usage_errors(tmp_path: Path)
     assert oversized.exit_code == 2
 
 
+def _s403_cli_home(root: Path) -> tuple[Path, Path]:
+    home = root / "hermes"
+    data = home / "data"
+    data.mkdir(parents=True)
+    source = data / "memory.db"
+    connection = sqlite3.connect(source)
+    connection.execute("create table facts(id text)")
+    connection.commit()
+    connection.close()
+    (home / "config.yaml").write_bytes(b"{}\n")
+    (home / "target-entry").write_bytes(b"target\\x00entry")
+    return home, source
+
+
+def _s403_cli(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment["PYTHONPATH"] = str(source_root) + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["HOME"] = str(home.parent / "synthetic-home")
+    environment["HERMES_HOME"] = str(home)
+    environment["TMPDIR"] = str(home.parent / "synthetic-tmp")
+    Path(environment["HOME"]).mkdir(exist_ok=True)
+    Path(environment["TMPDIR"]).mkdir(exist_ok=True)
+    return subprocess.run(
+        [sys.executable, "-m", "memory_server.cli", "migrate-profile-storage", "--hermes-home", str(home), *args],
+        cwd=home.parent, env=environment, text=True, capture_output=True, check=False,
+    )
+
+
+def _s403_bytes_and_listing(root: Path) -> tuple[tuple[str, int, int, int, bytes | None], ...]:
+    result = []
+    for path in sorted(root.rglob("*")):
+        info = path.lstat()
+        result.append((str(path.relative_to(root)), info.st_size, info.st_mtime_ns, info.st_mode,
+                       path.read_bytes() if path.is_file() else None))
+    return tuple(result)
+
+
+def test_s4_03_b1_dry_run_subprocess_prints_but_creates_no_manifest(tmp_path: Path) -> None:
+    home, source = _s403_cli_home(tmp_path)
+    before = _s403_bytes_and_listing(home)
+    run_id = "0123456789abcdef0123456789abcdef"
+    result = _s403_cli(home, "--source-sql", str(source), "--run-id", run_id, "--json")
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    manifest = home / ".cmms-migrations" / run_id / "manifest.json"
+    assert payload["mode"] == "dry-run"
+    assert payload["proposed_manifest_path"] == str(manifest)
+    assert _s403_bytes_and_listing(home) == before
+    assert not manifest.exists()
+    assert not manifest.parent.exists()
+    assert not (home / ".cmms-migrations").exists()
+
+
+def test_s4_03_b2_strategy_override_and_byte_target_are_refused(tmp_path: Path) -> None:
+    home, source = _s403_cli_home(tmp_path)
+    manifest = home / "manifest.json"
+    strategy = _s403_cli(home, "--resume", str(manifest), "--apply", "--strategy", "rebuild-from-profile-sql")
+    rollback = _s403_cli(home, "--rollback", str(manifest), "--apply", "--strategy", "rebuild-from-profile-sql")
+    assert strategy.returncode == 2
+    assert rollback.returncode == 2
+    target = home / "target"
+    target.mkdir()
+    mismatch = _s403_cli(home, "--source-sql", str(source), "--target-root", str(target), "--apply",
+                         "--confirm-target", str(target) + "x")
+    assert mismatch.returncode == 1
+    assert "E_CONFIRM_TARGET_MISMATCH" in mismatch.stdout
+
+
+def test_s4_03_b3_rollback_subprocess_does_not_require_embedding(tmp_path: Path) -> None:
+    home, source = _s403_cli_home(tmp_path)
+    run_id = "fedcba9876543210fedcba9876543210"
+    dry = _s403_cli(home, "--source-sql", str(source), "--run-id", run_id, "--json")
+    assert dry.returncode == 0
+    plan = plan_profile_migration(MigrationRequest(home, source_sql=source, run_id=run_id))
+    manifest = home / ".cmms-migrations" / run_id / "manifest.json"
+    _write_manifest_for_entrypoint(manifest, plan)
+    result = _s403_cli(home, "--rollback", str(manifest), "--apply", "--confirm-target", str(home),
+                       "--attest-runtimes-stopped", "ticket", "--json")
+    assert result.returncode in {1, 4, 5}
+    assert "E_EMBEDDING_PLAN_DIGEST_REQUIRED" not in result.stdout
+    assert "embedding_cost" not in result.stdout
+
+
+def test_s4_03_b4_apply_failure_after_manifest_is_real_child_exit_three(tmp_path: Path) -> None:
+    home, source = _s403_cli_home(tmp_path)
+    run_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    digest = plan_profile_migration(MigrationRequest(home, source_sql=source)).embedding.digest
+    result = _s403_cli(home, "--source-sql", str(source), "--run-id", run_id, "--apply",
+                       "--confirm-target", str(home), "--attest-runtimes-stopped", "ticket",
+                       "--confirm-embedding-plan", digest, "--json")
+    assert result.returncode == 3
+    assert (home / ".cmms-migrations" / run_id / "manifest.json").is_file()
+    assert json.loads(result.stdout)["code"] == "E_SQLITE_SCHEMA"
+
+
+def test_s4_03_b5_subprocess_dry_run_never_edits_config_or_emits_success_digest(tmp_path: Path) -> None:
+    home, source = _s403_cli_home(tmp_path)
+    config = home / "config.yaml"
+    before = (config.read_bytes(), config.stat().st_mtime_ns)
+    result = _s403_cli(home, "--source-sql", str(source), "--run-id", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "--json")
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert "config_digest" not in payload
+    assert (config.read_bytes(), config.stat().st_mtime_ns) == before
+
+
+def test_s4_03_b6_real_subprocess_json_and_human_outputs_differ(tmp_path: Path) -> None:
+    home, source = _s403_cli_home(tmp_path)
+    run_id = "cccccccccccccccccccccccccccccccc"
+    human = _s403_cli(home, "--source-sql", str(source), "--run-id", run_id)
+    machine = _s403_cli(home, "--source-sql", str(source), "--run-id", run_id, "--json")
+    assert human.returncode == machine.returncode == 0
+    assert human.stdout.startswith("mode: dry-run\n")
+    assert json.loads(machine.stdout)["mode"] == "dry-run"
+    assert human.stdout != machine.stdout
+
+
 def test_s4_01_s1_extra_code_uses_compatible_exit_surface() -> None:
     assert profile_migration.exit_code_for_diagnostic("E_STORAGE_MODE_INVALID") == 1
     diagnostic = profile_migration.Diagnostic(
