@@ -417,7 +417,100 @@ archive(fact_id)
 `memory-server migrate-profile-storage` is a read-only dry-run by default.
 Review its JSON report, then use `--apply --confirm-target <canonical-root>
 --attest-runtimes-stopped <ticket>` only after every CMMS writer is stopped and
-SQLite has no WAL/SHM/journal sidecars. Apply creates a run manifest under
+Apply requires the source SQLite database to have no WAL/SHM/journal sidecars.
+If any sidecar is present or ambiguous, the migration blocks before opening the
+source; only a normal external shutdown may clear it. Apply creates a run
+manifest under
 `.cmms-migrations`; use `--resume` or `--rollback` with the same confirmations.
 Legacy projections are inventory-only (`preserve-only; not imported`).
+
+### Migration contract and exact CLI
+
+The native profile, explicit shared root, and standalone path contracts are
+resolved with precedence from explicit configuration, environment, YAML, and
+safe defaults as implemented by `StorageLayout`; the installation checkout is
+not a data root. Remote Qdrant/profile namespace ambiguity fails closed. SQLite
+is the source of truth; vectors and graph are projections rebuilt by
+`rebuild-from-profile-sql`, not partitioned or imported from a mixed legacy
+projection. An escaping vector symlink produces degraded-safe startup: recall is unavailable until migration.
+
+All examples use synthetic paths and values; they are transcripts/templates,
+not live-home commands. The command is dry-run unless `--apply` is present.
+For apply/resume, copy the digest emitted by the immediately preceding dry-run;
+the displayed digest is a synthetic transcript value:
+
+```text
+memory-server doctor --hermes-home /tmp/synthetic-hermes-home --json
+memory-server migrate-profile-storage --hermes-home /tmp/synthetic-hermes-home \
+  --source-sql /tmp/synthetic-hermes-home/data/memory.db \
+  --target-root /tmp/synthetic-hermes-home/data \
+  --strategy rebuild-from-profile-sql --run-id 0123456789abcdef0123456789abcdef --json
+
+memory-server migrate-profile-storage --hermes-home /tmp/synthetic-hermes-home \
+  --apply --confirm-target /tmp/synthetic-hermes-home/data \
+  --attest-runtimes-stopped ticket-synthetic-001 \
+  --confirm-embedding-plan 1494e1aca9ec745a7db7f92c0b26f8a33dbdc26eb40f904a15ab55e7dc288051
+
+memory-server migrate-profile-storage --hermes-home /tmp/synthetic-hermes-home \
+  --resume /tmp/synthetic-hermes-home/data/.cmms-migrations/0123456789abcdef0123456789abcdef/manifest.json \
+  --apply --confirm-target /tmp/synthetic-hermes-home/data \
+  --attest-runtimes-stopped ticket-synthetic-002 \
+  --confirm-embedding-plan 1494e1aca9ec745a7db7f92c0b26f8a33dbdc26eb40f904a15ab55e7dc288051
+
+memory-server migrate-profile-storage --hermes-home /tmp/synthetic-hermes-home \
+  --rollback /tmp/synthetic-hermes-home/data/.cmms-migrations/0123456789abcdef0123456789abcdef/manifest.json \
+  --apply --confirm-target /tmp/synthetic-hermes-home/data \
+  --attest-runtimes-stopped ticket-synthetic-003
+```
+
+The real option set is `--hermes-home`, `--source-sql`, `--target-root`,
+`--strategy`, `--run-id`, `--apply`, `--confirm-target`,
+`--attest-runtimes-stopped`, `--confirm-embedding-plan`,
+`--allow-network-embedding`, `--resume`, `--rollback`, and `--json`. Resume
+and rollback require `--apply`, are mutually exclusive, and cannot combine
+with a new-run `--source-sql` or `--strategy`. Attestation is at most 256 UTF-8
+bytes. Remote embedding needs both the exact plan digest and explicit
+`--allow-network-embedding`; the operator must authorize network, quota, and
+API cost.
+
+JSON dry-run shape is implementation-owned and may report these keys:
+
+```json
+{"schema_version":1,"mode":"dry-run","strategy":"rebuild-from-profile-sql","source_sql":{},"target":{},"lock_availability":"unknown","embedding":{},"warnings":[],"blockers":[],"planned_operations":[],"proposed_manifest_path":"<synthetic-path>"}
+```
+
+`lock_availability: unknown`, unknown schema/integrity, unknown cost, or a
+mixed-version writer state is not permission to apply. Stop all gateways,
+providers, outbox workers, standalone servers, and maintenance commands, then
+independently verify they are stopped before attestation. The phrase
+`independently verified stopped` is a hard precondition, not a suggestion. A normal external
+shutdown must clear WAL/SHM/journal. Never manually checkpoint. Never delete WAL/SHM.
+Never copy WAL/SHM. The command never stops or restarts a runtime. It inventories
+symlink entries without following them; backup/quarantine and rollback never
+write through a link. Source SQL, legacy stores, backups, and quarantine are
+preserved unless an operator separately removes them. This is the source preservation rule.
+
+Manifest checkpoints are `planned`, `locked`, `backed_up`,
+`sqlite_snapshotted`, `projections_built`, `staged_verified`, `publishing`,
+`published`, `verified`, and `complete`; run statuses are `running`, `failed`,
+`complete`, `rolled_back`, and `rollback_failed`. Resume uses a fresh stop
+attestation and the exact embedding resume digest. After verified data, the
+operator edits configuration separately and records the config_digest only from
+verified data. Root locks are complete only after full rollout; root-lock-only protection is complete only after full rollout.
+
+Process exit codes are the committed CLI contract:
+
+| code | meaning |
+|---:|---|
+| `0` | doctor fully OK; side-effect-free dry-run with no blockers; apply/resume complete; rollback verified |
+| `1` | doctor WARN/ERROR or dry-run/precondition blocker before mutation |
+| `2` | Typer/CLI usage error |
+| `3` | apply/resume failed after run directory/manifest creation; manifest is resumable or rollback-capable |
+| `4` | rollback failed or publication ambiguity requires manual escalation |
+| `5` | invalid/tampered/unknown manifest |
+| `6` | lock/runtime-writer state cannot be proven safe |
+
+No real configuration, credential, memory content, or live-store transcript is
+part of documentation validation; validation uses synthetic homes and no
+network.
 
