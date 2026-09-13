@@ -167,6 +167,21 @@ def test_ci_clean_wheel_smoke_exercises_serve_startup():
     assert 'await session.call_tool("ping", arguments={})' in ci
 
 
+def test_s5_package_source_compiles_in_isolated_tree(tmp_path):
+    import os
+    import subprocess
+
+    environment = os.environ.copy()
+    environment["PYTHONPYCACHEPREFIX"] = str(tmp_path / "pycache")
+    result = subprocess.run(
+        [sys.executable, "-m", "compileall", "-q", str(ROOT / "src"), "-f"],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode == 0
+
+
 def test_s405_documented_cli_flags_are_registered_by_the_real_app():
     from inspect import signature
 
