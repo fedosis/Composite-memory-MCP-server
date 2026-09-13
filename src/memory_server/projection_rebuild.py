@@ -26,11 +26,23 @@ from pathlib import Path
 from typing import AbstractSet, Any, Literal, Mapping, Sequence
 from uuid import NAMESPACE_DNS, uuid5
 
+import prometheus_client
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from memory_server.evaluation.metrics import metrics_registry
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.router.graph_router import GraphRouter
+
+_projection_verification_failures = prometheus_client.Counter(
+    "cmms_projection_verification_failures_total",
+    "Projection verification failures",
+    ["store"],
+    registry=metrics_registry,
+)
+_projection_failure_children = {
+    store: _projection_verification_failures.labels(store=store) for store in ("vector", "graph")
+}
 
 
 @dataclass(frozen=True)
@@ -707,10 +719,16 @@ async def _verify_projection_artifacts(
             "empty digests must never be accepted as proof",
         )
     _observe_snapshot(snapshot_url, observed, errors)
+    vector_errors_before = len(errors)
     await _observe_vector_artifact(
         expected, Path(vector_path), observed, errors, expected_vector_size=expected_vector_size
     )
+    if len(errors) > vector_errors_before:
+        _projection_failure_children["vector"].inc()
+    graph_errors_before = len(errors)
     _observe_graph_artifact(expected, Path(graph_path), observed, errors)
+    if len(errors) > graph_errors_before:
+        _projection_failure_children["graph"].inc()
     expected_nodes_digest, expected_edges_digest = expected_graph_digests(expected)
     actual_nodes_digest = observed.graph_nodes_digest or EMPTY_ID_DIGEST
     actual_edges_digest = observed.graph_edges_digest or EMPTY_ID_DIGEST

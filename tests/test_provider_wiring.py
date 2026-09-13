@@ -1307,6 +1307,44 @@ def test_mark_poisoned_t6_unit():
     assert provider._outbox_stop_failed is False
 
 
+@pytest.mark.asyncio
+async def test_s4_04_metrics_refresh_outbox_gauges():
+    from memory_server.evaluation.metrics import generate_latest
+    from memory_server.plugins.hermes import provider as module
+
+    class Counts:
+        def __init__(self, session):
+            pass
+        async def get_pending_count(self):
+            return 7
+        async def get_failed_count(self):
+            return 2
+
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+        async def __aexit__(self, *args):
+            return False
+
+    class FakeSQLite:
+        async def _get_session(self):
+            return SessionContext()
+
+    class FakeProvider:
+        _provider = FakeSQLite()
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(module, "OutboxRepository", Counts, raising=False)
+        await module._update_outbox_metrics(FakeProvider())
+        snapshot = generate_latest().decode()
+        assert "cmms_outbox_pending 7.0" in snapshot
+        assert "cmms_outbox_failed 2.0" in snapshot
+        assert "cmms_outbox_pending{" not in snapshot
+    finally:
+        monkeypatch.undo()
+
+
 # ---------------------------------------------------------------------------
 # 14. Shutdown reverse order — final flush BEFORE engine dispose ([R4-F1])
 # ---------------------------------------------------------------------------

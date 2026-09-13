@@ -36,6 +36,7 @@ from memory_server.paths import (
     StorageLayout,
     StorageResolutionInputs,
     resolve_storage_layout,
+    serialize_layout_redacted,
     validate_write_target,
 )
 from memory_server.providers.graph_provider import SimpleGraph
@@ -202,6 +203,7 @@ async def lifespan(server: FastMCP):
     """Own all store handles until deterministic final cleanup, even on errors."""
     global _outbox_task
     _ensure_storage_ready()
+    logger.info("cmms.storage_layout %s", serialize_layout_redacted(_get_storage_layout()))
     try:
         provider = await _get_provider()
         worker = await _get_outbox_worker()

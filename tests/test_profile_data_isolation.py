@@ -271,6 +271,28 @@ def test_s1_layout_origins_are_snapshot_and_serialization_is_redacted(tmp_path: 
     assert "api_key" in str(report)
 
 
+def test_s4_04_layout_failures_export_only_closed_code_series(tmp_path: Path) -> None:
+    from memory_server.evaluation.metrics import generate_latest
+
+    with pytest.raises(StorageLayoutError):
+        resolve_storage_layout(StorageResolutionInputs(profile_home=tmp_path / "missing"))
+    after = generate_latest().decode()
+    assert 'cmms_layout_validation_failures_total{code="E_HERMES_HOME_REQUIRED"}' in after
+    assert 'profile=' not in after and 'path=' not in after and 'run_id=' not in after
+    assert len([line for line in after.splitlines() if line.startswith("cmms_layout_validation_failures_total{")]) <= 17
+
+
+def test_s4_04_layout_startup_report_contains_safe_identity_fields(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    report = serialize_layout_redacted(resolve_storage_layout(StorageResolutionInputs(profile_home=home)))
+    assert {
+        "profile_hash", "mode", "root_policy", "store_kind", "origins",
+        "compatibility", "unavailable_projections",
+    } <= report.keys()
+    assert report["profile_hash"] and len(report["profile_hash"]) == 16
+
+
 def test_s1_write_target_rejects_root_and_symlink(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
