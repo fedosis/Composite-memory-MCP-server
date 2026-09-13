@@ -1175,6 +1175,18 @@ def _encode_manifest(manifest: MigrationManifest) -> bytes:
     return _canonical_bytes(asdict(_decode_manifest(asdict(manifest))))
 
 
+_CONFIG_DIGEST_LAYOUT_KEYS = (
+    "mode",
+    "profile_home",
+    "data_root",
+    "sqlite",
+    "vector",
+    "graph",
+    "compatibility",
+    "unavailable_projections",
+)
+
+
 def _config_identity(
     request: MigrationRequest,
     layout: StorageLayout,
@@ -1193,7 +1205,10 @@ def _config_identity(
     return {
         "strategy": request.strategy,
         "profile_home": str(request.profile_home),
-        "layout": serialize_layout_redacted(layout),
+        "layout": {
+            key: serialize_layout_redacted(layout)[key]
+            for key in _CONFIG_DIGEST_LAYOUT_KEYS
+        },
         "source_sql_origin": source_origin,
         "raw_config": view.get("raw", {}),
         "effective_config": view.get("effective", {}),
