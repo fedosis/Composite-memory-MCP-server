@@ -584,13 +584,11 @@ def _migration_dry_run_payload(plan: MigrationPlan, request: MigrationRequest) -
     return {
         "schema_version": 1,
         "run_id": request.run_id,
-        "profile_home": str(request.profile_home),
         "mode": "dry-run",
         "strategy": request.strategy,
         "source_sql": plan.source_sql.__dict__,
         "target": {"root": str(plan.layout.data_root)},
         "lock_availability": plan.lock_availability,
-        "embedding": plan.embedding,
         "warnings": [warning.__dict__ for warning in plan.warnings],
         "blockers": [blocker.__dict__ for blocker in plan.blockers],
         "planned_operations": [operation.__dict__ for operation in plan.planned_operations],
