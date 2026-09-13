@@ -577,8 +577,8 @@ def _migration_dry_run_payload(plan: MigrationPlan, request: MigrationRequest) -
     if isinstance(report, dict) and report:
         payload = dict(report)
         payload["run_id"] = request.run_id
-        payload["profile_home"] = str(request.profile_home)
-        payload["embedding"] = plan.embedding
+        payload["profile_home"] = str(getattr(request, "profile_home", payload.get("profile_home", "")))
+        payload["embedding"] = getattr(plan, "embedding", payload.get("embedding", {}))
         return payload
     # Compatibility for small callers that construct a pre-S2 test double.
     return {
