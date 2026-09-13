@@ -1699,3 +1699,71 @@ async def test_s3_07_server_projection_dispatch_returns_stable_error(monkeypatch
         "message": "E_PROJECTION_UNAVAILABLE: vector requires migration",
         "hint": server.PROJECTION_MIGRATION_HINT,
     }
+
+
+@pytest.mark.asyncio
+async def test_s3_07_server_remember_degraded_skips_graph_lookup(monkeypatch):
+    """The server write boundary remains usable when graph projection is down."""
+    import memory_server.server as server
+
+    class _Dumpable:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def model_dump(self, mode="json"):
+            return self.payload
+
+    called = {}
+
+    async def fake_provider():
+        return object()
+
+    async def graph_unavailable():
+        raise RuntimeError("E_PROJECTION_UNAVAILABLE: graph requires migration")
+
+    async def fake_remember(provider, **kwargs):
+        called.update(kwargs)
+        return {
+            "receipt": _Dumpable({"id": "receipt-1"}),
+            "fact": _Dumpable({"id": "fact-1", "subject": kwargs["subject"]}),
+        }
+
+    monkeypatch.setattr(server, "_get_provider", fake_provider)
+    monkeypatch.setattr(server, "_get_graph_router", graph_unavailable)
+    monkeypatch.setattr(server, "remember_fn", fake_remember)
+
+    result = json.loads(await server.remember_tool(
+        subject="degraded", predicate="writes", object="safely"
+    ))
+    assert result["fact"]["subject"] == "degraded"
+    assert called["subject"] == "degraded"
+    assert "graph" not in called
+
+
+@pytest.mark.asyncio
+async def test_s3_07_server_remember_normal_path_keeps_graph_sync(monkeypatch):
+    """The normal server path still passes the graph for inline compatibility."""
+    import memory_server.server as server
+
+    class _Dumpable:
+        def model_dump(self, mode="json"):
+            return {"id": "x"}
+
+    graph = object()
+    called = {}
+
+    async def fake_provider():
+        return object()
+
+    async def graph_available():
+        return type("Router", (), {"graph": graph})()
+
+    async def fake_remember(provider, **kwargs):
+        called.update(kwargs)
+        return {"receipt": _Dumpable(), "fact": _Dumpable()}
+
+    monkeypatch.setattr(server, "_get_provider", fake_provider)
+    monkeypatch.setattr(server, "_get_graph_router", graph_available)
+    monkeypatch.setattr(server, "remember_fn", fake_remember)
+    await server.remember_tool(subject="normal", predicate="keeps", object="graph")
+    assert called["graph"] is graph

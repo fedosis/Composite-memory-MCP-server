@@ -500,14 +500,21 @@ async def remember_tool(
     collector = get_collector()
     with collector.tool_call("remember") as _ctx:
         provider = await _get_provider()
-        result = await remember_fn(
-            provider,
-            subject=subject,
-            predicate=predicate,
-            object=object,
-            confidence=confidence,
-            source=source,
-        )
+        remember_kwargs = {
+            "subject": subject,
+            "predicate": predicate,
+            "object": object,
+            "confidence": confidence,
+            "source": source,
+        }
+        try:
+            graph_router = await _get_graph_router()
+        except RuntimeError as exc:
+            if _projection_error(exc) is None:
+                raise
+        else:
+            remember_kwargs["graph"] = graph_router.graph
+        result = await remember_fn(provider, **remember_kwargs)
 
         # Serialize Pydantic models in result
         fact = result["fact"]
