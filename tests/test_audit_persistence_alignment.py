@@ -118,6 +118,7 @@ def test_hermes_provider_audit_uses_persisted_sql_state(tmp_path):
         config={
             "db_url": f"sqlite+aiosqlite:///{tmp_path / 'plugin-memory.db'}",
         },
+        hermes_home=str(tmp_path),
     )
 
     provider.handle_tool_call(
@@ -158,6 +159,7 @@ def test_hermes_provider_full_audit_surfaces_persisted_low_confidence(tmp_path):
         config={
             "db_url": f"sqlite+aiosqlite:///{tmp_path / 'plugin-low-confidence.db'}",
         },
+        hermes_home=str(tmp_path),
     )
 
     remember_result = json.loads(
@@ -229,6 +231,7 @@ def test_hermes_provider_audit_loads_graph_snapshot_and_active_vector_backend(tm
             "db_url": f"sqlite+aiosqlite:///{tmp_path / 'plugin-memory.db'}",
             "path": str(tmp_path),
         },
+        hermes_home=str(tmp_path),
     )
 
     provider.handle_tool_call(
