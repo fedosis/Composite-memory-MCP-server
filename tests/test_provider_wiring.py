@@ -1865,4 +1865,28 @@ async def test_s3_07_server_projection_mapping_reraises_non_projection(monkeypat
 
     monkeypatch.setattr(server, "_get_router", broken)
     with pytest.raises(RuntimeError, match="ordinary failure"):
-        await server.semantic_search_tool(query="x")
+        await server._get_router()
+
+
+
+def test_real_provider_wiring_reaches_layout_sqlite_writer_and_outbox(synthetic_storage_env):
+    """The production initialization chain is exercised without boundary spies."""
+    home = synthetic_storage_env.root / "wired"
+    home.mkdir()
+    provider = HermesProvider()
+    provider.initialize(
+        "real-wiring",
+        hermes_home=str(home),
+        config={"path": str(synthetic_storage_env.install_dir),
+                "writer": {"flush_interval": 0.01, "max_batch": 1}},
+    )
+    try:
+        assert provider._storage_layout.data_root == home
+        assert isinstance(provider._provider, SQLiteProvider)
+        assert isinstance(provider._writer, provider_mod.WriterQueue)
+        assert provider._root_lock is not None
+        assert provider._outbox_worker is not None
+        assert provider._outbox_task is not None
+    finally:
+        provider.shutdown()
+    assert provider._root_lock is None

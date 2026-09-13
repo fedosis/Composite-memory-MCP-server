@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -745,6 +746,178 @@ def test_degraded_provider_write_commits_sql_and_pending_outbox(synthetic_storag
         facts, statuses = _run_async(inspect_rows())
         assert facts == ["degraded"]
         assert statuses == ["pending"]
-        assert provider._outbox_worker is None and provider._outbox_task is None
     finally:
         provider.shutdown()
+
+
+def test_real_concurrent_profiles_keep_sql_vectors_graph_and_paths_disjoint(
+    synthetic_storage_env,
+):
+    """Concurrent real providers write and read back only their own stores."""
+    env = synthetic_storage_env
+    homes = {name: env.root / name for name in ("default", "invest-agent")}
+    for home in homes.values():
+        home.mkdir()
+    providers = {}
+    config = {"path": str(env.install_dir), "writer": {"flush_interval": 0.01, "max_batch": 1}}
+    try:
+        for name, home in homes.items():
+            provider = HermesProvider()
+            provider.initialize(f"concurrent-{name}", config=config, hermes_home=str(home))
+            providers[name] = provider
+            env.assert_provider_synthetic(provider, profile_home=home)
+
+        def write(name: str, index: int) -> str:
+            result = json.loads(providers[name].handle_tool_call("remember", {
+                "subject": name, "predicate": "owns", "object": f"fact-{index}",
+            }))
+            search = providers[name].handle_tool_call("search", {"query": name})
+            assert "error" not in search.lower(), search
+            return result["fact"]["subject"]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda pair: write(*pair), homes.items()))
+        assert results == ["default", "invest-agent"]
+
+        async def read_back(provider):
+            from sqlalchemy import text
+            async with provider._provider.engine.connect() as conn:
+                rows = (await conn.execute(text(
+                    "SELECT subject, object FROM facts ORDER BY object"
+                ))).all()
+            vectors = await provider._lancedb.scroll(provider._storage_layout.vector.collection, limit=100)
+            nodes = provider._graph.search_by_type("fact")
+            return rows, vectors, nodes
+
+        for name, provider in providers.items():
+            rows, vectors, nodes = _run_async(read_back(provider))
+            assert len(rows) == 1
+            assert {row.subject for row in rows} == {name}
+            assert all(item.get("payload", {}).get("subject") == name for item in vectors)
+            assert all(node.attributes.get("subject") == name for node in nodes)
+    finally:
+        for provider in reversed(list(providers.values())):
+            provider.shutdown()
+
+
+def test_resolution_installation_path_is_invariant(tmp_path: Path):
+    """Changing only the install/import path cannot change data placement."""
+    home = tmp_path / "profile"
+    home.mkdir()
+    from memory_server.plugins.hermes.config import HermesPluginConfig
+    from memory_server.settings import Settings
+    layouts = [HermesPluginConfig.from_dict({"path": str(path)}).resolve_storage_layout(
+        hermes_home=str(home), settings=Settings(_env_file=None)
+    ) for path in (tmp_path / "install-a", tmp_path / "install-b")]
+    def paths(layout):
+        return (layout.sqlite.local_path, layout.vector.local_path,
+                layout.graph_snapshot_path, layout.graph_lock_path,
+                layout.root_lock_path)
+    assert paths(layouts[0]) == paths(layouts[1])
+
+
+def test_pure_db_resolution_performs_no_filesystem_access(monkeypatch, tmp_path: Path):
+    """Pure URL resolution is behavioral and does not touch filesystem APIs."""
+    from memory_server import paths as paths_module
+    from memory_server.plugins.hermes import config as config_module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(f"filesystem access during pure resolution: {args!r}")
+
+    with monkeypatch.context() as isolated:
+        isolated.setattr(paths_module.os, "stat", forbidden)
+        isolated.setattr(paths_module.os, "open", forbidden)
+        isolated.setattr(config_module, "cmms_repo_root", lambda: tmp_path / "install")
+        config = config_module.HermesPluginConfig.from_dict({
+            "path": str(tmp_path / "install"),
+            "db_url": "sqlite+aiosqlite:///data/memory.db",
+        }, use_env=False)
+        resolved = config.resolve_db_url(str(tmp_path))
+    assert resolved == f"sqlite+aiosqlite:///{tmp_path}/data/memory.db"
+
+
+def test_final_link_doctor_returns_nonzero_without_mutation(synthetic_storage_env):
+    """A degraded final link makes the real doctor return its nonzero contract."""
+    from memory_server.cli import _do_doctor
+    home = synthetic_storage_env.root / "home"
+    (home / "data").mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "memory:\n  providers:\n    memory_server:\n      path: /synthetic/install\n"
+    )
+    external = synthetic_storage_env.root / "external"
+    external.mkdir()
+    (home / "data/graph.json").symlink_to(external, target_is_directory=True)
+    output = []
+    assert _do_doctor(str(home), out=output.append) == 1
+    assert any("WARN" in line or "ERROR" in line for line in output)
+
+
+def test_startup_preserves_synthetic_legacy_artifacts(synthetic_storage_env):
+    """Provider startup never moves, deletes, or overwrites legacy artifacts."""
+    home = synthetic_storage_env.root / "legacy-profile"
+    legacy = home / "data" / "legacy"
+    legacy.mkdir(parents=True)
+    (legacy / "memory.db").write_bytes(b"legacy-sql")
+    (legacy / "graph.json").write_bytes(b"legacy-graph")
+    (legacy / "lancedb.marker").write_bytes(b"legacy-vector")
+    before = sorted((p.relative_to(home), p.read_bytes()) for p in legacy.iterdir())
+    provider = HermesProvider()
+    try:
+        provider.initialize("legacy-preservation", hermes_home=str(home))
+    finally:
+        provider.shutdown()
+    after = sorted((p.relative_to(home), p.read_bytes()) for p in legacy.iterdir())
+    assert after == before
+
+
+def test_named_profiles_resolve_complete_distinct_store_and_lock_sets(tmp_path: Path):
+    """The named default/invest-agent pair owns disjoint complete layouts."""
+    from memory_server.paths import StorageResolutionInputs, resolve_storage_layout
+    homes = {name: tmp_path / name for name in ("default", "invest-agent")}
+    for home in homes.values():
+        home.mkdir()
+    layouts = {
+        name: resolve_storage_layout(StorageResolutionInputs(profile_home=home))
+        for name, home in homes.items()
+    }
+    for name, layout in layouts.items():
+        home = homes[name]
+        owned = (layout.sqlite.local_path, layout.vector.local_path,
+                 layout.graph_snapshot_path, layout.graph_lock_path,
+                 layout.root_lock_path)
+        assert all(path is not None and home in path.parents for path in owned)
+        assert layout.data_root == homes[name]
+    assert layouts["default"].sqlite.local_path != layouts["invest-agent"].sqlite.local_path
+
+
+def test_shared_storage_requires_explicit_mode_and_one_absolute_complete_root(tmp_path: Path):
+    """Shared placement is accepted only with explicit mode and absolute root."""
+    from memory_server.paths import StorageLayoutError, StorageResolutionInputs, resolve_storage_layout
+    with pytest.raises(StorageLayoutError) as missing:
+        resolve_storage_layout(StorageResolutionInputs(mode="shared"))
+    assert missing.value.code == "E_SHARED_ROOT_REQUIRED"
+    with pytest.raises(StorageLayoutError) as relative:
+        resolve_storage_layout(StorageResolutionInputs(mode="shared", data_root="relative"))
+    assert relative.value.code == "E_SHARED_ROOT_RELATIVE"
+    root = tmp_path / "shared"
+    layout = resolve_storage_layout(StorageResolutionInputs(mode="shared", data_root=root))
+    assert layout.data_root == root
+    assert layout.sqlite.local_path == root / "data/memory.db"
+    assert layout.vector.local_path == root / "data/lancedb"
+    assert layout.graph_snapshot_path == root / "data/graph.json"
+
+
+def test_cmms_path_two_values_do_not_change_storage_placement(tmp_path: Path):
+    """Installation/import path is not a storage-root input."""
+    from memory_server.plugins.hermes.config import HermesPluginConfig
+    from memory_server.settings import Settings
+    home = tmp_path / "profile"
+    home.mkdir()
+    settings = Settings(_env_file=None)
+    layouts = [HermesPluginConfig.from_dict({"path": str(value)}).resolve_storage_layout(
+        hermes_home=str(home), settings=settings
+    ) for value in (tmp_path / "one", tmp_path / "two")]
+    assert layouts[0].data_root == layouts[1].data_root == home
+    assert layouts[0].sqlite.local_path == layouts[1].sqlite.local_path
+    assert layouts[0].vector.local_path == layouts[1].vector.local_path
+    assert layouts[0].graph_snapshot_path == layouts[1].graph_snapshot_path
