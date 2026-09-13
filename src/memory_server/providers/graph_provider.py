@@ -56,7 +56,10 @@ except ImportError:  # pragma: no cover - Windows
 # How long a writer/reader waits for the inter-process snapshot lock before
 # giving up (writes are skipped with an error log; a crash releases flock).
 GRAPH_LOCK_TIMEOUT = float(os.environ.get("MEMORY_GRAPH_LOCK_TIMEOUT", "30"))
-_MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+# Bound validation's read/memory exposure, not the product's graph size: 256 MiB
+# leaves substantial headroom over the observed ~14 MiB production snapshot while
+# keeping malformed or hostile inputs from becoming an unbounded read.
+_MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
 
 
 @dataclass

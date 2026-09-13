@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -750,11 +751,41 @@ class TestSnapshotValidationHook:
 
     def test_oversized_snapshot_is_refused_at_bound(self, tmp_path):
         path = tmp_path / "large.json"
-        path.write_bytes(b"{" + b" " * (8 * 1024 * 1024) + b"}")
+        with path.open("wb") as stream:
+            stream.truncate(256 * 1024 * 1024 + 1)
         result = SimpleGraph.validate_snapshot(path)
         assert result.valid is False
         assert "maximum snapshot size" in result.error
         assert self._listing(tmp_path) == [("large.json", path.stat().st_size, path.stat().st_mtime_ns)]
+
+    def test_production_order_snapshot_validates_with_structural_counts(self, tmp_path):
+        gate_tmp = Path(os.environ.get("GATE_TMP", str(tmp_path)))
+        gate_tmp.mkdir(parents=True, exist_ok=True)
+        path = gate_tmp / "synthetic-production-order-graph.json"
+        padding = "synthetic-only-padding-" + ("x" * (15 * 1024 * 1024 // 4))
+        payload = {
+            "nodes": {
+                node_id: {
+                    "id": node_id,
+                    "type": "synthetic",
+                    "name": f"Synthetic node {node_id}",
+                    "attributes": {"padding": padding},
+                }
+                for node_id in ("node-1", "node-2", "node-3", "node-4")
+            },
+            "edges": [
+                {"source_id": "node-1", "target_id": "node-2", "relation": "synthetic-link"},
+                {"source_id": "node-2", "target_id": "node-3", "relation": "synthetic-link"},
+                {"source_id": "node-3", "target_id": "node-4", "relation": "synthetic-link"},
+            ],
+        }
+        path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        assert 14 * 1024 * 1024 <= path.stat().st_size <= 16 * 1024 * 1024
+
+        result = SimpleGraph.validate_snapshot(path)
+
+        assert result.valid is True
+        assert (result.node_count, result.edge_count) == (4, 3)
 
     def test_hook_has_no_live_graph_or_journal_side_effects(self, tmp_path):
         path = tmp_path / "valid.json"
