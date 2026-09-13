@@ -382,4 +382,3 @@ The operator edits YAML separately only after verified data. Start one profile,
 verify the structured `cmms.storage_layout` event and projection health, then
 roll out the remaining profiles. Root-lock-only protection is complete only
 after full rollout.
-
