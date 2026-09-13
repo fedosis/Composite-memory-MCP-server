@@ -1,0 +1,58 @@
+--- /tmp/cmms-baseline-da1cd0e/tests/test_outbox.py	2026-09-13 23:06:22.378825009 +0300
++++ /tmp/cmms-baseline-run/tests/test_outbox.py	2026-09-13 23:18:17.676752535 +0300
+@@ -12,8 +12,10 @@
+ import logging
+ import os
+ import subprocess
++import sys
+ import uuid
+ from datetime import datetime, timedelta, timezone
++from pathlib import Path
+ 
+ import pytest
+ from sqlalchemy.ext.asyncio import (
+@@ -39,9 +41,16 @@
+ # =============================================================================
+ 
+ 
+-def _make_engine_and_factory():
++def _sandbox_tmp_root(fallback: Path) -> Path:
++    """Return the certified writable scratch root when one is configured."""
++    return Path(os.environ.get("GATE_TMP", str(fallback)))
++
++
++def _make_engine_and_factory(root: Path | None = None):
+     """Create a unique file-based SQLite engine + session factory."""
+-    db_path = f"/tmp/test_outbox_{uuid.uuid4().hex[:16]}.db"
++    root = _sandbox_tmp_root(root or Path(".pytest-tmp"))
++    root.mkdir(parents=True, exist_ok=True)
++    db_path = root / f"test_outbox_{uuid.uuid4().hex[:16]}.db"
+     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+     return engine, factory, db_path
+@@ -1220,13 +1229,20 @@
+             assert result.status == "pending"
+             assert result.retry_count == 0
+ 
+-    async def test_migration_creates_outbox_table(self):
++    async def test_migration_creates_outbox_table(self, tmp_path: Path):
+         """Verify an online Alembic upgrade creates outbox_entries."""
+-        project_dir = os.path.join(os.path.dirname(__file__), "..")
+-        db_path = os.path.join(project_dir, "tests", f"tmp_outbox_migration_{uuid.uuid4().hex}.db")
+-        ini_path = os.path.join(project_dir, f"tmp_outbox_migration_{uuid.uuid4().hex}.ini")
++        project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
++        gate_tmp = _sandbox_tmp_root(tmp_path)
++        gate_tmp.mkdir(parents=True, exist_ok=True)
++        db_path = gate_tmp / f"tmp_outbox_migration_{uuid.uuid4().hex}.db"
++        ini_path = gate_tmp / f"tmp_outbox_migration_{uuid.uuid4().hex}.ini"
+         with open(os.path.join(project_dir, "alembic.ini"), encoding="utf-8") as stream:
+-            ini_text = stream.read().replace("sqlite:///memory.db", f"sqlite:///{db_path}")
++            ini_text = (
++                stream.read()
++                .replace("%(here)s/alembic", os.path.join(project_dir, "alembic"))
++                .replace("%(here)s/migrations/versions", os.path.join(project_dir, "migrations", "versions"))
++                .replace("sqlite:///memory.db", f"sqlite:///{db_path}")
++            )
+         with open(ini_path, "w", encoding="utf-8") as stream:
+             stream.write(ini_text)
+ 
