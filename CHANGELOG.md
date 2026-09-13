@@ -6,6 +6,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/)
 versioning with SemVer-like semantics.
 
+## 0.12.0 — 2026-09-14
+
+Profile isolation series (cards S1..S5 plus the S5 fix loop): storage is
+resolved once per profile and rooted under that profile's own data root, the
+migration to that layout is crash-safe and reversible, a second writer is
+refused, and the doctor reports the raw/effective model. Reviewed end to end by
+an independent cross-provider reviewer (`VERDICT: APPROVE`, 57 commits,
+`da1cd0e..5ec25ad`).
+
+### Added
+
+- **Profile-owned storage layout** — `StorageLayout` is resolved once and
+  frozen; every local store constructor receives its values from that frozen
+  object, and profile mode roots all stores under the profile's own data root.
+- **Profile migration with resume and rollback** — plan / apply / resume /
+  rollback with a durable backup taken before the target is touched,
+  checkpointed publication, and an exact raw-symlink referent restored on
+  rollback. `E_RESUME_CONFIG_CHANGED` guards resuming against a changed config
+  digest; `E_SQLITE_INTEGRITY` rejects a corrupt target before any mutation.
+- **Storage locks** — a root lock plus old-writer detection that checks both
+  SQLite activity and graph activity, refusing with `E_WRITER_ACTIVE` /
+  `E_OLD_WRITER_ACTIVE` instead of signalling success.
+- **Doctor raw/effective model** — per-profile status, severity, canonical
+  origins and exit codes, with root and profile homes inspected in one run.
+
+### Fixed
+
+- **Canonical Qdrant endpoint was discarded at the wiring boundary** — the
+  server passed the frozen-layout `vector.qdrant_location` (which is `None`
+  whenever the vector backend is the default `lancedb`) instead of the
+  resolved `settings.qdrant_location`, so `MEMORY_SERVER_QDRANT_LOCATION` never
+  reached the provider. The canonical environment now wins over YAML, an
+  existing legacy alias, `.env`/`Settings` and the field default, as DETAIL
+  §3.2 specifies.
+- **Settings and layout were not hermetic inside the plugin path** — cached
+  server state (`_storage_settings`, `_storage_layout`, root lock, cleanup flag)
+  is now reset per wiring test, so env overrides are honoured deterministically.
+- **Rust logger panic across in-process LanceDB tests** — the collection-time
+  import probe in `tests/test_ping.py` popped already-loaded native modules out
+  of `sys.modules` and never restored them; restoring them in a `finally`
+  removes a 53-node shared-process failure cohort.
+- **Outbox harness wrote into sandbox-denied scratch paths** — the harness now
+  routes its databases and the migration INI into `GATE_TMP`.
+
+### Changed
+
+- **Doctor coverage** — six legacy doctor assertions were replaced by the
+  rewritten raw/effective model and remain deliberately unasserted; the
+  id-by-id disposition (successor citation or accepted LOST) is recorded in
+  `S5-02C_DISPOSITION.md`. A vanished assertion is treated as lost coverage,
+  never as an improvement.
+- **Packaging** — wheel and sdist carry the new modules; the release-candidate
+  check no longer masks a missing `CHANGELOG.md` in the sdist.
+
+### Notes
+
+- Upgrading from an earlier layout **runs a migration**: take a backup, inspect
+  with the dry-run, then apply while no other writer is active.
+- 28 tests in the certified offline environment fail identically at the
+  pre-series baseline and at this release (no network for the embedder, no
+  `memory-server` console script on `PATH`, read-only fixture tree); they are
+  environment-conditioned, not regressions — see `S5-02E_ACCEPTANCE.md`.
+
 ## 0.12.0b1 — 2026-09-02
 
 Major CMMS series hardening: 30 cards across the fact-extraction,
