@@ -31,6 +31,7 @@ from uuid import NAMESPACE_DNS, uuid5
 
 import pytest
 
+import memory_server.cli as cli
 import memory_server.profile_migration as profile_migration
 import memory_server.projection_rebuild as projection_rebuild
 from memory_server.profile_migration import (
@@ -49,7 +50,24 @@ from memory_server.projection_rebuild import CanonicalProjectionRecord
 
 
 def test_s4_01_catalogue_is_complete_and_table_driven() -> None:
-    expected = profile_migration.DETAIL_DIAGNOSTIC_CODES
+    expected = (
+        "E_HERMES_HOME_REQUIRED", "E_PROFILE_ROOT_EXTERNAL", "E_SHARED_ROOT_REQUIRED",
+        "E_SHARED_ROOT_RELATIVE", "E_SHARED_SPLIT_LAYOUT", "E_PATH_OUTSIDE_ROOT",
+        "E_PATH_SYMLINK_PARENT", "E_PATH_FINAL_SYMLINK_UNSAFE", "W_LEGACY_SPLIT_LAYOUT",
+        "E_PATH_SPECIAL_FILE", "E_PATH_OVERLAP", "E_FORBIDDEN_TARGET_ROOT",
+        "E_ARTIFACT_IDENTITY_CHANGED", "E_QDRANT_PROFILE_NAMESPACE_UNDEFINED", "E_PROJECTION_UNAVAILABLE",
+        "E_SOURCE_SQL_REQUIRED", "E_SOURCE_SQL_NOT_REGULAR", "E_SQLITE_WAL_ACTIVE",
+        "E_SQLITE_SHM_AMBIGUOUS", "E_SQLITE_HOT_JOURNAL", "E_SQLITE_READONLY_UNSAFE",
+        "E_SQLITE_PROBE_UNSAFE", "E_SQLITE_INTEGRITY", "E_SQLITE_SCHEMA", "E_SOURCE_CHANGED",
+        "E_LEGACY_PROJECTION_IMPORT_FORBIDDEN", "E_INSUFFICIENT_SPACE", "E_BACKUP_COLLISION",
+        "E_BACKUP_VERIFY", "E_STAGING_VERIFY", "E_EMBEDDER_UNAVAILABLE", "E_EMBEDDER_AUTH_REQUIRED",
+        "E_EMBEDDER_DIMENSION", "E_EMBEDDER_PARTIAL", "E_CROSS_FILESYSTEM_PUBLICATION",
+        "E_PUBLICATION_AMBIGUOUS", "E_ROLLBACK_VERIFY", "E_CONFIRMATION_REQUIRED",
+        "E_CONFIRM_TARGET_MISMATCH", "E_STOP_ATTESTATION_REQUIRED", "E_WRITER_ACTIVE",
+        "E_WRITER_STATE_UNKNOWN", "E_LOCK_HELD", "E_LOCK_TIMEOUT", "E_LOCK_PERMISSION",
+        "E_LOCK_UNSUPPORTED", "E_LOCK_ENTRY_UNSAFE", "E_MANIFEST_VERSION", "E_MANIFEST_SCHEMA",
+        "E_MANIFEST_TAMPERED", "E_MANIFEST_PATH_ESCAPE", "E_CONFIG_DIGEST_CHANGED",
+    )
     table = profile_migration.DIAGNOSTIC_CONTRACT
     assert len(expected) == 52
     assert set(table) == set(expected)
@@ -70,6 +88,65 @@ def test_s4_01_diagnostic_redaction_is_bounded() -> None:
     assert len(diagnostic.message) <= profile_migration.DIAGNOSTIC_MESSAGE_LIMIT
     assert "token=sk-" not in diagnostic.message
     assert hostile not in encoded
+
+
+def test_s4_01_redaction_kills_secret_and_path_mutants() -> None:
+    assert profile_migration.Diagnostic("E_BACKUP_VERIFY", "error", "token=abc123").message == "token=[redacted]"
+    exception = "prefix secret=sk-live-DEADBEEFCAFE " + ("X" * 6000)
+    diagnostic = profile_migration.Diagnostic("E_MIGRATION_STAGE_FAILED", "error", exception)
+    assert len(diagnostic.message) <= profile_migration.DIAGNOSTIC_MESSAGE_LIMIT
+    assert "sk-live-DEADBEEFCAFE" not in diagnostic.message
+    assert "the dry-run report never consults Settings/.env" == (
+        profile_migration.Diagnostic(
+            "E_BACKUP_VERIFY", "error", "the dry-run report never consults Settings/.env"
+        ).message
+    )
+    assert profile_migration.Diagnostic("E_BACKUP_VERIFY", "error", "data/memory.db").message == "data/memory.db"
+
+
+def test_s4_01_diagnostic_preserves_caller_values() -> None:
+    diagnostic = profile_migration.Diagnostic(
+        "E_BACKUP_VERIFY", "error", "", "", ""
+    )
+    assert diagnostic.__dict__ == {
+        "code": "E_BACKUP_VERIFY",
+        "severity": "error",
+        "message": "",
+        "artifact": "",
+        "hint": "",
+    }
+
+
+def test_s4_01_cli_and_manifest_json_shapes_are_additive() -> None:
+    source = type("Source", (), {})()
+    source.path = "data/memory.db"
+    layout = type("Layout", (), {})()
+    layout.data_root = Path("data")
+    plan = type("Plan", (), {
+        "source_sql": source, "layout": layout, "lock_availability": {"available": True},
+        "warnings": [], "blockers": [], "planned_operations": [],
+    })()
+    request = type("Request", (), {"run_id": "r1", "strategy": "rebuild-from-profile-sql"})()
+    payload = cli._migration_dry_run_payload(cast(Any, plan), cast(Any, request))
+    assert set(payload) == {
+        "schema_version", "run_id", "mode", "strategy", "source_sql", "target",
+        "lock_availability", "warnings", "blockers", "planned_operations", "proposed_manifest_path",
+    }
+    assert isinstance(payload["source_sql"], dict)
+    assert isinstance(payload["target"], dict) and set(payload["target"]) == {"root"}
+    assert isinstance(payload["lock_availability"], dict)
+    assert isinstance(payload["warnings"], list)
+    assert isinstance(payload["blockers"], list)
+    assert isinstance(payload["planned_operations"], list)
+    assert isinstance(cli.DIAGNOSTIC_CONTRACT, dict)
+
+
+def test_s4_01_s1_extra_code_uses_compatible_exit_surface() -> None:
+    assert profile_migration.exit_code_for_diagnostic("E_STORAGE_MODE_INVALID") == 1
+    diagnostic = profile_migration.Diagnostic(
+        "E_STORAGE_MODE_INVALID", "error", "E_STORAGE_MODE_INVALID"
+    )
+    assert diagnostic.code == "E_STORAGE_MODE_INVALID"
 
 
 @pytest.mark.parametrize("code", range(7))
