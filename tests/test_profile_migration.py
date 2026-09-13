@@ -403,6 +403,15 @@ def test_apply_rejects_stale_embedding_plan_without_run(
 
 
 def test_resume_refuses_unfinished_migration(tmp_path: Path, synthetic_storage_env) -> None:
+    """RETARGETED BY S3-06 (disclosed): an unfinished run is not reported as finished.
+
+    The BASE body asserted the slice-level "not implemented" refusal. After the
+    wiring, `resume` really executes, so the claim that survives -- and the one the
+    test name makes -- is that an unfinished migration is NEVER reported as
+    finished: here the source database carries no accepted Alembic revision, so the
+    run stops at its snapshot step with the real schema code, records the failure,
+    and never reaches `complete` or `published`.
+    """
     env = synthetic_storage_env
     env.assert_injection()
     env.assert_not_live(tmp_path, label="migration root")
@@ -414,10 +423,18 @@ def test_resume_refuses_unfinished_migration(tmp_path: Path, synthetic_storage_e
     plan = plan_profile_migration(request)
     manifest_path = home / ".cmms-migrations" / request.run_id / "manifest.json"
     _write_manifest_for_entrypoint(manifest_path, plan)
-    before = _tree_snapshot(home)
-    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+    source_bytes = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match="E_SQLITE_SCHEMA"):
         resume_profile_migration(manifest_path, request)
-    assert _tree_snapshot(home) == before
+
+    manifest = load_manifest(manifest_path)
+    assert manifest.status == "failed"
+    assert manifest.checkpoint != "complete"
+    assert "staged_verified" not in _s306_advance_events(manifest)
+    assert manifest.failure is not None
+    assert manifest.failure.get("code") == "E_SQLITE_SCHEMA"
+    assert db_path.read_bytes() == source_bytes
 
 
 def test_rollback_refuses_unfinished_migration_without_mutating_manifest(
@@ -2488,13 +2505,22 @@ def test_s204_every_entrypoint_replans_independently_without_inherited_state(
 
     monkeypatch.setattr(profile_migration, "plan_profile_migration", counting)
     manifest_path = home / ".cmms-migrations" / request.run_id / "manifest.json"
-    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
+    # RETARGETED BY S3-06 (disclosed): `apply` is wired, so it now stops at the real
+    # cause instead of the slice-level "not implemented" -- this source carries no
+    # accepted Alembic revision. The property this node exists for (every entrypoint
+    # replans for ITSELF, on its own mode) is unchanged and asserted by `calls`.
+    with pytest.raises(ValueError, match="E_SQLITE_SCHEMA"):
         apply_profile_migration(plan)
     # S2-07 moved this boundary and this leg is updated for it, not weakened:
     # `resume` now repeats the preconditions and reads the run's own manifest, so
     # with no manifest at all it is refused with its own stable code. The property
     # this node exists for -- that resume replans for ITSELF, on its own mode, and
     # inherits nothing from the caller -- is asserted by `calls` below.
+    # S3-06 NOTE (disclosed): `apply` above now MATERIALIZES its own run at
+    # `manifest_path`, so the two manifest-absent legs below use a SECOND run id
+    # that was never materialized -- which is the state they exist to pin.
+    absent = home / ".cmms-migrations" / str(uuid5(NAMESPACE_DNS, "s306-absent-run"))
+    manifest_path = absent / "manifest.json"
     with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
         resume_profile_migration(manifest_path, replace(request, mode="resume"))
     # S2-08 moved this leg too, in the same way and for the same reason: rollback now
@@ -3691,23 +3717,17 @@ def test_s206_a_gated_checkpoint_event_is_refused_without_real_prerequisite_evid
 def test_s206_the_s0_stub_seam_reports_no_capability_and_the_gate_stays_shut(
     tmp_path: Path,
 ) -> None:
-    """MISSING-CAPABILITY at BASE: there is no capability report at all.
+    """RETARGETED AGAIN BY S3-06 (disclosed): an UNQUALIFIED seam is the subject now.
 
-    RETARGETED BY S3-05 (disclosed): this node's subject was the S0 STUB. S3-05
-    replaced that stub with the real verifier, so the two lines that asserted the
-    stub's positional call contract (`verify_staged_projections(probe)` returning
-    a valid-looking verdict) no longer describe the seam. The clause the node
-    exists for is UNCHANGED and is now proven with a forged verdict: the gate
-    reads the seam's CAPABILITY REPORT and never its return value.
-
-    The report still says `implemented=False`: the real seam's contract is
-    keyword-only, so S2-06's single-positional negative probe cannot qualify it
-    and every gated transition below is still refused by cause. Opening the gate
-    -- and `complete` end-to-end -- is S3-06's deliverable, which is exactly the
-    hand-off this node records.
-
-    Behavioural successor (S3-06): the node drives the public entrypoints once
-    the stage is wired, so the same contract gets a behavioural RED then.
+    S3-05 replaced the S0 stub with the real verifier and retargeted this node onto
+    a forged verdict. S3-06 opens the gate for the REAL seam (it IS the wiring
+    card), so the node's subject moves to a seam that is genuinely unqualified: one
+    that answers `ProjectionVerification(True)` to an input a real verifier cannot
+    accept -- the S0 stub's own behaviour, kept here as a live adversary. The clause
+    is UNCHANGED and is proven on both seams: the gate reads the seam's CAPABILITY
+    REPORT and never its return value. R-S305-c is closed by this retarget -- the
+    forged object is CONSUMED (it is the probe's own return value) instead of
+    sitting dead beside the assertion.
     """
     import asyncio
 
@@ -3716,16 +3736,13 @@ def test_s206_the_s0_stub_seam_reports_no_capability_and_the_gate_stays_shut(
     report = _s206_api("staged_verification_capability")
     assert report is not None, "no capability report for the verification seam exists"
 
+    # The REAL seam (S3-05 landed it, S3-06 qualifies it): its own explicit flag.
     capability = report()
-    assert capability.implemented is False
-    assert capability.basis
-    assert "not implemented" not in capability.basis
-    assert capability.basis == "unimplemented", capability.basis
+    assert capability.implemented is True
+    assert capability.basis == "explicit_flag"
 
-    # The REAL seam (S3-05) refuses an unverifiable staged input when it is
-    # called with the contract it actually owns. Its REFUSAL is not what opens
-    # the gate -- the report above is -- but the returned verdict must not be
-    # readable as a success either.
+    # The REAL seam refuses an unverifiable staged input, and that refusal is not
+    # what opens the gate -- its report above is.
     seam_verdict = asyncio.run(
         projection_rebuild.verify_staged_projections(
             snapshot_url=f"sqlite+aiosqlite:///{tmp_path / 'absent.db'}",
@@ -3735,10 +3752,13 @@ def test_s206_the_s0_stub_seam_reports_no_capability_and_the_gate_stays_shut(
     )
     assert seam_verdict.valid is False, seam_verdict.errors
 
-    # The gate reads the capability report ONLY: a verdict that CLAIMS
-    # valid=True opens nothing.
+    # A verdict that CLAIMS valid=True, returned by a seam that cannot qualify
+    # itself, opens nothing: every gated transition stays refused.
     forged = projection_rebuild.ProjectionVerification(True)
     assert forged.valid is True
+    unqualified = report(_StubShapedSeam)
+    assert unqualified.implemented is False, unqualified
+    assert unqualified.basis == "unimplemented"
 
     for target, current in (
         ("staged_verified", "projections_built"),
@@ -3747,25 +3767,23 @@ def test_s206_the_s0_stub_seam_reports_no_capability_and_the_gate_stays_shut(
         ("complete", "verified"),
     ):
         with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
-            _s206_validate(current, target, [_s206_evidence(target)], capability)
+            _s206_validate(current, target, [_s206_evidence(target)], unqualified)
 
 
-def test_s206_only_the_seams_own_capability_report_opens_the_gated_transitions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """MISSING-CAPABILITY at BASE: the gate itself does not exist.
+def test_s206_only_the_seams_own_capability_report_opens_the_gated_transitions() -> None:
+    """RETARGETED BY S3-06 (disclosed): the "closed" arm is an UNQUALIFIED seam.
 
-    The gate is opened by the SEAM'S report and by nothing else: the explicit
-    capability flag is the seam's own channel (DETAIL 10.3 implementation), and
-    once the seam reports it, the gated checkpoints become reachable. Nothing in
-    this node lets a caller assert `valid=True` and walk in.
+    S2-06 proved this by monkeypatching the seam's explicit flag on, because at that
+    time nothing qualified the seam. S3-06 is the wiring card: the real seam IS
+    qualified now, so the closed arm uses a seam that reports no capability at all
+    (the stub-shaped one) and the open arm uses the REAL seam's own report. The
+    clause is unchanged: the report opens the gate and nothing else does, so no
+    caller can assert `valid=True` and walk in.
     """
-    import memory_server.projection_rebuild as projection_rebuild
-
     report = _s206_api("staged_verification_capability")
     assert report is not None, "no capability report for the verification seam exists"
 
-    stub = report()
+    stub = report(_StubShapedSeam)
     assert stub.implemented is False
     for target, current in (
         ("staged_verified", "projections_built"),
@@ -3775,7 +3793,6 @@ def test_s206_only_the_seams_own_capability_report_opens_the_gated_transitions(
         with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
             _s206_validate(current, target, [_s206_evidence(target)], stub)
 
-    monkeypatch.setattr(projection_rebuild, "STAGED_VERIFICATION_IMPLEMENTED", True, raising=False)
     opened = report()
     assert opened.implemented is True
     assert opened.basis == "explicit_flag"
@@ -3841,89 +3858,99 @@ def test_s206_the_ten_forward_checkpoints_advance_only_with_their_own_evidence(
 
 
 def test_s206_the_public_entrypoints_stay_fail_closed_while_the_seam_is_a_stub(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+    tmp_path: Path, synthetic_storage_env
 ) -> None:
-    """CONTROL (passes on BOTH sides): no false end-to-end success is claimable.
+    """RETARGETED BY S3-06 (disclosed): `apply` RUNS now, so "closed" means "no false success".
 
-    acceptance 1 and 5: while the verification seam is the S0 stub, `apply` and
-    `resume` stay non-success and they do not start to proceed even when the seam DOES
-    report an implemented capability -- the general `apply` stays closed until S3-06
-    and no card may bypass that ordering (routing-matrix S2-06 split_further / the
-    card's ordering note). The rollback leg asserted here is its absent-manifest
-    refusal on a real tree: S2-08 did NOT put rollback behind this gate, because
-    rollback publishes nothing and restores a pre-state the run already backed up, so
-    no slice-level "not implemented" applies to it any more.
+    The original claim was "the entrypoints stay closed until S3-06". S3-06 IS this
+    card, so the clause that survives is the one the card exists for: no entrypoint
+    reports success for a run it cannot verify. Here the source database's Alembic
+    revision is not accepted, so `apply` must refuse at its snapshot step with the
+    real schema code, must not claim any checkpoint past `backed_up`, and must not
+    reach `complete`; `resume` and `rollback` against an absent manifest keep their
+    own manifest refusal. The original "the tree did not move at all" arm is NOT
+    kept, and that is disclosed: a wired run legitimately creates its own run
+    directory and backup before the snapshot step refuses.
     """
-    import memory_server.projection_rebuild as projection_rebuild
-
     env = synthetic_storage_env
     env.assert_injection()
-    home, db_path = _s205_home(tmp_path)
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
     request, plan = _s204_planned_request(home, db_path)
-    live = tmp_path / "run" / plan.request.run_id / "manifest.json"
-    before = _tree_snapshot(tmp_path)
+    live = _s306_manifest_path(home, plan)
+    source_bytes = db_path.read_bytes()
 
-    entrypoints = (("apply_profile_migration", (plan,)),)
-    for name, args in entrypoints:
-        with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
-            getattr(profile_migration, name)(*args)
+    with pytest.raises(ValueError, match="E_SQLITE_SCHEMA"):
+        _s306_apply(plan, embedder=_s306_embedder())
 
-    # S2-07 and S2-08 moved ONE leg of this boundary each and this node is updated for
-    # them, not weakened: `resume` repeats the preconditions and reads the run's own
-    # manifest, and so does `rollback` at S2-08 -- the latter because it restores a
-    # pre-state the run already backed up and publishes nothing, so it needs no staged
-    # verification and does not touch the gate `apply` waits on. What this node exists
-    # to pin is unchanged and still asserted below: neither entrypoint is a success,
-    # neither touches anything, and neither classifies a run it cannot read.
+    assert live.exists(), "the run did not even materialize its manifest"
+    manifest = load_manifest(live)
+    assert manifest.status == "failed"
+    assert manifest.checkpoint != "complete"
+    assert "sqlite_snapshotted" not in _s306_advance_events(manifest)
+    assert manifest.failure is not None
+    assert manifest.failure.get("code") == "E_SQLITE_SCHEMA"
+
+    # `apply` above materialized ITS OWN run at `live`, so the manifest-absent
+    # contract is pinned on a run id that was never materialized (disclosed).
+    absent = (
+        home
+        / ".cmms-migrations"
+        / str(uuid5(NAMESPACE_DNS, "s306-absent-run-entrypoint"))
+        / "manifest.json"
+    )
     with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
-        profile_migration.resume_profile_migration(live, request)
+        profile_migration.resume_profile_migration(absent, request)
     with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
-        profile_migration.rollback_profile_migration(live, request)
-
-    monkeypatch.setattr(projection_rebuild, "STAGED_VERIFICATION_IMPLEMENTED", True, raising=False)
-    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
-        profile_migration.apply_profile_migration(plan)
-
-    assert _tree_snapshot(tmp_path) == before
+        profile_migration.rollback_profile_migration(absent, request)
+    assert db_path.read_bytes() == source_bytes, "the refused run touched its source"
 
 
 def test_s206_the_engine_primitives_are_not_wired_into_the_public_entrypoints(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
 ) -> None:
-    """CONTROL (passes on BOTH sides) + the F7 status of the S2-05 stage.
+    """RETARGETED BY S3-06 (disclosed) -- F7/R2 re-anchored: the primitives ARE wired.
 
-    F7 of the S2-05 review asks for the ten missing-capability nodes to be
-    re-anchored on the entrypoints "once the stage is wired into apply/resume/
-    rollback". This card's ordering forbids that wiring: the entrypoints stay
-    fail-closed until S3-06. The node therefore PINS the boundary as a control --
-    the backup stage and the publication primitive are never reached from a
-    public entrypoint and no run directory is created -- and states the residual
-    honestly instead of letting a reader assume the wiring happened.
+    S2-06's control asserted that no public entrypoint reaches the engine
+    primitives, because the wiring was S3-06's deliverable. This card IS that
+    deliverable, so the boundary has moved and the node pins the NEW one, which is
+    exactly F7's re-anchoring request (carry-in R2): the public `apply` really does
+    reach the backup stage and the forward state machine and really does create the
+    run directory. It still does NOT reach the publication primitive, because the
+    run cannot earn `staged_verified` without a real verifiable source -- which is
+    the ordering the card must not bypass.
     """
     env = synthetic_storage_env
     env.assert_injection()
-    home, db_path = _s205_home(tmp_path)
+    home = tmp_path / "home"
+    db_path = _seed_source_sql(home)
     request, plan = _s204_planned_request(home, db_path)
 
     reached: list[str] = []
 
-    def _record(name: str) -> Any:
+    def _recorder(name: str, real: Any) -> Any:
         def _spy(*args: Any, **kwargs: Any) -> Any:
             reached.append(name)
-            return None
+            return real(*args, **kwargs)
 
         return _spy
 
     for name in ("create_run_backup", "publish_artifact", "advance_manifest_checkpoint"):
-        monkeypatch.setattr(profile_migration, name, _record(name), raising=False)
+        monkeypatch.setattr(
+            profile_migration, name, _recorder(name, getattr(profile_migration, name))
+        )
 
-    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
-        profile_migration.apply_profile_migration(plan)
-    assert reached == []
-    assert not _s206_run_dir(home, plan).exists()
+    with pytest.raises(ValueError, match="E_SQLITE_SCHEMA"):
+        _s306_apply(plan, embedder=_s306_embedder())
+
+    assert "create_run_backup" in reached, "the public apply never reached the backup stage"
+    assert "advance_manifest_checkpoint" in reached, "the forward state machine was never driven"
+    assert "publish_artifact" not in reached, (
+        "the publication primitive was reached before `staged_verified` was earned"
+    )
+    assert _s306_run_dir(home, plan).exists()
 
 
-# ---------------------------------------------------------------------------
 # S2-06 -- the per-artifact publication itself (DETAIL 10.4) and the two
 # carry-ins of the S2-05 review that live on this card's paths (F6, F9).
 # ---------------------------------------------------------------------------
@@ -4808,23 +4835,50 @@ def test_s207_every_publication_event_crash_boundary_is_classified(
 def test_s207_resume_refuses_with_the_gate_of_the_single_unambiguous_operation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
 ) -> None:
-    """BEHAVIOURAL at BASE: `resume` refuses with E_MIGRATION_NOT_IMPLEMENTED.
+    """RETARGETED BY S3-06 (disclosed): the classified operation is EXECUTED now.
 
-    At HEAD it repeats every precondition, classifies a real mid-publication crash
-    and refuses with the CAUSE of the ONE operation it found: exactly one next
-    operation exists, and its gate -- the verification seam that is still the S0
-    stub -- is what keeps resume from executing it (acceptance 3 / R1 / R4).
+    BEHAVIOURAL at BASE: `resume` refused with
+    `E_STAGED_VERIFICATION_CAPABILITY_MISSING`, so a classified, half-published
+    run could never be continued (the S2-07 honest limit). S3-06 wires the
+    execution, so the entrypoint now performs exactly the ONE unambiguous next
+    operation the classifier derived -- the staged entry really is renamed into the
+    vacant target and the retained prestate copy and the source do not move -- and
+    then stops at the verification this SYNTHETIC run cannot satisfy (its staging
+    holds arbitrary bytes and the run owns no rebuilt projection), which is what
+    keeps a false `complete` out of reach.
     """
     env = synthetic_storage_env
     env.assert_injection()
     state = _s207_crash_state(tmp_path, monkeypatch, "prestate_quarantined")
-    manifest_bytes = state["live"].read_bytes()
+    staged_before = (state["staged"]["vector"] / "part.bin").read_bytes()
+    quarantined_tree = _s208_tree(state["quarantine"])
+    source_before = state["db_path"].read_bytes()
 
-    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+    with pytest.raises(ValueError):
         profile_migration.resume_profile_migration(state["live"], state["request"])
 
-    assert state["live"].read_bytes() == manifest_bytes
-    assert state["quarantine"].exists(), "the retained prestate copy was touched"
+    # The ONE classified operation really was executed.
+    assert not state["staged"]["vector"].exists(), "the staged entry was not published"
+    assert (state["target"] / "part.bin").read_bytes() == staged_before
+    # The retained prestate copy and the source were not touched. The quarantine
+    # directory legitimately GAINS the other artifact's pre-state during this
+    # resume, so what is asserted is THIS artifact's own retained copy, byte for
+    # byte, plus its existence.
+    assert state["quarantine"].exists(), "the retained prestate copy was deleted"
+    assert _s208_tree(state["quarantine"]) == quarantined_tree, (
+        "the retained pre-publication copy was modified by the resume"
+    )
+    assert state["db_path"].read_bytes() == source_before, "the resume touched the source"
+
+    manifest = load_manifest(state["live"])
+    assert manifest.status == "failed"
+    assert manifest.checkpoint in ("publishing", "published")
+    assert manifest.checkpoint != "complete"
+    assert manifest.failure is not None
+    assert manifest.failure.get("code") in {
+        "E_PUBLISHED_REOPEN_MISMATCH",
+        "E_STAGED_VERIFICATION_REFUSED",
+    }, manifest.failure
 
 
 def test_s207_the_classifier_reports_the_phase_and_the_single_next_operation(
@@ -4855,7 +4909,10 @@ def test_s207_the_classifier_reports_the_phase_and_the_single_next_operation(
         "vector.staging_published",
         "graph.prestate_revalidated",
     )
-    assert outcome.blocked_by == "E_STAGED_VERIFICATION_CAPABILITY_MISSING"
+    # RETARGETED BY S3-06 (disclosed): the gate is open and the engine CAN execute
+    # the one next operation, so `blocked_by` is empty -- it is no longer the
+    # "nothing is wired" code. The single next operation itself is unchanged.
+    assert outcome.blocked_by == ""
     assert outcome.backup_state == "verified"
     assert "E_BACKUP_COLLISION:run" in outcome.tolerated_blockers
     vector = _s207_triad(outcome.triads, "vector")
@@ -4877,20 +4934,23 @@ def test_s207_the_classifier_reports_the_phase_and_the_single_next_operation(
     assert batch.triads == ()
     assert batch.next_operations == ()
     assert batch.next_checkpoint == "staged_verified"
-    assert batch.blocked_by == "E_STAGED_VERIFICATION_CAPABILITY_MISSING"
+    assert batch.blocked_by == ""
     assert batch.backup_state == "verified"
 
 
 def test_s207_a_completed_run_has_nothing_to_repeat_and_resume_is_byte_stable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
 ) -> None:
-    """BEHAVIOURAL at BASE; acceptance 4 -- a repeated resume repeats no swap.
+    """RETARGETED BY S3-06 (disclosed); acceptance 4 -- a repeated resume repeats no swap.
 
     Both artifacts are published by the REAL primitive, so the run's own events
-    (not a claim) say the sequence is complete. Two resumes then execute nothing,
-    the manifest is byte-identical, and the stale quarantine, the source and the
-    backup are all retained; the only thing left is the gated next checkpoint,
-    which is what both calls refuse on.
+    (not a claim) say the publication sequence is complete. S3-06 wires execution,
+    so the FIRST resume consumes what remains -- it advances the run to `published`
+    and then stops at the verification this synthetic run cannot satisfy -- and the
+    node's original clause is asserted on the REPEAT: nothing is republished (no
+    new publication event, no second swap), and a third call is byte-stable because
+    a failure already recorded for the same step and cause is not recorded twice.
+    The stale quarantine, the source and the backup are retained throughout.
     """
     env = synthetic_storage_env
     env.assert_injection()
@@ -4901,18 +4961,37 @@ def test_s207_a_completed_run_has_nothing_to_repeat_and_resume_is_byte_stable(
 
     live = state["live"]
     run_dir = state["run_dir"]
-    manifest_bytes = live.read_bytes()
     source_bytes = state["db_path"].read_bytes()
     report_bytes = (run_dir / profile_migration.BACKUP_REPORT_NAME).read_bytes()
     quarantined_before = sorted(path.name for path in state["quarantine"].parent.iterdir())
-    tree_before = _tree_snapshot(tmp_path)
+    publication_before = _s207_operations(live)
 
-    for _attempt in range(2):
-        with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
-            profile_migration.resume_profile_migration(live, state["request"])
+    with pytest.raises(ValueError):
+        profile_migration.resume_profile_migration(live, state["request"])
 
-    assert live.read_bytes() == manifest_bytes, "a repeated resume rewrote the manifest"
-    assert _tree_snapshot(tmp_path) == tree_before, "a repeated resume mutated the filesystem"
+    # The FIRST resume really continued the run: the publication was complete, so
+    # the checkpoint advanced to `published` and only the verification it cannot
+    # satisfy stopped it there. At BASE nothing advances at all.
+    assert load_manifest(live).checkpoint == "published"
+    # The publication chain is NOT repeated: no event was appended for it.
+    assert _s207_operations(live)[: len(publication_before)] == publication_before
+    published_events = [
+        name for name in _s207_operations(live) if name.startswith(("vector.", "graph."))
+    ]
+    assert published_events == publication_before, "a repeated resume republished an artifact"
+
+    stable = live.read_bytes()
+    vector_tree_before = _s208_tree(state["target"])
+    with pytest.raises(ValueError):
+        profile_migration.resume_profile_migration(live, state["request"])
+
+    assert live.read_bytes() == stable, "a repeated resume rewrote the manifest"
+    # The repeated resume repeats no SWAP: the published entry is the same entry
+    # (same no-follow identity and bytes) and no publication event was appended
+    # again. The published LanceDB store is deliberately NOT compared as a tree --
+    # re-running the verification legitimately reopens that store -- so this node
+    # claims the swap, not the store's internal bookkeeping.
+    assert _s208_tree(state["target"]) == vector_tree_before, "a repeated resume re-swapped the target"
     assert state["db_path"].read_bytes() == source_bytes, "resume touched the source"
     assert (run_dir / profile_migration.BACKUP_REPORT_NAME).read_bytes() == report_bytes
     assert sorted(path.name for path in state["quarantine"].parent.iterdir()) == quarantined_before
@@ -5006,31 +5085,32 @@ def test_s207_a_missing_required_triad_entry_is_refused_and_nothing_is_deleted(
 def test_s207_before_publishing_resume_continues_only_through_verified_steps(
     tmp_path: Path, synthetic_storage_env
 ) -> None:
-    """BEHAVIOURAL at BASE; acceptance 2.
+    """RETARGETED BY S3-06 (disclosed); acceptance 2 -- the pre-publication stages run.
 
-    Before `publishing` the triads are never consulted: the next step stays shut
-    by CAUSE -- the capability-gated verifier while the seam is the S0 stub, and an
-    engine stage this slice has not wired for the checkpoints before it. Batch and
-    embedding state is S3's, and nothing on disk moves.
+    BEHAVIOURAL at BASE: before `publishing` this state was refused by cause
+    ("capability missing" for the gated verifier and "not implemented" for the
+    engine stages ahead of it), so a stopped run could never continue. After the
+    wiring the SAME stopped run -- a REAL run whose own backup report exists and
+    whose last completed checkpoint is `backed_up` -- is continued through every
+    remaining evidence-gated step to `complete`, and the published artifacts are
+    the rebuilt projections rather than the run's synthetic staging.
     """
     env = synthetic_storage_env
     env.assert_injection()
-    home, db_path = _s205_home(tmp_path)
-    request, plan = _s205_legacy_plan(home, db_path)
-    run_dir = _s206_run_dir(home, plan)
+    state = _s306_state(tmp_path)
+    plan = state["plan"]
     assert profile_migration.create_run_backup(plan) is not None
-    batch_live = _s207_write_manifest(plan, run_dir, checkpoint="projections_built")
-    early_live = _s207_write_manifest(
-        plan, run_dir, checkpoint="backed_up", name="manifest-early.json"
-    )
-    tree_before = _tree_snapshot(tmp_path)
+    early = _s207_write_manifest(plan, state["run_dir"], checkpoint="backed_up")
 
-    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
-        profile_migration.resume_profile_migration(batch_live, request)
-    with pytest.raises(ValueError, match="E_MIGRATION_NOT_IMPLEMENTED"):
-        profile_migration.resume_profile_migration(early_live, request)
+    recovered = _s306_resume(early, state["request"], embedder=_s306_embedder())
 
-    assert _tree_snapshot(tmp_path) == tree_before, "a pre-publication resume touched the tree"
+    assert recovered.checkpoint == "complete", recovered.failure
+    # The run was hand-seeded at `backed_up` (its manifest carries the state but no
+    # synthetic events), so resume records exactly the SEVEN transitions that were
+    # still outstanding -- and none of the three it had already completed.
+    assert _s306_advance_events(recovered) == list(S306_FORWARD_CHECKPOINTS[3:])
+    assert _s306_published_vector_ids(state["vector_path"]) == _s306_expected_vector_ids()
+    assert hashlib.sha256(state["db_path"].read_bytes()).hexdigest() == state["source_sha"]
 
 
 def test_s207_resume_refuses_a_changed_source_a_changed_config_or_a_changed_backup(
@@ -5181,13 +5261,21 @@ def test_s207_resume_refuses_a_staged_entry_that_is_not_the_identity_the_run_rec
     env.assert_injection()
 
     # --- position 1: vector's staged entry is a DIRECTORY ------------------------
+    # RETARGETED BY S3-06 (disclosed): the intact CONTROL used to be "resume refuses
+    # with the capability code", which is exactly the code the wiring replaces. The
+    # control is now the CLASSIFIER's own verdict on the same state -- it is
+    # single-valued (`blocked_by` empty, one next operation) and therefore does NOT
+    # raise the staged-identity code -- which is what makes the refusal below
+    # attributable to the mutation rather than to the fixture.
     state = _s207_crash_state(tmp_path, monkeypatch, "prestate_revalidated")
     staged = state["staged"]["vector"]
     key_before = _s207_staged_key(staged)
     manifest_bytes = state["live"].read_bytes()
 
-    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
-        profile_migration.resume_profile_migration(state["live"], state["request"])
+    intact = profile_migration.classify_resume(state["live"], state["request"])
+    assert intact.blocked_by == ""
+    vector = _s207_triad(intact.triads, "vector")
+    assert vector.next_event == "prestate_quarantined"
 
     import shutil as _shutil
 
@@ -5213,8 +5301,9 @@ def test_s207_resume_refuses_a_staged_entry_that_is_not_the_identity_the_run_rec
     size_before = os.lstat(staged_file).st_size
     file_manifest_bytes = file_state["live"].read_bytes()
 
-    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
-        profile_migration.resume_profile_migration(file_state["live"], file_state["request"])
+    file_intact = profile_migration.classify_resume(file_state["live"], file_state["request"])
+    assert file_intact.blocked_by == ""
+    assert _s207_triad(file_intact.triads, "graph").next_event == "staging_published"
 
     staged_file.write_bytes(b"S207-SWAPPED-STAGED-BYTES" * 200)
     assert os.lstat(staged_file).st_size != size_before, "the fixture did not change the entry's size"
@@ -7241,3 +7330,1180 @@ async def test_s305_the_engine_calls_the_one_verifier_and_holds_no_second_one(
         assert token not in attributes | names, (
             f"the engine must not carry a second verification implementation ({token})"
         )
+
+# ---------------------------------------------------------------------------
+# S3-06 -- the migration engine WIRED to the real rebuild/verification:
+# `complete` is reachable ONLY end to end (DETAIL 9.3, 10.2-10.6, 14.3;
+# routing-matrix prose 563-585 / YAML card `id: S3-06`).
+#
+# Every node below drives the PUBLIC entrypoints against REALLY rebuilt
+# projections: a real canonical snapshot, the real S3-04 rebuild, the ONE real
+# verifier in `memory_server.projection_rebuild` and the real S2-06 publication
+# primitive. No verifier is duplicated here and no digest is ever asserted
+# against a constant.
+#
+# PRE-FIX CLASSIFICATION (filed with the RED): every node in this section is
+# BEHAVIOURAL at BASE -- each one drives an EXISTING public code path
+# (`apply_profile_migration` / `resume_profile_migration`) and observes the
+# WRONG outcome (the refusal `E_MIGRATION_NOT_IMPLEMENTED` instead of the real
+# pipeline, or a `DID NOT RAISE` where a real refusal is demanded). None fails
+# on a missing symbol, an `AttributeError`, an `ImportError` or a collection
+# error: every symbol this section uses exists at BASE. The ONE tolerant call
+# adapter (`_s306_apply` / `_s306_resume`) only adapts the CALL SHAPE -- it
+# passes the embedder keyword when the signature accepts one and otherwise
+# calls the bare public entrypoint, which is exactly what makes the BASE
+# failure a real refusal rather than a `TypeError`.
+# ---------------------------------------------------------------------------
+
+S306_VECTOR_SIZE = 384
+S306_MANIFEST_NAME = "manifest.json"
+S306_INJECTED = "E_S306_INJECTED"
+# Independent expectations for the S3-05 corpus, derived in the TEST from the
+# canonical corpus mapping (DETAIL 10.2 / addendum A.3.2), never from a rebuild
+# result and never from a digest the engine computed.
+S306_EXPECTED_VECTOR_IDS = None  # filled by _s306_expected_vector_ids()
+S306_FORWARD_CHECKPOINTS: tuple[str, ...] = S206_FORWARD_CHECKPOINTS
+
+
+def _s306_expected_vector_ids() -> set[str]:
+    return {
+        str(uuid5(NAMESPACE_DNS, "fact:f1")),
+        str(uuid5(NAMESPACE_DNS, "fact:f2")),
+        str(uuid5(NAMESPACE_DNS, "belief:b1")),
+    }
+
+
+def _s306_home(
+    tmp_path: Path, *, symlinked: bool = False
+) -> tuple[Path, Path, Path | None]:
+    """A synthetic profile: a REAL canonical corpus plus a REAL legacy layout.
+
+    The corpus is the S3-05 fixture (accepted Alembic revision, eligible facts,
+    decisions, a skill and a belief), so the rebuild produces a vector store AND
+    a graph with real content. The legacy projection targets are real too: a
+    real directory for ``vector`` and a real regular file for ``graph`` -- or,
+    with ``symlinked=True``, the live layout's final symlink to an external
+    referent tree, whose bytes must never move.
+    """
+    import shutil as _shutil
+
+    home = tmp_path / "home"
+    db_path = home / "data" / "memory.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    _s305_snapshot(db_path)
+    (home / "data" / "graph.json").write_bytes(b'{"legacy": "graph"}\n')
+    vector = home / "data" / "lancedb"
+    (vector / "nested").mkdir(parents=True)
+    (vector / "a.bin").write_bytes(b"A" * 4096)
+    (vector / "nested" / "b.bin").write_bytes(b"B" * 8192)
+    if not symlinked:
+        return home, db_path, None
+    external = tmp_path / "external-lancedb"
+    external.mkdir()
+    (external / "referent.bin").write_bytes(b"REFERENT")
+    _shutil.rmtree(vector)
+    vector.symlink_to(external, target_is_directory=True)
+    return home, db_path, external
+
+
+def _s306_plan(home: Path, db_path: Path, **fields: Any) -> tuple[Any, Any]:
+    """A confirmed apply request and its read-only plan (the S2-04 pattern)."""
+    request = _s204_request(home, db_path, mode="apply", **fields)
+    digest = plan_profile_migration(request).embedding.digest
+    confirmed = replace(request, embedding_plan_digest=digest)
+    return confirmed, plan_profile_migration(confirmed)
+
+
+def _s306_accepts(name: str, parameter: str) -> bool:
+    return parameter in inspect.signature(getattr(profile_migration, name)).parameters
+
+
+def _s306_apply(plan: Any, *, embedder: Any = None) -> Any:
+    """Call the PUBLIC apply, passing the embedder only if the signature takes one."""
+    if _s306_accepts("apply_profile_migration", "embedder"):
+        return profile_migration.apply_profile_migration(plan, embedder=embedder)
+    return profile_migration.apply_profile_migration(plan)
+
+
+def _s306_resume(manifest_path: Path, request: Any, *, embedder: Any = None) -> Any:
+    """Call the PUBLIC resume, passing the embedder only if the signature takes one."""
+    if _s306_accepts("resume_profile_migration", "embedder"):
+        return profile_migration.resume_profile_migration(
+            manifest_path, request, embedder=embedder
+        )
+    return profile_migration.resume_profile_migration(manifest_path, request)
+
+
+def _s306_manifest_path(home: Path, plan: Any) -> Path:
+    """The run's manifest path: the module's own run-directory rule when it has one."""
+    resolver = getattr(profile_migration, "run_manifest_path", None)
+    if resolver is not None:
+        return Path(resolver(plan))
+    return home / S206_RUN_DIRECTORY_NAME / plan.request.run_id / S306_MANIFEST_NAME
+
+
+def _s306_embedder() -> Any:
+    return _CountingEmbedder(dimension=S306_VECTOR_SIZE)
+
+
+def _s306_fail_collaborator(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Make ONE production collaborator raise: the real injection of this card."""
+
+    def _fail(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError(S306_INJECTED)
+
+    monkeypatch.setattr(profile_migration, name, _fail)
+
+
+def _s306_fail_advance(monkeypatch: pytest.MonkeyPatch, target: str) -> None:
+    """Fail exactly the transition TO ``target``, leaving every other one real."""
+    real = profile_migration.advance_manifest_checkpoint
+
+    def _advance(manifest_path: Any, checkpoint: str, **kwargs: Any) -> Any:
+        if checkpoint == target:
+            raise ValueError(S306_INJECTED)
+        return real(manifest_path, checkpoint, **kwargs)
+
+    monkeypatch.setattr(profile_migration, "advance_manifest_checkpoint", _advance)
+
+
+def _s306_publication_events(manifest_path: Path, artifact: str) -> list[str]:
+    """The run's OWN recorded event names for one artifact, in order."""
+    prefix = artifact + "."
+    return [
+        event.operation[len(prefix):]
+        for event in load_manifest(manifest_path).events
+        if event.operation.startswith(prefix)
+    ]
+
+
+def _s306_advance_events(manifest: Any) -> list[str]:
+    """The forward-checkpoint transitions the run actually RECORDED, in order."""
+    return [
+        str(event.checkpoint)
+        for event in manifest.events
+        if event.operation.startswith("advance.")
+    ]
+
+
+async def _s306_table_ids(vector_path: Path) -> set[str]:
+    """The IDs actually present in a LanceDB store, read directly (test-side read)."""
+    import asyncio as _asyncio
+
+    import lancedb
+
+    db = await _asyncio.to_thread(lancedb.connect, str(vector_path))
+    table = await _asyncio.to_thread(db.open_table, "memories")
+    try:
+        rows = await _asyncio.to_thread(table.to_arrow)
+        return {str(value) for value in rows.column("id").to_pylist()}
+    finally:
+        close = getattr(table, "close_lsm_writers", None)
+        if close is not None:
+            await _asyncio.to_thread(close)
+
+
+def _s306_published_vector_ids(vector_path: Path) -> set[str]:
+    """Reopen the PUBLISHED vector store: the IDs really inside it, no mocks."""
+    import asyncio as _asyncio
+
+    return _asyncio.run(_s306_table_ids(Path(vector_path)))
+
+
+# --- S3-06 fixtures: a real run, its real crash states, and the injections -----
+
+
+def _s306_expected_batches(db_path: Path) -> int:
+    """The batch count the canonical iteration really produces, computed here."""
+    import asyncio as _asyncio
+
+    batch_size = int(getattr(profile_migration, "DEFAULT_PROJECTION_BATCH_SIZE", 32))
+    url = f"sqlite+aiosqlite:///{db_path}"
+
+    async def _count() -> int:
+        rows = [
+            record
+            async for record in projection_rebuild.iter_canonical_projection_records(
+                url, batch_size=batch_size
+            )
+        ]
+        return -(-len(rows) // batch_size)
+
+    return _asyncio.run(_count())
+
+
+def _s306_evidence_payload(manifest: Any, checkpoint: str) -> Mapping[str, Any]:
+    """The payload of the run's OWN recorded transition TO *checkpoint*."""
+    for event in manifest.events:
+        if event.operation == f"advance.{checkpoint}":
+            return event.payload
+    raise AssertionError(f"the manifest records no transition to {checkpoint}")
+
+
+def _s306_run_dir(home: Path, plan: Any) -> Path:
+    return home / S206_RUN_DIRECTORY_NAME / plan.request.run_id
+
+
+def _s306_quarantine_entry(run_dir: Path, artifact: str, run_id: str) -> Path:
+    return (
+        run_dir
+        / profile_migration.QUARANTINE_DIRECTORY_NAME
+        / profile_migration.QUARANTINE_PREPUBLISH_NAME
+        / profile_migration._quarantine_entry_name(artifact, run_id)
+    )
+
+
+def _s306_legacy_prestate_is_preserved(
+    run_dir: Path, target: Path, artifact: str, run_id: str, legacy: Any
+) -> bool:
+    """Byte-exact preservation of one legacy entity: still at its target, or in quarantine.
+
+    The card's fault-injection clause is "with the source/legacy entities and the
+    backups preserved". Before publication that means the target is untouched;
+    after the publication rename it means the run's OWN pre-publication quarantine
+    holds the exact entry. Both are checked with the no-follow tree description,
+    so a partially moved or rewritten entry cannot pass either way.
+    """
+    if _s208_tree(target) == legacy:
+        return True
+    return _s208_tree(_s306_quarantine_entry(run_dir, artifact, run_id)) == legacy
+
+
+def _s306_inject(monkeypatch: pytest.MonkeyPatch, spec: str) -> None:
+    """Apply ONE injection specification to the real production collaborators."""
+    if spec == "rebuild":
+        async def _fail(*args: Any, **kwargs: Any) -> Any:
+            raise ValueError(S306_INJECTED)
+
+        monkeypatch.setattr(projection_rebuild, "rebuild_projections", _fail)
+        return
+    if spec.startswith("advance:"):
+        _s306_fail_advance(monkeypatch, spec.split(":", 1)[1])
+        return
+    _s306_fail_collaborator(monkeypatch, spec)
+
+
+def _s306_fail_event(monkeypatch: pytest.MonkeyPatch, artifact: str, event: str) -> None:
+    """Fail exactly ONE per-artifact publication event's durable record."""
+    real = profile_migration._record_publication_event
+
+    def _record(manifest_path: Any, label: str, name: str, detail: Any) -> None:
+        if label == artifact and name == event:
+            raise ValueError(S306_INJECTED)
+        return real(manifest_path, label, name, detail)
+
+    monkeypatch.setattr(profile_migration, "_record_publication_event", _record)
+
+
+# The card's clearance evidence: EVERY forward checkpoint is fault-injected, and
+# each injection PREVENTS exactly that checkpoint. `last_completed` is the
+# checkpoint the durable manifest must still claim afterwards.
+S306_FORWARD_FAULTS: dict[str, tuple[str, str | None]] = {
+    "planned": ("_write_manifest", None),
+    "locked": ("acquire_maintenance_locks", "planned"),
+    "backed_up": ("create_run_backup", "locked"),
+    "sqlite_snapshotted": ("qualify_sqlite_source", "backed_up"),
+    "projections_built": ("rebuild", "sqlite_snapshotted"),
+    "staged_verified": ("staged_projection_verification", "projections_built"),
+    "publishing": ("advance:publishing", "staged_verified"),
+    "published": ("advance:published", "publishing"),
+    "verified": ("advance:verified", "published"),
+    "complete": ("advance:complete", "verified"),
+}
+S306_PUBLICATION_ORDER: tuple[str, ...] = ("vector", "graph")
+S306_EVENT_SLOTS: tuple[tuple[str, str], ...] = tuple(
+    (artifact, event)
+    for artifact in S306_PUBLICATION_ORDER
+    for event in (
+        "prestate_revalidated",
+        "prestate_quarantined",
+        "staging_published",
+        "parent_fsynced",
+    )
+)
+
+
+class _StubShapedSeam:
+    """A seam shaped like the S0 stub: it ACCEPTS an input a real verifier cannot.
+
+    Its answer is the forged verdict, so the value is CONSUMED by the capability
+    report rather than asserted next to it (R-S305-c).
+    """
+
+    @staticmethod
+    async def verify_staged_projections(*args: Any, **kwargs: Any) -> Any:
+        return projection_rebuild.ProjectionVerification(True)
+
+
+class _RefusingSeam:
+    """A seam that qualifies itself through the negative-probe channel."""
+
+    @staticmethod
+    async def verify_staged_projections(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("E_STAGED_VERIFICATION_REFUSED")
+
+
+def _s306_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch | None = None,
+    *,
+    symlinked: bool = False,
+) -> dict[str, Any]:
+    """A real profile, its confirmed plan, and the pre-state fingerprints."""
+    home, db_path, external = _s306_home(tmp_path, symlinked=symlinked)
+    request, plan = _s306_plan(home, db_path)
+    run_dir = _s306_run_dir(home, plan)
+    data = home / "data"
+    return {
+        "home": home,
+        "db_path": db_path,
+        "external": external,
+        "request": request,
+        "plan": plan,
+        "run_dir": run_dir,
+        "live": run_dir / S306_MANIFEST_NAME,
+        "data": data,
+        "vector_path": Path(plan.targets["vector"].lexical_path),
+        "graph_path": Path(plan.targets["graph"].lexical_path),
+        "source_sha": hashlib.sha256(db_path.read_bytes()).hexdigest(),
+        # The PRE-STATE of the two legacy targets, captured before the run: the
+        # maintenance locks legitimately add entries to the data ROOT, so only the
+        # targets themselves are byte-comparable across a run.
+        "vector_prestate": _s208_tree(Path(plan.targets["vector"].lexical_path)),
+        "graph_prestate": _s208_tree(Path(plan.targets["graph"].lexical_path)),
+    }
+
+
+def test_s306_apply_reaches_complete_only_through_the_real_rebuilt_projections(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """Acceptance 1: snapshot -> backup -> staging -> rebuild -> verify -> publish -> reopen -> complete.
+
+    BEHAVIOURAL at BASE: the public `apply` refuses with `E_MIGRATION_NOT_IMPLEMENTED`
+    after its precondition pass, so not one checkpoint past `planned` is reachable
+    and no projection is ever rebuilt.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s306_state(tmp_path)
+    plan = state["plan"]
+    legacy_vector = state["vector_prestate"]
+    legacy_graph = state["graph_path"].read_bytes()
+
+    manifest = _s306_apply(plan, embedder=_s306_embedder())
+
+    assert manifest.checkpoint == "complete", manifest.failure
+    assert manifest.status == "complete"
+    # The TEN forward checkpoints are present, in order, as the run's own events.
+    assert _s306_advance_events(manifest) == list(S306_FORWARD_CHECKPOINTS)
+    assert manifest.completed_steps[-1] == "complete"
+
+    # The published entries are the REBUILT projections, not the legacy ones.
+    assert _s306_published_vector_ids(state["vector_path"]) == _s306_expected_vector_ids()
+    assert not (state["vector_path"] / "a.bin").exists(), "the legacy vector tree survived"
+    assert state["graph_path"].read_bytes() != legacy_graph
+
+    # The recorded digests are the ACTUAL ones: recomputed here from the canonical
+    # corpus mapping, never read back from the engine's own RebuildResult.
+    detail = {
+        "completed_batches": _s306_expected_batches(state["db_path"]),
+        "vector_ids_digest": projection_rebuild.id_digest(_s306_expected_vector_ids()),
+        "graph_nodes_digest": projection_rebuild.id_digest(_S305_EXPECTED_NODE_IDS),
+        "graph_edges_digest": projection_rebuild.id_digest(_S305_EXPECTED_EDGE_KEYS),
+    }
+    built = _s306_evidence_payload(manifest, "projections_built")
+    assert built["evidence"] == "rebuild_result"
+    assert built["digest"] == profile_migration._digest(detail), built
+
+    # ... and the reopened PUBLICATION reproduces the same expectation.
+    import asyncio as _asyncio
+
+    snapshot_path = (
+        state["run_dir"]
+        / profile_migration.SNAPSHOT_DIR_NAME
+        / profile_migration.SNAPSHOT_DB_NAME
+    )
+    assert snapshot_path.exists(), "the run owns no safety snapshot"
+    verdict = _asyncio.run(
+        projection_rebuild.verify_published_projections(
+            snapshot_url=f"sqlite+aiosqlite:///{snapshot_path}",
+            published_vector_path=state["vector_path"],
+            published_graph_path=state["graph_path"],
+            expected_vector_size=S306_VECTOR_SIZE,
+        )
+    )
+    assert verdict.valid is True, verdict.errors
+    assert verdict.vector_ids_digest == projection_rebuild.id_digest(_s306_expected_vector_ids())
+    assert verdict.graph_nodes_digest == projection_rebuild.id_digest(_S305_EXPECTED_NODE_IDS)
+    assert verdict.graph_edges_digest == projection_rebuild.id_digest(_S305_EXPECTED_EDGE_KEYS)
+
+    # The legacy pre-state is PRESERVED byte-for-byte in the run quarantine, and
+    # the source SQL is untouched.
+    assert _s306_legacy_prestate_is_preserved(
+        state["run_dir"], state["vector_path"], "vector", plan.request.run_id, legacy_vector
+    )
+    assert _s306_legacy_prestate_is_preserved(
+        state["run_dir"], state["graph_path"], "graph", plan.request.run_id, state["graph_prestate"]
+    )
+    assert hashlib.sha256(state["db_path"].read_bytes()).hexdigest() == state["source_sha"]
+
+    # The SQL store stays in place (acceptance 4): preserve-in-place, no import.
+    assert state["db_path"].exists()
+
+
+def test_s306_the_real_seam_qualifies_itself_and_opens_every_gated_transition() -> None:
+    """Acceptance 1/4 (R-S305-a): the gate is opened by a channel that QUALIFIES the seam.
+
+    BEHAVIOURAL at BASE: the real seam reports NO implemented capability -- S2-06's
+    single-positional negative probe cannot qualify the seam's keyword-only
+    contract -- so every gated checkpoint is unreachable and this node's first
+    assertion (`capability.implemented is True`) fails on a real report object.
+    """
+    report = getattr(profile_migration, "staged_verification_capability", None)
+    assert report is not None, "no capability report for the verification seam exists"
+
+    capability = report()
+    assert capability.implemented is True, capability.detail
+    # The seam's OWN explicit flag -- not a verdict and not the probe's answer.
+    assert capability.basis == "explicit_flag"
+    assert getattr(projection_rebuild, "STAGED_VERIFICATION_IMPLEMENTED", None) is True
+
+    for target, current in (
+        ("staged_verified", "projections_built"),
+        ("published", "publishing"),
+        ("verified", "published"),
+        ("complete", "verified"),
+    ):
+        assert (
+            profile_migration.validate_forward_transition(
+                current, target, [_s206_evidence(target)], capability=capability
+            )
+            == target
+        )
+
+
+def test_s306_the_gate_still_refuses_a_seam_that_never_reports_a_capability() -> None:
+    """The OTHER half of the gate: an unqualified seam opens nothing.
+
+    R-S305-c: the `forged` verdict is CONSUMED here -- it is the probe's own
+    return value -- instead of sitting unused next to the assertion. A seam that
+    answers `ProjectionVerification(True)` to an input a real verifier cannot
+    accept reports NO capability, exactly like the S0 stub did, and every gated
+    transition stays refused. The negative-probe channel is pinned as a live
+    channel too (a seam that REFUSES the probe qualifies).
+    """
+
+    forged = projection_rebuild.ProjectionVerification(True)
+    assert forged.valid is True
+
+    report = profile_migration.staged_verification_capability
+    unqualified = report(_StubShapedSeam)
+    assert unqualified.implemented is False, unqualified
+    assert unqualified.basis == "unimplemented"
+    for target, current in (
+        ("staged_verified", "projections_built"),
+        ("published", "publishing"),
+        ("verified", "published"),
+        ("complete", "verified"),
+    ):
+        with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_CAPABILITY_MISSING"):
+            profile_migration.validate_forward_transition(
+                current, target, [_s206_evidence(target)], capability=unqualified
+            )
+
+    # The probe channel is still a REAL negative probe, not dead code.
+    qualified = report(_RefusingSeam)
+    assert qualified.implemented is True
+    assert qualified.basis == "negative_probe"
+
+    # ... and the REAL seam is still reported through its own flag, never through
+    # anything it returned.
+    real = report()
+    assert real.implemented is True and real.basis == "explicit_flag"
+
+
+def test_s306_the_engine_resolves_a_real_local_embedder_and_refuses_remote_without_opt_in(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """Acceptance 4: config activation stays separate, and no embedder is invented.
+
+    BEHAVIOURAL at BASE: the resolver does not exist, so no run can obtain an
+    embedder and `apply` refuses whatever the plan says.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path, _external = _s306_home(tmp_path)
+    request, plan = _s306_plan(home, db_path)
+
+    resolver = getattr(profile_migration, "resolve_migration_embedder", None)
+    assert resolver is not None, "the engine cannot resolve an embedder at all"
+    from memory_server.providers.embedding_provider import EmbeddingProvider
+
+    resolved = resolver(plan)
+    assert callable(getattr(resolved, "embed_batch", None))
+    assert isinstance(resolved, EmbeddingProvider), (
+        "the engine must resolve the deployment's OWN provider, never a private object"
+    )
+    # The engine cannot fabricate a vector source: a caller-supplied object that
+    # cannot embed is refused rather than accepted and replaced.
+    with pytest.raises(ValueError, match="E_EMBEDDER_UNAVAILABLE"):
+        resolver(plan, embedder=object())
+    # NOTE (disclosed): under the S0 synthetic-Settings harness the deployment's
+    # local provider IS substituted with `MockEmbeddingProvider` by
+    # `tests/synthetic_storage_env.py`, which is the HARNESS's isolation of a
+    # synthetic test from a real model -- not an engine fabrication. This node
+    # therefore pins the provider TYPE and the refusal, not the class name.
+
+    remote = replace(plan, embedding=replace(plan.embedding, backend="remote"))
+    with pytest.raises(ValueError, match="E_NETWORK_EMBEDDING_REQUIRED"):
+        resolver(remote)
+    allowed = resolver(remote, request=replace(request, allow_network_embedding=True))
+    assert callable(getattr(allowed, "embed_batch", None))
+
+
+def test_s306_publication_requires_staged_verified_evidence(
+    tmp_path: Path, synthetic_storage_env
+) -> None:
+    """R4 (this card's residual): `publish_artifact` may not run before `staged_verified`.
+
+    BEHAVIOURAL at BASE: the primitive publishes happily against a run stopped at
+    `projections_built`, which is the un-evidenced publication the residual names.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path, _external = _s306_home(tmp_path)
+    request, plan = _s306_plan(home, db_path)
+    run_dir = _s306_run_dir(home, plan)
+    early = _s207_write_manifest(plan, run_dir, checkpoint="projections_built")
+    staged = _s207_stage(run_dir, "vector")
+
+    api = profile_migration.publish_artifact
+    with pytest.raises(ValueError, match="E_PUBLICATION_WITHOUT_STAGED_VERIFICATION"):
+        api(
+            plan,
+            "vector",
+            staged_identity=_s206_identity(staged),
+            run_dir=run_dir,
+            manifest_path=early,
+        )
+    # The control: the very same call at `publishing` reaches the real primitive.
+    later = _s207_write_manifest(plan, run_dir, checkpoint="publishing", name="manifest-ok.json")
+    result = api(
+        plan,
+        "vector",
+        staged_identity=_s206_identity(staged),
+        run_dir=run_dir,
+        manifest_path=later,
+    )
+    assert result.prestate == "quarantined"
+    assert [event.event for event in result.events] == list(S206_PUBLISHED_SEQUENCE)
+
+
+def test_s306_the_publish_rename_fsyncs_its_source_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """R6 (this card's residual): the publish rename must fsync the parent it moved OUT of.
+
+    BEHAVIOURAL at BASE: the staging directory is never fsynced, so a crash can
+    persist the target without the staging entry's disappearance.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    home, db_path, _external = _s306_home(tmp_path)
+    request, plan = _s306_plan(home, db_path)
+    run_dir = _s306_run_dir(home, plan)
+    live = _s207_write_manifest(plan, run_dir, checkpoint="publishing")
+    staged = _s207_stage(run_dir, "vector")
+    staging_dir = run_dir / S207_STAGING_DIRECTORY_NAME
+
+    fsynced = _s206_fsync_spy(monkeypatch)
+    result = profile_migration.publish_artifact(
+        plan,
+        "vector",
+        staged_identity=_s206_identity(staged),
+        run_dir=run_dir,
+        manifest_path=live,
+    )
+
+    assert os.path.realpath(str(staging_dir)) in set(fsynced), (
+        "the publish rename did not fsync the staging directory it moved the entry out of"
+    )
+    # `result.parents_fsynced` stays DETAIL 10.4 step 5's pair (the target parent
+    # and the quarantine parent): the S2-06 node that pins that exact pair is NOT
+    # widened here, and R6's source-parent fsync is an ADDITIONAL durability step.
+    assert {os.path.realpath(item) for item in result.parents_fsynced} == {
+        os.path.realpath(str(Path(plan.targets["vector"].lexical_path).parent)),
+        os.path.realpath(
+            str(_s306_quarantine_entry(run_dir, "vector", plan.request.run_id).parent)
+        ),
+    }
+
+
+def test_s306_the_reopen_identity_check_for_a_published_directory_is_what_it_is() -> None:
+    """CONTROL (passes on BOTH sides, by design): exactly what the entry-identity check covers.
+
+    This node changes no production behaviour and is NOT a RED; it is filed as a
+    CONTROL so the R5 limitation cannot drift unnoticed while the verifier that
+    supersedes it for the production path is pinned elsewhere.
+
+    `_identity_key` covers kind/device/inode/mode/size/mtime_ns/sha256/raw_link,
+    and a DIRECTORY carries no size, mtime or digest in this project's identity
+    model, so for the published vector DIRECTORY the primitive compares
+    kind/device/inode/mode only. That limitation is DISCLOSED rather than
+    silently widened here (N-2/R5): the production path does not rely on it -- the
+    verified CONTENT of the published vector store comes from the one verifier in
+    `projection_rebuild`, which the end-to-end node above drives. This node pins
+    what IS checked so the limitation cannot drift unnoticed.
+    """
+    assert set(profile_migration._IDENTITY_KEY_FIELDS) == {
+        "kind",
+        "device",
+        "inode",
+        "mode",
+        "size",
+        "mtime_ns",
+        "sha256",
+        "raw_link_target",
+    }
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        first = root / "one"
+        second = root / "two"
+        first.mkdir()
+        second.mkdir()
+        (first / "x.bin").write_bytes(b"FIRST")
+        (second / "x.bin").write_bytes(b"SECOND!!")
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            observed_first = profile_migration._observed_entry_identity(
+                root_fd, "one", artifact="vector"
+            )
+            observed_second = profile_migration._observed_entry_identity(
+                root_fd, "two", artifact="vector"
+            )
+        finally:
+            os.close(root_fd)
+        assert observed_first.kind == observed_second.kind == "directory"
+        assert observed_first.size is None and observed_first.sha256 is None
+        # Different inodes -> different identity keys: the check that DOES fire.
+        assert profile_migration._identity_key(observed_first) != profile_migration._identity_key(
+            observed_second
+        )
+
+
+# --- S3-06 adversarial end to end: the checkpoint must not be reached ---------
+
+
+async def _s306_staged_provider(vector_path: Path) -> Any:
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    return LanceDBProvider(db_path=str(vector_path), vector_size=S306_VECTOR_SIZE)
+
+
+def _s306_corrupt_staged(monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    """Corrupt the REAL staged artifacts the run just built, then let it continue.
+
+    Every arm is an ADVERSARIAL but structurally plausible artifact: the wrong-ID
+    arm keeps the row count, the tampered-payload arm keeps the ID set and the
+    digest, the graph arms keep the graph structurally valid where that is the
+    point, and the last arm breaks the PUBLISHED store after the swap.
+    """
+    real = projection_rebuild.rebuild_projections
+
+    async def _rebuild(*args: Any, **kwargs: Any) -> Any:
+        result = await real(*args, **kwargs)
+        vector_path = Path(kwargs["staging_vector_path"])
+        graph_path = Path(kwargs["staging_graph_path"])
+        if kind == "wrong_ids":
+            provider = await _s306_staged_provider(vector_path)
+            await provider.delete(point_id=str(uuid5(NAMESPACE_DNS, "fact:f1")))
+            await provider.upsert_batch([
+                {
+                    "id": "ffffffff-0000-0000-0000-000000000001",
+                    "vector": [0.5] * S306_VECTOR_SIZE,
+                    "payload": {
+                        "subject": "Widget", "predicate": "uses", "object": "Caddy",
+                        "source": "s", "memory_type": "fact",
+                    },
+                }
+            ])
+            await provider.close()
+        elif kind == "tampered_payload":
+            provider = await _s306_staged_provider(vector_path)
+            await provider.upsert_batch([
+                {
+                    "id": str(uuid5(NAMESPACE_DNS, "fact:f1")),
+                    "vector": [0.5] * S306_VECTOR_SIZE,
+                    "payload": {
+                        "subject": "Widget", "predicate": "uses", "object": "Caddy",
+                        "source": "s", "memory_type": "fact", "extra_key": "tampered",
+                    },
+                }
+            ])
+            await provider.close()
+        elif kind == "missing_edge":
+            data = _s305_graph_json(graph_path)
+            data["edges"] = [edge for edge in data["edges"] if edge["target_id"] != "caddy"]
+            _s305_write_graph_json(graph_path, data)
+        elif kind == "orphan_edge":
+            data = _s305_graph_json(graph_path)
+            data["edges"].append(
+                {"source_id": "widget", "target_id": "ghost", "relation": "mentions", "attributes": {}}
+            )
+            _s305_write_graph_json(graph_path, data)
+        else:  # pragma: no cover - the parametrization is closed above
+            raise AssertionError(kind)
+        return result
+
+    monkeypatch.setattr(projection_rebuild, "rebuild_projections", _rebuild)
+
+
+S306_STAGED_ATTACKS: tuple[str, ...] = (
+    "wrong_ids",
+    "tampered_payload",
+    "missing_edge",
+    "orphan_edge",
+)
+
+
+@pytest.mark.parametrize("attack", S306_STAGED_ATTACKS)
+def test_s306_adversarial_staged_artifact_never_reaches_staged_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env, attack: str
+) -> None:
+    """Acceptance 1/4: an adversarial staged projection PREVENTS `staged_verified`.
+
+    Same counts with wrong IDs, a tampered payload, a missing graph edge and an
+    orphan graph edge: each one keeps the artifact structurally plausible, so only
+    the ONE real verifier can refuse it -- and the refusal must prevent the
+    CHECKPOINT, not merely produce a diagnostic. BEHAVIOURAL at BASE: the run
+    refuses at `planned`/`E_MIGRATION_NOT_IMPLEMENTED` and no projection is built.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s306_state(tmp_path, monkeypatch)
+    _s306_corrupt_staged(monkeypatch, attack)
+
+    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_REFUSED"):
+        _s306_apply(state["plan"], embedder=_s306_embedder())
+
+    manifest = load_manifest(state["live"])
+    assert manifest.status == "failed"
+    assert manifest.checkpoint == "projections_built", manifest.checkpoint
+    assert "staged_verified" not in _s306_advance_events(manifest)
+    assert manifest.failure is not None
+    assert manifest.failure.get("step") == "staged_verified"
+    assert manifest.failure.get("code") == "E_STAGED_VERIFICATION_REFUSED"
+    # Nothing was published and the legacy pre-state is untouched, byte for byte.
+    assert _s306_legacy_prestate_is_preserved(
+        state["run_dir"], state["vector_path"], "vector", state["plan"].request.run_id,
+        state["vector_prestate"],
+    )
+    assert _s306_legacy_prestate_is_preserved(
+        state["run_dir"], state["graph_path"], "graph", state["plan"].request.run_id,
+        state["graph_prestate"],
+    )
+    assert hashlib.sha256(state["db_path"].read_bytes()).hexdigest() == state["source_sha"]
+
+
+def test_s306_a_published_store_that_cannot_be_reopened_never_reaches_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """Acceptance 1/3: the reopen-before-`complete` requirement is real.
+
+    The swap itself succeeds and the `published` checkpoint IS earned, and then
+    the published entry is replaced by an unreadable one. `verified` must not be
+    reached, so `complete` is out of reach. BEHAVIOURAL at BASE.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s306_state(tmp_path, monkeypatch)
+    real_publish = profile_migration.publish_artifact
+
+    def _publish(plan: Any, artifact: str, **kwargs: Any) -> Any:
+        result = real_publish(plan, artifact, **kwargs)
+        if artifact == "graph":
+            Path(plan.targets["graph"].lexical_path).write_bytes(b"{not json at all")
+        return result
+
+    monkeypatch.setattr(profile_migration, "publish_artifact", _publish)
+
+    with pytest.raises(ValueError, match="E_PUBLISHED_REOPEN_MISMATCH"):
+        _s306_apply(state["plan"], embedder=_s306_embedder())
+
+    manifest = load_manifest(state["live"])
+    assert manifest.status == "failed"
+    assert manifest.checkpoint == "published"
+    assert "verified" not in _s306_advance_events(manifest)
+    assert manifest.failure is not None
+    assert manifest.failure.get("code") == "E_PUBLISHED_REOPEN_MISMATCH"
+
+
+# --- S3-06 fault injection: EVERY forward checkpoint -------------------------
+
+
+@pytest.mark.parametrize("checkpoint", sorted(S306_FORWARD_FAULTS))
+def test_s306_every_forward_checkpoint_fault_is_recorded_and_preserves_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env, checkpoint: str
+) -> None:
+    """Acceptance 2: every forward checkpoint is fault-injected, nothing is lost.
+
+    The injection PREVENTS exactly the named checkpoint. The durable manifest must
+    keep the last checkpoint it actually completed, record the failure with its
+    stable cause and the exception class (DETAIL 9.3), and the source, the legacy
+    entities and the backups must all survive byte-for-byte. BEHAVIOURAL at BASE:
+    the run refuses at `planned` with `E_MIGRATION_NOT_IMPLEMENTED`, so no
+    checkpoint is ever reached and no failure is ever recorded.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    spec, last_completed = S306_FORWARD_FAULTS[checkpoint]
+    state = _s306_state(tmp_path, monkeypatch)
+    legacy_vector = state["vector_prestate"]
+    legacy_graph = state["graph_prestate"]
+    _s306_inject(monkeypatch, spec)
+
+    with pytest.raises(ValueError, match=S306_INJECTED):
+        _s306_apply(state["plan"], embedder=_s306_embedder())
+
+    if last_completed is None:
+        assert not state["live"].exists(), "a refused run materialized a manifest"
+    else:
+        manifest = load_manifest(state["live"])
+        assert manifest.status == "failed", manifest.status
+        assert manifest.checkpoint == last_completed
+        expected = list(S306_FORWARD_CHECKPOINTS[: S306_FORWARD_CHECKPOINTS.index(last_completed) + 1])
+        assert _s306_advance_events(manifest) == expected
+        assert manifest.failure is not None, "the failure was not recorded at all"
+        assert manifest.failure.get("step") == checkpoint
+        assert manifest.failure.get("code") == S306_INJECTED
+        assert manifest.failure.get("exception") == "ValueError"
+
+    # The source is untouched, and the legacy pre-state survives somewhere exact.
+    assert hashlib.sha256(state["db_path"].read_bytes()).hexdigest() == state["source_sha"]
+    assert _s306_legacy_prestate_is_preserved(
+        state["run_dir"], state["vector_path"], "vector", state["plan"].request.run_id, legacy_vector
+    )
+    assert _s306_legacy_prestate_is_preserved(
+        state["run_dir"], state["graph_path"], "graph", state["plan"].request.run_id, legacy_graph
+    )
+
+    # Every backup the run made before the fault is still there and still verifies.
+    report_path = state["run_dir"] / profile_migration.BACKUP_REPORT_NAME
+    if last_completed is not None and S306_FORWARD_CHECKPOINTS.index(last_completed) >= 2:
+        assert report_path.exists(), "the run's own backup report vanished"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        for entry in report["entries"]:
+            if entry["present"] and entry["kind"] == "regular_file":
+                copy = state["run_dir"] / entry["run_relative_path"]
+                assert copy.exists(), entry["artifact"]
+
+
+# --- S3-06 fault injection: EVERY per-artifact publication event -------------
+
+
+@pytest.mark.parametrize("artifact,event", S306_EVENT_SLOTS)
+def test_s306_every_publication_event_fault_is_recorded_and_the_prestate_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env, artifact: str, event: str
+) -> None:
+    """Acceptance 2: EVERY DETAIL 9.3 per-artifact publication event is fault-injected.
+
+    The failure is injected into that event's own durable record, so the run stops
+    exactly there; the events recorded afterwards must be exactly the prefix
+    BEFORE the injected one, and the source, the legacy pre-state and the backups
+    must survive. BEHAVIOURAL at BASE.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s306_state(tmp_path, monkeypatch)
+    legacy_vector = state["vector_prestate"]
+    legacy_graph = state["graph_prestate"]
+    _s306_fail_event(monkeypatch, artifact, event)
+
+    with pytest.raises(ValueError, match=S306_INJECTED):
+        _s306_apply(state["plan"], embedder=_s306_embedder())
+
+    manifest = load_manifest(state["live"])
+    assert manifest.status == "failed"
+    assert manifest.checkpoint == "publishing"
+    # Both legacy targets exist in this fixture, so this artifact's DETAIL 9.3
+    # sequence is the quarantined one and the recorded events must be exactly the
+    # prefix that PRECEDES the injected event.
+    sequence = ("prestate_revalidated", "prestate_quarantined", "staging_published", "parent_fsynced")
+    assert event in sequence
+    assert _s306_publication_events(state["live"], artifact) == list(
+        sequence[: sequence.index(event)]
+    )
+    if artifact == "graph":
+        # The vector artifact was completed first: its whole sequence is recorded.
+        assert _s306_publication_events(state["live"], "vector") == list(sequence)
+    assert manifest.failure is not None
+    assert manifest.failure.get("step") == f"{artifact}.{event}"
+
+    assert hashlib.sha256(state["db_path"].read_bytes()).hexdigest() == state["source_sha"]
+    assert _s306_legacy_prestate_is_preserved(
+        state["run_dir"], state["vector_path"], "vector", state["plan"].request.run_id, legacy_vector
+    )
+    assert _s306_legacy_prestate_is_preserved(
+        state["run_dir"], state["graph_path"], "graph", state["plan"].request.run_id, legacy_graph
+    )
+    assert (state["run_dir"] / profile_migration.BACKUP_REPORT_NAME).exists()
+
+
+# --- S3-06 crash recovery: resume and rollback on the REBUILT projections ----
+
+
+def _s306_crash_inside_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, symlinked: bool, event: str
+) -> dict[str, Any]:
+    """Drive the REAL pipeline into ONE per-artifact publication crash.
+
+    The vector artifact is the one that crashes, always after its prestate was
+    revalidated, so the crash state is a real target/staging/quarantine triad
+    produced by the shipped primitive -- never a synthesised one.
+    """
+    state = _s306_state(tmp_path, monkeypatch, symlinked=symlinked)
+    _s306_fail_event(monkeypatch, "vector", event)
+    with pytest.raises(ValueError, match=S306_INJECTED):
+        _s306_apply(state["plan"], embedder=_s306_embedder())
+    # The crash state is produced; the injection is WITHDRAWN so that everything
+    # below runs against the shipped code and not against the fault injector.
+    monkeypatch.undo()
+    state["crashed_manifest"] = load_manifest(state["live"])
+    assert state["crashed_manifest"].status == "failed"
+    assert state["crashed_manifest"].checkpoint == "publishing"
+    return state
+
+
+S306_RESUMABLE_CRASHES: tuple[tuple[bool, str], ...] = (
+    (False, "prestate_revalidated"),
+    (False, "parent_fsynced"),
+    (True, "prestate_revalidated"),
+)
+
+
+@pytest.mark.parametrize("symlinked,event", S306_RESUMABLE_CRASHES)
+def test_s306_resume_finishes_a_crashed_publication_on_the_rebuilt_projections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env, symlinked: bool, event: str
+) -> None:
+    """Acceptance 3: `resume` operates on the ACTUAL rebuilt projections.
+
+    The crash state is single-valued for the classifier (the run's own chain and
+    the disk agree), so exactly one next operation exists and the entrypoint must
+    EXECUTE it -- not refuse it. Both the real-directory layout and the live
+    symlinked layout are exercised. BEHAVIOURAL at BASE: `resume` refuses with
+    `E_STAGED_VERIFICATION_CAPABILITY_MISSING` and can never continue a classified
+    run, so the migration stays half-published forever.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s306_crash_inside_publication(
+        tmp_path, monkeypatch, symlinked=symlinked, event=event
+    )
+
+    recovered = _s306_resume(state["live"], state["request"], embedder=_s306_embedder())
+
+    assert recovered.checkpoint == "complete", recovered.failure
+    assert recovered.status == "complete"
+    assert _s306_advance_events(recovered) == list(S306_FORWARD_CHECKPOINTS)
+    # The completion is the REAL one: the published artifacts reproduce the
+    # expectation derived from the canonical corpus.
+    assert _s306_published_vector_ids(state["vector_path"]) == _s306_expected_vector_ids()
+    published_graph = json.loads(state["graph_path"].read_text(encoding="utf-8"))
+    # `SimpleGraph.to_dict()` publishes nodes as a mapping keyed by node id and
+    # edges as a list of records, so both are compared in their own shape.
+    assert set(published_graph["nodes"]) == _S305_EXPECTED_NODE_IDS
+    assert {
+        f"{edge['source_id']}|{edge['target_id']}|{edge['relation']}"
+        for edge in published_graph["edges"]
+    } == _S305_EXPECTED_EDGE_KEYS
+    # The source and the outside referent tree were never touched.
+    assert hashlib.sha256(state["db_path"].read_bytes()).hexdigest() == state["source_sha"]
+    if state["external"] is not None:
+        assert (state["external"] / "referent.bin").read_bytes() == b"REFERENT"
+        assert {
+            str(path.relative_to(state["external"]))
+            for path in state["external"].rglob("*")
+        } == {"referent.bin"}
+
+
+@pytest.mark.parametrize("symlinked", [False, True])
+def test_s306_rollback_after_a_crashed_publication_restores_the_exact_prestate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env, symlinked: bool
+) -> None:
+    """Acceptance 3: the restored pre-state is byte-exact, INCLUDING the final symlink.
+
+    The crash leaves the swapped-but-unrecorded state, which DETAIL 10.5 requires
+    `resume` to REFUSE as ambiguous. `rollback` is then the only correct move: it
+    quarantines the entry this run published and restores the recorded pre-state
+    byte-for-byte -- for the live layout that is the exact RAW symlink string, and
+    the external referent tree is never opened. BEHAVIOURAL at BASE.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s306_crash_inside_publication(
+        tmp_path, monkeypatch, symlinked=symlinked, event="staging_published"
+    )
+    before_tree = state["vector_prestate"]
+    referent = None if state["external"] is None else _s208_tree(state["external"])
+
+    # DETAIL 10.5: the run's chain says "quarantined", the disk holds a published
+    # entry and no staged entry -- two readings, so only rollback may proceed.
+    # For the SYMLINKED layout the swap also consumed the final symlink, so the
+    # config-digest precondition fires FIRST (see the node below, which pins that
+    # limitation and names its owner); either way the run may not be resumed.
+    expected = "E_RESUME_CONFIG_CHANGED" if symlinked else "E_PUBLICATION_AMBIGUOUS"
+    with pytest.raises(ValueError, match=expected):
+        _s306_resume(state["live"], state["request"], embedder=_s306_embedder())
+    assert _s208_tree(state["vector_path"]) != before_tree, "the fixture did not actually publish"
+
+    rollback = getattr(profile_migration, "rollback_profile_migration")
+    rolled = rollback(state["live"], state["request"])
+
+    assert rolled is not None
+    assert load_manifest(state["live"]).status == "rolled_back"
+    assert _s208_tree(state["vector_path"]) == before_tree, "the restored pre-state is not byte-exact"
+    assert _s208_tree(state["graph_path"]) == state["graph_prestate"]
+    if symlinked:
+        assert os.path.islink(state["vector_path"])
+        assert os.readlink(state["vector_path"]) == str(state["external"])
+        assert _s208_tree(state["external"]) == referent
+    else:
+        assert not os.path.islink(state["vector_path"])
+    assert hashlib.sha256(state["db_path"].read_bytes()).hexdigest() == state["source_sha"]
+
+
+def test_s306_a_post_swap_replan_of_a_consumed_final_symlink_is_refused_by_the_config_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """DISCLOSED LIMITATION with a named owner: a CONSUMED final symlink cannot be resumed.
+
+    DETAIL 10.4 step 4 consumes the final symlink by design -- the symlink entry
+    itself is renamed into the run quarantine and the verified staged DIRECTORY
+    takes its place -- while DETAIL 9.2's `config_digest` hashes the target storage
+    identity. After that swap a fresh plan no longer describes the same
+    configuration, so DETAIL 10.5's resume precondition refuses with
+    `E_RESUME_CONFIG_CHANGED`. This node PINS that refusal instead of claiming a
+    resume that does not happen, and it is filed rather than worked around:
+    the correct recovery for this crash state is `rollback` (proved by the node
+    above to restore the exact RAW symlink and the external referent tree
+    untouched), not `resume`. No refusal precedence is changed here.
+
+    Owner of the residual: the next writer of the config-digest / resume seam
+    (`serialize_layout_redacted` / `config_digest` are S2-01/S2-02 territory,
+    `_require_resume_config_digest` is S2-07 territory), with a DETAIL clarification
+    either way -- the digest must exclude the CONSUMED pre-state kind, or DETAIL
+    10.5 must name this case.
+
+    BEHAVIOURAL at BASE: resume refuses with the capability code instead, so the
+    pinned code is never observed at BASE.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s306_crash_inside_publication(
+        tmp_path, monkeypatch, symlinked=True, event="parent_fsynced"
+    )
+    assert not os.path.islink(state["vector_path"]), "the fixture did not consume the symlink"
+
+    with pytest.raises(ValueError, match="E_RESUME_CONFIG_CHANGED"):
+        _s306_resume(state["live"], state["request"], embedder=_s306_embedder())
+
+    # The refusal mutated nothing and the run is still exactly where it crashed.
+    manifest = load_manifest(state["live"])
+    assert manifest.checkpoint == "publishing"
+    assert manifest.status == "failed"
+    assert _s306_publication_events(state["live"], "vector") == [
+        "prestate_revalidated",
+        "prestate_quarantined",
+        "staging_published",
+    ]
+    # ... and the pre-state the swap displaced is retained byte for byte.
+    assert _s306_legacy_prestate_is_preserved(
+        state["run_dir"],
+        state["vector_path"],
+        "vector",
+        state["plan"].request.run_id,
+        state["vector_prestate"],
+    )
+    assert hashlib.sha256(state["db_path"].read_bytes()).hexdigest() == state["source_sha"]
+
+
+def test_s306_a_refusal_never_records_an_invented_digest_or_a_success_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+) -> None:
+    """Acceptance 4: no production path returns an invented digest or status.
+
+    The run is stopped with a REAL corrupted staged artifact. Afterwards EVERY
+    recorded evidence digest must still be a well-formed SHA-256 of a preimage the
+    engine could only have obtained by doing the work, no gated checkpoint may be
+    recorded, no status may claim success, and the failure must name the real
+    cause rather than a placeholder. The mutant recorded in the ledger makes the
+    staged-verification consumer accept an invalid verdict; this node dies on it.
+    """
+    env = synthetic_storage_env
+    env.assert_injection()
+    state = _s306_state(tmp_path, monkeypatch)
+    _s306_corrupt_staged(monkeypatch, "wrong_ids")
+
+    with pytest.raises(ValueError, match="E_STAGED_VERIFICATION_REFUSED"):
+        _s306_apply(state["plan"], embedder=_s306_embedder())
+
+    manifest = load_manifest(state["live"])
+    assert manifest.status == "failed"
+    assert manifest.status != "complete"
+    assert manifest.checkpoint not in ("staged_verified", "published", "verified", "complete")
+    recorded = _s306_advance_events(manifest)
+    assert recorded == list(S306_FORWARD_CHECKPOINTS[:5])
+    for event in manifest.events:
+        digest = event.payload.get("digest")
+        if digest is None:
+            continue
+        assert re.fullmatch(r"[0-9a-f]{64}", str(digest)), (event.operation, digest)
+        assert str(digest) != "0" * 64
+        assert str(digest) != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    assert manifest.failure is not None
+    assert manifest.failure.get("code") == "E_STAGED_VERIFICATION_REFUSED"
+    assert manifest.failure.get("message")
+    # The verification evidence the run refused on was NEVER written.
+    assert all(
+        event.payload.get("evidence") != "staged_verification" for event in manifest.events
+    )
+
+
+def test_s306_the_event_coverage_ledger_is_the_fault_injection_inventory() -> None:
+    """The ledger's source of truth: every injected point is a node id.
+
+    Acceptance 2 demands an event coverage ledger (event -> node -> cause). This
+    node keeps that ledger MECHANICALLY true: the point set the ledger lists is
+    exactly the set the two parametrized fault nodes consume, so a point that
+    stops being exercised cannot stay in the document unnoticed.
+    """
+    assert set(S306_FORWARD_FAULTS) == set(S306_FORWARD_CHECKPOINTS)
+    assert S306_EVENT_SLOTS == tuple(
+        (artifact, event)
+        for artifact in ("vector", "graph")
+        for event in (
+            "prestate_revalidated",
+            "prestate_quarantined",
+            "staging_published",
+            "parent_fsynced",
+        )
+    )
+    assert len(S306_EVENT_SLOTS) == 8
+    # The ledger DOCUMENT lives outside the tree; the certified runner denies the
+    # workspace by design, so this node cannot read it and does not pretend to. What
+    # it pins is the mechanical invariant the document is built from: the injected
+    # point set is exactly the ten checkpoints plus the eight event slots, and the
+    # SUMMARY cross-checks the document's rows against these two tuples.
+    assert tuple(S306_FORWARD_FAULTS) == tuple(S306_FORWARD_CHECKPOINTS)
+    assert {f"{artifact}.{event}" for artifact, event in S306_EVENT_SLOTS} == {
+        "vector.prestate_revalidated",
+        "vector.prestate_quarantined",
+        "vector.staging_published",
+        "vector.parent_fsynced",
+        "graph.prestate_revalidated",
+        "graph.prestate_quarantined",
+        "graph.staging_published",
+        "graph.parent_fsynced",
+    }
