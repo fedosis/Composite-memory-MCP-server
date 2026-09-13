@@ -30,14 +30,24 @@ def test_server_import_does_not_import_optional_vector_backends(monkeypatch):
             raise ImportError(f"blocked optional dependency: {name}")
         return original_import(name, globals, locals, fromlist, level)
 
-    for module_name in list(sys.modules):
-        if module_name == "memory_server.server" or module_name.startswith("memory_server.router"):
-            sys.modules.pop(module_name)
-        if module_name.split(".", maxsplit=1)[0] in blocked_roots:
-            sys.modules.pop(module_name)
+    removed_optional = {
+        module_name: module
+        for module_name, module in sys.modules.items()
+        if module_name.split(".", maxsplit=1)[0] in blocked_roots
+    }
+    try:
+        for module_name in list(sys.modules):
+            if module_name == "memory_server.server" or module_name.startswith("memory_server.router"):
+                sys.modules.pop(module_name)
+            if module_name.split(".", maxsplit=1)[0] in blocked_roots:
+                sys.modules.pop(module_name)
 
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
 
-    import memory_server.server as server
+        import memory_server.server as server
 
-    assert server.mcp is not None
+        assert server.mcp is not None
+    finally:
+        # Keep this collection-time import probe from poisoning later real
+        # LanceDB tests: the pyo3 extension owns a process-global Rust logger.
+        sys.modules.update(removed_optional)
