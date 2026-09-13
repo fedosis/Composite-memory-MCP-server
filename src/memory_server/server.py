@@ -769,6 +769,7 @@ async def add_relation_tool(
 
 
 @mcp.tool(name="invalidate")
+@_stable_projection_errors
 async def invalidate_tool(
     memory_id: str,
     memory_type: str,
@@ -818,6 +819,7 @@ async def _get_hybrid_router() -> HybridRouter:
 
 
 @mcp.tool(name="route")
+@_stable_projection_errors
 async def route_tool(
     query: str = "",
     top_k: int = get_settings().semantic_top_k,
@@ -845,6 +847,7 @@ async def route_tool(
 
 
 @mcp.tool(name="audit")
+@_stable_projection_errors
 async def audit_tool(
     audit_type: str = "full",
 ) -> str:
@@ -878,6 +881,7 @@ async def metrics_tool() -> str:
 
 
 @mcp.tool(name="set_belief")
+@_stable_projection_errors
 async def set_belief_tool(
     proposition: str,
     confidence: float = 0.5,
@@ -1075,6 +1079,7 @@ async def get_belief_tool(
 
 
 @mcp.tool(name="resolve_conflict")
+@_stable_projection_errors
 async def resolve_conflict_tool(
     belief_a_id: str,
     belief_b_id: str,
