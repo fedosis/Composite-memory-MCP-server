@@ -28,7 +28,6 @@ from storage.outbox import OutboxEntry, OutboxEntryORM, OutboxRepository
 from storage.outbox_worker import OutboxWorker
 
 from memory_server.models import Fact, MemoryReceipt, VerificationStatus
-from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
 from memory_server.providers.exceptions import ProviderSearchError, ProviderWriteError
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.qdrant_provider import QdrantProvider
@@ -87,8 +86,8 @@ async def qdrant_provider():
 
 @pytest.fixture
 async def embedder():
-    """Sentence transformer embedder."""
-    return SentenceTransformerEmbeddingProvider()
+    """Deterministic offline embedder for the certified runner."""
+    return _FakeEmbedder()
 
 
 @pytest.fixture
@@ -398,10 +397,12 @@ class TestOutboxRepository:
 
 class _FakeEmbedder:
     def embed(self, text: str) -> list[float]:
-        return [0.1, 0.2, 0.3]
+        vector = [0.0] * 384
+        vector[sum(map(ord, text)) % 384] = 1.0
+        return vector
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        return [[0.1, 0.2, 0.3] for _ in texts]
+        return [self.embed(text) for text in texts]
 
 
 class _FakeQdrantFalse:

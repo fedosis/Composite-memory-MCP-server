@@ -15,6 +15,7 @@ file's subject. Always run the source-tree gate:
 
 import asyncio
 import inspect
+import json
 import logging
 import threading
 import time
@@ -1682,3 +1683,19 @@ async def test_s1_standalone_graph_router_consumes_frozen_settings(s1_server, mo
     monkeypatch.setattr(server, "get_settings", forbid)
     router = await server._get_graph_router()
     assert router._max_path_depth == frozen.graph_max_path_depth
+
+
+@pytest.mark.asyncio
+async def test_s3_07_server_projection_dispatch_returns_stable_error(monkeypatch):
+    import memory_server.server as server
+
+    async def unavailable(*args, **kwargs):
+        raise RuntimeError("E_PROJECTION_UNAVAILABLE: vector requires migration")
+
+    monkeypatch.setattr(server, "_get_router", unavailable)
+    result = json.loads(await server.semantic_search_tool(query="x"))
+    assert result == {
+        "error": "E_PROJECTION_UNAVAILABLE",
+        "message": "E_PROJECTION_UNAVAILABLE: vector requires migration",
+        "hint": server.PROJECTION_MIGRATION_HINT,
+    }

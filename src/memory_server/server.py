@@ -9,6 +9,7 @@ v0.6 Phase 4: Uses transactional outbox pattern for async indexing.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import uuid
@@ -77,6 +78,33 @@ _outbox_task: asyncio.Task | None = None
 
 _storage_settings = None
 _storage_cleanup_failed = False
+
+PROJECTION_MIGRATION_HINT = "Run `memory-server migrate-profile-storage` to rebuild unavailable projections."
+
+
+def _projection_error(exc: BaseException) -> str | None:
+    message = str(exc)
+    if not message.startswith("E_PROJECTION_UNAVAILABLE"):
+        return None
+    return json.dumps({
+        "error": "E_PROJECTION_UNAVAILABLE",
+        "message": message,
+        "hint": PROJECTION_MIGRATION_HINT,
+    })
+
+
+def _stable_projection_errors(function):
+    """Map only projection-unavailable failures at public tool boundaries."""
+    @functools.wraps(function)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await function(*args, **kwargs)
+        except RuntimeError as exc:
+            result = _projection_error(exc)
+            if result is not None:
+                return result
+            raise
+    return wrapped
 
 
 def _get_storage_settings():
@@ -472,7 +500,6 @@ async def remember_tool(
     collector = get_collector()
     with collector.tool_call("remember") as _ctx:
         provider = await _get_provider()
-        graph_router = await _get_graph_router()
         result = await remember_fn(
             provider,
             subject=subject,
@@ -480,7 +507,6 @@ async def remember_tool(
             object=object,
             confidence=confidence,
             source=source,
-            graph=graph_router.graph,
         )
 
         # Serialize Pydantic models in result
@@ -545,6 +571,7 @@ def _serialize_route_result(result: dict) -> str:
 
 
 @mcp.tool(name="semantic_search")
+@_stable_projection_errors
 async def semantic_search_tool(
     query: str = "",
     top_k: int = get_settings().semantic_top_k,
@@ -603,6 +630,7 @@ async def _get_lifecycle_service() -> LifecycleService:
 
 
 @mcp.tool(name="graph_search")
+@_stable_projection_errors
 async def graph_search_fn(
     query: str = "",
     entity_id: str = "",
@@ -712,6 +740,7 @@ async def graph_search_fn(
 
 
 @mcp.tool(name="add_relation")
+@_stable_projection_errors
 async def add_relation_tool(
     source_id: str,
     target_id: str,
