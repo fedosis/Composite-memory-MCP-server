@@ -128,9 +128,10 @@ Slice S2-06 adds the forward state machine and the per-artifact publication
   update to have been re-read from disk; a graph lock this run CREATED is carried
   into the manifest for post-unlock cleanup (DETAIL 10.1).
 
-Wiring the stage into ``apply``/``resume``/``rollback`` is NOT part of this
-slice: those entrypoints keep raising ``E_MIGRATION_NOT_IMPLEMENTED`` until
-S3-06, and the ordering must not be bypassed.
+Wiring the stage into ``apply``/``resume``/``rollback`` was NOT part of this
+slice: the ordering was not bypassed here. S3-06 has since done that wiring --
+the three entrypoints no longer raise ``E_MIGRATION_NOT_IMPLEMENTED`` anywhere,
+because there is no unwired stage left to report.
 
 Slice S2-08 adds the rollback entrypoint (DETAIL 9.3's rollback event chain,
 DETAIL 10.6 steps 1-10), and it is the ONLY thing that changes about that
@@ -3939,17 +3940,28 @@ def _require_mutation_preconditions(
         raise ValueError(plan.blockers[0].code)
 
 
-def apply_profile_migration(plan: MigrationPlan) -> MigrationManifest:
-    """Independently validate every maintenance precondition, then refuse.
+def apply_profile_migration(plan: MigrationPlan, *, embedder: Any = None) -> MigrationManifest:
+    """Run the REAL migration pipeline and return the manifest it durably holds.
 
-    Each entrypoint re-validates the intent, the bounded attestation, a FRESH
-    replan and the sidecars/paths/disk on its own; nothing is inherited from the
-    caller's plan beyond the identity the staleness check compares against. The
-    engine itself is still unimplemented, so the refusal is raised after the
-    preconditions and before any lock or artifact is created.
+    S3-06 wired the entrypoint S2-06 kept fail-closed. It independently
+    re-validates every maintenance precondition (nothing is inherited from the
+    caller's plan beyond the identity the staleness check compares against),
+    materializes the run's manifest at `planned`, and then runs
+
+        SQL snapshot -> backup -> staging -> rebuild -> REAL staged verification
+        -> publish -> reopen -> `complete`
+
+    through the ONE forward stepper that `resume` also uses, so each checkpoint is
+    still earned by its own evidence and the `complete` state is reachable only
+    end to end. ``embedder`` is the only injection point and it is optional:
+    without it the deployment's own local provider is resolved, and a plan that
+    needs the network without ``allow_network_embedding`` is refused rather than
+    guessed at.
     """
-    validate_mutation_preconditions(plan.request, plan=plan)
-    raise ValueError("E_MIGRATION_NOT_IMPLEMENTED")
+    preconditions = validate_mutation_preconditions(plan.request, plan=plan)
+    path = run_manifest_path(plan)
+    _create_run_manifest(plan, preconditions)
+    return _run_forward(plan, path, embedder=embedder)
 
 
 def _read_bounded_manifest_bytes(target: Path) -> bytes:
@@ -4084,9 +4096,9 @@ def append_manifest_event(
 
 
 def resume_profile_migration(
-    manifest_path: Path, request: MigrationRequest
-) -> ResumeOutcome:
-    """Classify a stopped run, then CONTINUE it or refuse by cause.
+    manifest_path: Path, request: MigrationRequest, *, embedder: Any = None
+) -> MigrationManifest:
+    """Classify a stopped run, then CONTINUE it to `complete` or refuse by cause.
 
     S2-07 (DETAIL 9.3, 10.5). Resume is an ACTION entrypoint, so it stays
     fail-closed exactly like `apply`: it repeats every precondition the apply path
@@ -4113,19 +4125,27 @@ def resume_profile_migration(
        ``E_RESUME_STAGING_CHANGED`` -- never a guess, never a repair;
     4. when EXACTLY ONE next operation remains, the refusal is that operation's own
        gate: ``E_STAGED_VERIFICATION_CAPABILITY_MISSING`` while the verification
-       seam reports no implemented capability, and ``E_MIGRATION_NOT_IMPLEMENTED``
-       for an engine stage this slice has not wired. The entrypoint CONTINUES
-       (returns the classification) only when nothing remains at all.
+       seam reports no implemented capability. That is the ONLY cause left, because
+       S3-06 wired every engine stage; when nothing is blocked the entrypoint
+       CONTINUES the run through the forward stepper and returns the manifest.
 
-    No mutation happens on any path -- no swap, no repair, no deletion -- so a
-    repeated resume repeats nothing. Executing `next_operations` is S3-06's wiring:
-    publication requires evidence that `staged_verified` was reached and
-    `verify_staged_projections` is still the S0 stub (S2-06 review R1/R4).
+    S3-06 IS that wiring: the classification is now EXECUTED. When the classifier
+    leaves nothing blocked, this entrypoint continues the run through the same
+    forward stepper `apply` uses -- including the per-artifact publication events a
+    crash left unrecorded, which it executes from the run's OWN durable record with
+    the shipped primitives -- and returns the manifest the run durably holds. A
+    repeated resume repeats nothing: every step whose checkpoint is already recorded
+    is skipped, an artifact whose event sequence is complete is never republished,
+    and a failure already recorded for the same step and cause is not recorded
+    twice. `classify_resume` remains the public classification and still refuses
+    ambiguity, so a run this entrypoint cannot continue is still refused BY CAUSE
+    before any mutation.
     """
     outcome = classify_resume(manifest_path, request)
     if outcome.blocked_by:
         raise ValueError(outcome.blocked_by)
-    return outcome
+    plan = plan_profile_migration(request)
+    return _run_forward(plan, Path(manifest_path), embedder=embedder)
 
 
 # Slice S2-08 moved `rollback_profile_migration` to the S2-08 section at the bottom
@@ -4157,13 +4177,16 @@ def resume_profile_migration(
 # 2. NO FALSE END-TO-END SUCCESS. `staged_verified`, `published`, `verified` and
 #    `complete` may be entered ONLY when the verification seam REPORTS an
 #    implemented capability (an explicit flag, or a negative probe the seam
-#    refuses) and NEVER because of the seam's return value: the S0 stub answers
-#    `ProjectionVerification(True)` to a staged input that does not exist, which
-#    is exactly why its return value must not be read. The card names the last
-#    three checkpoints; `staged_verified` is gated here as well because DETAIL
-#    10.3 IS the seam's contract and recording a stub verdict as a completed
-#    checkpoint would be the false success this card forbids. There is exactly
-#    ONE verification implementation in this project
+#    refuses) and NEVER because of the seam's return value: a seam that answers
+#    `ProjectionVerification(True)` to a staged input that does not exist is
+#    exactly why a return value must not be read, and that behaviour is still
+#    rejected by the report (S3-06's `test_s306_the_gate_still_refuses_...`). The
+#    S0 stub that USED to answer that way is gone: S3-05 landed the real verifier
+#    in `memory_server.projection_rebuild`, and S3-06 set that seam's own explicit
+#    implemented-capability flag, so the gate is open for a seam that qualifies
+#    itself. The card names the last three checkpoints; `staged_verified` is gated
+#    here as well because DETAIL 10.3 IS the seam's contract. There is exactly ONE
+#    verification implementation in this project
 #    (`memory_server.projection_rebuild`); this module only ASKS it.
 #
 # 3. PER ARTIFACT, NEVER ATOMIC. Publication is per artifact: revalidate the
@@ -4175,10 +4198,12 @@ def resume_profile_migration(
 #    or crash-interrupted run can never be reported as published, and no claim of
 #    a multi-artifact atomic transaction is made anywhere.
 #
-# While `verify_staged_projections` is the S0 stub the public `apply`/`resume`/
-# `rollback` stay fail-closed (they still raise `E_MIGRATION_NOT_IMPLEMENTED`):
-# wiring the stage into them is S3-06's deliverable, and this card must not
-# bypass that ordering (routing-matrix S2-06 `split_further`).
+# While that stub existed the public `apply`/`resume`/`rollback` stayed
+# fail-closed. S3-06 then wired the stage: the verifier is real (S3-05), the seam
+# reports its capability through its own flag, and `apply`/`resume` run the real
+# pipeline below. `rollback` publishes nothing and never consulted this gate at
+# all, so it is unaffected. S2-06's ordering was therefore honoured, not bypassed
+# (routing-matrix S2-06 `split_further`).
 # ---------------------------------------------------------------------------
 
 FORWARD_CHECKPOINTS: tuple[Checkpoint, ...] = (
@@ -4367,8 +4392,10 @@ def staged_verification_capability(seam: Any = None) -> StagedVerificationCapabi
     * the seam's own explicit capability flag, and
     * a negative probe: a real verifier must REFUSE a staged entry that does not
       exist (with the module's fail-closed ``ValueError``, or by reporting
-      ``valid=False``). The S0 stub returns ``ProjectionVerification(True)``
-      instead, which is precisely why its answer may not be trusted.
+      ``valid=False``). The S0 stub that returned ``ProjectionVerification(True)``
+      is gone -- S3-05 landed the real verifier -- and its behaviour survives only
+      as the CLASS this report must still reject, which is why a return value is
+      never the thing the gate trusts.
 
     A probe that raises anything else (including a ``TypeError`` from an
     unimplemented call contract) reports NO capability: the gate stays shut
@@ -4753,9 +4780,15 @@ def _rename_entry(
     own stable code BEFORE anything is unlinked, and it is produced by the kernel
     on real devices rather than predicted from metadata. Any other failure is
     ``E_PUBLICATION_RENAME_FAILED``, and the entry stays where it was.
+
+    R6 (S2-06 review, this card's residual): the SOURCE parent is fsynced as soon
+    as the rename landed. Without it a crash can persist the destination entry
+    while the source entry's disappearance is lost, leaving a duplicate staging
+    entry behind for the next attempt to trip over.
     """
     try:
         os.rename(source_name, destination_name, src_dir_fd=source_fd, dst_dir_fd=destination_fd)
+        os.fsync(source_fd)
     except OSError as exc:
         if exc.errno == errno.EXDEV:
             raise _publication_failure(
@@ -4833,6 +4866,8 @@ def publish_artifact(
         raise _publication_failure("E_PUBLICATION_TARGET_MISSING", f"the plan records no {label} target")
     run = _backup_run_directory(plan) if run_dir is None else Path(run_dir)
     _prepare_run_directory(run, plan.request.run_id)
+    if manifest_path is not None:
+        _require_staged_verified_reached(Path(manifest_path), artifact=label)
     target = Path(pinned.lexical_path)
     quarantine_parent = run / QUARANTINE_DIRECTORY_NAME / QUARANTINE_PREPUBLISH_NAME
     events: list[PublicationEvent] = []
@@ -4960,6 +4995,25 @@ def publish_artifact(
         events=tuple(events),
         parents_fsynced=parents_fsynced,
     )
+
+
+def _require_staged_verified_reached(manifest_path: Path, *, artifact: str) -> None:
+    """R4: a publication that belongs to a RUN may follow only an EARNED `staged_verified`.
+
+    The primitive stays callable as a component (the S2-06 nodes drive it that
+    way, without a manifest), but the moment a run's own manifest is supplied the
+    entry must be part of a run whose durable record reached `staged_verified` --
+    the capability-gated checkpoint that is the only licence DETAIL 9.3 gives for
+    `publishing`. Before S3-06 the guard was unnecessary because nothing was wired;
+    now it is the difference between a verified swap and an unverified one.
+    """
+    manifest = load_manifest(Path(manifest_path))
+    if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index("staged_verified"):
+        raise _publication_failure(
+            E_PUBLICATION_WITHOUT_STAGED_VERIFICATION,
+            f"{artifact} may not be published from checkpoint `{manifest.checkpoint}`:"
+            " `staged_verified` was never earned for this run",
+        )
 
 
 def _fsync_pair(first_fd: int, second_fd: int) -> None:
@@ -5563,18 +5617,20 @@ def classify_publication_triads(
 def _resume_blocked_by(next_checkpoint: str | None, next_operations: tuple[str, ...]) -> str:
     """The stable code that keeps the ONE next operation from being executed here.
 
-    Empty only when nothing remains. A capability-gated checkpoint and any
-    publication operation both need the verification seam to REPORT an
-    implemented capability; while it does not, the gate stays shut and says so.
-    Anything else that remains is an engine stage this slice has not wired
-    (S3-06), which is reported with the project's existing code for that.
+    Empty only when nothing remains. S3-06 wired every engine stage, so the ONLY
+    cause that can still keep an operation from being executed is the verification
+    capability itself: a capability-gated checkpoint and any publication operation
+    both need the seam to REPORT an implemented capability, and while it does not
+    the gate stays shut and says so. The former "an engine stage this slice has not
+    wired" branch is GONE -- the stages are wired, and the branch is replaced by
+    the real transition rather than by a weaker refusal.
     """
     if next_checkpoint is None and not next_operations:
         return ""
     gated = next_checkpoint is not None and next_checkpoint in CAPABILITY_GATED_CHECKPOINTS
     if (gated or next_operations) and not staged_verification_capability().implemented:
         return "E_STAGED_VERIFICATION_CAPABILITY_MISSING"
-    return "E_MIGRATION_NOT_IMPLEMENTED"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -5692,14 +5748,7 @@ def staged_verification_evidence(
     verdict = staged_projection_verification(
         snapshot_path, run_dir, expected_vector_size=expected_vector_size, batch_size=batch_size
     )
-    if not getattr(verdict, "valid", False):
-        raise _manifest_failure(STAGED_VERIFICATION_REFUSED, _verdict_reason(verdict))
-    detail = {
-        "basis": str(getattr(verdict, "basis", "")),
-        "staging_digest": str(getattr(verdict, "staging_digest", "")),
-        "artifacts": list(getattr(verdict, "artifacts", ())),
-    }
-    return CheckpointEvidence("staged_verified", "staged_verification", _digest(detail), detail)
+    return _staged_evidence(verdict)
 
 
 def _artifact_identity(verdict: Any, label: str) -> tuple[Any, ...]:
@@ -5712,27 +5761,48 @@ def _artifact_identity(verdict: Any, label: str) -> tuple[Any, ...]:
 def reopen_verification_evidence(
     snapshot_path: Path,
     plan: MigrationPlan,
-    staged_verdict: Any,
+    staged_verdict: Any = None,
     *,
     expected_vector_size: int = DEFAULT_PROJECTION_VECTOR_SIZE,
     batch_size: int = 32,
 ) -> CheckpointEvidence:
     """The `verified` checkpoint's evidence: the reopened publication, per artifact.
 
-    Every artifact must be reopened AND still match the identity the staged
-    verification recorded; otherwise this refuses with
-    ``E_PUBLISHED_REOPEN_MISMATCH`` and `complete` stays out of reach.
+    Every artifact must be reopened AND must match the identity it is compared
+    against; otherwise this refuses with ``E_PUBLISHED_REOPEN_MISMATCH`` and
+    `complete` stays out of reach. The reference the comparison used is NAMED in
+    the evidence (`reference`), because a resume at or after `publishing` no
+    longer holds the staged verdict in memory -- the staged entries were renamed
+    away by the publication, so re-running staged verification is impossible:
+
+    * ``staged_verdict`` -- the strict two-verdict comparison, used whenever the
+      run computed the staged verdict in the same call (the `apply` path);
+    * ``snapshot_expectation`` -- the seam's OWN expectation, re-derived from the
+      SAME canonical snapshot the staged verification used. The published entry is
+      the very entry the publication renamed (which `publish_artifact` revalidated
+      against the run's recorded staged identity before the rename) and the seam
+      compares it against that independently derived expectation, so the two
+      verdicts are equal BY CONSTRUCTION rather than by assumption. The
+      alternative -- trusting the run's own recorded digests as the reference --
+      is exactly the false success this module refuses.
     """
     verdict = published_reopen_verdict(
         snapshot_path, plan, expected_vector_size=expected_vector_size, batch_size=batch_size
     )
     reopened = bool(getattr(verdict, "valid", False))
+    reference = "staged_verdict" if staged_verdict is not None else "snapshot_expectation"
     artifacts: dict[str, dict[str, Any]] = {}
     for label in PUBLICATION_ARTIFACTS:
-        matches = reopened and _artifact_identity(verdict, label) == _artifact_identity(staged_verdict, label)
+        if staged_verdict is not None:
+            matches = reopened and _artifact_identity(verdict, label) == _artifact_identity(
+                staged_verdict, label
+            )
+        else:
+            matches = reopened
         artifacts[label] = {
             "matches_staged": bool(matches),
             "digest": _digest(_artifact_identity(verdict, label)),
+            "reference": reference,
         }
     if not all(entry["matches_staged"] for entry in artifacts.values()):
         raise _manifest_failure(
@@ -5815,6 +5885,608 @@ def classify_resume(manifest_path: Path, request: MigrationRequest) -> ResumeOut
         tolerated_blockers=tolerated,
         manifest=manifest,
     )
+
+
+# ---------------------------------------------------------------------------
+# S3-06 -- the engine wired END TO END
+# (DETAIL 9.3's forward state machine, DETAIL 10.1-10.6, DETAIL 14.3; the
+# routing-matrix card `id: S3-06`).
+#
+# Every fail-closed branch this card removes is replaced by a REAL, evidenced
+# transition -- never by a weaker refusal, never by a fabricated verdict:
+#
+# 1. THE PIPELINE IS REAL. `apply` runs SQL snapshot -> backup -> staging ->
+#    rebuild -> REAL verification -> publish -> reopen -> `complete`. The snapshot
+#    comes from the S2-03 qualifier, the projections from the S3-04 rebuild, the
+#    verdicts from the ONE verifier in `memory_server.projection_rebuild` (this
+#    module only ASKS it -- there is no second implementation here) and the swap
+#    from the S2-06 publication primitive. Each step is still gated by the S2-06
+#    evidence requirement, so a checkpoint is EARNED.
+# 2. THE GATE IS OPENED BY A QUALIFIED CHANNEL. S3-05 landed the real verifier and
+#    the seam now carries its own explicit implemented-capability flag; that flag
+#    is what `staged_verification_capability` reports, never a return value.
+# 3. NOTHING IS INVENTED. A failure retains the last completed checkpoint, sets
+#    `status=failed` and records the step, the stable code and the exception class
+#    (DETAIL 9.3). No digest is synthesized anywhere on a refusal path, and a
+#    refusal reported for the same step and cause twice is not recorded twice.
+# 4. RESUME CONTINUES. `resume` EXECUTES the classification `classify_resume`
+#    derived -- including the per-artifact publication events a crash left
+#    unrecorded -- and refuses only where the classifier itself refuses.
+#
+# `rollback` is untouched by this section: it publishes nothing, so it needs no
+# staged verification and does not consult this gate.
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROJECTION_BATCH_SIZE = 32
+E_EMBEDDER_UNAVAILABLE = "E_EMBEDDER_UNAVAILABLE"
+E_NETWORK_EMBEDDING_REQUIRED = "E_NETWORK_EMBEDDING_REQUIRED"
+E_MIGRATION_STAGE_FAILED = "E_MIGRATION_STAGE_FAILED"
+E_RUN_ALREADY_EXISTS = "E_RUN_ALREADY_EXISTS"
+E_PUBLICATION_WITHOUT_STAGED_VERIFICATION = "E_PUBLICATION_WITHOUT_STAGED_VERIFICATION"
+# A remote vector backend (or a plan that declares network embedding) may not be
+# used unless the operator opted in; the concrete remote provider is config
+# activation, which acceptance 4 keeps OUT of this engine.
+NETWORK_VECTOR_BACKENDS: frozenset[str] = frozenset({"remote", "qdrant"})
+
+
+def run_manifest_path(plan: MigrationPlan) -> Path:
+    """The run's own manifest: ``<data_root>/.cmms-migrations/<run-id>/manifest.json``."""
+    return _backup_run_directory(plan) / MANIFEST_FILE_NAME
+
+
+def resolve_migration_embedder(
+    plan: MigrationPlan, *, embedder: Any = None, request: MigrationRequest | None = None
+) -> Any:
+    """The embedder the rebuild may use -- resolved or refused, never invented.
+
+    A caller-supplied embedder must really embed. Otherwise the deployment's LOCAL
+    provider is constructed (its model loads lazily, so construction is offline and
+    side-effect free) and a plan that asks for a remote vector backend or declares
+    network embedding is refused unless the request opted in with
+    ``allow_network_embedding``. No mock, stub or fabricated vector source is ever
+    returned; if no embedder can be obtained the rebuild refuses by itself.
+    """
+    if embedder is not None:
+        if not callable(getattr(embedder, "embed_batch", None)):
+            raise ValueError(E_EMBEDDER_UNAVAILABLE)
+        return embedder
+    asking = plan.request if request is None else request
+    needs_network = bool(getattr(plan.embedding, "network", False)) or str(
+        getattr(plan.embedding, "backend", "")
+    ) in NETWORK_VECTOR_BACKENDS
+    if needs_network and not asking.allow_network_embedding:
+        raise ValueError(E_NETWORK_EMBEDDING_REQUIRED)
+    from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
+
+    resolved = SentenceTransformerEmbeddingProvider()
+    if not callable(getattr(resolved, "embed_batch", None)):
+        raise ValueError(E_EMBEDDER_UNAVAILABLE)
+    return resolved
+
+
+def _run_blocking(factory: Callable[[], Any]) -> Any:
+    """Run one coroutine factory from this synchronous engine, bounded and closed."""
+    return _run_verification_probe(lambda _ignored: factory(), None)
+
+
+def _planned_evidence(
+    plan: MigrationPlan, preconditions: MutationPreconditions
+) -> CheckpointEvidence:
+    detail = {
+        "plan_digest": preconditions.replan_digest,
+        "config_digest": plan.config_digest,
+    }
+    return CheckpointEvidence("planned", "plan_digest", _digest(detail), detail)
+
+
+def _lock_ownership_evidence(plan: MigrationPlan, locks: Any) -> CheckpointEvidence:
+    identities: dict[str, Any] = {}
+    for root in getattr(locks, "roots", ()):
+        try:
+            info = os.lstat(root)
+        except OSError as exc:
+            raise _manifest_failure("E_LOCK_OWNERSHIP_UNPROVEN", f"locked root {root} vanished") from exc
+        identities[str(root)] = [info.st_dev, info.st_ino]
+    detail: dict[str, Any] = {
+        "held": bool(getattr(locks, "roots", ())) and locks is not None,
+        "roots": [str(root) for root in getattr(locks, "roots", ())],
+        "identities": identities,
+    }
+    return CheckpointEvidence("locked", "lock_ownership", _digest(detail), detail)
+
+
+def _backup_evidence(backup: Any) -> CheckpointEvidence:
+    detail = {"report_digest": str(backup.digest), "entries": len(tuple(backup.entries))}
+    return CheckpointEvidence("backed_up", "backup_report", _digest(detail), detail)
+
+
+def _snapshot_report(plan: MigrationPlan, run_dir: Path) -> Mapping[str, Any]:
+    """The run-owned SQL safety snapshot, created once and reused idempotently.
+
+    DETAIL 10.5: a completed idempotent step continues. A snapshot a previous
+    attempt already materialized is therefore VERIFIED and reused rather than
+    refused as a collision, and one that does not verify stops the run.
+    """
+    existing = Path(run_dir) / SNAPSHOT_DIR_NAME / SNAPSHOT_DB_NAME
+    if os.path.lexists(existing):
+        verification, diagnostics = verify_snapshot(existing)
+        if diagnostics:
+            raise _manifest_failure(diagnostics[0].code, diagnostics[0].message)
+        return {"path": str(existing), "verification": verification}
+    report, diagnostics = qualify_sqlite_source(
+        Path(plan.source_sql.lexical_path), run_dir=Path(run_dir)
+    )
+    if diagnostics:
+        raise _manifest_failure(diagnostics[0].code, diagnostics[0].message)
+    snapshot = report.get("snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise _manifest_failure("E_SQLITE_PROBE_UNSAFE", "the source yielded no usable snapshot")
+    return snapshot
+
+
+def _snapshot_evidence(snapshot: Mapping[str, Any]) -> CheckpointEvidence:
+    verification = snapshot["verification"]
+    detail = {
+        "integrity": str(verification.get("integrity", "")),
+        "revision": str(verification.get("alembic_revision", "")),
+        "snapshot_device": int(os.lstat(Path(str(snapshot["path"]))).st_dev),
+    }
+    return CheckpointEvidence("sqlite_snapshotted", "snapshot_verification", _digest(detail), detail)
+
+
+def _rebuild_step(plan: MigrationPlan, run_dir: Path, *, embedder: Any) -> Any:
+    """Build the run's staged projections from the safety snapshot (DETAIL 10.2)."""
+    snapshot_path = Path(run_dir) / SNAPSHOT_DIR_NAME / SNAPSHOT_DB_NAME
+    url = snapshot_url_for(snapshot_path)
+    resolved = resolve_migration_embedder(plan, embedder=embedder)
+    records = _run_blocking(
+        lambda: _collect_records(url, batch_size=DEFAULT_PROJECTION_BATCH_SIZE)
+    )
+    staging = staged_projection_paths(Path(run_dir))
+    return _run_blocking(
+        lambda: projection_rebuild.rebuild_projections(
+            url,
+            staging_vector_path=staging["vector"],
+            staging_graph_path=staging["graph"],
+            embedder=resolved,
+            vector_size=DEFAULT_PROJECTION_VECTOR_SIZE,
+            batch_size=DEFAULT_PROJECTION_BATCH_SIZE,
+            embedding_plan_digest=projection_rebuild.embedding_plan_digest(records),
+        )
+    )
+
+
+async def _collect_records(url: str, *, batch_size: int) -> list[Any]:
+    return [
+        record
+        async for record in projection_rebuild.iter_canonical_projection_records(
+            url, batch_size=batch_size
+        )
+    ]
+
+
+def _rebuild_evidence(result: Any) -> CheckpointEvidence:
+    detail = {
+        "completed_batches": int(getattr(result, "completed_batches", 0)),
+        "vector_ids_digest": str(getattr(result, "vector_ids_digest", "")),
+        "graph_nodes_digest": str(getattr(result, "graph_nodes_digest", "")),
+        "graph_edges_digest": str(getattr(result, "graph_edges_digest", "")),
+    }
+    return CheckpointEvidence("projections_built", "rebuild_result", _digest(detail), detail)
+
+
+def _staged_evidence(verdict: Any) -> CheckpointEvidence:
+    """The `staged_verified` evidence, built from the seam's OWN verdict."""
+    if not getattr(verdict, "valid", False):
+        raise _manifest_failure(STAGED_VERIFICATION_REFUSED, _verdict_reason(verdict))
+    detail = {
+        "basis": str(getattr(verdict, "basis", "")),
+        "staging_digest": str(getattr(verdict, "staging_digest", "")),
+        "artifacts": list(getattr(verdict, "artifacts", ())),
+    }
+    return CheckpointEvidence("staged_verified", "staged_verification", _digest(detail), detail)
+
+
+def _publication_plan_evidence(plan: MigrationPlan) -> CheckpointEvidence:
+    detail = {
+        "targets": list(PUBLICATION_ARTIFACTS),
+        "pinned": {
+            label: _digest(asdict(plan.targets[label])) for label in PUBLICATION_ARTIFACTS
+        },
+    }
+    return CheckpointEvidence("publishing", "publication_plan", _digest(detail), detail)
+
+
+def _publication_events_evidence(manifest: MigrationManifest) -> CheckpointEvidence:
+    recorded = publication_events_from_manifest(manifest)
+    detail = {
+        "artifacts": {label: list(recorded.get(label, ())) for label in PUBLICATION_ARTIFACTS}
+    }
+    return CheckpointEvidence("published", "publication_events", _digest(detail), detail)
+
+
+def _manifest_update_evidence(manifest_path: Path) -> CheckpointEvidence:
+    payload = Path(manifest_path).read_bytes()
+    detail = {
+        "manifest_digest": hashlib.sha256(payload).hexdigest(),
+        "manifest_bytes": len(payload),
+        "checkpoint": "complete",
+    }
+    return CheckpointEvidence("complete", "manifest_update", _digest(detail), detail)
+
+
+def _staged_entry_identity(path: Path, *, artifact: str) -> ArtifactIdentity:
+    """The no-follow identity of a staged entry observed through its own parent."""
+    candidate = Path(path)
+    with storage_lock.open_directory_nofollow(candidate.parent) as parent_fd:
+        return _observed_entry_identity(parent_fd, candidate.name, artifact=artifact)
+
+
+def _create_run_manifest(
+    plan: MigrationPlan, preconditions: MutationPreconditions
+) -> MigrationManifest:
+    """Materialize the run's manifest at ``planned`` -- the first durable state.
+
+    A run id that already owns a manifest is ``E_RUN_ALREADY_EXISTS``: a run id is
+    never reused. The `planned` event carries the plan evidence the first
+    transition would have required, so the chain starts complete rather than with
+    an unproven first element.
+    """
+    path = run_manifest_path(plan)
+    if os.path.lexists(path):
+        raise _manifest_failure(
+            E_RUN_ALREADY_EXISTS, "this run id already owns a manifest; a run id is never reused"
+        )
+    _prepare_run_directory(path.parent, plan.request.run_id)
+    manifest = MigrationManifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        run_id=plan.request.run_id,
+        strategy=plan.request.strategy,
+        checkpoint="planned",
+        status="running",
+        source_identity=plan.source_sql,
+        target_identities_before={
+            label: plan.targets[label] for label in PUBLICATION_ARTIFACTS if label in plan.targets
+        },
+        config_digest=plan.config_digest,
+        runtime_stop_attestation=asdict(preconditions.attestation),
+        artifacts={},
+        completed_steps=["planned"],
+        events=[],
+        embedding=asdict(plan.embedding),
+        failure=None,
+    )
+    evidence = _planned_evidence(plan, preconditions)
+    seeded = _append_event_to_manifest(
+        manifest,
+        "planned",
+        f"advance{_checkpoint_operation_separator()}planned",
+        {"evidence": evidence.code, "digest": evidence.digest},
+    )
+    _write_manifest(path, replace(seeded, checkpoint="planned", completed_steps=["planned"]))
+    reopened = load_manifest(path)
+    if reopened.checkpoint != "planned":
+        raise _manifest_failure(
+            "E_MANIFEST_UPDATE_UNPROVEN", "the durable manifest does not record `planned`"
+        )
+    return reopened
+
+
+def _record_forward_failure(manifest_path: Path, step: str, exc: BaseException) -> None:
+    """DETAIL 9.3: keep the last completed checkpoint and record the cause, in full.
+
+    The stable code is the refusal's own leading token when it has one (this
+    module raises ``CODE: detail`` / ``CODE``), the step is the stage that failed,
+    and the exception CLASS is the root cause of the chain -- never the wrapping
+    ``ValueError``. A failure already recorded for the same step and cause is not
+    recorded a second time: a repeated resume must repeat nothing, including its
+    own failure record.
+    """
+    path = Path(manifest_path)
+    if not os.path.lexists(path):
+        return
+    message = str(exc)
+    token = message.split(":", 1)[0].strip() if message else ""
+    code = token if re.fullmatch(r"E_[A-Z0-9_]+", token) else E_MIGRATION_STAGE_FAILED
+    with contextlib.suppress(Exception):
+        manifest = load_manifest(path)
+        failure: dict[str, Any] = {
+            "code": code[:128],
+            "step": step[:128],
+            "message": message[:512],
+            "exception": _failure_exception_class(exc)[:128],
+            "completed_steps": list(manifest.completed_steps)[:MAX_MANIFEST_ENTRIES],
+        }
+        recorded = manifest.failure or {}
+        if (
+            manifest.status == "failed"
+            and recorded.get("step") == failure["step"]
+            and recorded.get("code") == failure["code"]
+        ):
+            return
+        _write_manifest(path, replace(manifest, status="failed", failure=failure))
+
+
+_PUBLICATION_EVENT_SEQUENCE: tuple[str, ...] = (
+    PUBLICATION_EVENT_REVALIDATED,
+    PUBLICATION_EVENT_QUARANTINED,
+    PUBLICATION_EVENT_STAGING_PUBLISHED,
+    PUBLICATION_EVENT_PARENT_FSYNCED,
+)
+
+
+def _failure_step(manifest_path: Path, cursor: Mapping[str, str]) -> str:
+    """Name the step that actually failed, refining a per-artifact cursor.
+
+    The forward stepper reports a publication failure per ARTIFACT (the shipped
+    primitive records four events of its own), so the run's OWN durable record is
+    consulted: the first event of that artifact's DETAIL 9.3 sequence it has not
+    recorded yet is exactly the event the failure hit -- the filesystem operation
+    is performed before its event is written. A step that is not a publication
+    operation is returned unchanged.
+    """
+    step = str(cursor.get("step", ""))
+    artifact, _separator, _event = step.partition(PUBLICATION_EVENT_OPERATION_SEPARATOR)
+    if artifact not in PUBLICATION_ARTIFACTS:
+        return step
+    with contextlib.suppress(Exception):
+        recorded = _publication_records(load_manifest(Path(manifest_path)), artifact)[0]
+        if len(recorded) < len(_PUBLICATION_EVENT_SEQUENCE):
+            return (
+                f"{artifact}{PUBLICATION_EVENT_OPERATION_SEPARATOR}"
+                f"{_PUBLICATION_EVENT_SEQUENCE[len(recorded)]}"
+            )
+    return step
+
+
+def _publish_artifact_now(
+    plan: MigrationPlan,
+    label: str,
+    *,
+    run_dir: Path,
+    manifest_path: Path,
+    staged: Path,
+) -> None:
+    """Publish one fully staged artifact with the shipped primitive."""
+    publish_artifact(
+        plan,
+        label,
+        staged_identity=_staged_entry_identity(staged, artifact=label),
+        run_dir=Path(run_dir),
+        manifest_path=Path(manifest_path),
+    )
+
+
+def _continue_publication(
+    plan: MigrationPlan,
+    label: str,
+    names: tuple[str, ...],
+    *,
+    run_dir: Path,
+    manifest_path: Path,
+    cursor: dict[str, str],
+) -> None:
+    """Execute the ONE remaining step of one artifact's DETAIL 9.3 event sequence.
+
+    `classify_resume` has already proved that the run's own recorded events are a
+    PREFIX of this artifact's sequence and that the disk agrees with that prefix,
+    so exactly one operation remains. This function performs it with the same
+    primitives `publish_artifact` uses -- the rename, the no-follow revalidation,
+    the fsyncs and the per-event durable record -- and never repairs, guesses or
+    deletes anything. The staged identity it publishes is the one the run's OWN
+    `prestate_revalidated` record pinned.
+    """
+    run = Path(run_dir)
+    target = Path(plan.targets[label].lexical_path)
+    events = list(names)
+    _recorded_names, payloads = _publication_records(load_manifest(manifest_path), label)
+    recorded_identity = _recorded_staging_identity(payloads[0]) if payloads else None
+    if events == [PUBLICATION_EVENT_REVALIDATED]:
+        with storage_lock.open_directory_nofollow(run) as run_fd:
+            with storage_lock.open_directory_nofollow(target.parent) as parent_fd:
+                observed = _observed_entry_identity(parent_fd, target.name, artifact=label)
+                if observed.kind == "absent":
+                    cursor["step"] = f"{label}.{PUBLICATION_EVENT_ABSENT}"
+                    _record_publication_event(
+                        manifest_path, label, PUBLICATION_EVENT_ABSENT, {"prestate": "absent"}
+                    )
+                else:
+                    cursor["step"] = f"{label}.{PUBLICATION_EVENT_QUARANTINED}"
+                    quarantine_fd = _open_quarantine_directory(run_fd)
+                    try:
+                        entry = _quarantine_entry_name(label, plan.request.run_id)
+                        _rename_entry(parent_fd, target.name, quarantine_fd, entry, artifact=label)
+                        os.fsync(quarantine_fd)
+                        _record_publication_event(
+                            manifest_path,
+                            label,
+                            PUBLICATION_EVENT_QUARANTINED,
+                            {
+                                "quarantine": f"{QUARANTINE_DIRECTORY_NAME}/"
+                                f"{QUARANTINE_PREPUBLISH_NAME}/{entry}",
+                                "kind": observed.kind,
+                                "identity": _digest(asdict(observed)),
+                            },
+                        )
+                    finally:
+                        os.close(quarantine_fd)
+        events.append(PUBLICATION_EVENT_QUARANTINED)
+    if events[-1] in (PUBLICATION_EVENT_QUARANTINED, PUBLICATION_EVENT_ABSENT):
+        staged = staged_projection_paths(run)[label]
+        staged_identity = _staged_entry_identity(staged, artifact=label)
+        if recorded_identity is not None and _identity_key(staged_identity) != recorded_identity:
+            raise _publication_failure(
+                "E_STAGING_IDENTITY_CHANGED",
+                f"{label} staged entry is not the identity this run revalidated its prestate against",
+            )
+        cursor["step"] = f"{label}.{PUBLICATION_EVENT_STAGING_PUBLISHED}"
+        with storage_lock.open_directory_nofollow(staged.parent) as staging_fd:
+            with storage_lock.open_directory_nofollow(target.parent) as parent_fd:
+                _rename_entry(staging_fd, staged.name, parent_fd, target.name, artifact=label)
+                os.fsync(parent_fd)
+        _record_publication_event(
+            manifest_path,
+            label,
+            PUBLICATION_EVENT_STAGING_PUBLISHED,
+            {"identity": _digest(asdict(staged_identity)), "path_present": True},
+        )
+        events.append(PUBLICATION_EVENT_STAGING_PUBLISHED)
+    if events[-1] == PUBLICATION_EVENT_STAGING_PUBLISHED:
+        cursor["step"] = f"{label}.{PUBLICATION_EVENT_PARENT_FSYNCED}"
+        parents = [str(target.parent)]
+        with storage_lock.open_directory_nofollow(target.parent) as parent_fd:
+            os.fsync(parent_fd)
+        quarantine_parent = run / QUARANTINE_DIRECTORY_NAME / QUARANTINE_PREPUBLISH_NAME
+        if os.path.isdir(quarantine_parent):
+            with storage_lock.open_directory_nofollow(quarantine_parent) as quarantine_fd:
+                os.fsync(quarantine_fd)
+            parents.append(str(quarantine_parent))
+        _record_publication_event(
+            manifest_path, label, PUBLICATION_EVENT_PARENT_FSYNCED, {"parents": parents}
+        )
+
+
+def _publish_remaining(
+    plan: MigrationPlan,
+    manifest_path: Path,
+    *,
+    run_dir: Path,
+    cursor: dict[str, str],
+) -> MigrationManifest:
+    """Publish every artifact whose OWN recorded event sequence is not complete.
+
+    Nothing is republished: an artifact whose sequence is already complete is
+    skipped, which is what makes a repeated resume repeat no swap (acceptance 4).
+    """
+    path = Path(manifest_path)
+    recorded = publication_events_from_manifest(load_manifest(path))
+    staging = staged_projection_paths(Path(run_dir))
+    for label in PUBLICATION_ARTIFACTS:
+        names = tuple(recorded.get(label, ()))
+        if _published_sequence_is_complete(names):
+            continue
+        if not names:
+            cursor["step"] = f"{label}.{PUBLICATION_EVENT_REVALIDATED}"
+            _publish_artifact_now(
+                plan, label, run_dir=Path(run_dir), manifest_path=path, staged=staging[label]
+            )
+        else:
+            _continue_publication(
+                plan, label, names, run_dir=Path(run_dir), manifest_path=path, cursor=cursor
+            )
+    return load_manifest(path)
+
+
+def _run_forward(
+    plan: MigrationPlan,
+    manifest_path: Path,
+    *,
+    embedder: Any = None,
+) -> MigrationManifest:
+    """Advance one run to `complete`, one earned checkpoint at a time.
+
+    Idempotent by construction: a step whose checkpoint is already recorded is
+    skipped (DETAIL 10.5's "completed idempotent steps may continue"), a
+    publication whose per-artifact sequence is already complete is not repeated,
+    and any failure is recorded exactly once with its stable cause before it is
+    re-raised. The maintenance locks are held for the whole run -- they are taken
+    here rather than trusted from a caller -- and released afterwards even when
+    the run fails, which is what keeps the root-lock protection intact.
+    """
+    path = Path(manifest_path)
+    run_dir = path.parent
+    cursor = {"step": "locked"}
+    locks: Any = None
+    try:
+        locks = acquire_maintenance_locks(plan)
+        manifest = load_manifest(path)
+        if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index("locked"):
+            manifest = advance_manifest_checkpoint(
+                path, "locked", evidence=[_lock_ownership_evidence(plan, locks)]
+            )
+        if getattr(locks, "graph_lock_created", False):
+            manifest = record_graph_lock_creation(path, graph_lock_creation_record(plan, locks))
+        if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index("backed_up"):
+            cursor["step"] = "backed_up"
+            backup = create_run_backup(plan, locks=locks)
+            manifest = advance_manifest_checkpoint(
+                path, "backed_up", evidence=[_backup_evidence(backup)]
+            )
+        if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index(
+            "sqlite_snapshotted"
+        ):
+            cursor["step"] = "sqlite_snapshotted"
+            manifest = advance_manifest_checkpoint(
+                path, "sqlite_snapshotted", evidence=[_snapshot_evidence(_snapshot_report(plan, run_dir))]
+            )
+        if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index(
+            "projections_built"
+        ):
+            cursor["step"] = "projections_built"
+            manifest = advance_manifest_checkpoint(
+                path, "projections_built", evidence=[_rebuild_evidence(_rebuild_step(plan, run_dir, embedder=embedder))]
+            )
+        staged_verdict = None
+        if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index("staged_verified"):
+            cursor["step"] = "staged_verified"
+            staged_verdict = staged_projection_verification(
+                run_dir / SNAPSHOT_DIR_NAME / SNAPSHOT_DB_NAME,
+                run_dir,
+                expected_vector_size=DEFAULT_PROJECTION_VECTOR_SIZE,
+                batch_size=DEFAULT_PROJECTION_BATCH_SIZE,
+            )
+            manifest = advance_manifest_checkpoint(
+                path, "staged_verified", evidence=[_staged_evidence(staged_verdict)]
+            )
+        if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index("publishing"):
+            cursor["step"] = "publishing"
+            manifest = advance_manifest_checkpoint(
+                path, "publishing", evidence=[_publication_plan_evidence(plan)]
+            )
+        if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index("published"):
+            cursor["step"] = "published"
+            manifest = _publish_remaining(plan, path, run_dir=run_dir, cursor=cursor)
+            cursor["step"] = "published"
+            manifest = advance_manifest_checkpoint(
+                path, "published", evidence=[_publication_events_evidence(manifest)]
+            )
+        if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index("verified"):
+            cursor["step"] = "verified"
+            manifest = advance_manifest_checkpoint(
+                path,
+                "verified",
+                evidence=[
+                    reopen_verification_evidence(
+                        run_dir / SNAPSHOT_DIR_NAME / SNAPSHOT_DB_NAME,
+                        plan,
+                        staged_verdict,
+                        expected_vector_size=DEFAULT_PROJECTION_VECTOR_SIZE,
+                        batch_size=DEFAULT_PROJECTION_BATCH_SIZE,
+                    )
+                ],
+            )
+        if forward_checkpoint_index(manifest.checkpoint) < forward_checkpoint_index("complete"):
+            cursor["step"] = "complete"
+            manifest = advance_manifest_checkpoint(
+                path, "complete", evidence=[_manifest_update_evidence(path)]
+            )
+        if manifest.status != "complete":
+            # DETAIL 9.3: `status` is orthogonal to the checkpoint chain, and a run
+            # that reached `complete` is COMPLETE -- never left claiming "running".
+            _write_manifest(path, replace(manifest, status="complete"))
+            manifest = load_manifest(path)
+            if manifest.status != "complete":
+                raise _manifest_failure(
+                    "E_MANIFEST_UPDATE_UNPROVEN", "the durable manifest does not record `complete`"
+                )
+        return manifest
+    except BaseException as exc:
+        _record_forward_failure(path, _failure_step(path, cursor), exc)
+        raise
+    finally:
+        if locks is not None:
+            with contextlib.suppress(Exception):
+                locks.release()
 
 
 # ---------------------------------------------------------------------------

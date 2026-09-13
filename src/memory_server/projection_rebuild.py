@@ -1,8 +1,17 @@
 """Deterministic projection mapping and migration verification seams.
 
-Slice S0 keeps this module as a contract seam only: the projection rebuild and
-staged-verification bodies are implemented in a later slice. Nothing here is
-wired into a runtime path yet, and none of these functions touches a store.
+This module is the ONE place staged/published projection verification lives:
+`verify_staged_projections` (DETAIL 10.3) and `verify_published_projections` are
+the single implementation the migration engine ASKS, and S3-05 replaced the S0
+contract stub with them. The module therefore also carries the seam's own
+implemented-capability flag, which is the channel the engine's capability gate
+reads -- never a verdict this module returns:
+
+    STAGED_VERIFICATION_IMPLEMENTED = True
+
+The S0 stub that answered ``ProjectionVerification(True)`` to a staged entry that
+did not exist is GONE; the engine's gate still rejects that behaviour, and a
+return value is still never the thing the gate trusts.
 """
 
 from __future__ import annotations
@@ -68,9 +77,11 @@ class ProjectionVerification:
 
     The first five fields are the S0 contract and keep their meaning. The S3-05
     fields are additive and every one of them carries a default, so the S0
-    construction (`ProjectionVerification(True)`) stays valid; the verifier
-    fills them from the ACTUAL reopened artifacts and from the expectation it
-    derives itself from the canonical snapshot.
+    construction (`ProjectionVerification(True)`) stays a valid object -- which is
+    exactly why it is the shape the engine's capability gate must still reject
+    when a seam answers it. The verifier fills the fields from the ACTUAL reopened
+    artifacts and from the expectation it derives itself from the canonical
+    snapshot.
     """
 
     valid: bool
@@ -112,6 +123,12 @@ class ExpectedProjection:
     vector_ids: frozenset[str]
     graph_nodes: frozenset[tuple[str, str]]
     graph_edges: frozenset[tuple[str, str, str]]
+
+
+# The seam's OWN report of what it implements. The engine's capability gate reads
+# THIS (or the seam's refusal of a negative probe) and never a return value; see
+# `profile_migration.staged_verification_capability`.
+STAGED_VERIFICATION_IMPLEMENTED = True
 
 
 def deterministic_vector_id(record_type: str, record_id: str) -> str:
@@ -972,12 +989,14 @@ async def verify_staged_projections(
     ``RebuildResult`` and no artifact is mutated; every store this call opens is
     released before it returns, so the caller may rename the staged entries.
 
-    The signature is keyword-only ON PURPOSE. The S2-06 capability gate probes
-    this seam with a single positional argument and treats a qualified refusal as
-    an implemented capability; a keyword-only contract therefore leaves the
-    gate's report exactly as S2-06 wrote it (`implemented=False`), keeps the
-    public `apply`/`resume` refusals unchanged, and leaves opening the gate --
-    and `complete` end-to-end -- to S3-06, which owns that wiring.
+    The signature is keyword-only ON PURPOSE, and it stays that way: the S2-06
+    capability gate probes this seam with a single positional argument and treats
+    a qualified refusal as an implemented capability, so a positional call must
+    keep failing rather than being accommodated by widening this contract. S3-06
+    therefore opens the gate through the seam's own explicit flag defined in this
+    module (`STAGED_VERIFICATION_IMPLEMENTED`), which is the channel that genuinely
+    qualifies this implementation -- not through the probe and never through a
+    verdict.
     """
     return await _verify_projection_artifacts(
         basis="staged",
