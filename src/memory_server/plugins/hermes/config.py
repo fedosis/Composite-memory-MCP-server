@@ -330,11 +330,7 @@ def build_storage_config_report(
         effective[key] = None if selected is None else str(selected)
         effective_origins[key] = origin.kind
     divergence = tuple(
-        sorted(
-            key
-            for key in _STORAGE_REPORT_KEYS
-            if env_values[key] is not None and env_values[key] != raw[key]
-        )
+        sorted(key for key in _STORAGE_REPORT_KEYS if env_values[key] is not None and env_values[key] != raw[key])
     )
     return StorageConfigReport(
         raw=MappingProxyType(raw),
@@ -609,7 +605,7 @@ class HermesPluginConfig:
         if (
             mode == "standalone"
             and data_root == "."
-            and origins.get("root", ValueOrigin("default")).kind in {"default", "settings"}
+            and origins.get("root", ValueOrigin("default")).kind in {"default", "settings", "yaml"}
         ):
             data_root = None
         return resolve_storage_layout(

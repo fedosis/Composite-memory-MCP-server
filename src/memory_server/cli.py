@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Optional, cast
@@ -16,7 +17,11 @@ from uuid import uuid4
 
 import typer
 
-from memory_server.paths import cmms_repo_root
+from memory_server.paths import (
+    StorageLayoutError,
+    classify_artifact_nofollow,
+    cmms_repo_root,
+)
 from memory_server.profile_migration import (
     DIAGNOSTIC_CONTRACT,
     Diagnostic,
@@ -371,7 +376,7 @@ def _do_uninstall(
 
 
 # ---------------------------------------------------------------------------
-# Doctor — data-root consolidation check
+# Doctor — read-only raw/effective storage diagnostics
 # ---------------------------------------------------------------------------
 
 
@@ -391,18 +396,144 @@ def _collect_profile_homes(hermes_home: str) -> list[tuple[str, Path]]:
 
 
 def _profile_data_dirs(home: Path) -> list[Path]:
-    """Return per-profile CMMS data dirs that exist under *home*.
+    """Return legacy store entries, classifying final links without following."""
+    from memory_server.paths import inspect_component_chain_nofollow
 
-    These are the fragmentation symptoms: a LanceDB index or graph
-    snapshot living under a profile's own HERMES_HOME instead of the
-    shared repo-root data dir.
-    """
     found: list[Path] = []
     for rel in ("data/lancedb", "data/graph.json"):
         candidate = home / rel
-        if candidate.exists():
+        if inspect_component_chain_nofollow(candidate, anchor=Path("/"))[-1].kind != "absent":
             found.append(candidate)
     return found
+
+
+_DOCTOR_HINT = "Run `memory-server migrate-profile-storage` to rebuild unavailable projections."
+
+
+def _safe_store_diagnostics(layout) -> dict:
+    """Inspect only existing regular entries; never initialize a provider/store."""
+    result = {
+        "sqlite": {"schema": "unknown", "integrity": "unknown", "counts": "unknown"},
+        "outbox_counts": {key: "unknown" for key in ("pending", "processing", "completed", "failed")},
+        "vector": {"available": "unknown", "count": "unknown", "dimension": "unknown", "coverage": "unknown"},
+        "graph": {"available": "unknown", "nodes": "unknown", "edges": "unknown", "structure": "unknown"},
+    }
+    if layout.sqlite.local_path is not None and classify_artifact_nofollow(layout.sqlite.local_path) == "regular_file":
+        path = layout.sqlite.local_path
+        if all(
+            classify_artifact_nofollow(Path(str(path) + suffix)) == "absent" for suffix in ("-wal", "-shm", "-journal")
+        ):
+            try:
+                uri = f"file:{path}?mode=ro&immutable=1"
+                with sqlite3.connect(uri, uri=True) as conn:
+                    integrity = conn.execute("PRAGMA integrity_check").fetchone()
+                    result["sqlite"]["integrity"] = "ok" if integrity == ("ok",) else "unknown"
+                    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    result["sqlite"]["schema"] = "known"
+                    counts = {}
+                    for table in ("facts", "outbox"):
+                        if table in tables:
+                            counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    result["sqlite"]["counts"] = counts
+                    if "outbox" in tables:
+                        for state, count in conn.execute("SELECT status, COUNT(*) FROM outbox GROUP BY status"):
+                            if state in result["outbox_counts"]:
+                                result["outbox_counts"][state] = count
+            except (OSError, sqlite3.Error):
+                pass
+    graph = layout.graph_snapshot_path
+    if classify_artifact_nofollow(graph) == "regular_file":
+        try:
+            payload = json.loads(graph.read_text(encoding="utf-8"))
+            nodes = payload.get("nodes") if isinstance(payload, dict) else None
+            edges = payload.get("edges") if isinstance(payload, dict) else None
+            if isinstance(nodes, list) and isinstance(edges, list):
+                result["graph"] = {"available": True, "nodes": len(nodes), "edges": len(edges), "structure": "known"}
+        except (OSError, ValueError, TypeError):
+            pass
+    if layout.vector.local_path is not None:
+        result["vector"]["available"] = classify_artifact_nofollow(layout.vector.local_path) != "absent"
+    elif layout.vector.kind == "memory":
+        result["vector"]["available"] = False
+    return result
+
+
+def _doctor_report(hermes_home: str, *, env: dict | None = None) -> dict:
+    """Return stable, redacted, read-only diagnostics for every CMMS profile."""
+    from memory_server.plugins.hermes.config import (
+        HermesPluginConfig,
+        build_storage_config_report,
+    )
+
+    rows = []
+    for label, home in _collect_profile_homes(hermes_home):
+        cfg_path = _config_path(str(home))
+        if not cfg_path.is_file():
+            continue
+        data = _load_config(cfg_path)
+        entry = ((data.get("memory") or {}).get("providers") or {}).get("memory_server") or {}
+        if not entry:
+            continue
+        config_report = build_storage_config_report(entry, include_env=env is None or bool(env))
+        raw = dict(config_report.raw)
+        effective = dict(config_report.effective)
+        raw["path"] = entry.get("path")
+        env_path = os.environ.get("MEMORY_SERVER_PATH") if env is None else None
+        effective["path"] = env_path or entry.get("path")
+        effective_cfg = HermesPluginConfig.from_dict(effective, use_env=False)
+        status, code, message = "OK", None, "layout is coherent"
+        layout = None
+        try:
+            layout = effective_cfg.resolve_storage_layout(hermes_home=str(home), settings=None)
+            if layout.compatibility:
+                status, code, message = "WARN", "W_LEGACY_SPLIT_LAYOUT", "legacy-split-layout"
+            if layout.unavailable_projections:
+                status, code, message = (
+                    "ERROR",
+                    "E_PROJECTION_UNAVAILABLE",
+                    "projection unavailable without following link",
+                )
+        except StorageLayoutError as exc:
+            status, code, message = "ERROR", exc.code, str(exc)
+        canonical = {
+            "mode": config_report.effective_origins.get("storage_mode", "default"),
+            "root": config_report.effective_origins.get("data_root", "default"),
+            "installation": "env" if env_path else ("yaml" if entry.get("path") else "default"),
+        }
+        rows.append(
+            {
+                "profile": label,
+                "status": status,
+                "code": code,
+                "message": message,
+                "raw": config_report.as_dict()["raw"],
+                "effective": config_report.as_dict()["effective"],
+                "raw_origins": config_report.as_dict()["raw_origins"],
+                "effective_origins": config_report.as_dict()["effective_origins"],
+                "canonical_origins": canonical,
+                "safe_diagnostics": _safe_store_diagnostics(layout)
+                if layout
+                else {
+                    "sqlite": {"schema": "unknown", "integrity": "unknown", "counts": "unknown"},
+                    "outbox_counts": {key: "unknown" for key in ("pending", "processing", "completed", "failed")},
+                    "vector": {
+                        "available": "unknown",
+                        "count": "unknown",
+                        "dimension": "unknown",
+                        "coverage": "unknown",
+                    },
+                    "graph": {"available": "unknown", "nodes": "unknown", "edges": "unknown", "structure": "unknown"},
+                },
+            }
+        )
+    overall = (
+        "ERROR"
+        if any(row["status"] == "ERROR" for row in rows)
+        else "WARN"
+        if any(row["status"] == "WARN" for row in rows)
+        else "OK"
+    )
+    return {"status": overall, "profiles": rows, "migration_hint": _DOCTOR_HINT}
 
 
 def _do_doctor(
@@ -410,68 +541,15 @@ def _do_doctor(
     *,
     out,
 ) -> int:
-    """Scan profiles for CMMS data fragmentation. Returns problem count."""
-    from memory_server.plugins.hermes.config import HermesPluginConfig
-
-    expected = str(cmms_repo_root())
-    problems = 0
-
-    for label, home in _collect_profile_homes(hermes_home):
-        cfg_path = _config_path(str(home))
-        if not cfg_path.is_file():
-            continue
-        data = _load_config(cfg_path)
-        memory = data.get("memory") or {}
-        providers = memory.get("providers") or {}
-        entry = providers.get("memory_server") or {}
-        if not entry:
-            continue  # profile not using CMMS — nothing to check
-
-        configured_path = entry.get("path") or ""
-        data_dirs = _profile_data_dirs(home)
-        bad = []
-        warnings = []
-
-        if not configured_path:
-            bad.append("path is missing (will default to repo root — set it explicitly)")
-        else:
-            cfg = HermesPluginConfig.from_dict({"path": configured_path})
-            try:
-                cfg.validate_shared_root(expected=expected)
-            except ValueError as exc:
-                bad.append(str(exc))
-
-            env_path = os.environ.get("MEMORY_SERVER_PATH") or ""
-            if cfg.cmms_path_source == "env" and env_path != configured_path:
-                warnings.append(
-                    f"MEMORY_SERVER_PATH env overrides config path "
-                    f"({env_path!r} vs {configured_path!r}) — effective path "
-                    "validated above"
-                )
-                # Env masks a possibly-invalid config value; validate the raw
-                # config path too so unsetting env later cannot silently
-                # re-enable a per-profile data dir.
-                try:
-                    HermesPluginConfig.from_dict(
-                        {"path": configured_path}, use_env=False
-                    ).validate_shared_root(expected=expected)
-                except ValueError as exc:
-                    bad.append(str(exc))
-
-        for data_dir in data_dirs:
-            bad.append(f"per-profile data dir exists: {data_dir}")
-
-        for item in warnings:
-            out(f"ℹ️  {label}: {item}")
-        if bad:
-            problems += 1
-            out(f"⚠️  {label} ({home})")
-            for item in bad:
-                out(f"   - {item}")
-
-    if problems == 0:
-        out(f"✅ All CMMS profiles point at shared data root: {expected}")
-    return problems
+    """Render the read-only report and return 1 for WARN or ERROR."""
+    report = _doctor_report(hermes_home)
+    for row in report["profiles"]:
+        out(f"{row['status']} {row['profile']}: {row['message']}")
+        if row["code"]:
+            out(f"  code={row['code']}")
+    if report["status"] != "OK":
+        out(_DOCTOR_HINT)
+    return int(report["status"] != "OK")
 
 
 @app.command("doctor")
@@ -481,17 +559,16 @@ def doctor(
         "--hermes-home",
         help="Hermes config directory (default: $HERMES_HOME or ~/.hermes)",
     ),
+    json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Check CMMS data-root consolidation across Hermes profiles.
-
-    Flags profiles whose config.yaml is missing
-    ``memory.providers.memory_server.path``, points it at a non-repo
-    location, or still has per-profile data dirs (LanceDB index / graph
-    snapshot). Exits 1 when any problem is found.
-    """
+    """Inspect raw/effective StorageLayout without opening stores."""
     resolved = _find_hermes_home(hermes_home)
-    problems = _do_doctor(resolved, out=typer.echo)
-    sys.exit(1 if problems else 0)
+    report = _doctor_report(resolved)
+    if json_output:
+        typer.echo(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    else:
+        _do_doctor(resolved, out=typer.echo)
+    sys.exit(1 if report["status"] != "OK" else 0)
 
 
 def _migration_dry_run_payload(plan: MigrationPlan, request: MigrationRequest) -> dict:
@@ -506,12 +583,8 @@ def _migration_dry_run_payload(plan: MigrationPlan, request: MigrationRequest) -
         "lock_availability": plan.lock_availability,
         "warnings": [warning.__dict__ for warning in plan.warnings],
         "blockers": [blocker.__dict__ for blocker in plan.blockers],
-        "planned_operations": [
-            operation.__dict__ for operation in plan.planned_operations
-        ],
-        "proposed_manifest_path": str(
-            plan.layout.data_root / ".cmms-migrations" / request.run_id / "manifest.json"
-        ),
+        "planned_operations": [operation.__dict__ for operation in plan.planned_operations],
+        "proposed_manifest_path": str(plan.layout.data_root / ".cmms-migrations" / request.run_id / "manifest.json"),
     }
 
 
@@ -575,15 +648,11 @@ def migrate_profile_storage(
         code = raw.split(":", 1)[0].strip()
         if not code.startswith("E_"):
             code = "E_MIGRATION_STAGE_FAILED"
-        hint = DIAGNOSTIC_CONTRACT.get(code, {}).get(
-            "hint", "Resolve the reported condition before retrying."
-        )
+        hint = DIAGNOSTIC_CONTRACT.get(code, {}).get("hint", "Resolve the reported condition before retrying.")
         diagnostic = Diagnostic(code, "error", raw, "storage", hint)
         typer.echo(json.dumps(diagnostic.__dict__, sort_keys=True))
         phase = "manifest" if code.startswith("E_MANIFEST_") else "precondition"
         raise typer.Exit(exit_code_for_diagnostic(code, phase=phase)) from exc
-
-
 
 
 @app.callback(invoke_without_command=True)

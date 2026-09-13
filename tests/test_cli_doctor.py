@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -59,106 +60,88 @@ class TestProfileDataDirs:
 
 
 class TestDoDoctor:
-    """Test the doctor scan over a synthetic HERMES_HOME."""
+    """Doctor contract: raw/effective layout diagnostics."""
 
     @pytest.fixture(autouse=True)
-    def _no_memory_server_path_env(self, monkeypatch):
-        """Keep doctor deterministic: env override tests opt in explicitly."""
-        monkeypatch.delenv("MEMORY_SERVER_PATH", raising=False)
+    def clean(self, monkeypatch):
+        for n in (
+            "MEMORY_SERVER_PATH",
+            "MEMORY_SERVER_STORAGE_MODE",
+            "MEMORY_SERVER_DATA_ROOT",
+            "MEMORY_SERVER_DB_URL",
+        ):
+            monkeypatch.delenv(n, raising=False)
 
-    def _write_config(self, home: Path, *, path: str | None, use_cmms: bool = True):
+    def cfg(self, home, text):
         home.mkdir(parents=True, exist_ok=True)
-        if not use_cmms:
-            (home / "config.yaml").write_text("model:\n  default: x\n")
-            return
-        path_line = f"      path: {path}\n" if path is not None else ""
-        (home / "config.yaml").write_text(
-            "memory:\n"
-            "  provider: memory_server\n"
-            "  providers:\n"
-            "    memory_server:\n"
-            "      plugin: memory_server.plugins.hermes.provider.HermesProvider\n"
-            "      enabled: true\n"
-            f"{path_line}"
+        (home / "config.yaml").write_text(text)
+
+    def test_s402_matrix(self, tmp_path, monkeypatch):
+        from memory_server.cli import _doctor_report
+
+        self.cfg(
+            tmp_path,
+            "memory:\n  providers:\n    memory_server:\n      path: /external/install\n"
+            "      storage_mode: profile\n      data_root: .\n",
         )
+        assert _doctor_report(str(tmp_path), env={})["profiles"][0]["status"] == "OK"
+        monkeypatch.setenv("MEMORY_SERVER_STORAGE_MODE", "shared")
+        monkeypatch.setenv("MEMORY_SERVER_DATA_ROOT", str(tmp_path / "shared"))
+        row = _doctor_report(str(tmp_path))["profiles"][0]
+        assert row["raw"]["storage_mode"] == "profile"
+        assert row["effective"]["storage_mode"] == "shared"
+        assert row["effective_origins"]["storage_mode"] == "env"
 
-    def test_clean_profile_reports_zero(self, tmp_path, capsys):
-        repo_root = str(Path(__file__).resolve().parents[1])
-        self._write_config(tmp_path, path=repo_root)
-        problems = _do_doctor(str(tmp_path), out=lambda s: print(s))
-        assert problems == 0
-        assert "All CMMS profiles point at shared data root" in capsys.readouterr().out
+    @pytest.mark.parametrize("mode,root", [("profile", "."), ("shared", "/tmp/shared"), ("standalone", ".")])
+    def test_s402_modes(self, tmp_path, mode, root):
+        from memory_server.cli import _doctor_report
 
-    def test_missing_path_reports_problem(self, tmp_path, capsys):
-        self._write_config(tmp_path, path=None)
-        problems = _do_doctor(str(tmp_path), out=lambda s: print(s))
-        assert problems == 1
-        assert "path is missing" in capsys.readouterr().out
+        self.cfg(
+            tmp_path,
+            f"memory:\n  providers:\n    memory_server:\n      path: /external/install\n"
+            f"      storage_mode: {mode}\n      data_root: {root}\n",
+        )
+        assert _doctor_report(str(tmp_path), env={})["profiles"][0]["status"] == "OK"
 
-    def test_non_repo_path_reports_problem(self, tmp_path, capsys):
-        self._write_config(tmp_path, path="/tmp/not-the-repo")
-        problems = _do_doctor(str(tmp_path), out=lambda s: print(s))
-        assert problems == 1
-        assert "must point at the shared CMMS repo root" in capsys.readouterr().out
+    def test_s402_legacy_warn(self, tmp_path):
 
-    def test_per_profile_data_dir_reports_problem(self, tmp_path, capsys):
-        repo_root = str(Path(__file__).resolve().parents[1])
-        self._write_config(tmp_path, path=repo_root)
-        (tmp_path / "data" / "lancedb").mkdir(parents=True)
-        problems = _do_doctor(str(tmp_path), out=lambda s: print(s))
-        assert problems == 1
-        assert "per-profile data dir exists" in capsys.readouterr().out
+        self.cfg(
+            tmp_path,
+            "memory:\n  providers:\n    memory_server:\n      path: /external/install\n"
+            "      storage_mode: profile\n      data_root: .\n"
+            "      lancedb_path: /foreign/lancedb\n",
+        )
+        out = []
+        assert _do_doctor(str(tmp_path), out=out.append) == 1
+        assert "WARN" in "\n".join(out)
 
-    def test_non_cmms_profile_skipped(self, tmp_path, capsys):
-        self._write_config(tmp_path, path=None, use_cmms=False)
-        problems = _do_doctor(str(tmp_path), out=lambda s: print(s))
-        assert problems == 0
-        assert "All CMMS profiles point at shared data root" in capsys.readouterr().out
+    def test_s402_link_unknown_and_json(self, tmp_path, monkeypatch):
+        from memory_server.cli import _doctor_report
 
-    def test_profile_and_root_both_checked(self, tmp_path, capsys):
-        repo_root = str(Path(__file__).resolve().parents[1])
-        self._write_config(tmp_path, path=repo_root)
-        prof = tmp_path / "profiles" / "travel-agent"
-        self._write_config(prof, path=None)  # missing path → problem
-        problems = _do_doctor(str(tmp_path), out=lambda s: print(s))
-        assert problems == 1
-        assert "travel-agent" in capsys.readouterr().out
+        self.cfg(tmp_path, "memory:\n  providers:\n    memory_server:\n      path: /external/install\n")
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "lancedb").symlink_to(tmp_path / "foreign")
+        before = sorted(str(x.relative_to(tmp_path)) for x in tmp_path.rglob("*"))
+        row = _doctor_report(str(tmp_path), env={})["profiles"][0]
+        after = sorted(str(x.relative_to(tmp_path)) for x in tmp_path.rglob("*"))
+        assert before == after
+        assert row["status"] == "ERROR"
+        assert row["code"] == "E_PROJECTION_UNAVAILABLE"
+        assert row["safe_diagnostics"]["vector"]["count"] == "unknown"
+        from typer.testing import CliRunner
 
-    # --- W1: env override must be visible, not blind the doctor -------------
-
-    def test_env_override_warns_and_validates_config(self, tmp_path, capsys, monkeypatch):
-        """Env overriding config is reported, and the raw config path is
-        validated too (env may mask a bad config value)."""
-        repo_root = str(Path(__file__).resolve().parents[1])
-        monkeypatch.setenv("MEMORY_SERVER_PATH", repo_root)
-        self._write_config(tmp_path, path="/tmp/not-the-repo")
-        problems = _do_doctor(str(tmp_path), out=lambda s: print(s))
-        out = capsys.readouterr().out
-        assert problems == 1
-        assert "MEMORY_SERVER_PATH env overrides config path" in out
-        assert "must point at the shared CMMS repo root" in out
-
-    def test_env_override_bad_env_is_problem(self, tmp_path, capsys, monkeypatch):
-        """A bad env value is a real problem even when config is valid."""
-        repo_root = str(Path(__file__).resolve().parents[1])
-        monkeypatch.setenv("MEMORY_SERVER_PATH", "/tmp/not-the-repo")
-        self._write_config(tmp_path, path=repo_root)
-        problems = _do_doctor(str(tmp_path), out=lambda s: print(s))
-        out = capsys.readouterr().out
-        assert problems == 1
-        assert "must point at the shared CMMS repo root" in out
-        assert "env overrides config path" in out
-
-    def test_env_equal_to_config_is_quiet(self, tmp_path, capsys, monkeypatch):
-        """Env matching the config path is not flagged as an override."""
-        repo_root = str(Path(__file__).resolve().parents[1])
-        monkeypatch.setenv("MEMORY_SERVER_PATH", repo_root)
-        self._write_config(tmp_path, path=repo_root)
-        problems = _do_doctor(str(tmp_path), out=lambda s: print(s))
-        out = capsys.readouterr().out
-        assert problems == 0
-        assert "All CMMS profiles point at shared data root" in out
-        assert "env overrides" not in out
+        monkeypatch.setenv("MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///x.db?token=SECRET")
+        result = CliRunner().invoke(
+            __import__("memory_server.cli", fromlist=["app"]).app, ["doctor", "--hermes-home", str(tmp_path), "--json"]
+        )
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert set(payload) == {"status", "profiles", "migration_hint"}
+        assert "SECRET" not in result.stdout
+        assert (
+            payload["migration_hint"]
+            == "Run `memory-server migrate-profile-storage` to rebuild unavailable projections."
+        )
 
 
 class TestInstallUninstallBackupRestore:
@@ -171,9 +154,7 @@ class TestInstallUninstallBackupRestore:
 
     def _write_config(self, home: Path, *, provider: str | None) -> None:
         home.mkdir(parents=True, exist_ok=True)
-        provider_line = (
-            f"  provider: {provider}\n" if provider is not None else ""
-        )
+        provider_line = f"  provider: {provider}\n" if provider is not None else ""
         (home / "config.yaml").write_text(
             "model:\n"
             "  default: x\n"
@@ -219,9 +200,7 @@ class TestInstallUninstallBackupRestore:
         # the backup must be left untouched.
         out2 = []
         assert _do_install(str(home), False, out=out2.append) == 0
-        assert back.read_text().strip() == "openai_memory", (
-            "re-install clobbered the original provider backup"
-        )
+        assert back.read_text().strip() == "openai_memory", "re-install clobbered the original provider backup"
 
         # Uninstall restores the ORIGINAL provider from the untouched backup.
         out3 = []
@@ -249,9 +228,7 @@ class TestInstallUninstallBackupRestore:
         assert _do_install(str(home), False, out=out1.append) == 0
         assert self._provider(home) == "memory_server"
         back = _backup_path(str(home))
-        assert back.read_text().strip() == ABSENT_PROVIDER_MARKER, (
-            "absence must be recorded with the explicit marker"
-        )
+        assert back.read_text().strip() == ABSENT_PROVIDER_MARKER, "absence must be recorded with the explicit marker"
 
         out2 = []
         assert _do_uninstall(str(home), False, out=out2.append) == 0
@@ -304,3 +281,79 @@ class TestInstallUninstallBackupRestore:
         out = []
         assert _do_uninstall(str(home), False, out=out.append) == 0
         assert self._provider(home) == "manual_choice"
+
+
+def _s402_cfg(path="/external/install", mode="profile", root=".", extra=""):
+    return (
+        "memory:\n  provider: memory_server\n  providers:\n    memory_server:\n"
+        "      plugin: memory_server.plugins.hermes.provider.HermesProvider\n"
+        f"      path: {path}\n      storage_mode: {mode}\n      data_root: {root}\n{extra}"
+    )
+
+
+def test_s402_raw_effective_matrix_and_origins(tmp_path, monkeypatch):
+    from memory_server.cli import _doctor_report
+
+    (tmp_path / "config.yaml").write_text(_s402_cfg())
+    raw = _doctor_report(str(tmp_path), env={})["profiles"][0]
+    assert raw["status"] == "OK" and raw["raw"]["storage_mode"] == "profile"
+    monkeypatch.setenv("MEMORY_SERVER_STORAGE_MODE", "shared")
+    monkeypatch.setenv("MEMORY_SERVER_DATA_ROOT", str(tmp_path / "shared"))
+    row = _doctor_report(str(tmp_path))["profiles"][0]
+    assert row["effective"]["storage_mode"] == "shared"
+    assert row["effective_origins"]["storage_mode"] == "env"
+
+
+@pytest.mark.parametrize("mode,root", [("profile", "."), ("shared", "/tmp/shared"), ("standalone", ".")])
+def test_s402_profile_shared_standalone_statuses(tmp_path, mode, root):
+    from memory_server.cli import _doctor_report
+
+    (tmp_path / "config.yaml").write_text(_s402_cfg(mode=mode, root=root))
+    assert _doctor_report(str(tmp_path), env={})["profiles"][0]["status"] == "OK"
+
+
+def test_s402_installation_path_is_not_storage_root(tmp_path):
+    from memory_server.cli import _doctor_report
+
+    (tmp_path / "config.yaml").write_text(_s402_cfg(path="/not-the-repo"))
+    row = _doctor_report(str(tmp_path), env={})["profiles"][0]
+    assert row["status"] == "OK" and row["canonical_origins"]["installation"] == "yaml"
+
+
+def test_s402_legacy_split_warns_nonzero(tmp_path):
+
+    (tmp_path / "config.yaml").write_text(_s402_cfg(extra="      lancedb_path: /foreign/lancedb\n"))
+    out = []
+    assert _do_doctor(str(tmp_path), out=out.append) == 1
+    assert "WARN" in "\n".join(out)
+
+
+def test_s402_no_link_and_unknown_are_read_only(tmp_path):
+    from memory_server.cli import _doctor_report
+
+    (tmp_path / "config.yaml").write_text(_s402_cfg())
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "lancedb").symlink_to(tmp_path / "foreign")
+    before = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
+    row = _doctor_report(str(tmp_path), env={})["profiles"][0]
+    after = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
+    assert before == after
+    assert row["status"] == "ERROR" and row["code"] == "E_PROJECTION_UNAVAILABLE"
+    assert row["safe_diagnostics"]["vector"]["count"] == "unknown"
+
+
+def test_s402_json_redaction_and_exact_hint(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from memory_server.cli import app
+
+    (tmp_path / "config.yaml").write_text(_s402_cfg())
+    monkeypatch.setenv("MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///x.db?token=SECRET")
+    result = CliRunner().invoke(app, ["doctor", "--hermes-home", str(tmp_path), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert set(payload) == {"status", "profiles", "migration_hint"}
+    assert "SECRET" not in result.stdout
+    assert (
+        payload["migration_hint"] == "Run `memory-server migrate-profile-storage` to rebuild unavailable projections."
+    )
