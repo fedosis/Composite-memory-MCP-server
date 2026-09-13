@@ -452,11 +452,11 @@ def exit_code_for_diagnostic(code: str, *, phase: str = "precondition") -> int:
 
 def _bounded_diagnostic_text(value: str, code: str) -> str:
     text = str(value)
-    text = re.sub(r"(?i)(token|secret|password|api[_-]?key)\\s*[=:]\\s*[^\\s,;]+", r"\\1=[redacted]", text)
-    text = re.sub(r"(?:/|~[/\\])[^\\s,;]{3,}", "[path redacted]", text)
+    text = re.sub(r"(?i)(token|secret|password|api[_-]?key)\s*[=:]\s*[^\s,;]+", r"\1=[redacted]", text)
+    text = re.sub(r"(?<![\w.])(?:~|/)(?:[^\s,;]+/)+[^\s,;]+", "[path redacted]", text)
     if len(text) > DIAGNOSTIC_MESSAGE_LIMIT:
         text = text[:DIAGNOSTIC_MESSAGE_LIMIT - 14] + "…[truncated]"
-    return text or DIAGNOSTIC_CONTRACT.get(code, {}).get("message", code)
+    return text
 
 
 @dataclass(frozen=True)
@@ -468,17 +468,9 @@ class Diagnostic:
     hint: str = ""
 
     def __post_init__(self) -> None:
-        entry = DIAGNOSTIC_CONTRACT.get(self.code)
-        if entry is None:
-            entry = {
-                "severity": self.severity,
-                "message": self.code,
-                "artifact": self.artifact or "storage",
-                "hint": "Resolve the reported condition before retrying.",
-            }
         object.__setattr__(self, "message", _bounded_diagnostic_text(self.message, self.code))
-        object.__setattr__(self, "artifact", _bounded_diagnostic_text(self.artifact or entry["artifact"], self.code))
-        object.__setattr__(self, "hint", _bounded_diagnostic_text(self.hint or entry["hint"], self.code))
+        object.__setattr__(self, "artifact", _bounded_diagnostic_text(self.artifact, self.code))
+        object.__setattr__(self, "hint", _bounded_diagnostic_text(self.hint, self.code))
 
 
 @dataclass(frozen=True)

@@ -18,6 +18,7 @@ import typer
 
 from memory_server.paths import cmms_repo_root
 from memory_server.profile_migration import (
+    DIAGNOSTIC_CONTRACT,
     Diagnostic,
     MigrationPlan,
     MigrationRequest,
@@ -567,14 +568,17 @@ def migrate_profile_storage(
             else:
                 result = _migration_dry_run_payload(plan, request)
         typer.echo(json.dumps(result, default=str, sort_keys=True, indent=2))
-        if isinstance(result, dict) and result.get("status") == "failed":
+        if not isinstance(result, dict) and getattr(result, "status", "") == "failed":
             raise typer.Exit(3)
     except ValueError as exc:
         raw = str(exc)
         code = raw.split(":", 1)[0].strip()
         if not code.startswith("E_"):
             code = "E_MIGRATION_STAGE_FAILED"
-        diagnostic = Diagnostic(code, "error", raw)
+        hint = DIAGNOSTIC_CONTRACT.get(code, {}).get(
+            "hint", "Resolve the reported condition before retrying."
+        )
+        diagnostic = Diagnostic(code, "error", raw, "storage", hint)
         typer.echo(json.dumps(diagnostic.__dict__, sort_keys=True))
         phase = "manifest" if code.startswith("E_MANIFEST_") else "precondition"
         raise typer.Exit(exit_code_for_diagnostic(code, phase=phase)) from exc
