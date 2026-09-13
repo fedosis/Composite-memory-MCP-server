@@ -114,16 +114,10 @@ def test_manifest_in_includes_changelog():
 
 def test_sdist_contains_changelog(tmp_path):
     """Build and verify the sdist tarball actually carries CHANGELOG.md."""
-    import os
     import shutil
     import subprocess
     import sys
     import tarfile
-
-    import pytest
-
-    if os.environ.get("CMMS_SANDBOX_APPROVED") == "1" or not os.access(ROOT, os.W_OK):
-        pytest.skip("sdist build writes outside the certified read-only gate")
 
     build_root = tmp_path / "project"
     shutil.copytree(
