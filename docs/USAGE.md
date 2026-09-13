@@ -513,4 +513,3 @@ Process exit codes are the committed CLI contract:
 No real configuration, credential, memory content, or live-store transcript is
 part of documentation validation; validation uses synthetic homes and no
 network.
-
