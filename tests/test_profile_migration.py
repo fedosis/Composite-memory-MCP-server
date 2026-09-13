@@ -141,6 +141,110 @@ def test_s4_01_cli_and_manifest_json_shapes_are_additive() -> None:
     assert isinstance(cli.DIAGNOSTIC_CONTRACT, dict)
 
 
+def test_s4_03_dry_run_payload_is_the_library_report() -> None:
+    report = {
+        "schema_version": 1,
+        "run_id": "r1",
+        "mode": "dry-run",
+        "strategy": "rebuild-from-profile-sql",
+        "profile_home": "/home/profile",
+        "source_sql": {},
+        "source_sidecars": {},
+        "legacy_projections": [],
+        "target": {"root": "/target", "sqlite": "/db", "lancedb": "/vec", "graph": "/graph"},
+        "path_checks": [], "sqlite": {}, "outbox_counts": {}, "collisions": [], "disk": {},
+        "lock_availability": "unknown", "embedding": {}, "planned_operations": [],
+        "runtime_stop_instructions": [], "proposed_manifest_path": "/target/.cmms-migrations/r1/manifest.json",
+        "warnings": [], "blockers": [],
+    }
+    plan = type("Plan", (), {"report": report})()
+    request = type("Request", (), {"run_id": "r1", "strategy": "rebuild-from-profile-sql"})()
+    assert cli._migration_dry_run_payload(cast(Any, plan), cast(Any, request)) == report
+    assert json.loads(json.dumps(cli._migration_dry_run_payload(cast(Any, plan), cast(Any, request)))) == report
+
+
+def test_s4_03_json_switch_and_human_output_are_distinct(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    plan = type("Plan", (), {"report": {
+        "schema_version": 1, "run_id": "r", "mode": "dry-run",
+        "strategy": "rebuild-from-profile-sql", "blockers": [],
+    }})()
+    request = type("Request", (), {})()
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(cli, "plan_profile_migration", lambda _request: plan)
+    monkey.setattr(cli, "MigrationRequest", lambda *args, **kwargs: request)
+    try:
+        runner = CliRunner()
+        human = runner.invoke(cli.app, ["migrate-profile-storage", "--hermes-home", str(tmp_path)])
+        machine = runner.invoke(cli.app, ["migrate-profile-storage", "--hermes-home", str(tmp_path), "--json"])
+        assert human.exit_code == 0
+        assert "mode: dry-run" in human.stdout
+        assert json.loads(machine.stdout)["mode"] == "dry-run"
+        assert human.stdout != machine.stdout
+    finally:
+        monkey.undo()
+
+
+def test_s4_03_resume_forwards_embedding_and_network_flags(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    seen = {}
+    def request_factory(*args, **kwargs):
+        seen.update(kwargs)
+        return type("Request", (), kwargs)()
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(cli, "MigrationRequest", request_factory)
+    monkey.setattr(cli, "resume_profile_migration", lambda *_args: {"status": "complete"})
+    try:
+        result = CliRunner().invoke(cli.app, [
+            "migrate-profile-storage", "--resume", str(tmp_path / "m.json"), "--apply",
+            "--confirm-target", str(tmp_path), "--attest-runtimes-stopped", "ticket",
+            "--confirm-embedding-plan", "abc", "--allow-network-embedding", "--json",
+        ])
+        assert result.exit_code == 0
+        assert seen["embedding_plan_digest"] == "abc"
+        assert seen["allow_network_embedding"] is True
+    finally:
+        monkey.undo()
+
+
+def test_s4_03_blocker_dry_run_is_nonzero(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    plan = type("Plan", (), {
+        "report": {"schema_version": 1, "run_id": "r", "mode": "dry-run",
+                   "strategy": "rebuild-from-profile-sql",
+                   "blockers": [{"code": "E_SOURCE_SQL_REQUIRED"}]},
+        "blockers": (object(),),
+    })()
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(cli, "plan_profile_migration", lambda _request: plan)
+    try:
+        result = CliRunner().invoke(cli.app, ["migrate-profile-storage", "--hermes-home", str(tmp_path), "--json"])
+        assert result.exit_code == 1
+    finally:
+        monkey.undo()
+
+
+def test_s4_03_resume_overrides_and_attestation_are_usage_errors(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+    both = runner.invoke(cli.app, [
+        "migrate-profile-storage", "--resume", "m.json", "--rollback", "r.json", "--apply",
+    ])
+    override = runner.invoke(cli.app, [
+        "migrate-profile-storage", "--resume", "m.json", "--apply", "--source-sql", "db.sqlite",
+    ])
+    oversized = runner.invoke(cli.app, [
+        "migrate-profile-storage", "--apply", "--attest-runtimes-stopped", "я" * 257,
+    ])
+    assert both.exit_code == 2
+    assert override.exit_code == 2
+    assert oversized.exit_code == 2
+
+
 def test_s4_01_s1_extra_code_uses_compatible_exit_surface() -> None:
     assert profile_migration.exit_code_for_diagnostic("E_STORAGE_MODE_INVALID") == 1
     diagnostic = profile_migration.Diagnostic(
