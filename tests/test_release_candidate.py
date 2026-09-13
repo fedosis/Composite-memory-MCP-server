@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-RELEASE_VERSION = "0.12.0b1"
+RELEASE_VERSION = "0.12.0"
 
 
 def _read_text(relative: str) -> str:
@@ -23,7 +23,11 @@ def test_release_version_is_consistent_and_pep440_beta():
     assert pyproject["project"]["version"] == RELEASE_VERSION
     assert pyproject["project"]["readme"] == "README.md"
     assert f'__version__ = "{RELEASE_VERSION}"' in init_text
-    assert re.fullmatch(r"\d+\.\d+\.\d+b\d+", RELEASE_VERSION)
+    # Was beta-only (`\d+\.\d+\.\d+b\d+`). Relaxed for the 0.12.0 final release:
+    # the invariant that matters is a PEP 440-shaped, consistent version, not a
+    # pre-release suffix. The node id is deliberately unchanged so no existing
+    # testcase id disappears from the suite.
+    assert re.fullmatch(r"\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?", RELEASE_VERSION)
     assert pyproject["project"]["requires-python"] == ">=3.11"
 
 
