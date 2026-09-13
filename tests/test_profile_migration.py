@@ -48,6 +48,36 @@ from memory_server.profile_migration import (
 from memory_server.projection_rebuild import CanonicalProjectionRecord
 
 
+def test_s4_01_catalogue_is_complete_and_table_driven() -> None:
+    expected = profile_migration.DETAIL_DIAGNOSTIC_CODES
+    table = profile_migration.DIAGNOSTIC_CONTRACT
+    assert len(expected) == 52
+    assert set(table) == set(expected)
+    for code in expected:
+        entry = table[code]
+        assert entry["severity"] in {"warning", "error"}
+        assert entry["message"]
+        assert entry["artifact"]
+        assert entry["hint"]
+
+
+def test_s4_01_diagnostic_redaction_is_bounded() -> None:
+    hostile = "/srv/private/" + ("A" * 5000) + " token=sk-" + ("x" * 100)
+    diagnostic = profile_migration.Diagnostic("E_BACKUP_VERIFY", "error", hostile, "/tmp/private")
+    payload = diagnostic.__dict__
+    encoded = json.dumps(payload, sort_keys=True)
+    assert len(encoded) <= profile_migration.DIAGNOSTIC_MESSAGE_LIMIT + 512
+    assert len(diagnostic.message) <= profile_migration.DIAGNOSTIC_MESSAGE_LIMIT
+    assert "token=sk-" not in diagnostic.message
+    assert hostile not in encoded
+
+
+@pytest.mark.parametrize("code", range(7))
+def test_s4_01_exit_code_contract(code: int) -> None:
+    condition = profile_migration.EXIT_CODE_CONDITIONS[code]
+    assert profile_migration.exit_code_for_diagnostic(condition["code"], phase=condition["phase"]) == code
+
+
 def _s301_records() -> list[CanonicalProjectionRecord]:
     return [
         CanonicalProjectionRecord("decision", "d1", "index_decision", {

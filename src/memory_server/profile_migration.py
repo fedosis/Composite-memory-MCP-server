@@ -391,6 +391,74 @@ _MANIFEST_EVENT_FIELDS = frozenset(
 _EVENT_INPUT_FIELDS = frozenset({"checkpoint", "operation", "payload"})
 
 
+# DETAIL §12 is the single source of truth for the stable diagnostic catalogue.
+DETAIL_DIAGNOSTIC_CODES = (
+    "E_HERMES_HOME_REQUIRED", "E_PROFILE_ROOT_EXTERNAL", "E_SHARED_ROOT_REQUIRED",
+    "E_SHARED_ROOT_RELATIVE", "E_SHARED_SPLIT_LAYOUT", "E_PATH_OUTSIDE_ROOT",
+    "E_PATH_SYMLINK_PARENT", "E_PATH_FINAL_SYMLINK_UNSAFE", "W_LEGACY_SPLIT_LAYOUT",
+    "E_PATH_SPECIAL_FILE", "E_PATH_OVERLAP", "E_FORBIDDEN_TARGET_ROOT",
+    "E_ARTIFACT_IDENTITY_CHANGED", "E_QDRANT_PROFILE_NAMESPACE_UNDEFINED", "E_PROJECTION_UNAVAILABLE",
+    "E_SOURCE_SQL_REQUIRED", "E_SOURCE_SQL_NOT_REGULAR", "E_SQLITE_WAL_ACTIVE",
+    "E_SQLITE_SHM_AMBIGUOUS", "E_SQLITE_HOT_JOURNAL", "E_SQLITE_READONLY_UNSAFE",
+    "E_SQLITE_PROBE_UNSAFE", "E_SQLITE_INTEGRITY", "E_SQLITE_SCHEMA", "E_SOURCE_CHANGED",
+    "E_LEGACY_PROJECTION_IMPORT_FORBIDDEN", "E_INSUFFICIENT_SPACE", "E_BACKUP_COLLISION",
+    "E_BACKUP_VERIFY", "E_STAGING_VERIFY", "E_EMBEDDER_UNAVAILABLE", "E_EMBEDDER_AUTH_REQUIRED",
+    "E_EMBEDDER_DIMENSION", "E_EMBEDDER_PARTIAL", "E_CROSS_FILESYSTEM_PUBLICATION",
+    "E_PUBLICATION_AMBIGUOUS", "E_ROLLBACK_VERIFY", "E_CONFIRMATION_REQUIRED",
+    "E_CONFIRM_TARGET_MISMATCH", "E_STOP_ATTESTATION_REQUIRED", "E_WRITER_ACTIVE",
+    "E_WRITER_STATE_UNKNOWN", "E_LOCK_HELD", "E_LOCK_TIMEOUT", "E_LOCK_PERMISSION",
+    "E_LOCK_UNSUPPORTED", "E_LOCK_ENTRY_UNSAFE", "E_MANIFEST_VERSION", "E_MANIFEST_SCHEMA",
+    "E_MANIFEST_TAMPERED", "E_MANIFEST_PATH_ESCAPE", "E_CONFIG_DIGEST_CHANGED",
+)
+DIAGNOSTIC_MESSAGE_LIMIT = 512
+
+def _diagnostic_entry(code: str) -> dict[str, str]:
+    return {
+        "severity": "warning" if code.startswith("W_") else "error",
+        "message": f"{code} reported by the storage safety checks",
+        "artifact": "storage",
+        "hint": "Inspect the affected artifact and resolve the condition before retrying.",
+    }
+
+DIAGNOSTIC_CONTRACT = {code: _diagnostic_entry(code) for code in DETAIL_DIAGNOSTIC_CODES}
+
+# Process status is deliberately a separate table: changing diagnostic text or
+# emission must never change the lifecycle/control-flow contract.
+EXIT_CODE_CONDITIONS = {
+    0: {"code": "OK", "phase": "success"},
+    1: {"code": "E_PATH_OUTSIDE_ROOT", "phase": "precondition"},
+    2: {"code": "CLI_USAGE", "phase": "usage"},
+    3: {"code": "E_MIGRATION_STAGE_FAILED", "phase": "apply"},
+    4: {"code": "E_PUBLICATION_AMBIGUOUS", "phase": "rollback"},
+    5: {"code": "E_MANIFEST_TAMPERED", "phase": "manifest"},
+    6: {"code": "E_LOCK_ENTRY_UNSAFE", "phase": "lock"},
+}
+
+def exit_code_for_diagnostic(code: str, *, phase: str = "precondition") -> int:
+    if phase == "success":
+        return 0
+    if phase == "usage":
+        return 2
+    if phase in {"manifest", "resume-manifest"} or code.startswith("E_MANIFEST_"):
+        return 5
+    if phase in {"lock", "writer"} or code.startswith(("E_LOCK_", "E_WRITER_")):
+        return 6
+    if phase in {"rollback", "publication"} or code in {"E_PUBLICATION_AMBIGUOUS", "E_ROLLBACK_VERIFY"}:
+        return 4
+    if phase in {"apply", "resume"}:
+        return 3
+    return 1
+
+
+def _bounded_diagnostic_text(value: str, code: str) -> str:
+    text = str(value)
+    text = re.sub(r"(?i)(token|secret|password|api[_-]?key)\\s*[=:]\\s*[^\\s,;]+", r"\\1=[redacted]", text)
+    text = re.sub(r"(?:/|~[/\\])[^\\s,;]{3,}", "[path redacted]", text)
+    if len(text) > DIAGNOSTIC_MESSAGE_LIMIT:
+        text = text[:DIAGNOSTIC_MESSAGE_LIMIT - 14] + "…[truncated]"
+    return text or DIAGNOSTIC_CONTRACT.get(code, {}).get("message", code)
+
+
 @dataclass(frozen=True)
 class Diagnostic:
     code: str
@@ -398,6 +466,19 @@ class Diagnostic:
     message: str
     artifact: str = ""
     hint: str = ""
+
+    def __post_init__(self) -> None:
+        entry = DIAGNOSTIC_CONTRACT.get(self.code)
+        if entry is None:
+            entry = {
+                "severity": self.severity,
+                "message": self.code,
+                "artifact": self.artifact or "storage",
+                "hint": "Resolve the reported condition before retrying.",
+            }
+        object.__setattr__(self, "message", _bounded_diagnostic_text(self.message, self.code))
+        object.__setattr__(self, "artifact", _bounded_diagnostic_text(self.artifact or entry["artifact"], self.code))
+        object.__setattr__(self, "hint", _bounded_diagnostic_text(self.hint or entry["hint"], self.code))
 
 
 @dataclass(frozen=True)
