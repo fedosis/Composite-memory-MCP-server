@@ -275,7 +275,7 @@ async def _get_qdrant_provider() -> QdrantProvider:
         settings = _get_storage_settings()
         _ensure_storage_ready()
         _qdrant = QdrantProvider(
-            location=_get_storage_layout().vector.qdrant_location,
+            location=settings.qdrant_location,
             port=settings.qdrant_port,
             prefer_grpc=settings.qdrant_prefer_grpc,
             collection=_get_storage_layout().vector.collection,
