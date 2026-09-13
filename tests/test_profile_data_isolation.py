@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -746,6 +748,7 @@ def test_degraded_provider_write_commits_sql_and_pending_outbox(synthetic_storag
         facts, statuses = _run_async(inspect_rows())
         assert facts == ["degraded"]
         assert statuses == ["pending"]
+        assert provider._outbox_worker is None and provider._outbox_task is None
     finally:
         provider.shutdown()
 
@@ -771,30 +774,40 @@ def test_real_concurrent_profiles_keep_sql_vectors_graph_and_paths_disjoint(
             result = json.loads(providers[name].handle_tool_call("remember", {
                 "subject": name, "predicate": "owns", "object": f"fact-{index}",
             }))
-            search = providers[name].handle_tool_call("search", {"query": name})
-            assert "error" not in search.lower(), search
+            search = json.loads(providers[name].handle_tool_call("search", {"query": name}))
+            assert any(item.get("subject") == name for item in search["results"]), search
             return result["fact"]["subject"]
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda pair: write(*pair), homes.items()))
         assert results == ["default", "invest-agent"]
 
-        async def read_back(provider):
+        async def read_back(provider, name: str):
             from sqlalchemy import text
             async with provider._provider.engine.connect() as conn:
                 rows = (await conn.execute(text(
                     "SELECT subject, object FROM facts ORDER BY object"
                 ))).all()
-            vectors = await provider._lancedb.scroll(provider._storage_layout.vector.collection, limit=100)
-            nodes = provider._graph.search_by_type("fact")
+            deadline = time.monotonic() + 5.0
+            vectors = []
+            while time.monotonic() < deadline:
+                vectors = await provider._lancedb.scroll(provider._storage_layout.vector.collection, limit=100)
+                if vectors:
+                    break
+                await asyncio.sleep(0.05)
+            nodes = provider._graph.get_all_nodes()
             return rows, vectors, nodes
 
         for name, provider in providers.items():
-            rows, vectors, nodes = _run_async(read_back(provider))
+            rows, vectors, nodes = _run_async(read_back(provider, name))
             assert len(rows) == 1
             assert {row.subject for row in rows} == {name}
-            assert all(item.get("payload", {}).get("subject") == name for item in vectors)
-            assert all(node.attributes.get("subject") == name for node in nodes)
+            assert vectors, f"vector read-back empty for {name}"
+            assert {item.get("payload", {}).get("subject") for item in vectors} == {name}
+            assert {item.get("payload", {}).get("object") for item in vectors} == {rows[0].object}
+            node_names = {node.name for node in nodes}
+            assert node_names == {name, rows[0].object}, node_names
+            assert any(node.name == name for node in nodes)
     finally:
         for provider in reversed(list(providers.values())):
             provider.shutdown()
@@ -855,19 +868,40 @@ def test_final_link_doctor_returns_nonzero_without_mutation(synthetic_storage_en
 def test_startup_preserves_synthetic_legacy_artifacts(synthetic_storage_env):
     """Provider startup never moves, deletes, or overwrites legacy artifacts."""
     home = synthetic_storage_env.root / "legacy-profile"
-    legacy = home / "data" / "legacy"
-    legacy.mkdir(parents=True)
-    (legacy / "memory.db").write_bytes(b"legacy-sql")
-    (legacy / "graph.json").write_bytes(b"legacy-graph")
-    (legacy / "lancedb.marker").write_bytes(b"legacy-vector")
-    before = sorted((p.relative_to(home), p.read_bytes()) for p in legacy.iterdir())
+    home.mkdir()
+    layout = resolve_storage_layout(StorageResolutionInputs(profile_home=home))
+    sqlite_path = layout.sqlite.local_path
+    vector_path = layout.vector.local_path
+    graph_path = layout.graph_snapshot_path
+    assert sqlite_path is not None and vector_path is not None
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    vector_path.mkdir(parents=True, exist_ok=True)
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.execute("CREATE TABLE legacy_marker (value TEXT)")
+        connection.execute("INSERT INTO legacy_marker VALUES ('legacy-sql')")
+    (vector_path / "legacy.marker").write_bytes(b"legacy-vector")
+    graph_path.write_text(json.dumps({"nodes": {}, "edges": []}))
+    before = {
+        "sqlite_header": sqlite_path.read_bytes()[:16],
+        "vector": {p.relative_to(vector_path): p.read_bytes() for p in vector_path.rglob("*") if p.is_file()},
+        "graph": graph_path.read_bytes(),
+    }
     provider = HermesProvider()
     try:
         provider.initialize("legacy-preservation", hermes_home=str(home))
     finally:
         provider.shutdown()
-    after = sorted((p.relative_to(home), p.read_bytes()) for p in legacy.iterdir())
-    assert after == before
+    after = {
+        "sqlite_header": sqlite_path.read_bytes()[:16],
+        "vector": {p.relative_to(vector_path): p.read_bytes() for p in vector_path.rglob("*") if p.is_file()},
+        "graph": graph_path.read_bytes(),
+    }
+    assert after["sqlite_header"] == before["sqlite_header"]
+    assert after["graph"] == before["graph"]
+    assert all(after["vector"].get(path) == payload for path, payload in before["vector"].items())
+    with sqlite3.connect(sqlite_path) as connection:
+        assert connection.execute("SELECT value FROM legacy_marker").fetchone() == ("legacy-sql",)
 
 
 def test_named_profiles_resolve_complete_distinct_store_and_lock_sets(tmp_path: Path):
