@@ -17,6 +17,7 @@ baseline checkout to record the mandatory behavioral RED.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -280,6 +281,54 @@ def test_s4_04_layout_failures_export_only_closed_code_series(tmp_path: Path) ->
     assert 'cmms_layout_validation_failures_total{code="E_HERMES_HOME_REQUIRED"}' in after
     assert 'profile=' not in after and 'path=' not in after and 'run_id=' not in after
     assert len([line for line in after.splitlines() if line.startswith("cmms_layout_validation_failures_total{")]) <= 17
+
+
+def test_s4_04_layout_failure_increments_the_matching_closed_code_counter(tmp_path: Path) -> None:
+    from memory_server.evaluation.metrics import generate_latest
+
+    before = generate_latest().decode()
+    with pytest.raises(StorageLayoutError) as error:
+        resolve_storage_layout(StorageResolutionInputs(profile_home=tmp_path / "missing"))
+    after = generate_latest().decode()
+    label = 'cmms_layout_validation_failures_total{code="E_HERMES_HOME_REQUIRED"}'
+    def value(snapshot: str) -> float:
+        return float(next(line.split()[-1] for line in snapshot.splitlines() if line.startswith(label + " ")))
+    assert error.value.code == "E_HERMES_HOME_REQUIRED"
+    assert value(after) == value(before) + 1
+
+
+def test_s4_04_unknown_layout_code_does_not_mint_a_metric_series() -> None:
+    from memory_server.evaluation.metrics import generate_latest
+
+    before = generate_latest().decode()
+    StorageLayoutError("E_UNKNOWN_TEST_CODE", "synthetic unknown code")
+    after = generate_latest().decode()
+    assert 'cmms_layout_validation_failures_total{code="E_UNKNOWN_TEST_CODE"}' not in after
+    assert after == before
+
+
+def test_s4_04_projection_failures_increment_vector_and_graph_store_counters(tmp_path: Path, monkeypatch) -> None:
+    from memory_server import projection_rebuild
+    from memory_server.evaluation.metrics import generate_latest
+
+    async def records(_url, *, batch_size):
+        yield projection_rebuild.CanonicalProjectionRecord("fact", "f1", "index_fact", {"text": "x"})
+
+    monkeypatch.setattr(projection_rebuild, "iter_canonical_projection_records", records)
+    monkeypatch.setattr(projection_rebuild, "_observe_snapshot", lambda *_args: None)
+    before = generate_latest().decode()
+    asyncio.run(projection_rebuild._verify_projection_artifacts(
+        basis="test", snapshot_url="sqlite+aiosqlite:///unused.db", vector_path=tmp_path / "missing-vector",
+        graph_path=tmp_path / "missing-graph", expected_vector_size=3, batch_size=1,
+    ))
+    after = generate_latest().decode()
+    assert 'cmms_projection_verification_failures_total{store="vector"}' in after
+    assert 'cmms_projection_verification_failures_total{store="graph"}' in after
+    def counter(snapshot: str, store: str) -> float:
+        prefix = f'cmms_projection_verification_failures_total{{store="{store}"}} '
+        return float(next(line.split()[-1] for line in snapshot.splitlines() if line.startswith(prefix)))
+    assert counter(after, "vector") == counter(before, "vector") + 1
+    assert counter(after, "graph") == counter(before, "graph") + 1
 
 
 def test_s4_04_layout_startup_report_contains_safe_identity_fields(tmp_path: Path) -> None:

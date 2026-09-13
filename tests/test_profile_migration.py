@@ -1093,6 +1093,51 @@ def test_s2_write_manifest_enforces_0700_run_directory_and_0600_manifest(tmp_pat
     assert stat.S_IMODE(fresh.stat().st_mode) == 0o700
 
 
+def test_s4_04_migration_counter_counts_terminal_states_but_not_running(tmp_path: Path) -> None:
+    from memory_server.evaluation.metrics import generate_latest
+
+    running_path = _s2_run_dir(tmp_path) / "running.json"
+    before = generate_latest().decode()
+    profile_migration._write_manifest(running_path, _s2_manifest())
+    running = generate_latest().decode()
+    assert 'cmms_migration_runs_total{state="running"' not in running
+
+    complete_id = "22" * 16
+    complete_path = tmp_path / "runs" / complete_id / "complete.json"
+    profile_migration._write_manifest(
+        complete_path, _s2_manifest(run_id=complete_id, status="complete")
+    )
+    complete = generate_latest().decode()
+    label = 'cmms_migration_runs_total{state="complete",strategy="rebuild-from-profile-sql"}'
+    def value(snapshot: str) -> float:
+        return float(next((line.split()[-1] for line in snapshot.splitlines() if line.startswith(label + " ")), "0"))
+    assert value(complete) == value(before) + 1
+
+
+def test_s4_04_migration_event_redacts_path_query_and_manifest_payload(tmp_path: Path, caplog) -> None:
+    caplog.set_level("INFO")
+    run_id = "33" * 16
+    target = tmp_path / "runs" / run_id / "manifest.json"
+    manifest = _s2_manifest(
+        run_id=run_id, status="complete",
+        source_identity=ArtifactIdentity(str(tmp_path / "secret-source.sqlite?token=raw-secret"), "regular_file"),
+        artifacts={
+            "manifest_payload": {
+                "kind": "regular_file", "present": True,
+                "relative_path": "private/raw-secret", "sha256": "aa" * 32, "size": 11,
+            }
+        },
+    )
+    profile_migration._write_manifest(target, manifest)
+    messages = [record.getMessage() for record in caplog.records if record.getMessage().startswith("cmms.migration ")]
+    assert len(messages) == 1
+    message = messages[0]
+    assert str(target) not in message
+    assert "raw-secret" not in message
+    assert "manifest_payload" not in message
+    assert "<redacted>/manifest.json" in message
+
+
 def test_s2_write_manifest_refuses_run_directory_identity_mismatch(tmp_path: Path) -> None:
     mismatched = Path(tmp_path) / "runs" / ("11" * 16)
     mismatched.mkdir(parents=True)
