@@ -1345,6 +1345,21 @@ async def test_s4_04_metrics_refresh_outbox_gauges():
         monkeypatch.undo()
 
 
+def test_s4_04_provider_startup_layout_event_is_emitted_once_per_lifespan(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    provider = _init_inmemory_provider(tmp_path, monkeypatch)
+    try:
+        provider.initialize(
+            session_id="second",
+            config={"db_url": "sqlite+aiosqlite://", "path": str(tmp_path)},
+            hermes_home=str(tmp_path),
+        )
+        events = [record for record in caplog.records if record.getMessage().startswith("cmms.storage_layout")]
+        assert len(events) == 1
+    finally:
+        provider.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # 14. Shutdown reverse order — final flush BEFORE engine dispose ([R4-F1])
 # ---------------------------------------------------------------------------
