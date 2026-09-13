@@ -572,7 +572,11 @@ def doctor(
 
 
 def _migration_dry_run_payload(plan: MigrationPlan, request: MigrationRequest) -> dict:
-    """Stable dry-run report fields (DETAIL 8); nothing is created on disk."""
+    """Return the library-owned DETAIL 8 report without recreating its schema."""
+    report = getattr(plan, "report", None)
+    if isinstance(report, dict) and report:
+        return dict(report)
+    # Compatibility for small callers that construct a pre-S2 test double.
     return {
         "schema_version": 1,
         "run_id": request.run_id,
@@ -588,61 +592,119 @@ def _migration_dry_run_payload(plan: MigrationPlan, request: MigrationRequest) -
     }
 
 
+def _json_value(value):
+    """Convert dataclass output to JSON primitives without opaque fallback."""
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "__dataclass_fields__"):
+        from dataclasses import asdict
+
+        return _json_value(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _migration_human_output(result: dict) -> list[str]:
+    """Render a deliberately small, non-sensitive operator summary."""
+    lines = [f"mode: {result.get('mode', result.get('status', 'unknown'))}"]
+    if result.get("strategy"):
+        lines.append(f"strategy: {result['strategy']}")
+    if result.get("blockers"):
+        lines.append(f"blockers: {len(result['blockers'])}")
+    if result.get("warnings"):
+        lines.append(f"warnings: {len(result['warnings'])}")
+    if result.get("status") in {"complete", "rolled_back", "verified"} and result.get("config_digest"):
+        lines.append(f"config_digest: {result['config_digest']}")
+    return lines
+
+
 @app.command("migrate-profile-storage")
 def migrate_profile_storage(
     hermes_home: Optional[str] = typer.Option(None, "--hermes-home"),
     source_sql: Optional[Path] = typer.Option(None, "--source-sql"),
     target_root: Optional[Path] = typer.Option(None, "--target-root"),
-    strategy: str = typer.Option("rebuild-from-profile-sql", "--strategy"),
+    strategy: Optional[str] = typer.Option(None, "--strategy"),
     run_id: Optional[str] = typer.Option(None, "--run-id"),
     apply: bool = typer.Option(False, "--apply"),
     confirm_target: Optional[str] = typer.Option(None, "--confirm-target"),
     attest_runtimes_stopped: Optional[str] = typer.Option(None, "--attest-runtimes-stopped"),
     confirm_embedding_plan: Optional[str] = typer.Option(None, "--confirm-embedding-plan"),
+    allow_network_embedding: bool = typer.Option(False, "--allow-network-embedding"),
     resume: Optional[Path] = typer.Option(None, "--resume"),
     rollback: Optional[Path] = typer.Option(None, "--rollback"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Plan profile storage migration; mutation requires explicit confirmations."""
+    """Plan or execute profile storage migration through the library entrypoints."""
     home = Path(_find_hermes_home(hermes_home))
     if resume and rollback:
         raise typer.BadParameter("--resume and --rollback are mutually exclusive")
     if (resume or rollback) and not apply:
         raise typer.BadParameter("--apply is required")
+    if (resume or rollback) and (source_sql is not None or strategy is not None):
+        raise typer.BadParameter("--resume/--rollback cannot combine with --source-sql or --strategy")
+    if attest_runtimes_stopped is not None and len(attest_runtimes_stopped.encode("utf-8")) > 256:
+        raise typer.BadParameter("--attest-runtimes-stopped must be at most 256 UTF-8 bytes")
+
+    manifest_path = resume or rollback
+    created_manifest = False
+    expected_manifest_path: Path | None = None
     try:
-        manifest_path = resume or rollback
+        raw_config = _load_config(_config_path(str(home)))
+        memory = raw_config.get("memory", {}) if isinstance(raw_config, dict) else {}
+        providers = memory.get("providers", {}) if isinstance(memory, dict) else {}
+        raw_provider = providers.get("memory_server", {}) if isinstance(providers, dict) else {}
+        if not isinstance(raw_provider, dict):
+            raw_provider = {}
+        request_kwargs = {
+            "target_root": target_root,
+            "confirm_target": confirm_target,
+            "stop_attestation": attest_runtimes_stopped,
+            "embedding_plan_digest": confirm_embedding_plan,
+            "allow_network_embedding": allow_network_embedding,
+            "raw_config": raw_provider,
+            "raw_config_path": _config_path(str(home)),
+        }
         if manifest_path is not None:
-            request = MigrationRequest(
-                home,
-                target_root=target_root,
-                mode="resume" if resume else "rollback",
-                confirm_target=confirm_target,
-                stop_attestation=attest_runtimes_stopped,
-            )
-            if resume:
-                result: dict | object = resume_profile_migration(manifest_path, request)
-            else:
-                result = rollback_profile_migration(manifest_path, request)
+            request = MigrationRequest(home, mode="resume" if resume else "rollback", **request_kwargs)
+            result = (resume_profile_migration(manifest_path, request) if resume
+                      else rollback_profile_migration(manifest_path, request))
         else:
             request = MigrationRequest(
                 home,
                 source_sql=source_sql,
-                target_root=target_root,
-                strategy=cast(MigrationStrategy, strategy),
+                strategy=cast(MigrationStrategy, strategy or "rebuild-from-profile-sql"),
                 run_id=run_id or uuid4().hex,
                 mode="apply" if apply else "dry-run",
-                confirm_target=confirm_target,
-                stop_attestation=attest_runtimes_stopped,
-                embedding_plan_digest=confirm_embedding_plan,
+                **request_kwargs,
             )
             plan = plan_profile_migration(request)
             if apply:
-                result = apply_profile_migration(plan).__dict__
+                expected_manifest_path = (
+                    Path(plan.layout.data_root)
+                    / ".cmms-migrations"
+                    / request.run_id
+                    / "manifest.json"
+                )
+                result = apply_profile_migration(plan)
+                created_manifest = expected_manifest_path.exists()
             else:
                 result = _migration_dry_run_payload(plan, request)
-        typer.echo(json.dumps(result, default=str, sort_keys=True, indent=2))
-        if not isinstance(result, dict) and getattr(result, "status", "") == "failed":
-            raise typer.Exit(3)
+
+        payload = _json_value(result)
+        if not isinstance(payload, dict):
+            payload = {"result": payload}
+        if json_output:
+            typer.echo(json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False))
+        else:
+            for line in _migration_human_output(payload):
+                typer.echo(line)
+        if payload.get("status") == "failed":
+            raise typer.Exit(3 if manifest_path is None or resume else 4)
+        if not apply and not resume and not rollback and payload.get("blockers"):
+            raise typer.Exit(1)
     except ValueError as exc:
         raw = str(exc)
         code = raw.split(":", 1)[0].strip()
@@ -650,8 +712,19 @@ def migrate_profile_storage(
             code = "E_MIGRATION_STAGE_FAILED"
         hint = DIAGNOSTIC_CONTRACT.get(code, {}).get("hint", "Resolve the reported condition before retrying.")
         diagnostic = Diagnostic(code, "error", raw, "storage", hint)
-        typer.echo(json.dumps(diagnostic.__dict__, sort_keys=True))
-        phase = "manifest" if code.startswith("E_MANIFEST_") else "precondition"
+        typer.echo(json.dumps(_json_value(diagnostic), sort_keys=True))
+        if code.startswith("E_MANIFEST_"):
+            phase = "manifest"
+        elif rollback:
+            phase = "rollback"
+        elif resume:
+            phase = "resume"
+        else:
+            phase = "precondition"
+        if expected_manifest_path is not None:
+            created_manifest = expected_manifest_path.exists()
+        if created_manifest and apply and not rollback:
+            raise typer.Exit(3) from exc
         raise typer.Exit(exit_code_for_diagnostic(code, phase=phase)) from exc
 
 
