@@ -1206,6 +1206,8 @@ def test_poisoned_unstoppable_outbox_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(AsyncEngine, "dispose", spy_engine_dispose(log))
 
     loop, provider, worker = _poisoned_setup(tmp_path, monkeypatch)
+    lock_before = provider._root_lock
+    assert lock_before is not None
     try:
         # shutdown() -> POISONED at ~15s (10s + 5s) -> contract-breach RuntimeError.
         with pytest.raises(RuntimeError, match="outbox worker failed to stop"):
@@ -1220,6 +1222,7 @@ def test_poisoned_unstoppable_outbox_retry(tmp_path, monkeypatch):
         assert provider._provider is not None
         assert provider._writer is not None
         assert provider._lancedb is not None
+        assert provider._root_lock is lock_before
         assert len([e for e in log if e[0] == "dispose"]) == 0
         assert len([e for e in log if e[0] == "provider_close"]) == 0
         assert len([e for e in log if e[0] == "worker_close"]) == 0
@@ -1767,3 +1770,46 @@ async def test_s3_07_server_remember_normal_path_keeps_graph_sync(monkeypatch):
     monkeypatch.setattr(server, "remember_fn", fake_remember)
     await server.remember_tool(subject="normal", predicate="keeps", object="graph")
     assert called["graph"] is graph
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,args,dependency",
+    [
+        ("add_relation_tool", {"source_id": "a", "target_id": "b", "relation_type": "supports"}, "_get_graph_router"),
+        ("invalidate_tool", {"memory_id": "m", "memory_type": "fact", "reason": "test"}, "_get_lifecycle_service"),
+        ("route_tool", {"query": "x"}, "_get_hybrid_router"),
+        ("audit_tool", {}, "_build_auditor"),
+        ("set_belief_tool", {"proposition": "x"}, "_get_provider"),
+        ("resolve_conflict_tool", {"belief_a_id": "a", "belief_b_id": "b", "resolution": "keep_a"}, "_get_provider"),
+    ],
+    ids=["add_relation", "invalidate", "route", "audit", "set_belief", "resolve_conflict"],
+)
+async def test_s3_07_server_projection_tool_returns_stable_error(
+    monkeypatch, tool_name, args, dependency
+):
+    import memory_server.server as server
+
+    async def unavailable(*args, **kwargs):
+        raise RuntimeError("E_PROJECTION_UNAVAILABLE: vector requires migration")
+
+    monkeypatch.setattr(server, dependency, unavailable)
+    result = json.loads(await getattr(server, tool_name)(**args))
+    assert result == {
+        "error": "E_PROJECTION_UNAVAILABLE",
+        "message": "E_PROJECTION_UNAVAILABLE: vector requires migration",
+        "hint": server.PROJECTION_MIGRATION_HINT,
+    }
+    assert result not in (None, [], "")
+
+
+@pytest.mark.asyncio
+async def test_s3_07_server_projection_mapping_reraises_non_projection(monkeypatch):
+    import memory_server.server as server
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("ordinary failure")
+
+    monkeypatch.setattr(server, "_get_router", broken)
+    with pytest.raises(RuntimeError, match="ordinary failure"):
+        await server.semantic_search_tool(query="x")
