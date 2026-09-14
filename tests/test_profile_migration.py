@@ -367,6 +367,38 @@ def test_s4_03_b3_rollback_subprocess_does_not_require_embedding(tmp_path: Path)
     assert "embedding_cost" not in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("action", "expected_code"),
+    [("rollback", "E_ROLLBACK_IDENTITY_MISSING"), ("resume", "E_RESUME_CONFIG_CHANGED")],
+)
+def test_s4_03_cli_actions_forward_explicit_run_id(
+    tmp_path: Path, action: str, expected_code: str
+) -> None:
+    home, source = _s403_cli_home(tmp_path)
+    run_id = "1234567890abcdef1234567890abcdef"
+    plan = plan_profile_migration(
+        MigrationRequest(home, source_sql=source, run_id=run_id, mode=cast(MigrationMode, action))
+    )
+    manifest = home / ".cmms-migrations" / run_id / "manifest.json"
+    _write_manifest_for_entrypoint(manifest, plan)
+
+    result = _s403_cli(
+        home,
+        f"--{action}",
+        str(manifest),
+        "--apply",
+        "--run-id",
+        run_id,
+        "--confirm-target",
+        str(home),
+        "--attest-runtimes-stopped",
+        "ticket",
+    )
+
+    assert expected_code in result.stdout
+    assert "E_ROLLBACK_RUN_MISMATCH" not in result.stdout
+
+
 def test_s4_03_b4_apply_failure_after_manifest_is_real_child_exit_three(tmp_path: Path) -> None:
     home, source = _s403_cli_home(tmp_path)
     run_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
