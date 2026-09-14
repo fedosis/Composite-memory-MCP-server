@@ -677,7 +677,12 @@ def migrate_profile_storage(
             "raw_config_path": _config_path(str(home)),
         }
         if manifest_path is not None:
-            request = MigrationRequest(home, mode="resume" if resume else "rollback", **request_kwargs)
+            request = MigrationRequest(
+                home,
+                mode="resume" if resume else "rollback",
+                run_id=run_id or uuid4().hex,
+                **request_kwargs,
+            )
             result = (resume_profile_migration(manifest_path, request) if resume
                       else rollback_profile_migration(manifest_path, request))
         else:
