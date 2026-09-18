@@ -178,6 +178,7 @@ memory-server --help
 - [LongMemEval Harness](docs/longmemeval-harness.md) — v0.11 raw/source/canonical retrieval scoring
 - [Comparative Analysis](docs/comparative-metrics.md) — Comparative analysis with ChromaDB/SQLite
 - [Drift Matrix](docs/drift-matrix.md) — Contract audit
+- [Development Plans](docs/plans/) — planned evolution: v0.13 runtime/architecture refactor, HTTP Gateway + Neural Studio (proposals, not implemented)
 - [Contracts](contracts/) — JSON Schema 2020-12 tool contracts
 
 ## API Reference
