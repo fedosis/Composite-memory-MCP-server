@@ -58,11 +58,25 @@ Optional extras are declared for Qdrant, LanceDB, Hermes integration, sentence-t
 
 ## Hermes native provider
 
+The native provider is imported in-process by the Hermes Gateway. Install into
+the same Python environment that launches the Gateway; a separate repository
+`.venv` is not sufficient unless Hermes uses that interpreter. Check the
+interpreter from that environment with `python -c 'import sys; print(sys.executable)'`.
+
+For CPU embeddings with the default LanceDB backend, run from the CMMS
+repository root:
+
 ```bash
-pip install -e ".[hermes]"
+python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+  --extra-index-url https://pypi.org/simple \
+  -e ".[hermes,sentence,lancedb]"
 memory-server install-hermes-plugin --hermes-home ~/.hermes/profiles/coder
 # Restart Hermes separately after reviewing config changes.
 ```
+
+For Qdrant, replace the extras with `.[hermes,sentence,qdrant]`. For GPU
+embeddings, first install the matching PyTorch build from the official PyTorch
+selector, then install the CMMS extras into the same Gateway environment.
 
 Hermes native mode provides lifecycle hooks (`prefetch`, `sync_turn`, session boundary flush) through `memory_server.plugins.hermes.provider.HermesProvider`. It is optional, documented in `docs/INTEGRATION.md`, separate from MCP stdio, and should not be represented as a registry `transport`.
 

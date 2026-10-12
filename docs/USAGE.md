@@ -76,6 +76,9 @@ subject/predicate/object).
 
 ### semantic_search
 Vector similarity search via the configured vector backend + sentence-transformers.
+Install `.[sentence,lancedb]` for the default backend, or `.[sentence,qdrant]`
+when Qdrant is configured. The base package supports keyword search without
+these optional dependencies.
 
 | Param | Type | Required | Default |
 |-------|------|----------|---------|

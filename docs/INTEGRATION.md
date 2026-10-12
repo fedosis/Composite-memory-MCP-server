@@ -31,8 +31,30 @@ stdio does not provide — it enables:
 
 - Hermes installed and configured; v0.19 provider discovery is supported by the
   current plugin shim
-- CMMS installed (`pip install -e ".[hermes]"`)
+- Python 3.11+ available in the environment used by the Hermes Gateway
+- CMMS installed in that same environment with the `[hermes]`, `[sentence]`,
+  and active vector-backend extra
 - A valid `~/.hermes/config.yaml`
+
+The native provider is imported *inside the Gateway process*. Installing
+dependencies only into the repository's development `.venv` does not help if
+the Gateway runs under a different Python interpreter. Run the install command
+from the environment that launches the Gateway and check its interpreter with
+`python -c 'import sys; print(sys.executable)'`.
+
+For the default local setup (CPU embeddings + LanceDB), from the CMMS repository
+root run:
+
+```bash
+python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+  --extra-index-url https://pypi.org/simple \
+  -e ".[hermes,sentence,lancedb]"
+```
+
+This installs PyTorch's CPU wheel rather than CUDA libraries. If the configured
+backend is Qdrant, use `.[hermes,sentence,qdrant]` instead. For GPU embeddings,
+replace the CPU PyTorch index with the matching index from the [official PyTorch
+selector](https://pytorch.org/get-started/locally/).
 
 ### 1. Install the Plugin
 
@@ -65,6 +87,18 @@ Or check the Hermes logs:
 hermes logs --tail 20
 # → INFO  HermesProvider initialized (session=..., db=...)
 ```
+
+Verify the embedding and default vector-backend imports with the same Python
+interpreter:
+
+```bash
+python -c 'import sentence_transformers, torch, lancedb; print("CMMS semantic dependencies available")'
+```
+
+The first embedding call downloads the configured model (default:
+`all-MiniLM-L6-v2`) if it is not cached. Existing outbox rows marked `failed`
+are terminal after their retry limit; installing dependencies fixes future
+indexing but does not automatically replay those historical failures.
 
 ## What Changes
 

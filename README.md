@@ -50,12 +50,21 @@ cd Composite-memory-MCP-server
 python3.11 -m venv .venv
 source .venv/bin/activate
 
-# Install base package exactly as a clean user would
+# Install the base package (SQLite facts and keyword search)
 pip install .
 
-# Or install with all extras (recommended for development/full functionality)
+# Add the default semantic-search stack (CPU embeddings + LanceDB)
+python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+  --extra-index-url https://pypi.org/simple \
+  -e ".[sentence,lancedb]"
+
+# Or install all extras (development/test environment)
 pip install -e ".[dev]"
 ```
+
+The base install deliberately does not include the optional embedding model or
+vector database. `semantic_search` and secondary fact indexing require the
+`sentence` extra plus a vector backend (`lancedb` by default, or `qdrant`).
 
 ### Run the server
 
@@ -126,20 +135,29 @@ ruff check src/
 
 ## Hermes Integration
 
-CMMS can optionally run as a native Hermes MemoryProvider plugin via the
-`[hermes]` extra. Hermes is not a base runtime dependency of the MCP stdio
-server. The implemented integration enables Hermes lifecycle hooks such as
-auto-recall, auto-retain, and session-boundary flushing. It is a separate
-in-process Hermes path, not a remote MCP transport.
+CMMS can optionally run as a native Hermes MemoryProvider plugin. Hermes is not
+a base runtime dependency of the MCP stdio server. The implemented integration
+enables lifecycle hooks such as auto-recall, auto-retain, and session-boundary
+flushing. It is an in-process Hermes path, not a remote MCP transport.
+
+Install into the *same Python environment that runs the Hermes Gateway* (the
+plugin is imported in-process; installing only into an unrelated CMMS virtual
+environment will not expose its dependencies to Hermes). For the default
+LanceDB backend and local sentence-transformer embeddings:
 
 ```bash
-pip install -e ".[hermes]"
-memory-server install-hermes-plugin --hermes-home ~/.hermes/profiles/coder
-hermes gateway restart
+python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+  --extra-index-url https://pypi.org/simple \
+  -e ".[hermes,sentence,lancedb]"
+memory-server install-hermes-plugin
 ```
 
-See [Hermes Integration Guide](docs/INTEGRATION.md) for supported Hermes setup
-and v0.19 compatibility notes.
+The CPU PyTorch index avoids pulling CUDA libraries on CPU-only installations.
+For Qdrant, use `.[hermes,sentence,qdrant]` instead of `.[hermes,sentence,lancedb]`.
+For GPU embeddings, replace the CPU PyTorch index with the matching index from
+the official PyTorch selector. After installation, restart the Gateway from an
+interactive shell and verify the provider status. See the [Hermes Integration
+Guide](docs/INTEGRATION.md) for runtime selection and v0.19 compatibility notes.
 
 ## Dev Setup
 
