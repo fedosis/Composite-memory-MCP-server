@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import errno
 import json
@@ -242,6 +243,22 @@ def _open_lock(root_fd: int, name: str = _LOCK_NAME) -> int:
         raise _raise_oserror(exc) from exc
 
 
+def _write_exclusive_metadata(handle: int, mode: LockMode = "exclusive") -> None:
+    """Record the diagnostic owner payload on a held exclusive descriptor.
+
+    The payload is DIAGNOSTIC ONLY: it never grants or proves ownership, and a
+    stale pid/timestamp never justifies stealing, unlinking or replacing the lock
+    entry.  Bound and encoding are the ones the shared/exclusive path always
+    used, so existing diagnostics keep their exact shape.
+    """
+    payload = json.dumps(_owner(mode).__dict__, sort_keys=True, separators=(",", ":")).encode()
+    if len(payload) > _MAX_METADATA:
+        raise StorageLockError("E_LOCK_METADATA_UNSAFE")
+    os.ftruncate(handle, 0)
+    os.write(handle, payload)
+    os.fsync(handle)
+
+
 def _acquire(root: Path, mode: LockMode, timeout: float, *, entry_name: str = _LOCK_NAME) -> int:
     if not _LOCKING_SUPPORTED:
         raise StorageLockError("E_LOCK_UNSUPPORTED")
@@ -267,12 +284,7 @@ def _acquire(root: Path, mode: LockMode, timeout: float, *, entry_name: str = _L
                 if not _same_identity(current, os.fstat(handle)) or current.st_nlink != 1:
                     raise StorageLockError("E_ARTIFACT_IDENTITY_CHANGED")
                 if mode == "exclusive":
-                    payload = json.dumps(_owner(mode).__dict__, sort_keys=True, separators=(",", ":")).encode()
-                    if len(payload) > _MAX_METADATA:
-                        raise StorageLockError("E_LOCK_METADATA_UNSAFE")
-                    os.ftruncate(handle, 0)
-                    os.write(handle, payload)
-                    os.fsync(handle)
+                    _write_exclusive_metadata(handle, mode)
                 owned = handle
                 handle = None
                 return owned
@@ -289,7 +301,19 @@ def _acquire(root: Path, mode: LockMode, timeout: float, *, entry_name: str = _L
 
 
 class RuntimeStorageLock:
-    """Shared lock held for the whole native provider/standalone lifespan."""
+    """Root lock held for the whole runtime lifespan.
+
+    ``acquire``/``release`` keep the historical SH contract for the legacy
+    callers (``server.py:139``, ``plugins/hermes/provider.py:429``) until C10/C12
+    replace them.  ``acquire_exclusive``/``acquire_exclusive_async`` and
+    ``release_exclusive`` are the exclusive-ownership API: they take ``LOCK_EX``
+    on EXACTLY the same ``.cmms-storage.lock`` inode through the same no-follow
+    path walk, regular-file/single-link checks, ``O_CLOEXEC`` open, identity
+    recheck and bounded non-blocking poll.  There is no second lock file, no
+    SH->EX upgrade, no rename/unlink of the root lock entry and no fallback to
+    shared on any failure, so an old SH holder and a new owner exclude each other
+    in both acquisition orders with no metadata protocol.
+    """
 
     def __init__(self, root: Path, handle: int) -> None:
         self.root = _lexical(Path(root))
@@ -299,6 +323,75 @@ class RuntimeStorageLock:
     def acquire(cls, root: Path, *, timeout: float = _DEFAULT_TIMEOUT) -> "RuntimeStorageLock":
         return cls(root, _acquire(root, "shared", timeout))
 
+    @classmethod
+    def acquire_exclusive(
+        cls,
+        root: Path,
+        *,
+        timeout: float = _DEFAULT_TIMEOUT,
+        entry_name: str = _LOCK_NAME,
+    ) -> "RuntimeStorageLock":
+        """Take ``LOCK_EX`` on the existing root lock entry (DETAIL §2.2 item 1).
+
+        Synchronous constructor-time path; contention is ``E_LOCK_TIMEOUT`` and
+        every other failure keeps its existing ``E_LOCK_*``/``E_PATH_*`` code.
+        """
+        return cls(root, _acquire(root, "exclusive", timeout, entry_name=entry_name))
+
+    @classmethod
+    async def acquire_exclusive_async(
+        cls,
+        root: Path,
+        *,
+        timeout: float = _DEFAULT_TIMEOUT,
+        entry_name: str = _LOCK_NAME,
+    ) -> "RuntimeStorageLock":
+        """Event-loop-safe, cancellation-safe exclusive acquisition (§2.2 items 2-3).
+
+        Every ``fcntl.flock`` attempt is ``LOCK_EX | LOCK_NB`` and returns
+        immediately; the ONLY await point is the bounded ``asyncio.sleep``
+        between FAILED attempts, and there is no await between a successful
+        flock and the handover of the owned descriptor.  No thread, executor or
+        second event loop is used anywhere, so a cancelled start cannot leave an
+        abandoned grant that later takes EX: cancellation is deliverable only
+        while the descriptor is still unlocked, and ``finally`` closes it.
+        """
+        if not _LOCKING_SUPPORTED:
+            raise StorageLockError("E_LOCK_UNSUPPORTED")
+        handle: int | None = None
+        try:
+            try:
+                with open_directory_nofollow(root, create=True) as root_fd:
+                    handle = _open_lock(root_fd, entry_name)
+                    deadline = time.monotonic() + max(0.0, timeout)
+                    while True:
+                        try:
+                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise StorageLockError("E_LOCK_TIMEOUT")
+                            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+                        except OSError as exc:
+                            raise _raise_oserror(exc) from exc
+                    current = os.stat(entry_name, dir_fd=root_fd, follow_symlinks=False)
+                    if not _same_identity(current, os.fstat(handle)) or current.st_nlink != 1:
+                        raise StorageLockError("E_ARTIFACT_IDENTITY_CHANGED")
+                    _write_exclusive_metadata(handle)
+                    owned = handle
+                    handle = None
+                    return cls(root, owned)
+            except StorageLockError as exc:
+                if exc.code == "E_PATH_PERMISSION":
+                    raise StorageLockError("E_LOCK_PERMISSION") from exc
+                raise
+        finally:
+            if handle is not None:
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+
     def release(self) -> None:
         if self._fh is not None:
             try:
@@ -306,6 +399,35 @@ class RuntimeStorageLock:
             finally:
                 os.close(self._fh)
                 self._fh = None
+
+    def release_exclusive(self) -> None:
+        """Verified release of this runtime's exclusive ownership (§2.2 item 5).
+
+        Returns only after BOTH ``flock(LOCK_UN)`` and ``os.close`` succeeded.
+        On any failure the descriptor is RETAINED (never closed on the error
+        path) and ``E_LOCK_RELEASE_UNCERTAIN`` is raised: an unlock that could
+        not be proven must not be reported as a release, and closing the
+        descriptor would silently drop the advisory lock while the caller still
+        believes the root is owned — ownership stays uncertain, diagnostics are
+        retained and restart is denied rather than inferred.  Idempotent once
+        released; a caller that never held anything releases nothing.
+        """
+        handle = self._fh
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError as exc:
+            raise StorageLockError(
+                "E_LOCK_RELEASE_UNCERTAIN", f"unlock of the root lock descriptor failed: {exc}"
+            ) from exc
+        try:
+            os.close(handle)
+        except OSError as exc:
+            raise StorageLockError(
+                "E_LOCK_RELEASE_UNCERTAIN", f"closing the root lock descriptor failed: {exc}"
+            ) from exc
+        self._fh = None
 
 
 class MaintenanceStorageLocks:

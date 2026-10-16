@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import fcntl
 import importlib
+import json
 import multiprocessing
 import os
 import stat
@@ -385,3 +388,99 @@ def test_s204_real_upgraded_shared_holder_is_reported_and_stays_unsignalled(tmp_
         if proc.is_alive():
             proc.terminate()
     assert proc.exitcode == 0
+
+
+# ---------------------------------------------------------------------------
+# C01 -- exclusive ownership of the SAME root lock inode
+#
+# Additions only: every expectation above is untouched.  The exclusive path is
+# new API (``storage_lock.py`` ``RuntimeStorageLock.acquire_exclusive`` /
+# ``acquire_exclusive_async`` / ``release_exclusive``), so a node that fails on
+# the parent revision fails with AttributeError naming the absent symbol -- a
+# capability-absence failure, never an exclusivity proof.  The substantive RED
+# for the protocol lives in tests/test_exclusive_writer_protocol.py.
+# ---------------------------------------------------------------------------
+
+
+def test_c01_exclusive_acquisition_blocks_shared_legacy_and_maintenance(tmp_path: Path) -> None:
+    owner = RuntimeStorageLock.acquire_exclusive(tmp_path, timeout=1)
+    assert owner._fh is not None
+    entry = tmp_path / ".cmms-storage.lock"
+    inode = os.stat(entry).st_ino
+    variants = {
+        "shared": lambda: RuntimeStorageLock.acquire(tmp_path, timeout=0.1),
+        "exclusive": lambda: RuntimeStorageLock.acquire_exclusive(tmp_path, timeout=0.1),
+        "maintenance": lambda: MaintenanceStorageLocks.acquire([tmp_path], timeout=0.1),
+    }
+    for label, contender in variants.items():
+        with pytest.raises(StorageLockError) as timeout:
+            contender()
+        assert timeout.value.code == "E_LOCK_TIMEOUT", label
+        assert os.stat(entry).st_ino == inode
+    owner.release_exclusive()
+    assert owner._fh is None
+    successor = RuntimeStorageLock.acquire_exclusive(tmp_path, timeout=1)
+    try:
+        assert os.stat(entry).st_ino == inode, "the persistent inode must be reused"
+    finally:
+        successor.release_exclusive()
+
+
+def test_c01_exclusive_metadata_and_inspection_shape_are_unchanged(tmp_path: Path) -> None:
+    lock = RuntimeStorageLock.acquire_exclusive(tmp_path, timeout=1)
+    try:
+        payload = json.loads((tmp_path / ".cmms-storage.lock").read_bytes())
+        assert payload["mode"] == "exclusive" and payload["pid"] == os.getpid()
+        inspection = inspect_existing_lock_readonly(tmp_path)
+        assert inspection.availability == "held"
+        assert inspection.owner is not None and inspection.owner.mode == "exclusive"
+    finally:
+        lock.release_exclusive()
+    assert (tmp_path / ".cmms-storage.lock").exists(), "release never unlinks the entry"
+
+
+def test_c01_release_exclusive_distinguishes_success_from_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import memory_server.storage_lock as module
+
+    lock = RuntimeStorageLock.acquire_exclusive(tmp_path, timeout=1)
+    real_flock = module.fcntl.flock
+
+    def failing_unlock(fd: int, operation: int):
+        if operation == module.fcntl.LOCK_UN:
+            raise OSError(errno.EIO, "synthetic unlock failure")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(module.fcntl, "flock", failing_unlock)
+    with pytest.raises(StorageLockError) as uncertain:
+        lock.release_exclusive()
+    assert uncertain.value.code == "E_LOCK_RELEASE_UNCERTAIN"
+    assert lock._fh is not None, "the descriptor is retained on an uncertain release"
+    monkeypatch.undo()
+    lock.release_exclusive()
+    assert lock._fh is None
+    lock.release_exclusive()  # idempotent: a released lock owns nothing
+
+
+def test_c01_async_exclusive_codes_match_the_sync_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import memory_server.storage_lock as module
+
+    async def codes(root: Path) -> tuple[str, str]:
+        try:
+            lock = await module.RuntimeStorageLock.acquire_exclusive_async(root, timeout=0.4)
+        except StorageLockError as exc:
+            return "error", exc.code
+        lock.release_exclusive()
+        return "held", ""
+
+    assert asyncio.run(codes(tmp_path)) == ("held", "")
+    holder = RuntimeStorageLock.acquire_exclusive(tmp_path, timeout=1)
+    try:
+        assert asyncio.run(codes(tmp_path)) == ("error", "E_LOCK_TIMEOUT")
+    finally:
+        holder.release_exclusive()
+    monkeypatch.setattr(module, "_LOCKING_SUPPORTED", False)
+    assert asyncio.run(codes(tmp_path)) == ("error", "E_LOCK_UNSUPPORTED")

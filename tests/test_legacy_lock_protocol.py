@@ -106,6 +106,11 @@ def main():
         if args.mode == "shared":
             lock = module.RuntimeStorageLock.acquire(root, timeout=args.timeout)
             release = lock.release
+        elif args.mode == "exclusive-new":
+            api = getattr(module.RuntimeStorageLock, "acquire_exclusive", None)
+            record["api"] = "acquire_exclusive" if api else "acquire"
+            lock = (api or module.RuntimeStorageLock.acquire)(root, timeout=args.timeout)
+            release = lock.release_exclusive if api else lock.release
         else:
             handle = module._acquire(root, "exclusive", args.timeout)
             release = lambda: (module.fcntl.flock(handle, module.fcntl.LOCK_UN), os.close(handle))
@@ -308,3 +313,63 @@ def test_legacy_release_leaves_lock_inode_in_place(frozen: Any) -> None:
     assert lock._fh is None
     lock.release()  # idempotent: still the same inode
     assert _entry_inode(root) == inode
+
+
+# ---------------------------------------------------------------------------
+# C01 -- the new exclusive owner against the frozen L1 in both acquisition orders
+#
+# The "old binary" side stays the immutable frozen fixture.  The "new" side is
+# the working-tree ``storage_lock.py`` the suite imported, loaded by FILE into
+# the holder subprocess (``--module`` override), so the process under test is the
+# module this repository actually ships.  On the parent revision that module has
+# no ``acquire_exclusive``, so the probe falls back to ``acquire`` (SH) and both
+# holders coexist: the first node below is RED at base for that substantive
+# reason and GREEN after C01.
+# ---------------------------------------------------------------------------
+
+
+def test_c01_new_exclusive_excludes_frozen_legacy_in_both_orders(frozen: Any, holder: Any) -> None:
+    import memory_server.storage_lock as working_tree
+
+    module_path = Path(working_tree.__file__)
+    first = _root("c01-legacy-then-new")
+    legacy = holder(first, "shared")
+    assert legacy["record"]["status"] == "held"
+    before = _entry_inode(first)
+    contender = holder(first, "exclusive-new", timeout=0.4, module=module_path)
+    assert contender["record"].get("code") == "E_LOCK_TIMEOUT", (
+        f"a second cooperating holder entered while frozen L1 held SH: {contender['record']!r}")
+    assert contender["record"]["api"] == "acquire_exclusive"
+    assert _entry_inode(first) == before, "the lock inode must never be replaced"
+    legacy["release"].write_text("go")
+    assert legacy["process"].wait(timeout=30) == 0
+
+    second = _root("c01-new-then-legacy")
+    owner = holder(second, "exclusive-new", timeout=2.0, module=module_path)
+    assert owner["record"]["status"] == "held", owner["record"]
+    inode = owner["record"]["inode"]
+    old = holder(second, "shared", timeout=0.4)
+    assert old["record"].get("code") == "E_LOCK_TIMEOUT", (
+        f"frozen L1 entered a root the new EX owner held: {old['record']!r}")
+    owner["release"].write_text("go")
+    assert owner["process"].wait(timeout=30) == 0
+    assert _entry_inode(second) == inode, "the persistent inode must be reused"
+    successor = holder(second, "exclusive-new", timeout=2.0, module=module_path)
+    assert successor["record"]["status"] == "held", successor["record"]
+    successor["release"].write_text("go")
+    assert successor["process"].wait(timeout=30) == 0
+
+
+def test_c01_frozen_maintenance_ex_blocks_new_exclusive_owner(frozen: Any, holder: Any) -> None:
+    import memory_server.storage_lock as working_tree
+
+    root = _root("c01-frozen-maintenance-blocks-new")
+    maintenance = holder(root, "exclusive")
+    assert maintenance["record"]["status"] == "held", maintenance["record"]
+    before = _entry_inode(root)
+    contender = holder(root, "exclusive-new", timeout=0.4, module=Path(working_tree.__file__))
+    assert contender["record"].get("code") == "E_LOCK_TIMEOUT", contender["record"]
+    assert _entry_inode(root) == before
+    assert (root / LOCK_ENTRY).exists()
+    maintenance["release"].write_text("go")
+    assert maintenance["process"].wait(timeout=30) == 0
