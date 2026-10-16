@@ -77,6 +77,23 @@ class ReflectionCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class RelationCommand:
+    source_id: str
+    target_id: str
+    relation_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleCommand:
+    memory_id: str
+    memory_type: str
+    to_state: str
+    reason: str = ""
+    triggered_by: str = "system"
+    expected_version: str | int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RememberCommand:
     """Input DTO for the ``remember`` use case."""
 

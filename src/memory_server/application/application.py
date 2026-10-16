@@ -52,6 +52,8 @@ class MemoryApplication:
         get_graph: Callable[[], Awaitable[Any]] | None = None,
         reflection_provider: Any | None = None,
         reflection_policy: ReflectionPolicy | None = None,
+        relation_provider: Any | None = None,
+        lifecycle_provider: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         # Captured once here; MemoryService never re-reads it.
@@ -83,6 +85,22 @@ class MemoryApplication:
                 reflection_provider,
                 policy=reflection_policy,
             )
+        self._relations = None
+        if get_graph is not None:
+            from memory_server.application.relation_service import RelationService
+
+            self._relations = RelationService(
+                get_graph=get_graph,
+                provider=relation_provider,
+            )
+        self._lifecycle = None
+        if lifecycle_provider is not None:
+            from memory_server.application.lifecycle_service import LifecycleService
+
+            self._lifecycle = LifecycleService(
+                lifecycle_provider,
+                get_graph=get_graph,
+            )
 
     @classmethod
     def from_provider(
@@ -98,6 +116,8 @@ class MemoryApplication:
         belief_policy: BeliefPolicy | None = None,
         get_graph: Callable[[], Awaitable[Any]] | None = None,
         reflection_policy: ReflectionPolicy | None = None,
+        relation_provider: Any | None = None,
+        lifecycle_provider: Any | None = None,
     ) -> MemoryApplication:
         """Build from any object exposing ``_session_factory`` (duck-typed)."""
         return cls(
@@ -114,6 +134,8 @@ class MemoryApplication:
             get_graph=get_graph,
             reflection_provider=provider,
             reflection_policy=reflection_policy,
+            relation_provider=provider,
+            lifecycle_provider=provider,
         )
 
     @property
@@ -143,6 +165,18 @@ class MemoryApplication:
         if self._reflection is None:
             raise UnknownDependencyError("reflection service")
         return self._reflection
+
+    @property
+    def relations(self) -> Any:
+        if self._relations is None:
+            raise UnknownDependencyError("relation service")
+        return self._relations
+
+    @property
+    def lifecycle(self) -> Any:
+        if self._lifecycle is None:
+            raise UnknownDependencyError("lifecycle service")
+        return self._lifecycle
 
     def describe(self) -> dict[str, Any]:
         """Secrets-free by construction: no paths, no provider handles."""
