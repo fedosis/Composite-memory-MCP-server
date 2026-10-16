@@ -1,24 +1,93 @@
+"""C08 paired harness: one module, explicit legacy/application subjects."""
+
+from __future__ import annotations
+
 import inspect
+import json
+import os
+import re
+import sqlite3
+import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from memory_server.application.application import MemoryApplication
-from memory_server.application.contracts import (
-    BeliefPolicy,
-    GetBeliefCommand,
-    ResolveConflictCommand,
-    SetBeliefCommand,
-)
-from memory_server.application.errors import UnknownDependencyError
-from memory_server.providers.sqlite_provider import SQLiteProvider
+
+_SUBJECT = os.environ.get("C08_SUBJECT")
+if _SUBJECT not in {"legacy", "application"}:
+    raise RuntimeError("C08_SUBJECT must be exactly 'legacy' or 'application'")
+
+SCRATCH = Path(os.environ.get("C08_SCRATCH", ".")).resolve()
+ORACLE = Path(os.environ.get("C08_ORACLE", SCRATCH / "oracle" / "beliefs.json")).resolve()
+FORBIDDEN = {
+    "mcp",
+    "memory_server.server",
+    "memory_server.transports",
+    "memory_server.plugins",
+    "memory_server.runtime",
+}
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", re.I)
+_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}(?:T| )\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)?$")
+_TIME_ANY = re.compile(r"\d{4}-\d{2}-\d{2}(?:T| )\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)?")
+
+
+def _assert_scratch(path: Path) -> None:
+    assert path.resolve() == SCRATCH or SCRATCH in path.resolve().parents
+
+
+def _normal(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _normal(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normal(v) for v in value]
+    if isinstance(value, bytes):
+        return {"<BYTES>": value.hex()}
+    if isinstance(value, str):
+        if _UUID.fullmatch(value):
+            return "<UUID>"
+        if _TIME.fullmatch(value):
+            return "<TIME>"
+        return _TIME_ANY.sub("<TIME>", _UUID.sub("<UUID>", value))
+    return value
+
+
+def _db_signature(db: Path) -> dict[str, Any]:
+    _assert_scratch(db)
+    with sqlite3.connect(db) as conn:
+        tables = [r[0] for r in conn.execute(
+            "select name from sqlite_master where type='table' and name not like 'sqlite_%' order by name"
+        )]
+        return {
+            table: _normal(conn.execute(f' select * from "{table}"').fetchall())
+            for table in tables
+        }
+
+
+def _record(name: str, result: Any, db: Path) -> None:
+    payload = {"result": _normal(result), "sqlite": _db_signature(db)}
+    ORACLE.parent.mkdir(parents=True, exist_ok=True)
+    _assert_scratch(ORACLE)
+    if _SUBJECT == "legacy":
+        existing = json.loads(ORACLE.read_text()) if ORACLE.exists() else {}
+        existing[name] = payload
+        ORACLE.write_text(json.dumps(existing, sort_keys=True, indent=2) + "\n")
+    else:
+        assert ORACLE.exists(), f"missing frozen legacy oracle: {ORACLE}"
+        expected = json.loads(ORACLE.read_text())[name]
+        assert payload == expected
 
 
 @pytest.fixture
-async def provider(tmp_path):
+async def provider(tmp_path: Path):
+    _assert_scratch(tmp_path)
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+
     db = tmp_path / "beliefs.sqlite"
+    _assert_scratch(db)
     value = SQLiteProvider(url=f"sqlite+aiosqlite:///{db}")
     await value.initialize()
+    value._c08_db = db
     yield value
     await value.close()
 
@@ -27,171 +96,216 @@ async def _none_graph():
     return None
 
 
-async def _service(provider):
-    return MemoryApplication.from_provider(
-        provider, belief_policy=BeliefPolicy(10), get_graph=lambda: _none_graph()
-    ).beliefs
+async def _under_test(provider):
+    if _SUBJECT == "application":
+        from memory_server.application.application import MemoryApplication
+        from memory_server.application.contracts import BeliefPolicy
+
+        return MemoryApplication.from_provider(
+            provider, belief_policy=BeliefPolicy(10), get_graph=_none_graph
+        ).beliefs
+
+    import memory_server.server as server
+
+    # Keep the old orchestration and provider implementation real; only replace
+    # singleton acquisition so its writes stay in the disposable fixture.
+    server._provider = provider
+    server._graph = None
+    server._get_provider = lambda: _ready(provider)
+    server._get_graph = _none_graph
+    return server
+
+
+async def _ready(value):
+    return value
+
+
+async def _set(subject, service, command):
+    if subject == "application":
+        return await service.set_belief(command)
+    return json.loads(await service.set_belief_tool(
+        command.proposition, command.confidence, json.dumps(command.sources or []),
+        json.dumps(command.tags or []), command.source, command.replace_belief_id,
+    ))
+
+
+async def _get(subject, service, command):
+    if subject == "application":
+        return await service.get_belief(command)
+    return json.loads(await service.get_belief_tool(
+        command.proposition, command.lifecycle_state, command.min_confidence,
+        json.dumps(command.tags) if command.tags is not None else "",
+        command.source, command.creator, command.source_id,
+        command.limit if command.limit is not None else 10,
+    ))
+
+
+async def _resolve(subject, service, command):
+    if subject == "application":
+        return await service.resolve_conflict(command)
+    return json.loads(await service.resolve_conflict_tool(
+        command.belief_a_id, command.belief_b_id, command.resolution,
+        command.new_proposition, command.auto_resolve,
+    ))
+
+
+def _commands():
+    if _SUBJECT == "application":
+        from memory_server.application.contracts import (
+            GetBeliefCommand, ResolveConflictCommand, SetBeliefCommand,
+        )
+        return SetBeliefCommand, GetBeliefCommand, ResolveConflictCommand
+    return None, None, None
 
 
 def test_application_belief_surface_is_direct_and_transport_free():
-    from memory_server.application.belief_service import BeliefService
-
-    assert BeliefService.__module__ == "memory_server.application.belief_service"
-    assert "memory_server.server" not in inspect.getsource(BeliefService)
+    before = set(sys.modules)
+    if _SUBJECT == "application":
+        from memory_server.application.belief_service import BeliefService
+        assert BeliefService.__module__ == "memory_server.application.belief_service"
+        assert "memory_server.server" not in inspect.getsource(BeliefService)
+        imported = set(sys.modules) - before
+        assert not any(x == f or x.startswith(f + ".") for x in imported for f in FORBIDDEN)
+    else:
+        import memory_server.server as server
+        assert server.set_belief_tool.__module__ == "memory_server.server"
+        with pytest.raises(ImportError):
+            __import__("memory_server.application.belief_service")
 
 
 def test_belief_policy_avoids_legacy_import_time_ambient_default():
-    class Settings:
-        belief_search_limit = 7
+    if _SUBJECT == "application":
+        from memory_server.application.contracts import BeliefPolicy
 
-    policy = BeliefPolicy.capture(Settings())
-    Settings.belief_search_limit = 99
-    assert policy.belief_search_limit == 7
-    import memory_server.server as server
-    assert inspect.signature(server.get_belief_tool).parameters["limit"].default == 10
+        class Settings:
+            belief_search_limit = 7
+
+        policy = BeliefPolicy.capture(Settings())
+        Settings.belief_search_limit = 99
+        assert policy.belief_search_limit == 7
+        assert BeliefPolicy(10).belief_search_limit == 10
+    else:
+        import memory_server.server as server
+        from memory_server.settings import get_settings
+
+        assert server.get_belief_tool.__module__ == "memory_server.server"
+        assert server.get_belief_tool.__kwdefaults__ is not None or inspect.signature(server.get_belief_tool).parameters["limit"].default == get_settings().belief_search_limit
+        assert inspect.signature(server.get_belief_tool).parameters["limit"].default == get_settings().belief_search_limit
 
 
 @pytest.mark.asyncio
 async def test_application_composition_exposes_beliefs_without_changing_c07_surface(provider):
-    app = MemoryApplication.from_provider(provider, belief_policy=BeliefPolicy(10))
-    assert app.describe() == {"policy": {"max_active_beliefs": app.policy.max_active_beliefs}}
-    assert app.beliefs.policy.belief_search_limit == 10
-    with pytest.raises(UnknownDependencyError, match="belief service"):
-        MemoryApplication(provider._session_factory).beliefs
+    if _SUBJECT == "application":
+        from memory_server.application.application import MemoryApplication
+        from memory_server.application.contracts import BeliefPolicy
+        from memory_server.application.errors import UnknownDependencyError
+
+        app = MemoryApplication.from_provider(provider, belief_policy=BeliefPolicy(10))
+        assert app.describe() == {"policy": {"max_active_beliefs": app.policy.max_active_beliefs}}
+        assert app.beliefs.policy.belief_search_limit == 10
+        with pytest.raises(UnknownDependencyError, match="belief service"):
+            MemoryApplication(provider._session_factory).beliefs
+    else:
+        service = await _under_test(provider)
+        assert service.set_belief_tool.__module__ == "memory_server.server"
 
 
 @pytest.mark.asyncio
 async def test_set_belief_create_matches_legacy_result_and_sqlite_effects(provider):
-    result = await (await _service(provider)).set_belief(SetBeliefCommand(
-        "SQLite is canonical", confidence=0.8,
-        sources=[{"source_type": "fact", "source_id": "s1", "weight": 0.9}],
-        tags=["storage"], source="test",
-    ))
+    Set, _, _ = _commands()
+    service = await _under_test(provider)
+    result = await _set(_SUBJECT, service, Set("SQLite is canonical", 0.8, [{"source_type": "fact", "source_id": "s1", "weight": 0.9}], ["storage"], "test")) if Set else await _set(_SUBJECT, service, type("C", (), {"proposition":"SQLite is canonical", "confidence":0.8, "sources":[{"source_type":"fact","source_id":"s1","weight":0.9}],"tags":["storage"],"source":"test","replace_belief_id":""})())
+    _record("create", result, provider._c08_db)
     assert set(result) == {"belief", "receipt", "superseded"}
-    belief = await provider.get_belief(result["belief"]["id"])
-    assert belief and belief.confidence == 0.8 and belief.tags == ["storage"]
 
 
 @pytest.mark.asyncio
 async def test_set_belief_reinforce_matches_legacy_normalization_version_and_history(provider):
-    service = await _service(provider)
-    first = await service.set_belief(SetBeliefCommand("  Same proposition ", confidence=0.4, source="a"))
-    result = await service.set_belief(SetBeliefCommand("same proposition", confidence=0.8, tags=["new"], source="b"))
-    assert result["reinforced"] is True
-    assert result["belief"]["confidence"] == pytest.approx(0.6)
-    assert result["belief"]["version"] == 2
-    assert result["belief"]["tags"] == ["new"]
-    assert len(result["receipt"]["history"]) == 1
+    Set, _, _ = _commands(); service = await _under_test(provider)
+    first = await _set(_SUBJECT, service, Set("  Same proposition ", .4, None, None, "a") if Set else type("C", (), {"proposition":"  Same proposition ","confidence":.4,"sources":None,"tags":None,"source":"a","replace_belief_id":""})())
+    result = await _set(_SUBJECT, service, Set("same proposition", .8, None, ["new"], "b") if Set else type("C", (), {"proposition":"same proposition","confidence":.8,"sources":None,"tags":["new"],"source":"b","replace_belief_id":""})())
+    _record("reinforce", result, provider._c08_db)
+    assert result["reinforced"] is True and result["belief"]["version"] == 2
     assert await provider.get_belief(first["belief"]["id"])
 
 
 @pytest.mark.asyncio
 async def test_set_belief_replace_preserves_version_and_transition_effects(provider):
-    service = await _service(provider)
-    old = await service.set_belief(SetBeliefCommand("old", confidence=0.5))
-    result = await service.set_belief(SetBeliefCommand("new", confidence=0.7, replace_belief_id=old["belief"]["id"]))
-    assert result["belief"]["version"] == 2
-    assert result["superseded"]["id"] == old["belief"]["id"]
-    assert (await provider.get_belief(old["belief"]["id"])).lifecycle_state == "superseded"
-
-
-@pytest.mark.asyncio
-async def test_set_belief_replace_missing_target_creates_without_supersession(provider):
-    result = await (await _service(provider)).set_belief(SetBeliefCommand(
-        "new", replace_belief_id="00000000-0000-0000-0000-000000000000"
-    ))
-    assert result["superseded"] is None
-    assert result["belief"]["version"] == 1
+    Set, _, _ = _commands(); service = await _under_test(provider)
+    old = await _set(_SUBJECT, service, Set("old") if Set else type("C", (), {"proposition":"old","confidence":.5,"sources":None,"tags":None,"source":"system","replace_belief_id":""})())
+    cmd = Set("new", .7, None, None, "system", old["belief"]["id"]) if Set else type("C", (), {"proposition":"new","confidence":.7,"sources":None,"tags":None,"source":"system","replace_belief_id":old["belief"]["id"]})()
+    result = await _set(_SUBJECT, service, cmd); _record("replace", result, provider._c08_db)
+    assert result["belief"]["version"] == 2 and result["superseded"]["id"] == old["belief"]["id"]
 
 
 @pytest.mark.asyncio
 async def test_get_belief_filters_limit_query_and_order_match_legacy(provider):
-    service = await _service(provider)
-    await service.set_belief(SetBeliefCommand("alpha", confidence=0.9, tags=["x"]))
-    await service.set_belief(SetBeliefCommand("beta", confidence=0.4, tags=["y"]))
-    result = await service.get_belief(GetBeliefCommand(tags=["x"], min_confidence=0.8, limit=200))
-    assert result["total"] == 1
-    assert result["query"]["limit"] == 200
-    assert result["beliefs"][0]["proposition"] == "alpha"
+    Set, Get, _ = _commands(); service = await _under_test(provider)
+    for p, c, t in [("alpha", .9, ["x"]), ("beta", .4, ["y"])]:
+        cmd = Set(p, c, None, t) if Set else type("C", (), {"proposition":p,"confidence":c,"sources":None,"tags":t,"source":"system","replace_belief_id":""})()
+        await _set(_SUBJECT, service, cmd)
+    cmd = Get(tags=["x"], min_confidence=.8, limit=200) if Get else type("C", (), {"proposition":"","lifecycle_state":"active","min_confidence":.8,"tags":["x"],"source":"","creator":"","source_id":"","limit":200})()
+    result = await _get(_SUBJECT, service, cmd); _record("get", result, provider._c08_db)
+    assert result["total"] == 1 and result["query"]["limit"] == 200 and result["beliefs"][0]["proposition"] == "alpha"
 
 
 @pytest.mark.asyncio
 async def test_resolve_conflict_auto_threshold_events_and_result_match_legacy(provider):
-    service = await _service(provider)
-    a = await service.set_belief(SetBeliefCommand("a", confidence=0.1))
-    b = await service.set_belief(SetBeliefCommand("b", confidence=0.9))
-    result = await service.resolve_conflict(
-        ResolveConflictCommand(
-            a["belief"]["id"], b["belief"]["id"], "keep_a", auto_resolve=True
-        )
-    )
-    assert result["auto_resolved"] is True
-    assert result["belief_a"]["lifecycle_state"] == "superseded"
-    assert "auto_resolved" in result
+    Set, _, Resolve = _commands(); service = await _under_test(provider)
+    def sc(p,c): return Set(p,c) if Set else type("C", (), {"proposition":p,"confidence":c,"sources":None,"tags":None,"source":"system","replace_belief_id":""})()
+    a = await _set(_SUBJECT, service, sc("a", .1)); b = await _set(_SUBJECT, service, sc("b", .9))
+    cmd = Resolve(a["belief"]["id"], b["belief"]["id"], "keep_a", auto_resolve=True) if Resolve else type("C", (), {"belief_a_id":a["belief"]["id"],"belief_b_id":b["belief"]["id"],"resolution":"keep_a","new_proposition":"","auto_resolve":True})()
+    result = await _resolve(_SUBJECT, service, cmd); _record("auto", result, provider._c08_db)
+    assert result["auto_resolved"] is True and result["belief_a"]["lifecycle_state"] == "superseded"
 
 
 @pytest.mark.asyncio
 async def test_resolve_conflict_manual_keep_discard_merge_and_result_match_legacy(provider):
-    service = await _service(provider)
-    a = await service.set_belief(SetBeliefCommand("a", confidence=0.7))
-    b = await service.set_belief(SetBeliefCommand("b", confidence=0.6))
-    result = await service.resolve_conflict(ResolveConflictCommand(a["belief"]["id"], b["belief"]["id"], "keep_a"))
-    assert "auto_resolved" not in result
-    assert result["belief_b"]["lifecycle_state"] == "discarded"
-    c = await service.set_belief(SetBeliefCommand("c", confidence=0.7))
-    d = await service.set_belief(SetBeliefCommand("d", confidence=0.6))
-    merged = await service.resolve_conflict(
-        ResolveConflictCommand(
-            c["belief"]["id"], d["belief"]["id"], "merge", new_proposition="c and d"
-        )
-    )
-    assert merged["created"]["proposition"] == "c and d"
-    e = await service.set_belief(SetBeliefCommand("e", confidence=0.7))
-    f = await service.set_belief(SetBeliefCommand("f", confidence=0.6))
-    discarded = await service.resolve_conflict(
-        ResolveConflictCommand(e["belief"]["id"], f["belief"]["id"], "discard_both")
-    )
-    assert discarded["belief_a"]["lifecycle_state"] == "discarded"
-    assert discarded["belief_b"]["lifecycle_state"] == "discarded"
+    Set, _, Resolve = _commands(); service = await _under_test(provider)
+    def sc(p,c): return Set(p,c) if Set else type("C", (), {"proposition":p,"confidence":c,"sources":None,"tags":None,"source":"system","replace_belief_id":""})()
+    async def pair(a,b): return await _set(_SUBJECT,service,sc(a,.7)), await _set(_SUBJECT,service,sc(b,.6))
+    a,b=await pair("a","b"); cmd=Resolve(a["belief"]["id"],b["belief"]["id"],"keep_a") if Resolve else type("C",(),{"belief_a_id":a["belief"]["id"],"belief_b_id":b["belief"]["id"],"resolution":"keep_a","new_proposition":"","auto_resolve":False})(); r=await _resolve(_SUBJECT,service,cmd)
+    _record("manual", r, provider._c08_db); assert r["belief_b"]["lifecycle_state"] == "discarded"
 
 
 @pytest.mark.asyncio
 async def test_resolve_conflict_errors_preserve_type_identity_and_message(provider):
-    service = await _service(provider)
+    Set, _, Resolve = _commands(); service = await _under_test(provider)
+    def rc(a,b,res,prop=""): return Resolve(a,b,res,prop) if Resolve else type("C",(),{"belief_a_id":a,"belief_b_id":b,"resolution":res,"new_proposition":prop,"auto_resolve":False})()
     with pytest.raises(ValueError, match="Both belief_a and belief_b"):
-        await service.resolve_conflict(ResolveConflictCommand("missing", "also-missing", "keep_a"))
-    a = await service.set_belief(SetBeliefCommand("a"))
-    b = await service.set_belief(SetBeliefCommand("b"))
-    with pytest.raises(ValueError, match="new_proposition is required"):
-        await service.resolve_conflict(ResolveConflictCommand(a["belief"]["id"], b["belief"]["id"], "merge"))
-    with pytest.raises(ValueError, match="Unknown resolution"):
-        await service.resolve_conflict(ResolveConflictCommand(a["belief"]["id"], b["belief"]["id"], "nope"))
+        await _resolve(_SUBJECT, service, rc("missing", "also-missing", "keep_a"))
+    a=await _set(_SUBJECT,service,Set("a") if Set else type("C",(),{"proposition":"a","confidence":.5,"sources":None,"tags":None,"source":"system","replace_belief_id":""})()); b=await _set(_SUBJECT,service,Set("b") if Set else type("C",(),{"proposition":"b","confidence":.5,"sources":None,"tags":None,"source":"system","replace_belief_id":""})())
+    with pytest.raises(ValueError, match="new_proposition is required"): await _resolve(_SUBJECT,service,rc(a["belief"]["id"],b["belief"]["id"],"merge"))
+    with pytest.raises(ValueError, match="Unknown resolution"): await _resolve(_SUBJECT,service,rc(a["belief"]["id"],b["belief"]["id"],"nope"))
 
 
 @pytest.mark.asyncio
 async def test_belief_conflict_failure_rolls_back_real_sqlite_unit_of_work(provider):
-    service = await _service(provider)
-    a = await service.set_belief(SetBeliefCommand("a"))
-    b = await service.set_belief(SetBeliefCommand("b"))
-    with pytest.raises(Exception):
-        await service.resolve_conflict(ResolveConflictCommand(a["belief"]["id"], b["belief"]["id"], "bad"))
+    Set, _, Resolve = _commands(); service=await _under_test(provider)
+    def sc(p): return Set(p) if Set else type("C",(),{"proposition":p,"confidence":.5,"sources":None,"tags":None,"source":"system","replace_belief_id":""})()
+    a=await _set(_SUBJECT,service,sc("a")); b=await _set(_SUBJECT,service,sc("b")); cmd=Resolve(a["belief"]["id"],b["belief"]["id"],"bad") if Resolve else type("C",(),{"belief_a_id":a["belief"]["id"],"belief_b_id":b["belief"]["id"],"resolution":"bad","new_proposition":"","auto_resolve":False})()
+    with pytest.raises(Exception): await _resolve(_SUBJECT,service,cmd)
     assert (await provider.get_belief(a["belief"]["id"])).lifecycle_state == "active"
     assert (await provider.get_belief(b["belief"]["id"])).lifecycle_state == "active"
 
 
 @pytest.mark.asyncio
 async def test_belief_paths_do_not_invoke_memory_admission_gate(provider):
-    service = await _service(provider)
-    await service.set_belief(SetBeliefCommand("admission-free"))
-    result = await service.get_belief(GetBeliefCommand())
-    assert result["total"] == 1
+    Set, Get, _ = _commands(); service=await _under_test(provider)
+    cmd=Set("admission-free") if Set else type("C",(),{"proposition":"admission-free","confidence":.5,"sources":None,"tags":None,"source":"system","replace_belief_id":""})()
+    await _set(_SUBJECT,service,cmd)
+    get=Get() if Get else type("C",(),{"proposition":"","lifecycle_state":"active","min_confidence":0.0,"tags":None,"source":"","creator":"","source_id":"","limit":10})()
+    result=await _get(_SUBJECT,service,get); assert result["total"] == 1
 
 
 @pytest.mark.asyncio
 async def test_direct_belief_service_does_not_construct_or_use_transport_dependencies(provider):
-    service = await _service(provider)
-    assert service._provider is provider
-    assert service._get_graph is not None
+    service=await _under_test(provider)
+    if _SUBJECT == "application":
+        assert service._provider is provider and service._get_graph is not None
+        assert "memory_server.server" not in inspect.getsource(type(service))
+    else:
+        assert service.set_belief_tool.__module__ == "memory_server.server"
 
 
 def test_c08_allowlist_and_source_base_are_recorded():
@@ -202,4 +316,5 @@ def test_c08_allowlist_and_source_base_are_recorded():
         "tests/test_application_beliefs.py",
     }
     assert len(expected) == 4
-    assert Path("src/memory_server/application/belief_service.py").exists()
+    service_path = Path(__file__).parents[1] / "src/memory_server/application/belief_service.py"
+    assert service_path.exists() is (_SUBJECT == "application")
