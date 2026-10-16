@@ -95,6 +95,82 @@ class MemoryPolicy:
         return cls(max_active_beliefs=settings.max_active_beliefs)
 
 
+@dataclass(frozen=True, slots=True)
+class SearchCommand:
+    query: str = ""
+    subject: str | None = None
+    predicate: str | None = None
+    limit: int | None = None
+    include_inactive: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCommand:
+    task: str
+    subject: str | None = None
+    max_results: int | None = None
+    include_inactive: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticSearchCommand:
+    query: str = ""
+    top_k: int | None = None
+    score_threshold: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RouteCommand:
+    query: str = ""
+    top_k: int | None = None
+    score_threshold: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GraphSearchCommand:
+    query: str = ""
+    entity_id: str = ""
+    source_id: str = ""
+    target_id: str = ""
+    relation_type: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalPolicy:
+    search_default_limit: int
+    context_default_limit: int
+    context_dedup_overfetch_factor: int
+    semantic_top_k: int
+    semantic_score_threshold: float
+
+    @classmethod
+    def capture(cls, settings: Any = None) -> RetrievalPolicy:
+        if settings is None:
+            from memory_server.settings import get_settings
+
+            settings = get_settings()
+        return cls(
+            settings.search_default_limit,
+            settings.context_default_limit,
+            settings.context_dedup_overfetch_factor,
+            settings.semantic_top_k,
+            settings.semantic_score_threshold,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GraphPolicy:
+    graph_max_path_depth: int
+
+    @classmethod
+    def capture(cls, settings: Any = None) -> GraphPolicy:
+        if settings is None:
+            from memory_server.settings import get_settings
+
+            settings = get_settings()
+        return cls(settings.graph_max_path_depth)
+
+
 def validate_remember_command(command: RememberCommand) -> None:
     """Validate a ``RememberCommand``; mirrors ``ingestion_service.py:311-320``.
 

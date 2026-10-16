@@ -18,6 +18,8 @@ async def get_context(
     subject: Optional[str] = None,
     max_results: int | None = None,
     include_inactive: bool = False,
+    *,
+    overfetch_factor: int | None = None,
 ) -> dict:
     """Retrieve structured context for a task.
 
@@ -31,12 +33,14 @@ async def get_context(
     Returns:
         Dict with 'facts', 'decisions', and 'total' keys.
     """
-    from memory_server.settings import get_settings
+    if max_results is None or overfetch_factor is None:
+        from memory_server.settings import get_settings
 
-    settings = get_settings()
-    if max_results is None:
-        max_results = settings.context_default_limit
-    overfetch_factor = settings.context_dedup_overfetch_factor
+        settings = get_settings()
+        if max_results is None:
+            max_results = settings.context_default_limit
+        if overfetch_factor is None:
+            overfetch_factor = settings.context_dedup_overfetch_factor
     # Search facts by text (task) and optionally by subject
     facts = await provider.search_facts(
         text=task if task else None,
