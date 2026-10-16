@@ -158,39 +158,91 @@ def _commands():
     return None, None, None
 
 
-def test_application_belief_surface_is_direct_and_transport_free():
+@pytest.mark.asyncio
+async def test_application_belief_surface_is_direct_and_transport_free(provider):
     before = set(sys.modules)
     if _SUBJECT == "application":
         from memory_server.application.belief_service import BeliefService
+        from memory_server.application.contracts import SetBeliefCommand
+
+        service = BeliefService(provider, get_graph=_none_graph)
+        result = await service.set_belief(SetBeliefCommand("direct boundary"))
+        assert result["belief"]["proposition"] == "direct boundary"
         assert BeliefService.__module__ == "memory_server.application.belief_service"
         assert "memory_server.server" not in inspect.getsource(BeliefService)
         imported = set(sys.modules) - before
         assert not any(x == f or x.startswith(f + ".") for x in imported for f in FORBIDDEN)
     else:
         import memory_server.server as server
-        assert server.set_belief_tool.__module__ == "memory_server.server"
-        with pytest.raises(ImportError):
-            __import__("memory_server.application.belief_service")
+
+        # Cross the real legacy production boundary before checking the invariant.
+        server._provider = provider
+        server._get_provider = lambda: _ready(provider)
+        result = json.loads(await server.set_belief_tool("direct boundary"))
+        assert result["belief"]["proposition"] == "direct boundary"
+        assert server.set_belief_tool.__module__ == "memory_server.application.belief_service", (
+            "legacy server tool crossed the production boundary: "
+            f"observed module={server.set_belief_tool.__module__!r}"
+        )
 
 
-def test_belief_policy_avoids_legacy_import_time_ambient_default():
+@pytest.mark.asyncio
+async def test_belief_policy_avoids_legacy_import_time_ambient_default(provider, monkeypatch):
     if _SUBJECT == "application":
-        from memory_server.application.contracts import BeliefPolicy
+        from memory_server.application.belief_service import BeliefService
+        from memory_server.application.contracts import BeliefPolicy, GetBeliefCommand
+        import memory_server.settings as settings
 
-        class Settings:
-            belief_search_limit = 7
+        reads = 0
 
-        policy = BeliefPolicy.capture(Settings())
-        Settings.belief_search_limit = 99
-        assert policy.belief_search_limit == 7
-        assert BeliefPolicy(10).belief_search_limit == 10
+        def forbidden_read():
+            nonlocal reads
+            reads += 1
+            raise AssertionError("ambient settings read after explicit BeliefPolicy construction")
+
+        policy = BeliefPolicy(7)
+        service = BeliefService(provider, policy=policy, get_graph=_none_graph)
+        monkeypatch.setattr(settings, "get_settings", forbidden_read)
+        first = await service.get_belief(GetBeliefCommand(limit=None))
+        second = await service.get_belief(GetBeliefCommand(limit=None))
+        assert reads == 0
+        assert first["query"]["limit"] == second["query"]["limit"] == 7
+        assert first["query"]["limit"] == policy.belief_search_limit
     else:
-        import memory_server.server as server
-        from memory_server.settings import get_settings
+        import importlib
+        import memory_server.settings as settings
 
-        assert server.get_belief_tool.__module__ == "memory_server.server"
-        assert server.get_belief_tool.__kwdefaults__ is not None or inspect.signature(server.get_belief_tool).parameters["limit"].default == get_settings().belief_search_limit
-        assert inspect.signature(server.get_belief_tool).parameters["limit"].default == get_settings().belief_search_limit
+        original = settings.get_settings
+        current_limit = original().belief_search_limit
+        import_limit = current_limit + 1
+        import_reads: list[int] = []
+
+        class ImportSettings:
+            def __init__(self, base):
+                self._base = base
+                self.belief_search_limit = import_limit
+                import_reads.append(self.belief_search_limit)
+
+            def __getattr__(self, name):
+                return getattr(self._base, name)
+
+        def record_import_read():
+            return ImportSettings(original())
+
+        monkeypatch.setattr(settings, "get_settings", record_import_read)
+        sys.modules.pop("memory_server.server", None)
+        server = importlib.import_module("memory_server.server")
+        assert import_reads, "server import did not read settings for the get_belief_tool default"
+
+        server._provider = provider
+        server._get_provider = lambda: _ready(provider)
+        observed = json.loads(await server.get_belief_tool())
+        current = original().belief_search_limit
+        assert observed["query"]["limit"] == current, (
+            "legacy import-time ambient default drifted from current settings: "
+            f"import_read={import_reads[-1]!r}, current={current!r}, "
+            f"observed={observed['query']['limit']!r}"
+        )
 
 
 @pytest.mark.asyncio
