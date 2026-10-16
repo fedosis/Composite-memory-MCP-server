@@ -179,9 +179,15 @@ class ReflectEngine:
     All seven public methods return a dict suitable for JSON serialization.
     """
 
-    def __init__(self, provider: SQLiteProvider):
+    def __init__(self, provider: SQLiteProvider, *, policy: Any | None = None):
         self._provider = provider
         self._classifier = RelationClassifier()
+        self._policy = policy
+
+    def _setting(self, name: str) -> Any:
+        if self._policy is not None:
+            return getattr(self._policy, name)
+        return getattr(get_settings(), name)
 
     async def _fetch_beliefs(
         self, topic: str | None = None,
@@ -194,7 +200,11 @@ class ReflectEngine:
             min_confidence=min_confidence if min_confidence > 0 else None,
             lifecycle_state=None,  # all states
             include_inactive=True,
-            limit=limit if limit > 0 else get_settings().reflect_belief_cap,  # effectively-unlimited cap from Settings
+            limit=(
+                limit
+                if limit > 0
+                else self._setting("reflect_belief_cap")
+            ),  # effectively-unlimited cap from Settings
         )
 
     async def overview(
@@ -295,9 +305,8 @@ class ReflectEngine:
 
         # Decaying next 7d estimate: count beliefs nearing stale (age > 60% TTL for belief=180d)
         decaying_next_7d = 0
-        _s = get_settings()
-        belief_ttl = _s.ttl_days.get("belief", _s.decay_default_ttl_days)  # Decision 7 fallback
-        stale_ratio = _s.decay_stale_ratio
+        belief_ttl = self._setting("ttl_days").get("belief", self._setting("decay_default_ttl_days"))
+        stale_ratio = self._setting("decay_stale_ratio")
         for b in beliefs:
             created = _naive_dt(b.created_at)
             if created:
@@ -467,13 +476,10 @@ class ReflectEngine:
         """
         beliefs = await self._fetch_beliefs(topic, min_confidence, limit)
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-        _s = get_settings()
-        # fallback: settings can yield a PARTIAL ttl_days (nested-only/partial JSON env);
-        # missing 'belief' → decay_default_ttl_days (90.0), never KeyError (Design decision 7)
-        belief_ttl = _s.ttl_days.get("belief", _s.decay_default_ttl_days)
-        stale_ratio = _s.decay_stale_ratio
-        forgotten_ratio = _s.decay_forgotten_ratio
-        window = _s.decay_forecast_window_days
+        belief_ttl = self._setting("ttl_days").get("belief", self._setting("decay_default_ttl_days"))
+        stale_ratio = self._setting("decay_stale_ratio")
+        forgotten_ratio = self._setting("decay_forgotten_ratio")
+        window = self._setting("decay_forecast_window_days")
 
         stale_now = 0
         stale_7d = 0

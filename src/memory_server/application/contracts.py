@@ -22,11 +22,58 @@ never spells those literals out, and a guard test fails if they leak back in.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from memory_server.application.errors import InvalidCommandError
+
+
+@dataclass(frozen=True, slots=True)
+class ReflectionPolicy:
+    reflect_min_confidence: float = 0.0
+    reflect_limit: int = 50
+    reflect_belief_cap: int = 10000
+    ttl_days: Mapping[str, float] = field(
+        default_factory=lambda: {
+            "fact": 90.0,
+            "decision": 180.0,
+            "skill": 365.0,
+            "entity": 365.0,
+            "belief": 180.0,
+        }
+    )
+    decay_stale_ratio: float = 0.7
+    decay_forgotten_ratio: float = 2.0
+    decay_default_ttl_days: float = 90.0
+    decay_forecast_window_days: float = 7.0
+
+    @classmethod
+    def capture(cls, settings: Any = None) -> ReflectionPolicy:
+        if settings is None:
+            from memory_server.settings import get_settings
+
+            settings = get_settings()
+        return cls(
+            reflect_min_confidence=settings.reflect_min_confidence,
+            reflect_limit=settings.reflect_limit,
+            reflect_belief_cap=settings.reflect_belief_cap,
+            ttl_days=dict(settings.ttl_days),
+            decay_stale_ratio=settings.decay_stale_ratio,
+            decay_forgotten_ratio=settings.decay_forgotten_ratio,
+            decay_default_ttl_days=settings.decay_default_ttl_days,
+            decay_forecast_window_days=settings.decay_forecast_window_days,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReflectionCommand:
+    mode: str = "overview"
+    topic: str | None = None
+    min_confidence: float | None = None
+    limit: int | None = None
+    context: str | None = None
+    strict_same_context: bool = True
 
 
 @dataclass(frozen=True, slots=True)

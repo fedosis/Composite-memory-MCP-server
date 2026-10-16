@@ -24,6 +24,7 @@ from memory_server.application.contracts import (
     BeliefPolicy,
     GraphPolicy,
     MemoryPolicy,
+    ReflectionPolicy,
     RetrievalPolicy,
 )
 from memory_server.application.errors import UnknownDependencyError
@@ -49,6 +50,8 @@ class MemoryApplication:
         belief_provider: Any | None = None,
         belief_policy: BeliefPolicy | None = None,
         get_graph: Callable[[], Awaitable[Any]] | None = None,
+        reflection_provider: Any | None = None,
+        reflection_policy: ReflectionPolicy | None = None,
     ) -> None:
         self._session_factory = session_factory
         # Captured once here; MemoryService never re-reads it.
@@ -72,6 +75,14 @@ class MemoryApplication:
             if belief_provider is not None
             else None
         )
+        self._reflection = None
+        if reflection_provider is not None:
+            from memory_server.application.reflection_service import ReflectionService
+
+            self._reflection = ReflectionService(
+                reflection_provider,
+                policy=reflection_policy,
+            )
 
     @classmethod
     def from_provider(
@@ -86,6 +97,7 @@ class MemoryApplication:
         get_graph_router: Callable[[], Awaitable[Any]] | None = None,
         belief_policy: BeliefPolicy | None = None,
         get_graph: Callable[[], Awaitable[Any]] | None = None,
+        reflection_policy: ReflectionPolicy | None = None,
     ) -> MemoryApplication:
         """Build from any object exposing ``_session_factory`` (duck-typed)."""
         return cls(
@@ -100,6 +112,8 @@ class MemoryApplication:
             belief_provider=provider,
             belief_policy=belief_policy,
             get_graph=get_graph,
+            reflection_provider=provider,
+            reflection_policy=reflection_policy,
         )
 
     @property
@@ -123,6 +137,12 @@ class MemoryApplication:
         if self._beliefs is None:
             raise UnknownDependencyError("belief service")
         return self._beliefs
+
+    @property
+    def reflection(self) -> Any:
+        if self._reflection is None:
+            raise UnknownDependencyError("reflection service")
+        return self._reflection
 
     def describe(self) -> dict[str, Any]:
         """Secrets-free by construction: no paths, no provider handles."""
