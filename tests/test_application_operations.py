@@ -189,14 +189,14 @@ def _candidate_service(provider, settings=None):
 
 
 @pytest.mark.asyncio
-async def test_reflection_red_captured_policy_vs_legacy_ambient_reread(provider):
+async def test_reflection_red_captured_policy_vs_legacy_ambient_reread(provider, monkeypatch):
     await _seed(provider)
     settings = _settings(cap=2)
     if SUBJECT == "base":
         def monkeypatch_target():
             return settings
 
-        pytest.MonkeyPatch().setattr(reflect_api, "get_settings", monkeypatch_target)
+        monkeypatch.setattr(reflect_api, "get_settings", monkeypatch_target)
         engine = ReflectEngine(provider)
         settings.reflect_belief_cap = 1
         result = await engine.overview(limit=0)
@@ -211,15 +211,11 @@ async def test_reflection_red_captured_policy_vs_legacy_ambient_reread(provider)
         def fail_if_called():
             raise AssertionError("explicit reflection policy called api get_settings")
 
-        monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(reflect_api, "get_settings", fail_if_called)
-        try:
-            result = await service.reflect(
-                __import__("memory_server.application.contracts", fromlist=["ReflectionCommand"])
-                .ReflectionCommand(mode="overview", limit=0)
-            )
-        finally:
-            monkeypatch.undo()
+        result = await service.reflect(
+            __import__("memory_server.application.contracts", fromlist=["ReflectionCommand"])
+            .ReflectionCommand(mode="overview", limit=0)
+        )
         assert result["total_beliefs"] == 2
 
 
@@ -282,12 +278,22 @@ async def test_reflection_characterization_relations_direct_method(provider, fix
 
 
 @pytest.mark.asyncio
-async def test_reflection_characterization_invalid_mode_payload(provider):
+async def test_reflection_characterization_invalid_mode_payload(provider, monkeypatch):
     if SUBJECT == "base":
-        result = {
-            "error": "Invalid mode 'invalid'. Must be one of: confidence, contradictions, "
-            "decay, evidence_audit, overview, topics"
-        }
+        from prometheus_client import CollectorRegistry
+
+        from memory_server import server
+        from memory_server.evaluation.metrics import MetricsCollector
+
+        _assert_import_isolation(server)
+        isolated_collector = MetricsCollector(registry=CollectorRegistry())
+
+        async def scratch_provider():
+            return provider
+
+        monkeypatch.setattr(server, "_get_provider", scratch_provider)
+        monkeypatch.setattr(server, "get_collector", lambda: isolated_collector)
+        result = json.loads(await server.reflect_tool(mode="invalid"))
     else:
         from memory_server.application.contracts import ReflectionCommand
 
