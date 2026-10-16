@@ -19,7 +19,9 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
+from memory_server.application.belief_service import BeliefService
 from memory_server.application.contracts import (
+    BeliefPolicy,
     GraphPolicy,
     MemoryPolicy,
     RetrievalPolicy,
@@ -44,6 +46,9 @@ class MemoryApplication:
         get_embedding_router: Callable[[], Awaitable[Any]] | None = None,
         get_hybrid_router: Callable[[], Awaitable[Any]] | None = None,
         get_graph_router: Callable[[], Awaitable[Any]] | None = None,
+        belief_provider: Any | None = None,
+        belief_policy: BeliefPolicy | None = None,
+        get_graph: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         self._session_factory = session_factory
         # Captured once here; MemoryService never re-reads it.
@@ -62,6 +67,11 @@ class MemoryApplication:
             if get_graph_router is not None
             else None
         )
+        self._beliefs = (
+            BeliefService(belief_provider, policy=belief_policy, get_graph=get_graph)
+            if belief_provider is not None
+            else None
+        )
 
     @classmethod
     def from_provider(
@@ -74,6 +84,8 @@ class MemoryApplication:
         get_embedding_router: Callable[[], Awaitable[Any]] | None = None,
         get_hybrid_router: Callable[[], Awaitable[Any]] | None = None,
         get_graph_router: Callable[[], Awaitable[Any]] | None = None,
+        belief_policy: BeliefPolicy | None = None,
+        get_graph: Callable[[], Awaitable[Any]] | None = None,
     ) -> MemoryApplication:
         """Build from any object exposing ``_session_factory`` (duck-typed)."""
         return cls(
@@ -85,6 +97,9 @@ class MemoryApplication:
             get_embedding_router=get_embedding_router,
             get_hybrid_router=get_hybrid_router,
             get_graph_router=get_graph_router,
+            belief_provider=provider,
+            belief_policy=belief_policy,
+            get_graph=get_graph,
         )
 
     @property
@@ -102,6 +117,12 @@ class MemoryApplication:
         if self._graph is None:
             raise UnknownDependencyError("graph service")
         return self._graph
+
+    @property
+    def beliefs(self) -> BeliefService:
+        if self._beliefs is None:
+            raise UnknownDependencyError("belief service")
+        return self._beliefs
 
     def describe(self) -> dict[str, Any]:
         """Secrets-free by construction: no paths, no provider handles."""

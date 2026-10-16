@@ -171,6 +171,50 @@ class GraphPolicy:
         return cls(settings.graph_max_path_depth)
 
 
+@dataclass(frozen=True, slots=True)
+class BeliefPolicy:
+    belief_search_limit: int
+
+    @classmethod
+    def capture(cls, settings: Any = None) -> BeliefPolicy:
+        if settings is None:
+            from memory_server.settings import get_settings
+
+            settings = get_settings()
+        return cls(settings.belief_search_limit)
+
+
+@dataclass(frozen=True, slots=True)
+class SetBeliefCommand:
+    proposition: str
+    confidence: float = 0.5
+    sources: list[dict[str, Any]] | None = None
+    tags: list[str] | None = None
+    source: str = "system"
+    replace_belief_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class GetBeliefCommand:
+    proposition: str = ""
+    lifecycle_state: str = "active"
+    min_confidence: float = 0.0
+    tags: list[str] | None = None
+    source: str = ""
+    creator: str = ""
+    source_id: str = ""
+    limit: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveConflictCommand:
+    belief_a_id: str
+    belief_b_id: str
+    resolution: str
+    new_proposition: str = ""
+    auto_resolve: bool = False
+
+
 def validate_remember_command(command: RememberCommand) -> None:
     """Validate a ``RememberCommand``; mirrors ``ingestion_service.py:311-320``.
 
