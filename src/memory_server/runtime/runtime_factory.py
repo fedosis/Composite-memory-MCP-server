@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
 from memory_server.runtime.config import RuntimeConfig
@@ -42,6 +43,32 @@ class BuildStep:
 
     name: str
     resource: Any = None
+
+
+def frozen_settings(config: RuntimeConfig) -> Any:
+    """Settings-shaped view of the frozen create-time snapshot (C04).
+
+    The attribute names are exactly the ones the provider constructors read from
+    ``get_settings()``, so passing this view to them is a drop-in replacement for
+    the ambient resolution: the runtime path resolves no ambient settings after
+    ``create()``. Values come from ``RuntimeConfig``; nothing is re-read.
+    """
+    embedding = config.embedding
+    return SimpleNamespace(
+        lancedb_path=config.vector_local_path,
+        vector_collection=config.vector_collection,
+        vector_metric=config.vector_metric,
+        vector_size=config.vector_size,
+        qdrant_location=config.qdrant_location,
+        qdrant_port=config.qdrant_port,
+        qdrant_prefer_grpc=config.qdrant_prefer_grpc,
+        embedding_model=embedding["model"],
+        embedding_device=embedding["device"],
+        embedding_batch_size=embedding["batch_size"],
+        openai_embedding_model=embedding["openai_model"],
+        openai_embedding_vector_size=embedding["openai_vector_size"],
+        embedding_base_url=embedding["base_url"],
+    )
 
 
 def _unavailable(runtime: Any, label: str) -> bool:
@@ -70,6 +97,7 @@ def build_graph(runtime: Any) -> Any:
 def build_embedder(runtime: Any) -> Any:
     """Embedder selection captured at create() (no model download here)."""
     embedding = runtime.config.embedding
+    settings = frozen_settings(runtime.config)
     if embedding["provider"] == "openai":
         from memory_server.providers.embedding_provider import OpenAIEmbeddingProvider
         from memory_server.settings import get_openai_api_key
@@ -79,6 +107,7 @@ def build_embedder(runtime: Any) -> Any:
             base_url=embedding["base_url"],
             vector_size=embedding["openai_vector_size"],
             api_key=get_openai_api_key(),
+            settings=settings,
         )
     from memory_server.providers.embedding_provider import SentenceTransformerEmbeddingProvider
 
@@ -86,6 +115,7 @@ def build_embedder(runtime: Any) -> Any:
         model_name=embedding["model"],
         device=embedding["device"],
         batch_size=embedding["batch_size"],
+        settings=settings,
     )
 
 
@@ -94,6 +124,7 @@ def build_vector(runtime: Any) -> Any:
     config = runtime.config
     if _unavailable(runtime, "vector"):
         return None
+    settings = frozen_settings(config)
     if config.vector_backend == "qdrant":
         import qdrant_client  # noqa: F401  optional root, imported inside the recipe
 
@@ -106,6 +137,7 @@ def build_vector(runtime: Any) -> Any:
             collection=config.vector_collection,
             vector_size=config.vector_size,
             distance=config.vector_metric,
+            settings=settings,
         )
     from memory_server.providers.lancedb_provider import LanceDBProvider
 
@@ -114,6 +146,7 @@ def build_vector(runtime: Any) -> Any:
         table=config.vector_collection,
         metric=config.vector_metric,
         vector_size=config.vector_size,
+        settings=settings,
     )
 
 

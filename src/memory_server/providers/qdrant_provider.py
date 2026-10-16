@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from qdrant_client import QdrantClient as _QdrantClient
@@ -19,6 +19,9 @@ from memory_server.providers.exceptions import (
     ProviderSearchError,
     ProviderWriteError,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - annotation-only import
+    from memory_server.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,11 @@ class QdrantProvider:
         vector_size: Default vector dimensionality (default 384).
         distance: Distance metric (default "cosine").
         api_key: Optional API key for cloud Qdrant.
+        settings: Explicit create-time configuration (C04) with the attribute
+            names read below; the runtime factory passes its frozen snapshot,
+            which is then used verbatim and no ambient settings are resolved.
+            Omitted (or None) ⇒ the legacy ``get_settings()`` resolution runs
+            exactly as before.
     """
 
     def __init__(
@@ -74,12 +82,14 @@ class QdrantProvider:
         vector_size: int | None = None,
         distance: str | None = None,
         api_key: str | None = None,
+        *,
+        settings: Settings | None = None,
     ) -> None:
         # None → resolve from Settings (defaults equal the previous module
         # constants; explicit args still win). api_key stays env-only.
         from memory_server.settings import get_settings
 
-        settings = get_settings()
+        settings = settings if settings is not None else get_settings()
         location = location if location is not None else settings.qdrant_location
         port = port if port is not None else settings.qdrant_port
         prefer_grpc = (

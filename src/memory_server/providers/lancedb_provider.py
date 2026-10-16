@@ -17,12 +17,15 @@ import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AbstractSet, Any
+from typing import TYPE_CHECKING, AbstractSet, Any
 
 from memory_server.providers.exceptions import (
     ProviderSearchError,
     ProviderWriteError,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - annotation-only import
+    from memory_server.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +342,11 @@ class LanceDBProvider:
         table: Default table name (default "memories").
         metric: Distance metric (default "cosine"). Options: cosine, l2, dot.
         vector_size: Default vector dimensionality (default 384).
+        settings: Explicit create-time configuration (C04) with the attribute
+            names read below; the runtime factory passes its frozen snapshot,
+            which is then used verbatim and no ambient settings are resolved.
+            Omitted (or None) ⇒ the legacy ``get_settings()`` resolution runs
+            exactly as before.
     """
 
     def __init__(
@@ -347,12 +355,14 @@ class LanceDBProvider:
         table: str | None = None,
         metric: str | None = None,
         vector_size: int | None = None,
+        *,
+        settings: Settings | None = None,
     ) -> None:
         # None → resolve from Settings (defaults equal the previous module
         # constants; explicit args still win).
         from memory_server.settings import get_settings
 
-        settings = get_settings()
+        settings = settings if settings is not None else get_settings()
         self._db_path = db_path if db_path is not None else str(settings.lancedb_path)
         self._table_name = table if table is not None else settings.vector_collection
         metric_value = metric if metric is not None else settings.vector_metric

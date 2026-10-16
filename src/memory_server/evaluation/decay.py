@@ -9,7 +9,9 @@ they transition through the lifecycle:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from memory_server.evaluation.validator import Validator
@@ -35,6 +37,12 @@ class DecayEngine:
         per_type_ttl: Override the default per-type TTLs (in *days*).
         archive_threshold: Confidence below this triggers archival.
         validator: Optional Validator to drive lifecycle transitions.
+        settings: Explicit create-time values (C04) as a mapping keyed by the
+            Settings field names read below (``ttl_days``,
+            ``decay_archive_threshold``, …). The runtime passes a frozen
+            snapshot; supplied values are used verbatim and no ambient settings
+            are resolved. Omitted (or None) ⇒ the legacy ``get_settings()``
+            resolution at ``__init__`` runs exactly as before.
     """
 
     def __init__(
@@ -48,8 +56,10 @@ class DecayEngine:
         default_ttl_days: float | None = None,
         decay_base: float | None = None,
         confidence_floor: float | None = None,
+        *,
+        settings: Mapping[str, Any] | None = None,
     ) -> None:
-        _s = get_settings()
+        _s = SimpleNamespace(**settings) if settings is not None else get_settings()
         self._per_type_ttl = dict(_s.ttl_days)
         if per_type_ttl:
             self._per_type_ttl.update(per_type_ttl)

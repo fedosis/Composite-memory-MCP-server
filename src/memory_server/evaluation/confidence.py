@@ -9,7 +9,9 @@ Computes a 0.0–1.0 confidence score based on:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from memory_server.settings import get_settings
@@ -46,8 +48,18 @@ class ConfidenceEngine:
         boost_threshold: int | None = None,
         conflict_penalty: float | None = None,
         penalty_threshold: int | None = None,
+        *,
+        settings: Mapping[str, Any] | None = None,
     ) -> None:
-        _s = get_settings()
+        """Build a confidence engine.
+
+        ``settings`` (C04) is an explicit create-time values mapping keyed by the
+        Settings field names read below (``confidence_source_reliability``,
+        ``confidence_ttl_days``, …); supplied values are used verbatim and no
+        ambient settings are resolved. Omitted (or None) ⇒ the legacy
+        ``get_settings()`` resolution at ``__init__`` runs exactly as before.
+        """
+        _s = SimpleNamespace(**settings) if settings is not None else get_settings()
         self._source_reliability = source_reliability or dict(_s.confidence_source_reliability)
         self._ttl_days = _s.confidence_ttl_days if ttl_days is None else ttl_days
         self._lifecycle_multipliers = lifecycle_multipliers or dict(_s.confidence_lifecycle_multipliers)

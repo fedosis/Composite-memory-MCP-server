@@ -11,7 +11,10 @@ from __future__ import annotations
 import hashlib
 import logging
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - annotation-only import
+    from memory_server.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +109,11 @@ class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
         model_name: HuggingFace model name (default "all-MiniLM-L6-v2").
         device: Device to run on ("cpu", "cuda", or None for auto).
         batch_size: Batch size for embed_batch (default 32).
+        settings: Explicit create-time configuration (C04) with the attribute
+            names read below; the runtime factory passes its frozen snapshot,
+            which is then used verbatim and no ambient settings are resolved.
+            Omitted (or None) ⇒ the legacy ``get_settings()`` resolution runs
+            exactly as before.
     """
 
     def __init__(
@@ -113,12 +121,14 @@ class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
         model_name: str | None = None,
         device: str | None = None,
         batch_size: int | None = None,
+        *,
+        settings: Settings | None = None,
     ) -> None:
         # None → resolve from Settings (defaults equal the previous literals;
         # explicit args still win).
         from memory_server.settings import get_settings
 
-        settings = get_settings()
+        settings = settings if settings is not None else get_settings()
         self._model_name = (
             model_name if model_name is not None else settings.embedding_model
         )
@@ -190,6 +200,11 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         api_key: OpenAI API key (default: OPENAI_API_KEY env var).
         base_url: API base URL (default: https://api.openai.com/v1).
         vector_size: Expected vector dimensionality (default: 1536 for text-embedding-3-small).
+        settings: Explicit create-time configuration (C04) with the attribute
+            names read below; the runtime factory passes its frozen snapshot,
+            which is then used verbatim and no ambient settings are resolved.
+            Omitted (or None) ⇒ the legacy ``get_settings()`` resolution runs
+            exactly as before.
     """
 
     def __init__(
@@ -198,13 +213,15 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         api_key: str | None = None,
         base_url: str | None = None,
         vector_size: int | None = None,
+        *,
+        settings: Settings | None = None,
     ) -> None:
         # None → resolve from Settings (defaults equal the previous literals;
         # explicit args still win). api_key stays env-only — the openai
         # client reads OPENAI_API_KEY from the environment when None.
         from memory_server.settings import get_settings
 
-        settings = get_settings()
+        settings = settings if settings is not None else get_settings()
         self._model = (
             model if model is not None else settings.openai_embedding_model
         )
