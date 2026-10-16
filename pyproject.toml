@@ -75,6 +75,7 @@ packages = [
     "memory_server.plugins.hermes",
     "memory_server.providers",
     "memory_server.router",
+    "memory_server.runtime",
     "memory_server.services",
     "storage",
     "storage.adapters",
