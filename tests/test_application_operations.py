@@ -31,9 +31,7 @@ def _assert_import_isolation(*modules: object) -> None:
         assert origin, f"missing module origin for {module!r}"
         resolved = Path(origin).resolve()
         assert any(resolved == root or root in resolved.parents for root in roots), (
-            f"source isolation violation: {module!r} resolved to {resolved}, "
-            f"subject root is {SUBJECT_ROOT}"
-        )
+            f"source isolation violation: {module!r} resolved to {resolved}, subject root is {SUBJECT_ROOT}" )
 
 
 _assert_import_isolation()
@@ -44,21 +42,7 @@ _BASE_RESULTS: dict[str, object] = {}
 
 def _settings(cap: int = 10000) -> SimpleNamespace:
     return SimpleNamespace(
-        reflect_min_confidence=0.0,
-        reflect_limit=50,
-        reflect_belief_cap=cap,
-        ttl_days={
-            "fact": 90.0,
-            "decision": 180.0,
-            "skill": 365.0,
-            "entity": 365.0,
-            "belief": 180.0,
-        },
-        decay_stale_ratio=0.7,
-        decay_forgotten_ratio=2.0,
-        decay_default_ttl_days=90.0,
-        decay_forecast_window_days=7.0,
-    )
+        reflect_min_confidence=0.0, reflect_limit=50, reflect_belief_cap=cap, ttl_days={ "fact": 90.0, "decision": 180.0, "skill": 365.0, "entity": 365.0, "belief": 180.0, }, decay_stale_ratio=0.7, decay_forgotten_ratio=2.0, decay_default_ttl_days=90.0, decay_forecast_window_days=7.0, )  # noqa: E501
 
 
 def _normalize(value: object, key: str = "") -> object:
@@ -118,65 +102,10 @@ async def provider(request):
 async def _seed(provider: SQLiteProvider) -> None:
     created = datetime(2025, 12, 1, tzinfo=timezone.utc)
     beliefs = [
-        Belief(
-            id="belief-1",
-            proposition="Docker is better than Podman",
-            confidence=0.8,
-            tags=["docker", "container"],
-            created_at=created,
-            updated_at=created,
-            last_reinforced_at=created,
-        ),
-        Belief(
-            id="belief-2",
-            proposition="Docker is worse than Podman",
-            confidence=0.6,
-            tags=["podman", "container"],
-            created_at=created,
-            updated_at=created,
-            last_reinforced_at=created,
-        ),
-        Belief(
-            id="belief-3",
-            proposition="Caddy is a fast web server",
-            confidence=0.85,
-            tags=["caddy", "web"],
-            created_at=created,
-            updated_at=created,
-            last_reinforced_at=created,
-        ),
-        Belief(
-            id="belief-4",
-            proposition="User prefers dark mode",
-            confidence=0.7,
-            tags=["user-preference"],
-            created_at=created,
-            updated_at=created,
-            last_reinforced_at=created,
-        ),
-        Belief(
-            id="belief-5",
-            proposition="Deprecated belief",
-            confidence=0.3,
-            tags=["old"],
-            lifecycle_state="superseded",
-            created_at=created,
-            updated_at=created,
-            last_reinforced_at=created,
-        ),
-    ]
+        Belief( id="belief-1", proposition="Docker is better than Podman", confidence=0.8, tags=["docker", "container"], created_at=created, updated_at=created, last_reinforced_at=created, ), Belief( id="belief-2", proposition="Docker is worse than Podman", confidence=0.6, tags=["podman", "container"], created_at=created, updated_at=created, last_reinforced_at=created, ), Belief( id="belief-3", proposition="Caddy is a fast web server", confidence=0.85, tags=["caddy", "web"], created_at=created, updated_at=created, last_reinforced_at=created, ), Belief( id="belief-4", proposition="User prefers dark mode", confidence=0.7, tags=["user-preference"], created_at=created, updated_at=created, last_reinforced_at=created, ), Belief( id="belief-5", proposition="Deprecated belief", confidence=0.3, tags=["old"], lifecycle_state="superseded", created_at=created, updated_at=created, last_reinforced_at=created, ), ]  # noqa: E501
     for belief in beliefs:
         await provider.create_belief(
-            belief,
-            [
-                Evidence(
-                    belief_id=belief.id,
-                    source_type="fact",
-                    source_id=f"source-{belief.id}",
-                    weight=0.9,
-                )
-            ],
-        )
+            belief, [ Evidence( belief_id=belief.id, source_type="fact", source_id=f"source-{belief.id}", weight=0.9, ) ], )  # noqa: E501
 
 
 def _candidate_service(provider, settings=None):
@@ -193,6 +122,7 @@ async def test_reflection_red_captured_policy_vs_legacy_ambient_reread(provider,
     await _seed(provider)
     settings = _settings(cap=2)
     if SUBJECT == "base":
+
         def monkeypatch_target():
             return settings
 
@@ -201,9 +131,7 @@ async def test_reflection_red_captured_policy_vs_legacy_ambient_reread(provider,
         settings.reflect_belief_cap = 1
         result = await engine.overview(limit=0)
         assert result["total_beliefs"] == 2, (
-            "captured-policy boundary expected 2; legacy api/reflect.py:192-198 "
-            f"re-read the ambient cap and observed {result['total_beliefs']}"
-        )
+            "captured-policy boundary expected 2; legacy api/reflect.py:192-198 " f"re-read the ambient cap and observed {result['total_beliefs']}" )  # noqa: E501
     else:
         service, _policy = _candidate_service(provider, settings)
         settings.reflect_belief_cap = 1
@@ -213,9 +141,7 @@ async def test_reflection_red_captured_policy_vs_legacy_ambient_reread(provider,
 
         monkeypatch.setattr(reflect_api, "get_settings", fail_if_called)
         result = await service.reflect(
-            __import__("memory_server.application.contracts", fromlist=["ReflectionCommand"])
-            .ReflectionCommand(mode="overview", limit=0)
-        )
+            __import__("memory_server.application.contracts", fromlist=["ReflectionCommand"]).ReflectionCommand( mode="overview", limit=0 ) )  # noqa: E501
         assert result["total_beliefs"] == 2
 
 
@@ -229,16 +155,7 @@ async def test_reflection_characterization_six_modes(provider, fixed_reflection_
         try:
             engine = ReflectEngine(provider)
             result = {
-                mode: await getattr(engine, method)()
-                for mode, method in (
-                    ("overview", "overview"),
-                    ("contradictions", "contradictions"),
-                    ("decay", "decay_analysis"),
-                    ("topics", "topics"),
-                    ("evidence_audit", "evidence_audit"),
-                    ("confidence", "confidence_histogram"),
-                )
-            }
+                mode: await getattr(engine, method)() for mode, method in ( ("overview", "overview"), ("contradictions", "contradictions"), ("decay", "decay_analysis"), ("topics", "topics"), ("evidence_audit", "evidence_audit"), ("confidence", "confidence_histogram"), ) }  # noqa: E501
         finally:
             monkeypatch.undo()
     else:
@@ -261,18 +178,14 @@ async def test_reflection_characterization_relations_direct_method(provider, fix
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(reflect_api, "get_settings", lambda: settings)
         try:
-            result = await ReflectEngine(provider).relations(
-                context="container", strict_same_context=True, limit=0
-            )
+            result = await ReflectEngine(provider).relations(context="container", strict_same_context=True, limit=0)
         finally:
             monkeypatch.undo()
     else:
         service, _policy = _candidate_service(provider, settings)
         from memory_server.application.contracts import ReflectionCommand
 
-        result = await service.relations(
-            ReflectionCommand(mode="relations", context="container", limit=0)
-        )
+        result = await service.relations(ReflectionCommand(mode="relations", context="container", limit=0))
     assert result["mode"] == "relations"
     _record("relations", result)
 
@@ -300,9 +213,7 @@ async def test_reflection_characterization_invalid_mode_payload(provider, monkey
         service, _policy = _candidate_service(provider)
         result = await service.reflect(ReflectionCommand(mode="invalid"))
     assert result == {
-        "error": "Invalid mode 'invalid'. Must be one of: confidence, contradictions, "
-        "decay, evidence_audit, overview, topics"
-    }
+        "error": "Invalid mode 'invalid'. Must be one of: confidence, contradictions, " "decay, evidence_audit, overview, topics" }  # noqa: E501
     _record("invalid_mode", result)
 
 
@@ -325,15 +236,9 @@ async def test_reflection_composition_and_describe(provider):
 
         policy = ReflectionPolicy.capture(_settings())
         app = MemoryApplication(
-            object(),
-            policy=MemoryPolicy(max_active_beliefs=500),
-            reflection_provider=provider,
-            reflection_policy=policy,
-        )
+            object(), policy=MemoryPolicy(max_active_beliefs=500), reflection_provider=provider, reflection_policy=policy, )  # noqa: E501
         reflection_service = __import__(
-            "memory_server.application.reflection_service",
-            fromlist=["ReflectionService"],
-        )
+            "memory_server.application.reflection_service", fromlist=["ReflectionService"], )
         _assert_import_isolation(reflection_service)
         assert app.describe() == {"policy": {"max_active_beliefs": 500}}
         assert app.reflection.policy == policy
@@ -352,10 +257,7 @@ def _stack_modules() -> set[str]:
     import inspect
 
     return {
-        frame.frame.f_globals.get("__name__", "")
-        for frame in inspect.stack()
-        if frame.frame.f_globals.get("__name__")
-    }
+        frame.frame.f_globals.get("__name__", "") for frame in inspect.stack() if frame.frame.f_globals.get("__name__") }  # noqa: E501
 
 
 def _normalize_b(value: object, key: str = "") -> object:
@@ -385,9 +287,7 @@ def _record_b(name: str, value: object) -> None:
         B_ORACLE.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
         return
     assert B_ORACLE.is_file(), f"base B oracle missing: {B_ORACLE}"
-    assert json.loads(B_ORACLE.read_text())[name] == normalized, (
-        f"B oracle mismatch for {name}"
-    )
+    assert json.loads(B_ORACLE.read_text())[name] == normalized, f"B oracle mismatch for {name}"
 
 
 def _relation_graph():
@@ -406,25 +306,16 @@ def _application_for_b(provider, graph):
         return graph
 
     return MemoryApplication(
-        object(),
-        get_graph=get_graph,
-        relation_provider=provider,
-        lifecycle_provider=provider,
-    )
+        object(), get_graph=get_graph, relation_provider=provider, lifecycle_provider=provider, )
 
 
 def _legacy_payload(result):
     return {
-        "memory": result.memory.model_dump(mode="json"),
-        "event": result.event,
-        "propagated": result.propagated,
-    }
+        "memory": result.memory.model_dump(mode="json"), "event": result.event, "propagated": result.propagated, }
 
 
 @pytest.mark.asyncio
-async def test_relation_lifecycle_red_direct_application_boundary_after_real_base_operations(
-    provider, monkeypatch
-):
+async def test_relation_lifecycle_red_direct_application_boundary_after_real_base_operations(provider, monkeypatch):
     from storage.repositories import LifecycleRepository
 
     from memory_server.models import Fact
@@ -449,43 +340,29 @@ async def test_relation_lifecycle_red_direct_application_boundary_after_real_bas
     monkeypatch.setattr(DomainLifecycleService, "transition", probed_transition)
 
     fact = Fact(
-        id="red-lifecycle-fact",
-        subject="Red",
-        predicate="proves",
-        object="Boundary",
-    )
+        id="red-lifecycle-fact", subject="Red", predicate="proves", object="Boundary", )
     await provider.create_fact(fact)
 
     if SUBJECT == "base":
         from memory_server.api.add_relation import add_relation
 
-        relation_result = await add_relation(
-            graph, "relation-source", "relation-target", " SUPPORTS ", provider
-        )
+        relation_result = await add_relation(graph, "relation-source", "relation-target", " SUPPORTS ", provider)
         lifecycle_result = await DomainLifecycleService(provider).transition(
-            fact.id, "fact", "stale", expected_version=1
-        )
+            fact.id, "fact", "stale", expected_version=1 )
     else:
         from memory_server.application.contracts import LifecycleCommand, RelationCommand
 
         app = _application_for_b(provider, graph)
         relation_result = await app.relations.add_relation(
-            RelationCommand("relation-source", "relation-target", " SUPPORTS ")
-        )
+            RelationCommand("relation-source", "relation-target", " SUPPORTS ") )
         lifecycle_result = await app.lifecycle.transition(
-            LifecycleCommand(fact.id, "fact", "stale", expected_version=1)
-        )
+            LifecycleCommand(fact.id, "fact", "stale", expected_version=1) )
 
     assert relation_result["edge"]["relation"] == "supports"
     assert graph.get_edge("relation-source", "relation-target") is not None
-    assert "relation-source" in await provider.get_claim_dependents(
-        "relation-target", relation_type="supports"
-    )
+    assert "relation-source" in await provider.get_claim_dependents("relation-target", relation_type="supports")
     lifecycle_memory = (
-        lifecycle_result["memory"]
-        if SUBJECT == "candidate"
-        else lifecycle_result.memory.model_dump(mode="json")
-    )
+        lifecycle_result["memory"] if SUBJECT == "candidate" else lifecycle_result.memory.model_dump(mode="json") )
     assert lifecycle_memory["lifecycle_state"] == "stale"
     current = await provider.get_fact(fact.id)
     assert current is not None and current.lifecycle_state == "stale" and current.version == 2
@@ -497,13 +374,9 @@ async def test_relation_lifecycle_red_direct_application_boundary_after_real_bas
     observed_relation = set().union(*relation_modules)
     observed_lifecycle = set().union(*lifecycle_modules)
     assert "memory_server.application.relation_service" in observed_relation, (
-        "missing production-derived relation-service caller provenance after real "
-        f"SQL/graph operation; observed={sorted(observed_relation)}"
-    )
+        "missing production-derived relation-service caller provenance after real " f"SQL/graph operation; observed={sorted(observed_relation)}" )  # noqa: E501
     assert "memory_server.application.lifecycle_service" in observed_lifecycle, (
-        "missing production-derived lifecycle-service caller provenance after real "
-        f"SQL/event operation; observed={sorted(observed_lifecycle)}"
-    )
+        "missing production-derived lifecycle-service caller provenance after real " f"SQL/event operation; observed={sorted(observed_lifecycle)}" )  # noqa: E501
 
 
 @pytest.mark.asyncio
@@ -532,33 +405,17 @@ async def test_relation_characterization_result_sql_and_graph_parity(provider, m
     if SUBJECT == "base":
         from memory_server.api.add_relation import add_relation
 
-        first = await add_relation(
-            graph, "relation-source", "relation-target", " SUPPORTS ", provider
-        )
-        second = await add_relation(
-            graph, "relation-source", "relation-target", "supports", provider
-        )
+        first = await add_relation(graph, "relation-source", "relation-target", " SUPPORTS ", provider)
+        second = await add_relation(graph, "relation-source", "relation-target", "supports", provider)
     else:
         from memory_server.application.contracts import RelationCommand
 
         service = _application_for_b(provider, graph).relations
         command = RelationCommand("relation-source", "relation-target", " SUPPORTS ")
         first = await service.add_relation(command)
-        second = await service.add_relation(
-            RelationCommand("relation-source", "relation-target", "supports")
-        )
+        second = await service.add_relation(RelationCommand("relation-source", "relation-target", "supports"))
     _record_b(
-        "relation_result_sql_graph",
-        {
-            "first": first,
-            "second": second,
-            "ordering": ordering[:3],
-            "edge_count": len(graph.search_by_relation("supports")),
-            "dependents": await provider.get_claim_dependents(
-                "relation-target", relation_type="supports"
-            ),
-        },
-    )
+        "relation_result_sql_graph", { "first": first, "second": second, "ordering": ordering[:3], "edge_count": len(graph.search_by_relation("supports")), "dependents": await provider.get_claim_dependents("relation-target", relation_type="supports"), }, )  # noqa: E501
     assert ordering[:3] == ["sql", "graph_search", "graph_add"]
 
 
@@ -577,21 +434,12 @@ async def test_relation_characterization_validation_order_and_idempotence(provid
 
     errors = []
     for args in (
-        ("relation-source", "relation-target", "invalid"),
-        ("missing-source", "relation-target", "supports"),
-        ("relation-source", "missing-target", "supports"),
-    ):
+        ("relation-source", "relation-target", "invalid"), ("missing-source", "relation-target", "supports"), ("relation-source", "missing-target", "supports"), ):  # noqa: E501
         with pytest.raises((ValueError, KeyError)) as raised:
             await call(graph, *args, provider)
         errors.append({"type": type(raised.value).__name__, "message": raised.value.args[0]})
     assert errors == [
-        {
-            "type": "ValueError",
-            "message": "relation_type must be one of: supports, contradicts, derives",
-        },
-        {"type": "KeyError", "message": "Source node 'missing-source' not found"},
-        {"type": "KeyError", "message": "Target node 'missing-target' not found"},
-    ]
+        { "type": "ValueError", "message": "relation_type must be one of: supports, contradicts, derives", }, {"type": "KeyError", "message": "Source node 'missing-source' not found"}, {"type": "KeyError", "message": "Target node 'missing-target' not found"}, ]  # noqa: E501
     _record_b("relation_validation", errors)
 
 
@@ -606,10 +454,7 @@ async def test_lifecycle_characterization_cas_event_and_propagation(provider):
     await provider.create_fact(parent)
     await provider.create_fact(child)
     await provider.create_in_transaction(
-        relation_entries=[
-            {"source_id": child.id, "target_id": parent.id, "relation_type": "derived_from"}
-        ]
-    )
+        relation_entries=[{"source_id": child.id, "target_id": parent.id, "relation_type": "derived_from"}] )
     graph = _relation_graph()
     graph.add_node(id=parent.id, type="fact", name="parent")
     graph.add_node(id=child.id, type="fact", name="child")
@@ -619,16 +464,12 @@ async def test_lifecycle_characterization_cas_event_and_propagation(provider):
         from memory_server.services.lifecycle_service import LifecycleService as DomainLifecycleService
 
         result = _legacy_payload(
-            await DomainLifecycleService(provider).transition(
-                parent.id, "fact", "discarded", expected_version=1, graph=graph
-            )
-        )
+            await DomainLifecycleService(provider).transition( parent.id, "fact", "discarded", expected_version=1, graph=graph ) )  # noqa: E501
     else:
         from memory_server.application.contracts import LifecycleCommand
 
         result = await _application_for_b(provider, graph).lifecycle.transition(
-            LifecycleCommand(parent.id, "fact", "discarded", expected_version=1)
-        )
+            LifecycleCommand(parent.id, "fact", "discarded", expected_version=1) )
     updated_child = await provider.get_fact(child.id)
     assert updated_child is not None
     async with await provider._get_session() as session:
@@ -637,23 +478,13 @@ async def test_lifecycle_characterization_cas_event_and_propagation(provider):
     with pytest.raises(Exception) as stale:
         if SUBJECT == "base":
             await DomainLifecycleService(provider).transition(
-                parent.id, "fact", "stale", expected_version=1, graph=graph
-            )
+                parent.id, "fact", "stale", expected_version=1, graph=graph )
         else:
             await _application_for_b(provider, graph).lifecycle.transition(
-                LifecycleCommand(parent.id, "fact", "stale", expected_version=1)
-            )
+                LifecycleCommand(parent.id, "fact", "stale", expected_version=1) )
     assert "expected_version mismatch" in str(stale.value)
     _record_b(
-        "lifecycle_cas_event_propagation",
-        {
-            "result": result,
-            "child": updated_child.model_dump(mode="json"),
-            "parent_events": events,
-            "child_events": child_events,
-            "stale": {"type": type(stale.value).__name__, "message": str(stale.value)},
-        },
-    )
+        "lifecycle_cas_event_propagation", { "result": result, "child": updated_child.model_dump(mode="json"), "parent_events": events, "child_events": child_events, "stale": {"type": type(stale.value).__name__, "message": str(stale.value)}, }, )  # noqa: E501
 
 
 @pytest.mark.asyncio
@@ -681,53 +512,34 @@ async def test_lifecycle_characterization_graph_fallback_and_rollback(provider, 
         from memory_server.services.lifecycle_service import LifecycleService as DomainLifecycleService
 
         fallback = _legacy_payload(
-            await DomainLifecycleService(provider).transition(
-                parent.id, "fact", "discarded", expected_version=1, graph=graph
-            )
-        )
+            await DomainLifecycleService(provider).transition( parent.id, "fact", "discarded", expected_version=1, graph=graph ) )  # noqa: E501
     else:
         from memory_server.application.contracts import LifecycleCommand
 
         fallback = await _application_for_b(provider, graph).lifecycle.transition(
-            LifecycleCommand(parent.id, "fact", "discarded", expected_version=1)
-        )
+            LifecycleCommand(parent.id, "fact", "discarded", expected_version=1) )
     assert fallback["propagated"] and fallback["propagated"][0]["memory_id"] == child.id
 
     rollback_parent = Fact(id="rollback-parent", subject="Parent", predicate="is", object="valid")
     await provider.create_fact(rollback_parent)
     async with await provider._get_session() as session:
         await session.execute(
-            text(
-                "CREATE TRIGGER reject_c09_lifecycle_event BEFORE INSERT ON lifecycle_events "
-                "BEGIN SELECT RAISE(ABORT, 'c09 event rejected'); END"
-            )
-        )
+            text( "CREATE TRIGGER reject_c09_lifecycle_event BEFORE INSERT ON lifecycle_events " "BEGIN SELECT RAISE(ABORT, 'c09 event rejected'); END" ) )  # noqa: E501
         await session.commit()
     with pytest.raises(Exception, match="c09 event rejected"):
         if SUBJECT == "base":
             await DomainLifecycleService(provider).transition(
-                rollback_parent.id, "fact", "stale", expected_version=1, graph=graph
-            )
+                rollback_parent.id, "fact", "stale", expected_version=1, graph=graph )
         else:
             await _application_for_b(provider, graph).lifecycle.transition(
-                LifecycleCommand(rollback_parent.id, "fact", "stale", expected_version=1)
-            )
+                LifecycleCommand(rollback_parent.id, "fact", "stale", expected_version=1) )
     rolled_back = await provider.get_fact(rollback_parent.id)
     assert rolled_back is not None
     async with await provider._get_session() as session:
         rollback_events = await LifecycleRepository(session).get_events(rollback_parent.id)
     assert (rolled_back.lifecycle_state, rolled_back.version, rollback_events) == ("active", 1, [])
     _record_b(
-        "lifecycle_fallback_rollback",
-        {
-            "fallback": fallback,
-            "rollback": {
-                "state": rolled_back.lifecycle_state,
-                "version": rolled_back.version,
-                "events": rollback_events,
-            },
-        },
-    )
+        "lifecycle_fallback_rollback", { "fallback": fallback, "rollback": { "state": rolled_back.lifecycle_state, "version": rolled_back.version, "events": rollback_events, }, }, )  # noqa: E501
 
 
 _C_ORACLE = ORACLE.with_name("c09_c_characterization.json")
@@ -768,15 +580,7 @@ async def _c_audit(provider, validator, engine, graph, persisted, audit_type="fu
         from memory_server.evaluation.auditor import MemoryAuditor
 
         return MemoryAuditor(
-            validator=validator,
-            confidence_engine=engine,
-            graph=graph,
-            sqlite=provider,
-            receipt_ids=set(persisted["receipt_ids"]),
-            sqlite_counts=dict(persisted["sqlite_counts"]),
-            vector_point_count=persisted["vector_point_count"],
-            persisted_records=persisted["records"],
-        ).audit_report(audit_type)
+            validator=validator, confidence_engine=engine, graph=graph, sqlite=provider, receipt_ids=set(persisted["receipt_ids"]), sqlite_counts=dict(persisted["sqlite_counts"]), vector_point_count=persisted["vector_point_count"], persisted_records=persisted["records"], ).audit_report(audit_type)  # noqa: E501
 
     from memory_server.application.application import MemoryApplication
     from memory_server.application.contracts import AuditCommand
@@ -785,20 +589,12 @@ async def _c_audit(provider, validator, engine, graph, persisted, audit_type="fu
         return graph
 
     app = MemoryApplication(
-        object(),
-        audit_validator=validator,
-        audit_confidence_engine=engine,
-        audit_sqlite=provider,
-        audit_state=persisted,
-        get_graph=get_graph,
-    )
+        object(), audit_validator=validator, audit_confidence_engine=engine, audit_sqlite=provider, audit_state=persisted, get_graph=get_graph, )  # noqa: E501
     return await app.audit.audit(AuditCommand(audit_type=audit_type))
 
 
 @pytest.mark.asyncio
-async def test_audit_red_real_persisted_report_before_borrowed_application_boundary(
-    provider, monkeypatch
-):
+async def test_audit_red_real_persisted_report_before_borrowed_application_boundary(provider, monkeypatch):
     from memory_server.evaluation.auditor import MemoryAuditor
 
     fact, validator, engine, graph, persisted = await _audit_fixture(provider)
@@ -813,9 +609,7 @@ async def test_audit_red_real_persisted_report_before_borrowed_application_bound
     report = await _c_audit(provider, validator, engine, graph, persisted)
     assert report["audit_type"] == "full"
     assert calls and any(
-        "memory_server.application.audit_service" == frame.frame.f_globals.get("__name__")
-        for frame in calls[0]
-    )
+        "memory_server.application.audit_service" == frame.frame.f_globals.get("__name__") for frame in calls[0] )
     assert await provider.get_fact(fact.id) is not None
     assert persisted["sqlite_counts"]["facts"] == 1
     assert report == await _c_audit(provider, validator, engine, graph, persisted)
@@ -848,9 +642,7 @@ async def test_audit_characterization_optional_resources_preserve_behavior(provi
 @pytest.mark.asyncio
 async def test_audit_characterization_invalid_type_is_forwarded(provider):
     fact, validator, engine, graph, persisted = await _audit_fixture(provider)
-    report = await _c_audit(
-        provider, validator, engine, graph, persisted, audit_type="invalid"
-    )
+    report = await _c_audit(provider, validator, engine, graph, persisted, audit_type="invalid")
     assert report["audit_type"] == "invalid"
     assert report["warnings"] == []
     assert report["errors"] == []
@@ -876,12 +668,7 @@ async def test_audit_application_missing_optional_resources_and_composition(prov
 
         persisted = await collect_persisted_audit_state(sqlite=provider)
         app = MemoryApplication(
-            object(),
-            policy=MemoryPolicy(max_active_beliefs=500),
-            audit_validator=Validator(),
-            audit_confidence_engine=ConfidenceEngine(),
-            audit_state=persisted,
-        )
+            object(), policy=MemoryPolicy(max_active_beliefs=500), audit_validator=Validator(), audit_confidence_engine=ConfidenceEngine(), audit_state=persisted, )  # noqa: E501
         result = await app.audit.audit(AuditCommand())
         assert result["audit_type"] == "full"
         with pytest.raises(UnknownDependencyError, match="audit service"):
