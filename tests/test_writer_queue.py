@@ -242,3 +242,127 @@ class TestWriterQueue:
         assert queue.total_flushed == 2
 
         await queue.shutdown()
+
+
+# Real storage boundary: writer.py -> api/learn.py:57-77 ->
+# ingestion_service.py:607-875 -> storage/repositories + real SQLite commit.
+def _canonical_snapshot(db):
+    import sqlite3
+
+    with sqlite3.connect(db) as connection:
+        return {
+            table: connection.execute(f'SELECT * FROM {table} ORDER BY id').fetchall()
+            for table in ('facts', 'receipts', 'outbox_entries')
+        }
+
+
+def _assert_canonical(db, results):
+    import sqlite3
+
+    ids = {entry['receipt']['id'] for result in results for entry in result['facts']}
+    assert len(ids) == len(results)
+    with sqlite3.connect(db) as connection:
+        facts = connection.execute('SELECT id, subject, predicate, object FROM facts').fetchall()
+        receipts = connection.execute('SELECT id, source, created_by FROM receipts').fetchall()
+        outbox = connection.execute('SELECT record_id, operation FROM outbox_entries').fetchall()
+    assert {row[0] for row in facts} == ids
+    assert {row[0] for row in receipts} == ids
+    assert {row[0] for row in outbox} == ids
+    assert len(facts) == len(receipts) == len(outbox) == len(results)
+    assert all(row[2] == 'is' for row in facts)
+    assert all(row[1].startswith('c05:') and row[2] == 'learn' for row in receipts)
+    return _canonical_snapshot(db)
+
+
+@pytest.mark.asyncio
+async def test_real_ingestion_callback_commits_and_reports_outcomes(tmp_path):
+    from memory_server.api.learn import learn
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+
+    db = tmp_path / 'ingestion.db'
+    provider = SQLiteProvider(url=f'sqlite+aiosqlite:///{db}', busy_timeout_ms=100)
+    await provider.initialize()
+    results, outcomes = [], []
+
+    async def callback(batch):
+        for messages, turn_id in batch:
+            result = await learn(provider, text=messages, source=f'c05:{turn_id}', llm_extractor=None)
+            results.append(result)
+            outcomes.append(((messages, turn_id), bool(result['facts']), None))
+        return outcomes
+
+    queue = WriterQueue(callback)
+    try:
+        for messages, tid in [('Docker is container', 'docker'), ('Python is language', 'python')]:
+            await queue.add_turn(messages, tid)
+        assert await queue.flush() == 2
+        assert queue.total_flushed == 2 and queue.total_failed == queue.total_requeued == 0
+        assert [outcome[1] for outcome in outcomes] == [True, True]
+        _assert_canonical(db, results)
+    finally:
+        await queue.shutdown()
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('interrupt', ['before_commit', 'after_commit', 'callback_cancelled'])
+async def test_interrupted_flush_then_retry_settles_without_duplicate_receipt(tmp_path, interrupt):
+    import time
+
+    from memory_server.api.learn import learn
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+
+    db = tmp_path / 'interrupted.db'
+    provider = SQLiteProvider(url=f'sqlite+aiosqlite:///{db}', busy_timeout_ms=100)
+    await provider.initialize()
+    entered, release = asyncio.Event(), asyncio.Event()
+    results, calls = [], []
+
+    async def callback(batch):
+        calls.append(batch)
+        if interrupt == 'before_commit':
+            entered.set()
+            await release.wait()
+        result = await learn(provider, text=batch[0][0], source='c05:cancel', llm_extractor=None)
+        results.append(result)
+        entered.set()
+        if interrupt == 'callback_cancelled':
+            raise asyncio.CancelledError
+        await release.wait()
+        return [(batch[0], True, None)]
+
+    queue = WriterQueue(callback)
+    caller = None
+    try:
+        await queue.add_turn('Docker is container', 'cancel')
+        caller = asyncio.create_task(queue.flush())
+        await asyncio.wait_for(entered.wait(), 2)
+        if interrupt != 'callback_cancelled':
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+        else:
+            await caller
+        before = _canonical_snapshot(db)
+        assert len(before['receipts']) == (0 if interrupt == 'before_commit' else 1)
+        retained = sum(len(batch.items) for batch in getattr(queue, '_in_flight', {}).values())
+        assert queue.total_flushed + queue.total_failed + retained == 1
+        report = await queue.flush_final(time.monotonic() + 0.01)
+        assert (report.flushed, report.failed, report.unsettled) == (0, 0, 1)
+        release.set()
+        report = await queue.flush_final(time.monotonic() + 2)
+        expected = (0, 1) if interrupt == 'callback_cancelled' else (1, 0)
+        assert (report.flushed, report.unsettled) == expected
+        after = _assert_canonical(db, results)
+        if interrupt != 'before_commit':
+            assert before == after
+        assert len(calls) == 1
+        await queue.flush_final(time.monotonic() + 2)
+        assert _canonical_snapshot(db) == after
+        assert len(calls) == 1 and queue.total_requeued == 0
+    finally:
+        release.set()
+        if caller is not None:
+            await asyncio.gather(caller, return_exceptions=True)
+        await queue.shutdown()
+        await provider.close()

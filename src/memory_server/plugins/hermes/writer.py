@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,28 @@ class _QueuedTurn:
     turn_id: str | None
     attempts: int = 0
     available_at: float = 0.0
+
+
+@dataclass(slots=True)
+class _InFlightBatch:
+    seq: int
+    items: list[_QueuedTurn]
+    started_at: float
+    callback_task: asyncio.Task | None = None
+    state: Literal["draining", "callback_running", "settled", "unsettled"] = "draining"
+    outcomes: list[tuple[tuple[Any, str | None], bool, str | None]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FlushReport:
+    """Cumulative accounting only; provenance stays private on the queue."""
+
+    total: int
+    flushed: int
+    failed: int
+    unsettled: int
+    failed_records: int
+    requeued: int
 
 
 class WriterQueue:
@@ -62,6 +85,11 @@ class WriterQueue:
         self._failed_items: list[dict[str, Any]] = []
         self._retry_heap: list[tuple[float, int, _QueuedTurn]] = []
         self._retry_sequence = 0
+        self._in_flight: dict[int, _InFlightBatch] = {}
+        self._batch_seq = 0
+        self._flush_lock = asyncio.Lock()
+        self._paused = False
+        self._admission_closed = False
 
     @property
     def total_queued(self) -> int:
@@ -112,6 +140,8 @@ class WriterQueue:
         if self._task is not None and not self._task.done():
             logger.warning("WriterQueue already started")
             return
+        if self._paused or self._admission_closed:
+            return
         self._task = asyncio.create_task(self._run())
         logger.info(
             "WriterQueue started (flush_interval=%s, max_batch=%s)",
@@ -124,53 +154,93 @@ class WriterQueue:
 
         Never blocks — the write happens asynchronously.
         """
-        await self._queue.put(_QueuedTurn(messages=messages, turn_id=turn_id))
+        if self._admission_closed:
+            raise RuntimeError("WriterQueue admission is closed")
+        self._queue.put_nowait(_QueuedTurn(messages=messages, turn_id=turn_id))
         self._total_queued += 1
         logger.debug("WriterQueue: queued turn %s (total=%s)", turn_id, self._total_queued)
 
     async def flush(self) -> int:
-        """Drain the queue synchronously.
+        """Serialize explicit/background passes, settling prior custody first."""
+        async with self._flush_lock:
+            if self._paused:
+                return 0
+            before = self._total_flushed
+            await self._settle_locked()
+            if not self._in_flight and not self._paused:
+                await self._flush_batch_locked()
+            return self._total_flushed - before
 
-        Returns the number of items successfully flushed in this pass.
-        """
-        now = time.monotonic()
-        self._drain_due_retries(now)
-        batch: list[_QueuedTurn] = []
-        # Drain all currently available items (non-blocking)
-        while not self._queue.empty():
+    async def _flush_batch_locked(self) -> None:
+        self._drain_due_retries(time.monotonic())
+        if self._queue.empty():
+            return
+        self._batch_seq += 1
+        ledger = _InFlightBatch(self._batch_seq, [], time.monotonic())
+        self._in_flight[ledger.seq] = ledger
+        # No await between dequeue and ledger custody (nor before task retention).
+        while len(ledger.items) < self._max_batch:
             try:
                 item = self._queue.get_nowait()
-                if item is _SENTINEL:
-                    continue
-                batch.append(item)
             except asyncio.QueueEmpty:
                 break
-            if len(batch) >= self._max_batch:
-                break
+            if item is not _SENTINEL:
+                ledger.items.append(item)
+        if not ledger.items:
+            del self._in_flight[ledger.seq]
+            return
+        callback_batch = [(item.messages, item.turn_id) for item in ledger.items]
+        ledger.callback_task = asyncio.ensure_future(self._invoke_callback(callback_batch))
+        ledger.state = "callback_running"
+        await self._settle_locked()
 
-        if not batch:
-            return 0
-
-        outcomes: list[tuple[tuple[Any, str | None], bool, str | None]]
+    async def _invoke_callback(self, batch):
         try:
-            callback_batch = [(item.messages, item.turn_id) for item in batch]
-            result = self._write_callback(callback_batch)
-            if asyncio.iscoroutine(result):
+            result = self._write_callback(batch)
+            if inspect.isawaitable(result):
                 result = await result
             if result is None:
-                outcomes = [((item.messages, item.turn_id), True, None) for item in batch]
-            elif isinstance(result, list):
-                if len(result) != len(batch):
-                    raise RuntimeError(
-                        f"write callback returned {len(result)} outcomes for {len(batch)} items"
-                    )
-                outcomes = result
-            else:
+                return [(item, True, None) for item in batch]
+            if not isinstance(result, list):
                 raise RuntimeError(f"write callback returned unsupported result: {type(result)!r}")
+            if len(result) != len(batch):
+                raise RuntimeError(
+                    f"write callback returned {len(result)} outcomes for {len(batch)} items"
+                )
+            # Validate the WHOLE batch before any counter/retry mutation.
+            for item, outcome in zip(batch, result, strict=True):
+                if (not isinstance(outcome, (tuple, list)) or len(outcome) != 3
+                        or not isinstance(outcome[0], (tuple, list))
+                        or len(outcome[0]) != 2 or tuple(outcome[0]) != item
+                        or type(outcome[1]) is not bool
+                        or (outcome[2] is not None and not isinstance(outcome[2], str))):
+                    raise RuntimeError("write callback returned invalid per-item outcome")
+            return result
         except Exception as exc:
             logger.exception("WriterQueue: flush failed for %s items", len(batch))
-            outcomes = [((item.messages, item.turn_id), False, str(exc)) for item in batch]
+            return [(item, False, str(exc)) for item in batch]
 
+    async def _settle_locked(self) -> None:
+        for ledger in list(self._in_flight.values()):
+            task = ledger.callback_task
+            if task is None:
+                ledger.state = "unsettled"
+                continue
+            try:
+                ledger.outcomes = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                ledger.state = "unsettled"
+                # Distinguish caller cancellation from the callback's unknown
+                # outcome. Neither is evidence permitting a replay.
+                caller = asyncio.current_task()
+                if caller is not None and caller.cancelling():
+                    raise
+                continue
+            self._apply_outcomes(ledger.items, ledger.outcomes)
+            ledger.state = "settled"
+            del self._in_flight[ledger.seq]
+
+    def _apply_outcomes(self, batch, outcomes) -> int:
         flushed_now = 0
         for item, outcome in zip(batch, outcomes, strict=True):
             _, ok, error = outcome
@@ -218,44 +288,76 @@ class WriterQueue:
         )
         return flushed_now
 
-    async def shutdown(self) -> int:
-        """Flush remaining items and stop the background loop.
+    def stop_admission(self) -> None:
+        """Freeze accepted work; no new turn can enter after this call."""
+        self._admission_closed = True
 
-        Returns the number of items flushed during shutdown.
-        """
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+    async def pause(self) -> None:
+        """Stop normal batches, without cancelling the owned callback task."""
+        self._paused = True
+        task = self._task
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            # wait() does not propagate cancellation into the background task;
+            # the batch callback is separately shielded and strongly retained.
+            await asyncio.wait([task])
+            if not task.cancelled():
+                task.result()
             self._task = None
 
-        flushed = 0
-        while True:
-            passed = await self.flush()
-            flushed += passed
-            if self._queue.empty() and not self._retry_heap:
-                break
-            if self._retry_heap:
-                delay = max(0.0, self._retry_heap[0][0] - time.monotonic())
-                await asyncio.sleep(min(delay, 0.05))
-            else:
-                await asyncio.sleep(0)
-        logger.info(
-            "WriterQueue: shutdown complete (queued=%s, flushed=%s, failed=%s, requeued=%s)",
-            self._total_queued,
-            self._total_flushed,
-            self._total_failed,
-            self._total_requeued,
+    def _report(self) -> FlushReport:
+        return FlushReport(
+            total=self._total_queued,
+            flushed=self._total_flushed,
+            failed=self._total_failed,
+            unsettled=self._total_queued - self._total_flushed - self._total_failed,
+            failed_records=len(self._failed_items),
+            requeued=self._total_requeued,
         )
-        return flushed
+
+    async def settle(self) -> FlushReport:
+        """Join original callback tasks; never start a fresh callback here."""
+        async with self._flush_lock:
+            await self._settle_locked()
+            return self._report()
+
+    async def flush_final(self, deadline: float) -> FlushReport:
+        """Drain under one lock until an absolute monotonic deadline.
+
+        A timeout cancels only this waiter. Callback custody survives in the
+        ledger, and a later invocation resumes the same operation first.
+        """
+        if deadline <= time.monotonic():
+            return self._report()
+        try:
+            async with asyncio.timeout(deadline - time.monotonic()):
+                async with self._flush_lock:
+                    await self._settle_locked()
+                    while not self._in_flight:
+                        if time.monotonic() >= deadline:
+                            break
+                        await self._flush_batch_locked()
+                        if self._in_flight or (self._queue.empty() and not self._retry_heap):
+                            break
+                        if self._queue.empty() and self._retry_heap:
+                            delay = max(0.0, self._retry_heap[0][0] - time.monotonic())
+                            await asyncio.sleep(min(delay, 0.05))
+        except TimeoutError:
+            pass
+        return self._report()
+
+    async def shutdown(self) -> int:
+        """Compatibility wrapper: pause, final flush, return this call's count."""
+        before = self._total_flushed
+        await self.pause()
+        report = await self.flush_final(time.monotonic() + 30.0)
+        return report.flushed - before
 
     async def _run(self) -> None:
-        """Background loop: periodically flush pending items."""
+        """Background loop: never drain retry custody outside the flush lock."""
         try:
-            while True:
-                self._drain_due_retries(time.monotonic())
+            while not self._paused:
                 await asyncio.sleep(self._flush_interval)
                 await self.flush()
         except asyncio.CancelledError:
