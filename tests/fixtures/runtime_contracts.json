@@ -1,0 +1,1163 @@
+{
+ "mcp": {
+  "canonical_effects": {
+   "beliefs": [
+    [
+     "Baseline proposition one",
+     0.7,
+     "active",
+     1
+    ],
+    [
+     "Baseline proposition two",
+     0.4,
+     "discarded",
+     2
+    ]
+   ],
+   "facts": [
+    [
+     "Caddy",
+     "is",
+     "a web server",
+     0.5,
+     "active"
+    ],
+    [
+     "Caddy",
+     "serves",
+     "static files",
+     1.0,
+     "active"
+    ],
+    [
+     "PostgreSQL",
+     "stores",
+     "user data",
+     1.0,
+     "discarded"
+    ]
+   ],
+   "lifecycle_events": 2,
+   "outbox_by_record_and_operation": {
+    "belief:index_belief": 2,
+    "fact:index_fact": 3
+   },
+   "receipts_by_memory_type": {
+    "belief": 2,
+    "fact": 3
+   }
+  },
+  "contract_drift": {
+   "graph_search": {
+    "only_in_contract": [],
+    "only_in_live_tool": [
+     "relation_type"
+    ]
+   },
+   "reflect": {
+    "only_in_contract": [
+     "context",
+     "strict_same_context"
+    ],
+    "only_in_live_tool": []
+   }
+  },
+  "contracts": {
+   "files": [
+    "audit.schema.json",
+    "common.schema.json",
+    "get_belief.schema.json",
+    "get_context.schema.json",
+    "graph_search.schema.json",
+    "learn.schema.json",
+    "ping.schema.json",
+    "reflect.schema.json",
+    "remember.schema.json",
+    "resolve_conflict.schema.json",
+    "route.schema.json",
+    "search.schema.json",
+    "semantic_search.schema.json",
+    "set_belief.schema.json"
+   ],
+   "property_drift": {},
+   "tool_contracts": {
+    "audit": [
+     "audit_type"
+    ],
+    "get_belief": [
+     "creator",
+     "lifecycle_state",
+     "limit",
+     "min_confidence",
+     "proposition",
+     "source",
+     "source_id",
+     "tags"
+    ],
+    "get_context": [
+     "max_results",
+     "subject",
+     "task"
+    ],
+    "graph_search": [
+     "entity_id",
+     "query",
+     "source_id",
+     "target_id"
+    ],
+    "learn": [
+     "extract_beliefs",
+     "min_belief_confidence",
+     "source",
+     "text"
+    ],
+    "ping": [],
+    "reflect": [
+     "context",
+     "limit",
+     "min_confidence",
+     "mode",
+     "strict_same_context",
+     "topic"
+    ],
+    "remember": [
+     "confidence",
+     "object",
+     "predicate",
+     "source",
+     "subject"
+    ],
+    "resolve_conflict": [
+     "auto_resolve",
+     "belief_a_id",
+     "belief_b_id",
+     "new_proposition",
+     "resolution"
+    ],
+    "route": [
+     "query",
+     "score_threshold",
+     "top_k"
+    ],
+    "search": [
+     "limit",
+     "predicate",
+     "query",
+     "subject"
+    ],
+    "semantic_search": [
+     "query",
+     "score_threshold",
+     "top_k"
+    ],
+    "set_belief": [
+     "confidence",
+     "proposition",
+     "replace_belief_id",
+     "source",
+     "sources",
+     "tags"
+    ]
+   },
+   "tools_without_contract": [
+    "add_relation",
+    "invalidate",
+    "metrics"
+   ]
+  },
+  "entries": {
+   "happy.0.ping": {
+    "isError": false,
+    "observed": "{\"status\": \"ok\"}",
+    "raw": "{\"status\": \"ok\"}",
+    "transcript_sha256": "08e2c358ce13cb67f94ebb35b0f67c8763190a857c0db68da6eb196dfe9da46a"
+   },
+   "happy.1.search": {
+    "isError": false,
+    "observed": "{\"results\": [], \"total\": 0}",
+    "raw": "{\"results\": [], \"total\": 0}",
+    "transcript_sha256": "0debf9852a210eb23eaa6a4ff7cffcf14c2456fe884771264e88b4c6af8313a3"
+   },
+   "happy.10.add_relation": {
+    "isError": false,
+    "observed": "{\"edge\": {\"source_id\": \"seed-node-alpha\", \"target_id\": \"seed-node-beta\", \"relation\": \"supports\", \"attributes\": {}}, \"source\": {\"id\": \"seed-node-alpha\", \"type\": \"fact\", \"name\": \"PostgreSQL stores user data\", \"attributes\": {}}, \"target\": {\"id\": \"seed-node-beta\", \"type\": \"fact\", \"name\": \"Caddy serves static files\", \"attributes\": {}}}",
+    "raw": "{\"edge\": {\"source_id\": \"seed-node-alpha\", \"target_id\": \"seed-node-beta\", \"relation\": \"supports\", \"attributes\": {}}, \"source\": {\"id\": \"seed-node-alpha\", \"type\": \"fact\", \"name\": \"PostgreSQL stores user data\", \"attributes\": {}}, \"target\": {\"id\": \"seed-node-beta\", \"type\": \"fact\", \"name\": \"Caddy serves static files\", \"attributes\": {}}}",
+    "transcript_sha256": "3655333e8d74c4e79bd1f948116a599d62274a2725c5a63a6820c51c7f089af6"
+   },
+   "happy.11.graph_search": {
+    "isError": false,
+    "observed": "{\"nodes\": [{\"id\": \"seed-node-alpha\", \"name\": \"PostgreSQL stores user data\", \"type\": \"fact\", \"attributes\": {}}, {\"id\": \"seed-node-beta\", \"name\": \"Caddy serves static files\", \"type\": \"fact\", \"attributes\": {}}], \"edges\": [{\"source_id\": \"seed-node-alpha\", \"source_name\": \"PostgreSQL stores user data\", \"target_id\": \"seed-node-beta\", \"target_name\": \"Caddy serves static files\", \"relation\": \"supports\", \"attributes\": {}}], \"paths\": []}",
+    "raw": "{\"nodes\": [{\"id\": \"seed-node-alpha\", \"name\": \"PostgreSQL stores user data\", \"type\": \"fact\", \"attributes\": {}}, {\"id\": \"seed-node-beta\", \"name\": \"Caddy serves static files\", \"type\": \"fact\", \"attributes\": {}}], \"edges\": [{\"source_id\": \"seed-node-alpha\", \"source_name\": \"PostgreSQL stores user data\", \"target_id\": \"seed-node-beta\", \"target_name\": \"Caddy serves static files\", \"relation\": \"supports\", \"attributes\": {}}], \"paths\": []}",
+    "transcript_sha256": "bc25461de206526a3323575681c61ab4c0cbae5e831840b520ec5af5b44ea6ce"
+   },
+   "happy.12.learn": {
+    "isError": false,
+    "observed": "{\"facts\": [{\"receipt\": {\"id\": \"<uuid>\", \"memory_type\": \"fact\", \"source\": \"baseline\", \"created_by\": \"learn\", \"timestamp\": \"<timestamp>\", \"confidence\": 0.5, \"verification_status\": \"candidate\", \"history\": [], \"updated_at\": \"<timestamp>\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"item\": {\"id\": \"<uuid>\", \"subject\": \"Caddy\", \"predicate\": \"is\", \"object\": \"a web server\", \"dedup_key\": \"Caddy\\u001fis\\u001fa web server\", \"confidence\": 0.5, \"source\": \"baseline\", \"creator\": \"baseline\", \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\", \"version\": 1}}], \"decisions\": [], \"skills\": [], \"beliefs\": [], \"receipts\": [{\"id\": \"<uuid>\", \"memory_type\": \"fact\", \"source\": \"baseline\", \"created_by\": \"learn\", \"timestamp\": \"<timestamp>\", \"confidence\": 0.5, \"verification_status\": \"candidate\", \"history\": [], \"updated_at\": \"<timestamp>\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}]}",
+    "raw": "{\"facts\": [{\"receipt\": {\"id\": \"7fcfa5f4-2b80-4730-b207-20e28e2cfec9\", \"memory_type\": \"fact\", \"source\": \"baseline\", \"created_by\": \"learn\", \"timestamp\": \"2026-10-16T00:57:57.854527\", \"confidence\": 0.5, \"verification_status\": \"candidate\", \"history\": [], \"updated_at\": \"2026-10-16T00:57:57.856852\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"item\": {\"id\": \"7fcfa5f4-2b80-4730-b207-20e28e2cfec9\", \"subject\": \"Caddy\", \"predicate\": \"is\", \"object\": \"a web server\", \"dedup_key\": \"Caddy\\u001fis\\u001fa web server\", \"confidence\": 0.5, \"source\": \"baseline\", \"creator\": \"baseline\", \"created_at\": \"2026-10-16T00:57:57.854527\", \"updated_at\": \"2026-10-16T00:57:57.855684\", \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\", \"version\": 1}}], \"decisions\": [], \"skills\": [], \"beliefs\": [], \"receipts\": [{\"id\": \"7fcfa5f4-2b80-4730-b207-20e28e2cfec9\", \"memory_type\": \"fact\", \"source\": \"baseline\", \"created_by\": \"learn\", \"timestamp\": \"2026-10-16T00:57:57.854527\", \"confidence\": 0.5, \"verification_status\": \"candidate\", \"history\": [], \"updated_at\": \"2026-10-16T00:57:57.856852\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}]}",
+    "transcript_sha256": "d2f6d636d20fc8c01d6b9a1120918ae75178e158222ea667428d1fd0aa1325ba"
+   },
+   "happy.13.set_belief": {
+    "isError": false,
+    "observed": "{\"belief\": {\"id\": \"<uuid>\", \"proposition\": \"Baseline proposition one\", \"confidence\": 0.7, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"last_reinforced_at\": \"<timestamp>\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}, \"receipt\": {\"id\": \"<uuid>\", \"memory_type\": \"belief\", \"source\": \"baseline\", \"created_by\": \"baseline\", \"timestamp\": \"<timestamp>\", \"confidence\": 0.7, \"verification_status\": \"unverified\", \"history\": [], \"updated_at\": \"<timestamp>\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"superseded\": null}",
+    "raw": "{\"belief\": {\"id\": \"9d23d9c0-1963-4d7a-986b-b6cb89c03ffc\", \"proposition\": \"Baseline proposition one\", \"confidence\": 0.7, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"2026-10-16T00:57:57.860554Z\", \"updated_at\": \"2026-10-16T00:57:57.860555Z\", \"last_reinforced_at\": \"2026-10-16T00:57:57.860555Z\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}, \"receipt\": {\"id\": \"9d23d9c0-1963-4d7a-986b-b6cb89c03ffc\", \"memory_type\": \"belief\", \"source\": \"baseline\", \"created_by\": \"baseline\", \"timestamp\": \"2026-10-16T00:57:57.860562Z\", \"confidence\": 0.7, \"verification_status\": \"unverified\", \"history\": [], \"updated_at\": \"2026-10-16T00:57:57.860565Z\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"superseded\": null}",
+    "transcript_sha256": "52d7158c36eea7f4fc1e666be0ceb311f1943f9dc2a43118a90a182f84f007d5"
+   },
+   "happy.14.set_belief": {
+    "isError": false,
+    "observed": "{\"belief\": {\"id\": \"<uuid>\", \"proposition\": \"Baseline proposition two\", \"confidence\": 0.4, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"last_reinforced_at\": \"<timestamp>\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}, \"receipt\": {\"id\": \"<uuid>\", \"memory_type\": \"belief\", \"source\": \"baseline\", \"created_by\": \"baseline\", \"timestamp\": \"<timestamp>\", \"confidence\": 0.4, \"verification_status\": \"unverified\", \"history\": [], \"updated_at\": \"<timestamp>\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"superseded\": null}",
+    "raw": "{\"belief\": {\"id\": \"844b2c19-b56f-4159-a00e-33ccbc1a1fc4\", \"proposition\": \"Baseline proposition two\", \"confidence\": 0.4, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"2026-10-16T00:57:57.865569Z\", \"updated_at\": \"2026-10-16T00:57:57.865570Z\", \"last_reinforced_at\": \"2026-10-16T00:57:57.865571Z\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}, \"receipt\": {\"id\": \"844b2c19-b56f-4159-a00e-33ccbc1a1fc4\", \"memory_type\": \"belief\", \"source\": \"baseline\", \"created_by\": \"baseline\", \"timestamp\": \"2026-10-16T00:57:57.865575Z\", \"confidence\": 0.4, \"verification_status\": \"unverified\", \"history\": [], \"updated_at\": \"2026-10-16T00:57:57.865578Z\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"superseded\": null}",
+    "transcript_sha256": "46efa56fb7f5dcb2daa967cbb25f77b66d9d2b9504bdc669f8f7c9f5bf9d8c2b"
+   },
+   "happy.15.get_belief": {
+    "isError": false,
+    "observed": "{\"total\": 2, \"beliefs\": [{\"id\": \"<uuid>\", \"proposition\": \"Baseline proposition two\", \"confidence\": 0.4, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"last_reinforced_at\": \"<timestamp>\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}, {\"id\": \"<uuid>\", \"proposition\": \"Baseline proposition one\", \"confidence\": 0.7, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"last_reinforced_at\": \"<timestamp>\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}], \"query\": {\"proposition\": \"Baseline\", \"lifecycle_state\": \"active\", \"min_confidence\": 0.0, \"tags\": null, \"source\": \"\", \"creator\": \"\", \"source_id\": \"\", \"limit\": 10}}",
+    "raw": "{\"total\": 2, \"beliefs\": [{\"id\": \"844b2c19-b56f-4159-a00e-33ccbc1a1fc4\", \"proposition\": \"Baseline proposition two\", \"confidence\": 0.4, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"2026-10-16T00:57:57.865569\", \"updated_at\": \"2026-10-16T00:57:57.865570\", \"last_reinforced_at\": \"2026-10-16T00:57:57.865571\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}, {\"id\": \"9d23d9c0-1963-4d7a-986b-b6cb89c03ffc\", \"proposition\": \"Baseline proposition one\", \"confidence\": 0.7, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"2026-10-16T00:57:57.860554\", \"updated_at\": \"2026-10-16T00:57:57.860555\", \"last_reinforced_at\": \"2026-10-16T00:57:57.860555\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}], \"query\": {\"proposition\": \"Baseline\", \"lifecycle_state\": \"active\", \"min_confidence\": 0.0, \"tags\": null, \"source\": \"\", \"creator\": \"\", \"source_id\": \"\", \"limit\": 10}}",
+    "transcript_sha256": "0e88c0f195e9ba4e15da4a6cde6eace23cef6e7b64358b55bec6a35c08b01d94"
+   },
+   "happy.16.reflect": {
+    "isError": false,
+    "observed": "{\"mode\": \"overview\", \"total_beliefs\": 2, \"by_lifecycle_state\": {\"active\": 2}, \"by_topics\": {\"untagged\": 2}, \"confidence\": {\"high_0.8_1.0\": 0, \"medium_0.5_0.8\": 1, \"low_0.0_0.5\": 1, \"average\": 0.55}, \"contradiction_count\": 0, \"conflicts\": {\"total\": 0, \"unresolved\": 0, \"auto_resolvable\": 0, \"age_hours_max\": 0}, \"stale_count\": 0, \"decaying_next_7d\": 0, \"no_evidence_count\": 2, \"evidence_stats_status\": \"ok\", \"oldest_belief_days\": 0.0, \"newest_belief_days\": 0.0}",
+    "raw": "{\"mode\": \"overview\", \"total_beliefs\": 2, \"by_lifecycle_state\": {\"active\": 2}, \"by_topics\": {\"untagged\": 2}, \"confidence\": {\"high_0.8_1.0\": 0, \"medium_0.5_0.8\": 1, \"low_0.0_0.5\": 1, \"average\": 0.55}, \"contradiction_count\": 0, \"conflicts\": {\"total\": 0, \"unresolved\": 0, \"auto_resolvable\": 0, \"age_hours_max\": 0}, \"stale_count\": 0, \"decaying_next_7d\": 0, \"no_evidence_count\": 2, \"evidence_stats_status\": \"ok\", \"oldest_belief_days\": 0.0, \"newest_belief_days\": 0.0}",
+    "transcript_sha256": "c423cbea8a4534f5488f69d158c916a56085291a4976e674c46d926c3ceba050"
+   },
+   "happy.17.audit": {
+    "isError": false,
+    "observed": "{\"audit_type\": \"full\", \"warnings\": [\"SQL/vector drift detected: 3 SQL facts vs 0 Qdrant points (100.0% drift, more SQL facts than Qdrant points)\", \"SQL/graph drift detected: 3 SQL facts vs 2 graph nodes (33.3% drift, more SQL facts than graph nodes)\"], \"errors\": [], \"stats\": {\"confidence\": {\"total\": 3, \"buckets\": {\"0.0-0.3\": 0, \"0.3-0.5\": 0, \"0.5-0.7\": 1, \"0.7-0.85\": 0, \"0.85-1.0\": 2}, \"low_confidence\": []}, \"sql_vector_drift\": {\"sql_facts\": 3, \"qdrant_points\": 0, \"drift_pct\": 100.0}, \"sql_graph_drift\": {\"sql_facts\": 3, \"graph_nodes\": 2, \"drift_pct\": 33.33}, \"total_facts\": 3, \"total_decisions\": 0, \"total_skills\": 0, \"total_receipts\": 5, \"total_graph_nodes\": 2, \"total_qdrant_points\": 0}}",
+    "raw": "{\"audit_type\": \"full\", \"warnings\": [\"SQL/vector drift detected: 3 SQL facts vs 0 Qdrant points (100.0% drift, more SQL facts than Qdrant points)\", \"SQL/graph drift detected: 3 SQL facts vs 2 graph nodes (33.3% drift, more SQL facts than graph nodes)\"], \"errors\": [], \"stats\": {\"confidence\": {\"total\": 3, \"buckets\": {\"0.0-0.3\": 0, \"0.3-0.5\": 0, \"0.5-0.7\": 1, \"0.7-0.85\": 0, \"0.85-1.0\": 2}, \"low_confidence\": []}, \"sql_vector_drift\": {\"sql_facts\": 3, \"qdrant_points\": 0, \"drift_pct\": 100.0}, \"sql_graph_drift\": {\"sql_facts\": 3, \"graph_nodes\": 2, \"drift_pct\": 33.33}, \"total_facts\": 3, \"total_decisions\": 0, \"total_skills\": 0, \"total_receipts\": 5, \"total_graph_nodes\": 2, \"total_qdrant_points\": 0}}",
+    "transcript_sha256": "6b21e3e86dade73b3b448c626d9bb98297cd55e74123f8b1c063685f1a6b892a"
+   },
+   "happy.18.metrics": {
+    "isError": false,
+    "observed": "{\"families\": [[\"cmms_layout_validation_failures_created\", \"gauge\"], [\"cmms_layout_validation_failures_total\", \"counter\"], [\"cmms_migration_runs_total\", \"counter\"], [\"cmms_projection_verification_failures_created\", \"gauge\"], [\"cmms_projection_verification_failures_total\", \"counter\"], [\"derived_index_drift\", \"gauge\"], [\"reindex_repair_created\", \"gauge\"], [\"reindex_repair_total\", \"counter\"], [\"remember_latency_ms\", \"histogram\"], [\"remember_latency_ms_created\", \"gauge\"], [\"search_latency_ms\", \"histogram\"], [\"search_latency_ms_created\", \"gauge\"], [\"semantic_search_latency_ms\", \"histogram\"], [\"semantic_search_latency_ms_created\", \"gauge\"], [\"sqlite_busy_events_created\", \"gauge\"], [\"sqlite_busy_events_total\", \"counter\"], [\"tool_calls_created\", \"gauge\"], [\"tool_calls_total\", \"counter\"], [\"tool_error_total\", \"counter\"]], \"samples\": [\"cmms_layout_validation_failures_created{code=\\\"E_ARTIFACT_IDENTITY_CHANGED\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_FORBIDDEN_TARGET_ROOT\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_HERMES_HOME_REQUIRED\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_FINAL_SYMLINK_UNSAFE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_HARDLINK_UNSAFE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_OUTSIDE_ROOT\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_OVERLAP\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_SPECIAL_FILE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_SYMLINK_PARENT\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PROFILE_ROOT_EXTERNAL\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_QDRANT_PROFILE_NAMESPACE_UNDEFINED\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_SHARED_ROOT_RELATIVE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_SHARED_ROOT_REQUIRED\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_SHARED_SPLIT_LAYOUT\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_STANDALONE_ROOT_RELATIVE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_STORAGE_MODE_INVALID\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_VECTOR_BACKEND_INVALID\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_ARTIFACT_IDENTITY_CHANGED\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_FORBIDDEN_TARGET_ROOT\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_HERMES_HOME_REQUIRED\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_FINAL_SYMLINK_UNSAFE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_HARDLINK_UNSAFE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_OUTSIDE_ROOT\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_OVERLAP\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_SPECIAL_FILE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_SYMLINK_PARENT\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PROFILE_ROOT_EXTERNAL\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_QDRANT_PROFILE_NAMESPACE_UNDEFINED\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_SHARED_ROOT_RELATIVE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_SHARED_ROOT_REQUIRED\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_SHARED_SPLIT_LAYOUT\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_STANDALONE_ROOT_RELATIVE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_STORAGE_MODE_INVALID\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_VECTOR_BACKEND_INVALID\\\"}\", \"cmms_projection_verification_failures_created{store=\\\"graph\\\"}\", \"cmms_projection_verification_failures_created{store=\\\"vector\\\"}\", \"cmms_projection_verification_failures_total{store=\\\"graph\\\"}\", \"cmms_projection_verification_failures_total{store=\\\"vector\\\"}\", \"derived_index_drift\", \"reindex_repair_created\", \"reindex_repair_total\", \"remember_latency_ms_bucket{le=\\\"+Inf\\\"}\", \"remember_latency_ms_bucket{le=\\\"10.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"100.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"25.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"250.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"5.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"50.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"500.0\\\"}\", \"remember_latency_ms_count\", \"remember_latency_ms_created\", \"remember_latency_ms_sum\", \"search_latency_ms_bucket{le=\\\"+Inf\\\"}\", \"search_latency_ms_bucket{le=\\\"1.0\\\"}\", \"search_latency_ms_bucket{le=\\\"10.0\\\"}\", \"search_latency_ms_bucket{le=\\\"100.0\\\"}\", \"search_latency_ms_bucket{le=\\\"25.0\\\"}\", \"search_latency_ms_bucket{le=\\\"250.0\\\"}\", \"search_latency_ms_bucket{le=\\\"5.0\\\"}\", \"search_latency_ms_bucket{le=\\\"50.0\\\"}\", \"search_latency_ms_bucket{le=\\\"500.0\\\"}\", \"search_latency_ms_count\", \"search_latency_ms_created\", \"search_latency_ms_sum\", \"semantic_search_latency_ms_bucket{le=\\\"+Inf\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"10.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"100.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"1000.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"25.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"250.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"50.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"500.0\\\"}\", \"semantic_search_latency_ms_count\", \"semantic_search_latency_ms_created\", \"semantic_search_latency_ms_sum\", \"sqlite_busy_events_created\", \"sqlite_busy_events_total\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"add_relation\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"audit\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"get_belief\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"get_context\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"graph_search\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"learn\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"ping\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"reflect\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"remember\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"route\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"search\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"semantic_search\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"set_belief\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"add_relation\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"audit\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"get_belief\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"get_context\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"graph_search\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"learn\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"ping\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"reflect\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"remember\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"route\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"search\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"semantic_search\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"set_belief\\\"}\"]}",
+    "raw": "# HELP cmms_layout_validation_failures_total Storage layout validation failures\n# TYPE cmms_layout_validation_failures_total counter\ncmms_layout_validation_failures_total{code=\"E_ARTIFACT_IDENTITY_CHANGED\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_FORBIDDEN_TARGET_ROOT\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_HERMES_HOME_REQUIRED\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_FINAL_SYMLINK_UNSAFE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_HARDLINK_UNSAFE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_OUTSIDE_ROOT\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_OVERLAP\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_SPECIAL_FILE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_SYMLINK_PARENT\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PROFILE_ROOT_EXTERNAL\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_QDRANT_PROFILE_NAMESPACE_UNDEFINED\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_SHARED_ROOT_REQUIRED\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_SHARED_ROOT_RELATIVE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_SHARED_SPLIT_LAYOUT\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_STANDALONE_ROOT_RELATIVE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_STORAGE_MODE_INVALID\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_VECTOR_BACKEND_INVALID\"} 0.0\n# HELP cmms_layout_validation_failures_created Storage layout validation failures\n# TYPE cmms_layout_validation_failures_created gauge\ncmms_layout_validation_failures_created{code=\"E_ARTIFACT_IDENTITY_CHANGED\"} 1.792112273600076e+09\ncmms_layout_validation_failures_created{code=\"E_FORBIDDEN_TARGET_ROOT\"} 1.792112273600084e+09\ncmms_layout_validation_failures_created{code=\"E_HERMES_HOME_REQUIRED\"} 1.7921122736000886e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_FINAL_SYMLINK_UNSAFE\"} 1.7921122736000922e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_HARDLINK_UNSAFE\"} 1.7921122736000967e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_OUTSIDE_ROOT\"} 1.7921122736001e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_OVERLAP\"} 1.7921122736001034e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_SPECIAL_FILE\"} 1.792112273600106e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_SYMLINK_PARENT\"} 1.7921122736001084e+09\ncmms_layout_validation_failures_created{code=\"E_PROFILE_ROOT_EXTERNAL\"} 1.7921122736001108e+09\ncmms_layout_validation_failures_created{code=\"E_QDRANT_PROFILE_NAMESPACE_UNDEFINED\"} 1.7921122736001136e+09\ncmms_layout_validation_failures_created{code=\"E_SHARED_ROOT_REQUIRED\"} 1.7921122736001189e+09\ncmms_layout_validation_failures_created{code=\"E_SHARED_ROOT_RELATIVE\"} 1.7921122736001215e+09\ncmms_layout_validation_failures_created{code=\"E_SHARED_SPLIT_LAYOUT\"} 1.7921122736001241e+09\ncmms_layout_validation_failures_created{code=\"E_STANDALONE_ROOT_RELATIVE\"} 1.792112273600127e+09\ncmms_layout_validation_failures_created{code=\"E_STORAGE_MODE_INVALID\"} 1.7921122736001298e+09\ncmms_layout_validation_failures_created{code=\"E_VECTOR_BACKEND_INVALID\"} 1.792112273600132e+09\n# HELP cmms_projection_verification_failures_total Projection verification failures\n# TYPE cmms_projection_verification_failures_total counter\ncmms_projection_verification_failures_total{store=\"vector\"} 0.0\ncmms_projection_verification_failures_total{store=\"graph\"} 0.0\n# HELP cmms_projection_verification_failures_created Projection verification failures\n# TYPE cmms_projection_verification_failures_created gauge\ncmms_projection_verification_failures_created{store=\"vector\"} 1.7921122737032607e+09\ncmms_projection_verification_failures_created{store=\"graph\"} 1.792112273703266e+09\n# HELP cmms_migration_runs_total Terminal profile migration runs\n# TYPE cmms_migration_runs_total counter\n# HELP tool_calls_total Total MCP tool calls\n# TYPE tool_calls_total counter\ntool_calls_total{status=\"success\",tool=\"ping\"} 1.0\ntool_calls_total{status=\"success\",tool=\"search\"} 1.0\ntool_calls_total{status=\"success\",tool=\"get_context\"} 1.0\ntool_calls_total{status=\"success\",tool=\"semantic_search\"} 1.0\ntool_calls_total{status=\"success\",tool=\"graph_search\"} 2.0\ntool_calls_total{status=\"success\",tool=\"route\"} 1.0\ntool_calls_total{status=\"success\",tool=\"get_belief\"} 2.0\ntool_calls_total{status=\"success\",tool=\"reflect\"} 2.0\ntool_calls_total{status=\"success\",tool=\"remember\"} 2.0\ntool_calls_total{status=\"success\",tool=\"add_relation\"} 1.0\ntool_calls_total{status=\"success\",tool=\"learn\"} 1.0\ntool_calls_total{status=\"success\",tool=\"set_belief\"} 2.0\ntool_calls_total{status=\"success\",tool=\"audit\"} 1.0\n# HELP tool_calls_created Total MCP tool calls\n# TYPE tool_calls_created gauge\ntool_calls_created{status=\"success\",tool=\"ping\"} 1.792112274731262e+09\ntool_calls_created{status=\"success\",tool=\"search\"} 1.7921122747398565e+09\ntool_calls_created{status=\"success\",tool=\"get_context\"} 1.792112274747638e+09\ntool_calls_created{status=\"success\",tool=\"semantic_search\"} 1.7921122747510774e+09\ntool_calls_created{status=\"success\",tool=\"graph_search\"} 1.7921122747539794e+09\ntool_calls_created{status=\"success\",tool=\"route\"} 1.7921122778230839e+09\ntool_calls_created{status=\"success\",tool=\"get_belief\"} 1.7921122778294473e+09\ntool_calls_created{status=\"success\",tool=\"reflect\"} 1.792112277833044e+09\ntool_calls_created{status=\"success\",tool=\"remember\"} 1.7921122778412445e+09\ntool_calls_created{status=\"success\",tool=\"add_relation\"} 1.7921122778508384e+09\ntool_calls_created{status=\"success\",tool=\"learn\"} 1.792112277857931e+09\ntool_calls_created{status=\"success\",tool=\"set_belief\"} 1.7921122778631883e+09\ntool_calls_created{status=\"success\",tool=\"audit\"} 1.7921122778831837e+09\n# HELP tool_error_total Total tool errors\n# TYPE tool_error_total counter\n# HELP reindex_repair_total Reindex repairs triggered\n# TYPE reindex_repair_total counter\nreindex_repair_total 0.0\n# HELP reindex_repair_created Reindex repairs triggered\n# TYPE reindex_repair_created gauge\nreindex_repair_created 1.7921122747311656e+09\n# HELP sqlite_busy_events_total SQLite WAL busy events\n# TYPE sqlite_busy_events_total counter\nsqlite_busy_events_total 0.0\n# HELP sqlite_busy_events_created SQLite WAL busy events\n# TYPE sqlite_busy_events_created gauge\nsqlite_busy_events_created 1.79211227473117e+09\n# HELP search_latency_ms Search latency in ms\n# TYPE search_latency_ms histogram\nsearch_latency_ms_bucket{le=\"1.0\"} 0.0\nsearch_latency_ms_bucket{le=\"5.0\"} 1.0\nsearch_latency_ms_bucket{le=\"10.0\"} 1.0\nsearch_latency_ms_bucket{le=\"25.0\"} 1.0\nsearch_latency_ms_bucket{le=\"50.0\"} 1.0\nsearch_latency_ms_bucket{le=\"100.0\"} 1.0\nsearch_latency_ms_bucket{le=\"250.0\"} 1.0\nsearch_latency_ms_bucket{le=\"500.0\"} 1.0\nsearch_latency_ms_bucket{le=\"+Inf\"} 1.0\nsearch_latency_ms_count 1.0\nsearch_latency_ms_sum 4.029222996905446\n# HELP search_latency_ms_created Search latency in ms\n# TYPE search_latency_ms_created gauge\nsearch_latency_ms_created 1.792112274731183e+09\n# HELP semantic_search_latency_ms Semantic search latency in ms\n# TYPE semantic_search_latency_ms histogram\nsemantic_search_latency_ms_bucket{le=\"10.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"25.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"50.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"100.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"250.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"500.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"1000.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"+Inf\"} 1.0\nsemantic_search_latency_ms_count 1.0\nsemantic_search_latency_ms_sum 1.4774620067328215\n# HELP semantic_search_latency_ms_created Semantic search latency in ms\n# TYPE semantic_search_latency_ms_created gauge\nsemantic_search_latency_ms_created 1.7921122747312055e+09\n# HELP remember_latency_ms Remember latency in ms\n# TYPE remember_latency_ms histogram\nremember_latency_ms_bucket{le=\"5.0\"} 1.0\nremember_latency_ms_bucket{le=\"10.0\"} 2.0\nremember_latency_ms_bucket{le=\"25.0\"} 2.0\nremember_latency_ms_bucket{le=\"50.0\"} 2.0\nremember_latency_ms_bucket{le=\"100.0\"} 2.0\nremember_latency_ms_bucket{le=\"250.0\"} 2.0\nremember_latency_ms_bucket{le=\"500.0\"} 2.0\nremember_latency_ms_bucket{le=\"+Inf\"} 2.0\nremember_latency_ms_count 2.0\nremember_latency_ms_sum 9.022079058922827\n# HELP remember_latency_ms_created Remember latency in ms\n# TYPE remember_latency_ms_created gauge\nremember_latency_ms_created 1.7921122747312171e+09\n# HELP derived_index_drift SQL/vector index drift count\n# TYPE derived_index_drift gauge\nderived_index_drift 100.0\n",
+    "transcript_sha256": "782448cdc05151d06c3190a715e4fb64f4ebdb26f65e8714a24e443080e47802"
+   },
+   "happy.2.get_context": {
+    "isError": false,
+    "observed": "{\"facts\": [], \"decisions\": [], \"total\": 0}",
+    "raw": "{\"facts\": [], \"decisions\": [], \"total\": 0}",
+    "transcript_sha256": "90accd70f0310b4405205f7f12403f78af39b413e191d8215d7c95d1326a238e"
+   },
+   "happy.3.semantic_search": {
+    "isError": false,
+    "observed": "{\"rule_match\": {\"route\": \"sql\", \"rule_name\": \"port_query\", \"matched_keyword\": \"port\"}}",
+    "raw": "{\"rule_match\": {\"route\": \"sql\", \"rule_name\": \"port_query\", \"matched_keyword\": \"port\"}}",
+    "transcript_sha256": "71aed11a1d3f6ea2aeee74eb908f6305b112ee8a8f11762ab46ce7f84a1ac3ca"
+   },
+   "happy.4.graph_search": {
+    "isError": false,
+    "observed": "{\"nodes\": [{\"id\": \"seed-node-alpha\", \"name\": \"PostgreSQL stores user data\", \"type\": \"fact\", \"attributes\": {}}], \"edges\": [], \"paths\": []}",
+    "raw": "{\"nodes\": [{\"id\": \"seed-node-alpha\", \"name\": \"PostgreSQL stores user data\", \"type\": \"fact\", \"attributes\": {}}], \"edges\": [], \"paths\": []}",
+    "transcript_sha256": "f06590efca4b4019af121b595ea10f97dd45b8ab2e316849fd8c5d27021c7e78"
+   },
+   "happy.5.route": {
+    "isError": false,
+    "observed": "{\"stage\": 1, \"route\": \"rules\", \"rule_match\": {\"route\": \"sql\", \"rule_name\": \"port_query\", \"matched_keyword\": \"port\"}, \"all_results\": [], \"ranked_results\": [], \"total\": 0}",
+    "raw": "{\"stage\": 1, \"route\": \"rules\", \"rule_match\": {\"route\": \"sql\", \"rule_name\": \"port_query\", \"matched_keyword\": \"port\"}, \"all_results\": [], \"ranked_results\": [], \"total\": 0}",
+    "transcript_sha256": "9f9b6829eaff081a0819e6097f602d7caf2ae56eccbce4ce3450af7094eabb8e"
+   },
+   "happy.6.get_belief": {
+    "isError": false,
+    "observed": "{\"total\": 0, \"beliefs\": [], \"query\": {\"proposition\": \"Baseline\", \"lifecycle_state\": \"active\", \"min_confidence\": 0.0, \"tags\": null, \"source\": \"\", \"creator\": \"\", \"source_id\": \"\", \"limit\": 10}}",
+    "raw": "{\"total\": 0, \"beliefs\": [], \"query\": {\"proposition\": \"Baseline\", \"lifecycle_state\": \"active\", \"min_confidence\": 0.0, \"tags\": null, \"source\": \"\", \"creator\": \"\", \"source_id\": \"\", \"limit\": 10}}",
+    "transcript_sha256": "0c7a0fee4698fa3e0498dd1ca56b30b972834e0aaa3b69f293d366767315d97c"
+   },
+   "happy.7.reflect": {
+    "isError": false,
+    "observed": "{\"mode\": \"overview\", \"total_beliefs\": 0, \"by_lifecycle_state\": {}, \"by_topics\": {}, \"confidence\": {\"high_0.8_1.0\": 0, \"medium_0.5_0.8\": 0, \"low_0.0_0.5\": 0, \"average\": 0.0}, \"contradiction_count\": 0, \"conflicts\": {\"total\": 0, \"unresolved\": 0, \"auto_resolvable\": 0, \"age_hours_max\": 0}, \"stale_count\": 0, \"decaying_next_7d\": 0, \"no_evidence_count\": 0, \"evidence_stats_status\": \"ok\", \"oldest_belief_days\": 0, \"newest_belief_days\": 0}",
+    "raw": "{\"mode\": \"overview\", \"total_beliefs\": 0, \"by_lifecycle_state\": {}, \"by_topics\": {}, \"confidence\": {\"high_0.8_1.0\": 0, \"medium_0.5_0.8\": 0, \"low_0.0_0.5\": 0, \"average\": 0.0}, \"contradiction_count\": 0, \"conflicts\": {\"total\": 0, \"unresolved\": 0, \"auto_resolvable\": 0, \"age_hours_max\": 0}, \"stale_count\": 0, \"decaying_next_7d\": 0, \"no_evidence_count\": 0, \"evidence_stats_status\": \"ok\", \"oldest_belief_days\": 0, \"newest_belief_days\": 0}",
+    "transcript_sha256": "a115abe27293daaa3091c547a5c41faabb8c6b638b36008e6acc38fd586bda5e"
+   },
+   "happy.8.remember": {
+    "isError": false,
+    "observed": "{\"receipt\": {\"id\": \"<uuid>\", \"memory_type\": \"fact\", \"source\": \"baseline\", \"created_by\": \"user\", \"timestamp\": \"<timestamp>\", \"confidence\": 1.0, \"verification_status\": \"candidate\", \"history\": [], \"updated_at\": \"<timestamp>\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"fact\": {\"id\": \"<uuid>\", \"subject\": \"PostgreSQL\", \"predicate\": \"stores\", \"object\": \"user data\", \"dedup_key\": \"PostgreSQL\\u001fstores\\u001fuser data\", \"confidence\": 1.0, \"source\": \"baseline\", \"creator\": \"system\", \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\", \"version\": 1}}",
+    "raw": "{\"receipt\": {\"id\": \"d2e1b5fd-c370-47f3-bb01-5238aab3566e\", \"memory_type\": \"fact\", \"source\": \"baseline\", \"created_by\": \"user\", \"timestamp\": \"2026-10-16T00:57:57.835009\", \"confidence\": 1.0, \"verification_status\": \"candidate\", \"history\": [], \"updated_at\": \"2026-10-16T00:57:57.838813\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"fact\": {\"id\": \"d2e1b5fd-c370-47f3-bb01-5238aab3566e\", \"subject\": \"PostgreSQL\", \"predicate\": \"stores\", \"object\": \"user data\", \"dedup_key\": \"PostgreSQL\\u001fstores\\u001fuser data\", \"confidence\": 1.0, \"source\": \"baseline\", \"creator\": \"system\", \"created_at\": \"2026-10-16T00:57:57.835009\", \"updated_at\": \"2026-10-16T00:57:57.836130\", \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\", \"version\": 1}}",
+    "transcript_sha256": "9c84b972328fd079c9ac5e2acf5adb44b2fc8fe6bebb1915328d7c772ce17ca6"
+   },
+   "happy.9.remember": {
+    "isError": false,
+    "observed": "{\"receipt\": {\"id\": \"<uuid>\", \"memory_type\": \"fact\", \"source\": \"baseline\", \"created_by\": \"user\", \"timestamp\": \"<timestamp>\", \"confidence\": 1.0, \"verification_status\": \"candidate\", \"history\": [], \"updated_at\": \"<timestamp>\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"fact\": {\"id\": \"<uuid>\", \"subject\": \"Caddy\", \"predicate\": \"serves\", \"object\": \"static files\", \"dedup_key\": \"Caddy\\u001fserves\\u001fstatic files\", \"confidence\": 1.0, \"source\": \"baseline\", \"creator\": \"system\", \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\", \"version\": 1}}",
+    "raw": "{\"receipt\": {\"id\": \"bdbca64a-5f93-4255-b79a-8304c113bb5d\", \"memory_type\": \"fact\", \"source\": \"baseline\", \"created_by\": \"user\", \"timestamp\": \"2026-10-16T00:57:57.843310\", \"confidence\": 1.0, \"verification_status\": \"candidate\", \"history\": [], \"updated_at\": \"2026-10-16T00:57:57.844935\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"fact\": {\"id\": \"bdbca64a-5f93-4255-b79a-8304c113bb5d\", \"subject\": \"Caddy\", \"predicate\": \"serves\", \"object\": \"static files\", \"dedup_key\": \"Caddy\\u001fserves\\u001fstatic files\", \"confidence\": 1.0, \"source\": \"baseline\", \"creator\": \"system\", \"created_at\": \"2026-10-16T00:57:57.843310\", \"updated_at\": \"2026-10-16T00:57:57.843870\", \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\", \"version\": 1}}",
+    "transcript_sha256": "b4fa67a5344246b588cbac88bbb549c029216fb50e2e0c1740a92853593c0a4c"
+   },
+   "happy.invalidate": {
+    "isError": false,
+    "observed": "{\"memory\": {\"id\": \"<uuid>\", \"subject\": \"PostgreSQL\", \"predicate\": \"stores\", \"object\": \"user data\", \"dedup_key\": \"PostgreSQL\\u001fstores\\u001fuser data\", \"confidence\": 1.0, \"source\": \"baseline\", \"creator\": \"system\", \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"verification_status\": \"candidate\", \"lifecycle_state\": \"discarded\", \"version\": 2}, \"event\": {\"memory_id\": \"<uuid>\", \"memory_type\": \"fact\", \"from_state\": \"active\", \"to_state\": \"discarded\", \"reason\": \"baseline invalidation\", \"triggered_by\": \"system\"}, \"propagated\": []}",
+    "raw": "{\"memory\": {\"id\": \"d2e1b5fd-c370-47f3-bb01-5238aab3566e\", \"subject\": \"PostgreSQL\", \"predicate\": \"stores\", \"object\": \"user data\", \"dedup_key\": \"PostgreSQL\\u001fstores\\u001fuser data\", \"confidence\": 1.0, \"source\": \"baseline\", \"creator\": \"system\", \"created_at\": \"2026-10-16T00:57:57.835009\", \"updated_at\": \"2026-10-16T00:57:57.889145\", \"verification_status\": \"candidate\", \"lifecycle_state\": \"discarded\", \"version\": 2}, \"event\": {\"memory_id\": \"d2e1b5fd-c370-47f3-bb01-5238aab3566e\", \"memory_type\": \"fact\", \"from_state\": \"active\", \"to_state\": \"discarded\", \"reason\": \"baseline invalidation\", \"triggered_by\": \"system\"}, \"propagated\": []}",
+    "transcript_sha256": "84767cd8425b9981396f34f858156917789c849dceddcc7b4c397c3a1cb17328"
+   },
+   "happy.resolve_conflict": {
+    "isError": false,
+    "observed": "{\"belief_a\": {\"id\": \"<uuid>\", \"proposition\": \"Baseline proposition one\", \"confidence\": 0.7, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"last_reinforced_at\": \"<timestamp>\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}, \"belief_b\": {\"id\": \"<uuid>\", \"proposition\": \"Baseline proposition two\", \"confidence\": 0.4, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"<timestamp>\", \"updated_at\": \"<timestamp>\", \"last_reinforced_at\": \"<timestamp>\", \"version\": 2, \"verification_status\": \"candidate\", \"lifecycle_state\": \"discarded\"}, \"resolution\": \"keep_a\", \"created\": null, \"events\": [{\"belief_id\": \"<uuid>\", \"from_state\": \"active\", \"to_state\": \"discarded\", \"reason\": \"Discarded in favor of <uuid> via conflict resolution\"}], \"receipt\": {\"id\": \"<uuid>\", \"memory_type\": \"belief\", \"source\": \"conflict_resolution\", \"created_by\": \"system\", \"timestamp\": \"<timestamp>\", \"confidence\": 1.0, \"verification_status\": \"unverified\", \"history\": [], \"updated_at\": \"<timestamp>\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}}",
+    "raw": "{\"belief_a\": {\"id\": \"9d23d9c0-1963-4d7a-986b-b6cb89c03ffc\", \"proposition\": \"Baseline proposition one\", \"confidence\": 0.7, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"2026-10-16T00:57:57.860554\", \"updated_at\": \"2026-10-16T00:57:57.860555\", \"last_reinforced_at\": \"2026-10-16T00:57:57.860555\", \"version\": 1, \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\"}, \"belief_b\": {\"id\": \"844b2c19-b56f-4159-a00e-33ccbc1a1fc4\", \"proposition\": \"Baseline proposition two\", \"confidence\": 0.4, \"source\": \"baseline\", \"creator\": \"baseline\", \"source_ids\": [], \"tags\": [], \"created_at\": \"2026-10-16T00:57:57.865569\", \"updated_at\": \"2026-10-16T00:57:57.896755\", \"last_reinforced_at\": \"2026-10-16T00:57:57.865571\", \"version\": 2, \"verification_status\": \"candidate\", \"lifecycle_state\": \"discarded\"}, \"resolution\": \"keep_a\", \"created\": null, \"events\": [{\"belief_id\": \"844b2c19-b56f-4159-a00e-33ccbc1a1fc4\", \"from_state\": \"active\", \"to_state\": \"discarded\", \"reason\": \"Discarded in favor of 9d23d9c0-1963-4d7a-986b-b6cb89c03ffc via conflict resolution\"}], \"receipt\": {\"id\": \"04ffbf4c-b735-4e11-a74d-06d54bbfdbd6\", \"memory_type\": \"belief\", \"source\": \"conflict_resolution\", \"created_by\": \"system\", \"timestamp\": \"2026-10-16T00:57:57.898523Z\", \"confidence\": 1.0, \"verification_status\": \"unverified\", \"history\": [], \"updated_at\": \"2026-10-16T00:57:57.898528Z\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}}",
+    "transcript_sha256": "69e434538edf44bd876e3d8522e9e5730bec83e732d9fb375d458a8b23f74ed5"
+   },
+   "invalid.add_relation": {
+    "isError": true,
+    "observed": "Error executing tool add_relation: 2 validation errors for add_relation_toolArguments\ntarget_id\n  Field required [type=missing, input_value={'source_id': 'a'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nrelation_type\n  Field required [type=missing, input_value={'source_id': 'a'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing",
+    "raw": "Error executing tool add_relation: 2 validation errors for add_relation_toolArguments\ntarget_id\n  Field required [type=missing, input_value={'source_id': 'a'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nrelation_type\n  Field required [type=missing, input_value={'source_id': 'a'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing",
+    "transcript_sha256": "a1c083213241e9834789f378ea92252228e93b32f22f3a2057c5461b2846d97a"
+   },
+   "invalid.audit": {
+    "isError": true,
+    "observed": "Error executing tool audit: 1 validation error for audit_toolArguments\naudit_type\n  Input should be a valid string [type=string_type, input_value=7, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "raw": "Error executing tool audit: 1 validation error for audit_toolArguments\naudit_type\n  Input should be a valid string [type=string_type, input_value=7, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "transcript_sha256": "215b84f8a665a466237e6827bd14d6387dba672bc9c37c0a0b2aef06619a6f75"
+   },
+   "invalid.get_belief": {
+    "isError": true,
+    "observed": "Error executing tool get_belief: 1 validation error for get_belief_toolArguments\nlimit\n  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='many', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/int_parsing",
+    "raw": "Error executing tool get_belief: 1 validation error for get_belief_toolArguments\nlimit\n  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='many', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/int_parsing",
+    "transcript_sha256": "f2c02cfe970e0c98c23d34c40d9de0483a71a750c63866d47a6b7e1b449b9423"
+   },
+   "invalid.get_context": {
+    "isError": true,
+    "observed": "Error executing tool get_context: 1 validation error for get_context_toolArguments\ntask\n  Field required [type=missing, input_value={}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing",
+    "raw": "Error executing tool get_context: 1 validation error for get_context_toolArguments\ntask\n  Field required [type=missing, input_value={}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing",
+    "transcript_sha256": "d5ed3da8aa2ff4c645d889777b8f666e6a7c7b4f724d7e6c8815f59a70480c30"
+   },
+   "invalid.graph_search": {
+    "isError": true,
+    "observed": "Error executing tool graph_search: 1 validation error for graph_search_fnArguments\nquery\n  Input should be a valid string [type=string_type, input_value=12, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "raw": "Error executing tool graph_search: 1 validation error for graph_search_fnArguments\nquery\n  Input should be a valid string [type=string_type, input_value=12, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "transcript_sha256": "b6550da0bc2764f9e04552dc1fe67173a903a769d0623798b80bcddabec009cf"
+   },
+   "invalid.invalidate": {
+    "isError": true,
+    "observed": "Error executing tool invalidate: 2 validation errors for invalidate_toolArguments\nmemory_id\n  Input should be a valid string [type=string_type, input_value=5, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type\nmemory_type\n  Input should be a valid string [type=string_type, input_value=None, input_type=NoneType]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "raw": "Error executing tool invalidate: 2 validation errors for invalidate_toolArguments\nmemory_id\n  Input should be a valid string [type=string_type, input_value=5, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type\nmemory_type\n  Input should be a valid string [type=string_type, input_value=None, input_type=NoneType]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "transcript_sha256": "24a27c486234701030b08929e3ce5bae9c631cb430d097d83de6d6528d6a851d"
+   },
+   "invalid.learn": {
+    "isError": true,
+    "observed": "Error executing tool learn: 1 validation error for learn_toolArguments\ntext\n  Input should be a valid string [type=string_type, input_value=['not', 'a', 'string'], input_type=list]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "raw": "Error executing tool learn: 1 validation error for learn_toolArguments\ntext\n  Input should be a valid string [type=string_type, input_value=['not', 'a', 'string'], input_type=list]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "transcript_sha256": "868f86a401ad21d2c50f71595af3c8f10e00caa66544c9886ad42901f63a809a"
+   },
+   "invalid.metrics": {
+    "isError": false,
+    "observed": "{\"families\": [[\"cmms_layout_validation_failures_created\", \"gauge\"], [\"cmms_layout_validation_failures_total\", \"counter\"], [\"cmms_migration_runs_total\", \"counter\"], [\"cmms_projection_verification_failures_created\", \"gauge\"], [\"cmms_projection_verification_failures_total\", \"counter\"], [\"derived_index_drift\", \"gauge\"], [\"reindex_repair_created\", \"gauge\"], [\"reindex_repair_total\", \"counter\"], [\"remember_latency_ms\", \"histogram\"], [\"remember_latency_ms_created\", \"gauge\"], [\"search_latency_ms\", \"histogram\"], [\"search_latency_ms_created\", \"gauge\"], [\"semantic_search_latency_ms\", \"histogram\"], [\"semantic_search_latency_ms_created\", \"gauge\"], [\"sqlite_busy_events_created\", \"gauge\"], [\"sqlite_busy_events_total\", \"counter\"], [\"tool_calls_created\", \"gauge\"], [\"tool_calls_total\", \"counter\"], [\"tool_error_total\", \"counter\"]], \"samples\": [\"cmms_layout_validation_failures_created{code=\\\"E_ARTIFACT_IDENTITY_CHANGED\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_FORBIDDEN_TARGET_ROOT\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_HERMES_HOME_REQUIRED\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_FINAL_SYMLINK_UNSAFE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_HARDLINK_UNSAFE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_OUTSIDE_ROOT\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_OVERLAP\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_SPECIAL_FILE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PATH_SYMLINK_PARENT\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_PROFILE_ROOT_EXTERNAL\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_QDRANT_PROFILE_NAMESPACE_UNDEFINED\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_SHARED_ROOT_RELATIVE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_SHARED_ROOT_REQUIRED\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_SHARED_SPLIT_LAYOUT\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_STANDALONE_ROOT_RELATIVE\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_STORAGE_MODE_INVALID\\\"}\", \"cmms_layout_validation_failures_created{code=\\\"E_VECTOR_BACKEND_INVALID\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_ARTIFACT_IDENTITY_CHANGED\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_FORBIDDEN_TARGET_ROOT\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_HERMES_HOME_REQUIRED\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_FINAL_SYMLINK_UNSAFE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_HARDLINK_UNSAFE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_OUTSIDE_ROOT\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_OVERLAP\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_SPECIAL_FILE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PATH_SYMLINK_PARENT\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_PROFILE_ROOT_EXTERNAL\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_QDRANT_PROFILE_NAMESPACE_UNDEFINED\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_SHARED_ROOT_RELATIVE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_SHARED_ROOT_REQUIRED\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_SHARED_SPLIT_LAYOUT\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_STANDALONE_ROOT_RELATIVE\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_STORAGE_MODE_INVALID\\\"}\", \"cmms_layout_validation_failures_total{code=\\\"E_VECTOR_BACKEND_INVALID\\\"}\", \"cmms_projection_verification_failures_created{store=\\\"graph\\\"}\", \"cmms_projection_verification_failures_created{store=\\\"vector\\\"}\", \"cmms_projection_verification_failures_total{store=\\\"graph\\\"}\", \"cmms_projection_verification_failures_total{store=\\\"vector\\\"}\", \"derived_index_drift\", \"reindex_repair_created\", \"reindex_repair_total\", \"remember_latency_ms_bucket{le=\\\"+Inf\\\"}\", \"remember_latency_ms_bucket{le=\\\"10.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"100.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"25.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"250.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"5.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"50.0\\\"}\", \"remember_latency_ms_bucket{le=\\\"500.0\\\"}\", \"remember_latency_ms_count\", \"remember_latency_ms_created\", \"remember_latency_ms_sum\", \"search_latency_ms_bucket{le=\\\"+Inf\\\"}\", \"search_latency_ms_bucket{le=\\\"1.0\\\"}\", \"search_latency_ms_bucket{le=\\\"10.0\\\"}\", \"search_latency_ms_bucket{le=\\\"100.0\\\"}\", \"search_latency_ms_bucket{le=\\\"25.0\\\"}\", \"search_latency_ms_bucket{le=\\\"250.0\\\"}\", \"search_latency_ms_bucket{le=\\\"5.0\\\"}\", \"search_latency_ms_bucket{le=\\\"50.0\\\"}\", \"search_latency_ms_bucket{le=\\\"500.0\\\"}\", \"search_latency_ms_count\", \"search_latency_ms_created\", \"search_latency_ms_sum\", \"semantic_search_latency_ms_bucket{le=\\\"+Inf\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"10.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"100.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"1000.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"25.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"250.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"50.0\\\"}\", \"semantic_search_latency_ms_bucket{le=\\\"500.0\\\"}\", \"semantic_search_latency_ms_count\", \"semantic_search_latency_ms_created\", \"semantic_search_latency_ms_sum\", \"sqlite_busy_events_created\", \"sqlite_busy_events_total\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"add_relation\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"audit\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"get_belief\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"get_context\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"graph_search\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"invalidate\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"learn\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"ping\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"reflect\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"remember\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"resolve_conflict\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"route\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"search\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"semantic_search\\\"}\", \"tool_calls_created{status=\\\"success\\\",tool=\\\"set_belief\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"add_relation\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"audit\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"get_belief\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"get_context\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"graph_search\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"invalidate\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"learn\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"ping\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"reflect\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"remember\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"resolve_conflict\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"route\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"search\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"semantic_search\\\"}\", \"tool_calls_total{status=\\\"success\\\",tool=\\\"set_belief\\\"}\"]}",
+    "raw": "# HELP cmms_layout_validation_failures_total Storage layout validation failures\n# TYPE cmms_layout_validation_failures_total counter\ncmms_layout_validation_failures_total{code=\"E_ARTIFACT_IDENTITY_CHANGED\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_FORBIDDEN_TARGET_ROOT\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_HERMES_HOME_REQUIRED\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_FINAL_SYMLINK_UNSAFE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_HARDLINK_UNSAFE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_OUTSIDE_ROOT\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_OVERLAP\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_SPECIAL_FILE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PATH_SYMLINK_PARENT\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_PROFILE_ROOT_EXTERNAL\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_QDRANT_PROFILE_NAMESPACE_UNDEFINED\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_SHARED_ROOT_REQUIRED\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_SHARED_ROOT_RELATIVE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_SHARED_SPLIT_LAYOUT\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_STANDALONE_ROOT_RELATIVE\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_STORAGE_MODE_INVALID\"} 0.0\ncmms_layout_validation_failures_total{code=\"E_VECTOR_BACKEND_INVALID\"} 0.0\n# HELP cmms_layout_validation_failures_created Storage layout validation failures\n# TYPE cmms_layout_validation_failures_created gauge\ncmms_layout_validation_failures_created{code=\"E_ARTIFACT_IDENTITY_CHANGED\"} 1.792112273600076e+09\ncmms_layout_validation_failures_created{code=\"E_FORBIDDEN_TARGET_ROOT\"} 1.792112273600084e+09\ncmms_layout_validation_failures_created{code=\"E_HERMES_HOME_REQUIRED\"} 1.7921122736000886e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_FINAL_SYMLINK_UNSAFE\"} 1.7921122736000922e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_HARDLINK_UNSAFE\"} 1.7921122736000967e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_OUTSIDE_ROOT\"} 1.7921122736001e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_OVERLAP\"} 1.7921122736001034e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_SPECIAL_FILE\"} 1.792112273600106e+09\ncmms_layout_validation_failures_created{code=\"E_PATH_SYMLINK_PARENT\"} 1.7921122736001084e+09\ncmms_layout_validation_failures_created{code=\"E_PROFILE_ROOT_EXTERNAL\"} 1.7921122736001108e+09\ncmms_layout_validation_failures_created{code=\"E_QDRANT_PROFILE_NAMESPACE_UNDEFINED\"} 1.7921122736001136e+09\ncmms_layout_validation_failures_created{code=\"E_SHARED_ROOT_REQUIRED\"} 1.7921122736001189e+09\ncmms_layout_validation_failures_created{code=\"E_SHARED_ROOT_RELATIVE\"} 1.7921122736001215e+09\ncmms_layout_validation_failures_created{code=\"E_SHARED_SPLIT_LAYOUT\"} 1.7921122736001241e+09\ncmms_layout_validation_failures_created{code=\"E_STANDALONE_ROOT_RELATIVE\"} 1.792112273600127e+09\ncmms_layout_validation_failures_created{code=\"E_STORAGE_MODE_INVALID\"} 1.7921122736001298e+09\ncmms_layout_validation_failures_created{code=\"E_VECTOR_BACKEND_INVALID\"} 1.792112273600132e+09\n# HELP cmms_projection_verification_failures_total Projection verification failures\n# TYPE cmms_projection_verification_failures_total counter\ncmms_projection_verification_failures_total{store=\"vector\"} 0.0\ncmms_projection_verification_failures_total{store=\"graph\"} 0.0\n# HELP cmms_projection_verification_failures_created Projection verification failures\n# TYPE cmms_projection_verification_failures_created gauge\ncmms_projection_verification_failures_created{store=\"vector\"} 1.7921122737032607e+09\ncmms_projection_verification_failures_created{store=\"graph\"} 1.792112273703266e+09\n# HELP cmms_migration_runs_total Terminal profile migration runs\n# TYPE cmms_migration_runs_total counter\n# HELP tool_calls_total Total MCP tool calls\n# TYPE tool_calls_total counter\ntool_calls_total{status=\"success\",tool=\"ping\"} 2.0\ntool_calls_total{status=\"success\",tool=\"search\"} 1.0\ntool_calls_total{status=\"success\",tool=\"get_context\"} 1.0\ntool_calls_total{status=\"success\",tool=\"semantic_search\"} 1.0\ntool_calls_total{status=\"success\",tool=\"graph_search\"} 2.0\ntool_calls_total{status=\"success\",tool=\"route\"} 1.0\ntool_calls_total{status=\"success\",tool=\"get_belief\"} 2.0\ntool_calls_total{status=\"success\",tool=\"reflect\"} 2.0\ntool_calls_total{status=\"success\",tool=\"remember\"} 2.0\ntool_calls_total{status=\"success\",tool=\"add_relation\"} 1.0\ntool_calls_total{status=\"success\",tool=\"learn\"} 1.0\ntool_calls_total{status=\"success\",tool=\"set_belief\"} 2.0\ntool_calls_total{status=\"success\",tool=\"audit\"} 1.0\ntool_calls_total{status=\"success\",tool=\"invalidate\"} 1.0\ntool_calls_total{status=\"success\",tool=\"resolve_conflict\"} 1.0\n# HELP tool_calls_created Total MCP tool calls\n# TYPE tool_calls_created gauge\ntool_calls_created{status=\"success\",tool=\"ping\"} 1.792112274731262e+09\ntool_calls_created{status=\"success\",tool=\"search\"} 1.7921122747398565e+09\ntool_calls_created{status=\"success\",tool=\"get_context\"} 1.792112274747638e+09\ntool_calls_created{status=\"success\",tool=\"semantic_search\"} 1.7921122747510774e+09\ntool_calls_created{status=\"success\",tool=\"graph_search\"} 1.7921122747539794e+09\ntool_calls_created{status=\"success\",tool=\"route\"} 1.7921122778230839e+09\ntool_calls_created{status=\"success\",tool=\"get_belief\"} 1.7921122778294473e+09\ntool_calls_created{status=\"success\",tool=\"reflect\"} 1.792112277833044e+09\ntool_calls_created{status=\"success\",tool=\"remember\"} 1.7921122778412445e+09\ntool_calls_created{status=\"success\",tool=\"add_relation\"} 1.7921122778508384e+09\ntool_calls_created{status=\"success\",tool=\"learn\"} 1.792112277857931e+09\ntool_calls_created{status=\"success\",tool=\"set_belief\"} 1.7921122778631883e+09\ntool_calls_created{status=\"success\",tool=\"audit\"} 1.7921122778831837e+09\ntool_calls_created{status=\"success\",tool=\"invalidate\"} 1.7921122778925211e+09\ntool_calls_created{status=\"success\",tool=\"resolve_conflict\"} 1.792112277899375e+09\n# HELP tool_error_total Total tool errors\n# TYPE tool_error_total counter\n# HELP reindex_repair_total Reindex repairs triggered\n# TYPE reindex_repair_total counter\nreindex_repair_total 0.0\n# HELP reindex_repair_created Reindex repairs triggered\n# TYPE reindex_repair_created gauge\nreindex_repair_created 1.7921122747311656e+09\n# HELP sqlite_busy_events_total SQLite WAL busy events\n# TYPE sqlite_busy_events_total counter\nsqlite_busy_events_total 0.0\n# HELP sqlite_busy_events_created SQLite WAL busy events\n# TYPE sqlite_busy_events_created gauge\nsqlite_busy_events_created 1.79211227473117e+09\n# HELP search_latency_ms Search latency in ms\n# TYPE search_latency_ms histogram\nsearch_latency_ms_bucket{le=\"1.0\"} 0.0\nsearch_latency_ms_bucket{le=\"5.0\"} 1.0\nsearch_latency_ms_bucket{le=\"10.0\"} 1.0\nsearch_latency_ms_bucket{le=\"25.0\"} 1.0\nsearch_latency_ms_bucket{le=\"50.0\"} 1.0\nsearch_latency_ms_bucket{le=\"100.0\"} 1.0\nsearch_latency_ms_bucket{le=\"250.0\"} 1.0\nsearch_latency_ms_bucket{le=\"500.0\"} 1.0\nsearch_latency_ms_bucket{le=\"+Inf\"} 1.0\nsearch_latency_ms_count 1.0\nsearch_latency_ms_sum 4.029222996905446\n# HELP search_latency_ms_created Search latency in ms\n# TYPE search_latency_ms_created gauge\nsearch_latency_ms_created 1.792112274731183e+09\n# HELP semantic_search_latency_ms Semantic search latency in ms\n# TYPE semantic_search_latency_ms histogram\nsemantic_search_latency_ms_bucket{le=\"10.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"25.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"50.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"100.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"250.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"500.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"1000.0\"} 1.0\nsemantic_search_latency_ms_bucket{le=\"+Inf\"} 1.0\nsemantic_search_latency_ms_count 1.0\nsemantic_search_latency_ms_sum 1.4774620067328215\n# HELP semantic_search_latency_ms_created Semantic search latency in ms\n# TYPE semantic_search_latency_ms_created gauge\nsemantic_search_latency_ms_created 1.7921122747312055e+09\n# HELP remember_latency_ms Remember latency in ms\n# TYPE remember_latency_ms histogram\nremember_latency_ms_bucket{le=\"5.0\"} 1.0\nremember_latency_ms_bucket{le=\"10.0\"} 2.0\nremember_latency_ms_bucket{le=\"25.0\"} 2.0\nremember_latency_ms_bucket{le=\"50.0\"} 2.0\nremember_latency_ms_bucket{le=\"100.0\"} 2.0\nremember_latency_ms_bucket{le=\"250.0\"} 2.0\nremember_latency_ms_bucket{le=\"500.0\"} 2.0\nremember_latency_ms_bucket{le=\"+Inf\"} 2.0\nremember_latency_ms_count 2.0\nremember_latency_ms_sum 9.022079058922827\n# HELP remember_latency_ms_created Remember latency in ms\n# TYPE remember_latency_ms_created gauge\nremember_latency_ms_created 1.7921122747312171e+09\n# HELP derived_index_drift SQL/vector index drift count\n# TYPE derived_index_drift gauge\nderived_index_drift 100.0\n",
+    "transcript_sha256": "7b56bace338685026d9ad7e7119be168a513caaa0c869191980f46b65b4625e2"
+   },
+   "invalid.ping": {
+    "isError": false,
+    "observed": "{\"status\": \"ok\"}",
+    "raw": "{\"status\": \"ok\"}",
+    "transcript_sha256": "08e2c358ce13cb67f94ebb35b0f67c8763190a857c0db68da6eb196dfe9da46a"
+   },
+   "invalid.reflect": {
+    "isError": true,
+    "observed": "Error executing tool reflect: 1 validation error for reflect_toolArguments\nmode\n  Input should be a valid string [type=string_type, input_value=5, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "raw": "Error executing tool reflect: 1 validation error for reflect_toolArguments\nmode\n  Input should be a valid string [type=string_type, input_value=5, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "transcript_sha256": "7699fbd34d3d8f829996aa871e992e3e0eb0aa904687a1ecc9d5f281577a7d68"
+   },
+   "invalid.remember": {
+    "isError": true,
+    "observed": "Error executing tool remember: 1 validation error for remember_toolArguments\nsubject\n  Input should be a valid string [type=string_type, input_value=3, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "raw": "Error executing tool remember: 1 validation error for remember_toolArguments\nsubject\n  Input should be a valid string [type=string_type, input_value=3, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/string_type",
+    "transcript_sha256": "3c6ab304d8c0e1970267adc45ebc26c91a148f2f7df16eb358686affe8b543ab"
+   },
+   "invalid.resolve_conflict": {
+    "isError": true,
+    "observed": "Error executing tool resolve_conflict: 2 validation errors for resolve_conflict_toolArguments\nbelief_b_id\n  Field required [type=missing, input_value={'belief_a_id': 'a'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nresolution\n  Field required [type=missing, input_value={'belief_a_id': 'a'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing",
+    "raw": "Error executing tool resolve_conflict: 2 validation errors for resolve_conflict_toolArguments\nbelief_b_id\n  Field required [type=missing, input_value={'belief_a_id': 'a'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nresolution\n  Field required [type=missing, input_value={'belief_a_id': 'a'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing",
+    "transcript_sha256": "3a4b9944a6deb7df3b88ef3a7bfc17ceb2763999b9606690e125c6c8c09f3df2"
+   },
+   "invalid.route": {
+    "isError": true,
+    "observed": "Error executing tool route: 1 validation error for route_toolArguments\nscore_threshold\n  Input should be a valid number, unable to parse string as a number [type=float_parsing, input_value='high', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/float_parsing",
+    "raw": "Error executing tool route: 1 validation error for route_toolArguments\nscore_threshold\n  Input should be a valid number, unable to parse string as a number [type=float_parsing, input_value='high', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/float_parsing",
+    "transcript_sha256": "1b20d1307ac9f770bdfb33d5e1fd1125cda7b1d78e3a4f6270421c3f7a92267f"
+   },
+   "invalid.search": {
+    "isError": true,
+    "observed": "Error executing tool search: 1 validation error for search_toolArguments\nlimit\n  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='seven', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/int_parsing",
+    "raw": "Error executing tool search: 1 validation error for search_toolArguments\nlimit\n  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='seven', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/int_parsing",
+    "transcript_sha256": "236ccadb609afd55cf910663760953aba2b82b6bdf41651a0be1e1c808fef51b"
+   },
+   "invalid.semantic_search": {
+    "isError": true,
+    "observed": "Error executing tool semantic_search: 1 validation error for semantic_search_toolArguments\ntop_k\n  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='many', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/int_parsing",
+    "raw": "Error executing tool semantic_search: 1 validation error for semantic_search_toolArguments\ntop_k\n  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='many', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/int_parsing",
+    "transcript_sha256": "1920887245a221af483504f7fe7cf20a74d52e66e82f33d13e62da88fb69a97f"
+   },
+   "invalid.set_belief": {
+    "isError": true,
+    "observed": "Error executing tool set_belief: 2 validation errors for set_belief_toolArguments\nproposition\n  Field required [type=missing, input_value={'confidence': 'high'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nconfidence\n  Input should be a valid number, unable to parse string as a number [type=float_parsing, input_value='high', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/float_parsing",
+    "raw": "Error executing tool set_belief: 2 validation errors for set_belief_toolArguments\nproposition\n  Field required [type=missing, input_value={'confidence': 'high'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nconfidence\n  Input should be a valid number, unable to parse string as a number [type=float_parsing, input_value='high', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/float_parsing",
+    "transcript_sha256": "affb508fbb5c3d2a1c51b9cc2f99022c1fe5706d464167b001c2cbc4be71930f"
+   }
+  },
+  "initialize": {
+   "capabilities": {
+    "experimental": {},
+    "prompts": {
+     "listChanged": false
+    },
+    "resources": {
+     "listChanged": false,
+     "subscribe": false
+    },
+    "tools": {
+     "listChanged": false
+    }
+   },
+   "protocolVersion": "2025-11-25",
+   "serverInfo": {
+    "name": "CompositeMemoryServer",
+    "version": "1.29.1"
+   }
+  },
+  "projection_unavailable": {
+   "add_relation": {
+    "isError": false,
+    "observed": "{\"error\": \"E_PROJECTION_UNAVAILABLE\", \"message\": \"E_PROJECTION_UNAVAILABLE: graph requires migration\", \"hint\": \"Run `memory-server migrate-profile-storage` to rebuild unavailable projections.\"}",
+    "raw": "{\"error\": \"E_PROJECTION_UNAVAILABLE\", \"message\": \"E_PROJECTION_UNAVAILABLE: graph requires migration\", \"hint\": \"Run `memory-server migrate-profile-storage` to rebuild unavailable projections.\"}",
+    "transcript_sha256": "215666fbe7c74bd73288a6409618ea3da3ab81abed4e04663b4a1344dcbb4847"
+   },
+   "graph_search": {
+    "isError": false,
+    "observed": "{\"error\": \"E_PROJECTION_UNAVAILABLE\", \"message\": \"E_PROJECTION_UNAVAILABLE: graph requires migration\", \"hint\": \"Run `memory-server migrate-profile-storage` to rebuild unavailable projections.\"}",
+    "raw": "{\"error\": \"E_PROJECTION_UNAVAILABLE\", \"message\": \"E_PROJECTION_UNAVAILABLE: graph requires migration\", \"hint\": \"Run `memory-server migrate-profile-storage` to rebuild unavailable projections.\"}",
+    "transcript_sha256": "215666fbe7c74bd73288a6409618ea3da3ab81abed4e04663b4a1344dcbb4847"
+   }
+  },
+  "tools": [
+   {
+    "description": "Connectivity check — returns OK if server is alive",
+    "input_schema": {
+     "properties": {},
+     "title": "pingArguments",
+     "type": "object"
+    },
+    "name": "ping"
+   },
+   {
+    "description": "Search stored facts by keyword text with optional filters.\n\n    Args:\n        query: Free-text keyword to search across subject, predicate, object.\n        subject: Optional exact subject filter.\n        predicate: Optional exact predicate filter.\n        limit: Maximum number of results (default 50).\n    ",
+    "input_schema": {
+     "properties": {
+      "limit": {
+       "default": 50,
+       "title": "Limit",
+       "type": "integer"
+      },
+      "predicate": {
+       "default": "",
+       "title": "Predicate",
+       "type": "string"
+      },
+      "query": {
+       "default": "",
+       "title": "Query",
+       "type": "string"
+      },
+      "subject": {
+       "default": "",
+       "title": "Subject",
+       "type": "string"
+      }
+     },
+     "title": "search_toolArguments",
+     "type": "object"
+    },
+    "name": "search"
+   },
+   {
+    "description": "Retrieve structured context about a task.\n\n    Args:\n        task: The task description or search query.\n        subject: Optional subject filter (pass empty string for no filter).\n        max_results: Maximum number of facts to return (default 10).\n    ",
+    "input_schema": {
+     "properties": {
+      "max_results": {
+       "default": 10,
+       "title": "Max Results",
+       "type": "integer"
+      },
+      "subject": {
+       "default": "",
+       "title": "Subject",
+       "type": "string"
+      },
+      "task": {
+       "title": "Task",
+       "type": "string"
+      }
+     },
+     "required": [
+      "task"
+     ],
+     "title": "get_context_toolArguments",
+     "type": "object"
+    },
+    "name": "get_context"
+   },
+   {
+    "description": "Store a fact and generate a provenance receipt.\n\n    Writes the fact + receipt to SQL and adds an outbox entry for\n    async indexing into Qdrant (vector store) and graph. The outbox\n    worker processes the entry in the background.\n\n    Args:\n        subject: The subject of the fact.\n        predicate: The predicate/relation.\n        object: The object of the fact.\n        confidence: Confidence score 0.0-1.0 (default 1.0).\n        source: Source identifier (default \"user\").\n    ",
+    "input_schema": {
+     "properties": {
+      "confidence": {
+       "default": 1.0,
+       "title": "Confidence",
+       "type": "number"
+      },
+      "object": {
+       "title": "Object",
+       "type": "string"
+      },
+      "predicate": {
+       "title": "Predicate",
+       "type": "string"
+      },
+      "source": {
+       "default": "user",
+       "title": "Source",
+       "type": "string"
+      },
+      "subject": {
+       "title": "Subject",
+       "type": "string"
+      }
+     },
+     "required": [
+      "subject",
+      "predicate",
+      "object"
+     ],
+     "title": "remember_toolArguments",
+     "type": "object"
+    },
+    "name": "remember"
+   },
+   {
+    "description": "Extract and store facts, decisions, skills, and optionally beliefs from text.\n\n    Runs all three extractors (FactExtractor, DecisionExtractor, SkillExtractor)\n    on the input text, stores extracted items in SQLite, and adds outbox\n    entries for async indexing into Qdrant + graph.\n\n    When extract_beliefs=True, also runs BeliefExtractor after the main\n    transaction and creates or reinforces beliefs with evidence linked\n    to extracted facts.\n\n    Args:\n        text: Natural language text to extract knowledge from.\n        source: Optional source identifier (default \"user\").\n        extract_beliefs: If True, also extract and store beliefs (default False).\n        min_belief_confidence: Minimum confidence to create a belief (default 0.6).\n    ",
+    "input_schema": {
+     "properties": {
+      "extract_beliefs": {
+       "default": false,
+       "title": "Extract Beliefs",
+       "type": "boolean"
+      },
+      "min_belief_confidence": {
+       "default": 0.6,
+       "title": "Min Belief Confidence",
+       "type": "number"
+      },
+      "source": {
+       "default": "user",
+       "title": "Source",
+       "type": "string"
+      },
+      "text": {
+       "title": "Text",
+       "type": "string"
+      }
+     },
+     "required": [
+      "text"
+     ],
+     "title": "learn_toolArguments",
+     "type": "object"
+    },
+    "name": "learn"
+   },
+   {
+    "description": "Semantic search — embed a query and find similar facts via vector similarity.\n\n    First checks routing rules (keyword-based exact matches). If a rule matches,\n    the result indicates which route should handle the query. Otherwise, returns\n    semantically ranked results with similarity scores.\n\n    Args:\n        query: Natural language query text.\n        top_k: Maximum number of results (default 10).\n        score_threshold: Minimum similarity score 0.0-1.0 (default 0.0).\n    ",
+    "input_schema": {
+     "properties": {
+      "query": {
+       "default": "",
+       "title": "Query",
+       "type": "string"
+      },
+      "score_threshold": {
+       "default": 0.0,
+       "title": "Score Threshold",
+       "type": "number"
+      },
+      "top_k": {
+       "default": 10,
+       "title": "Top K",
+       "type": "integer"
+      }
+     },
+     "title": "semantic_search_toolArguments",
+     "type": "object"
+    },
+    "name": "semantic_search"
+   },
+   {
+    "description": "Search the knowledge graph for entities and relations.\n\n    Performs one of three search modes depending on parameters:\n    1. query: Extract entity references from text and find neighbors.\n    2. entity_id: Direct node lookup by ID.\n    3. source_id + target_id: Pathfinding between two entities.\n    4. relation_type: Return all edges for a typed relation.\n\n    Args:\n        query: Text to extract entity references from.\n        entity_id: Direct node ID lookup.\n        source_id: Source entity for pathfinding.\n        target_id: Target entity for pathfinding.\n        relation_type: Relation name to search by.\n    ",
+    "input_schema": {
+     "properties": {
+      "entity_id": {
+       "default": "",
+       "title": "Entity Id",
+       "type": "string"
+      },
+      "query": {
+       "default": "",
+       "title": "Query",
+       "type": "string"
+      },
+      "relation_type": {
+       "default": "",
+       "title": "Relation Type",
+       "type": "string"
+      },
+      "source_id": {
+       "default": "",
+       "title": "Source Id",
+       "type": "string"
+      },
+      "target_id": {
+       "default": "",
+       "title": "Target Id",
+       "type": "string"
+      }
+     },
+     "title": "graph_search_fnArguments",
+     "type": "object"
+    },
+    "name": "graph_search"
+   },
+   {
+    "description": "Create a typed inter-claim relation between two graph nodes.",
+    "input_schema": {
+     "properties": {
+      "relation_type": {
+       "title": "Relation Type",
+       "type": "string"
+      },
+      "source_id": {
+       "title": "Source Id",
+       "type": "string"
+      },
+      "target_id": {
+       "title": "Target Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "source_id",
+      "target_id",
+      "relation_type"
+     ],
+     "title": "add_relation_toolArguments",
+     "type": "object"
+    },
+    "name": "add_relation"
+   },
+   {
+    "description": "Invalidate a fact or belief and demote dependent confidence.",
+    "input_schema": {
+     "properties": {
+      "expected_version": {
+       "default": "",
+       "title": "Expected Version",
+       "type": "string"
+      },
+      "memory_id": {
+       "title": "Memory Id",
+       "type": "string"
+      },
+      "memory_type": {
+       "title": "Memory Type",
+       "type": "string"
+      },
+      "reason": {
+       "title": "Reason",
+       "type": "string"
+      }
+     },
+     "required": [
+      "memory_id",
+      "memory_type",
+      "reason"
+     ],
+     "title": "invalidate_toolArguments",
+     "type": "object"
+    },
+    "name": "invalidate"
+   },
+   {
+    "description": "Route a query through the 4-stage hybrid router (rules -> embeddings -> graph -> LLM).\n\n    Per ADR-005, evaluates each stage in priority order and returns the\n    result from the highest-priority stage that produces meaningful output.\n\n    Args:\n        query: Natural language query text.\n        top_k: Maximum semantic search results (default 10).\n        score_threshold: Minimum similarity score 0.0-1.0 (default 0.0).\n    ",
+    "input_schema": {
+     "properties": {
+      "query": {
+       "default": "",
+       "title": "Query",
+       "type": "string"
+      },
+      "score_threshold": {
+       "default": 0.0,
+       "title": "Score Threshold",
+       "type": "number"
+      },
+      "top_k": {
+       "default": 10,
+       "title": "Top K",
+       "type": "integer"
+      }
+     },
+     "title": "route_toolArguments",
+     "type": "object"
+    },
+    "name": "route"
+   },
+   {
+    "description": "Run a memory audit for consistency, orphans, confidence distribution.\n\n    Args:\n        audit_type: One of \"full\" (default), \"consistency\", \"orphans\", \"confidence\".\n\n    Returns:\n        Structured audit report with warnings, errors, and stats.\n    ",
+    "input_schema": {
+     "properties": {
+      "audit_type": {
+       "default": "full",
+       "title": "Audit Type",
+       "type": "string"
+      }
+     },
+     "title": "audit_toolArguments",
+     "type": "object"
+    },
+    "name": "audit"
+   },
+   {
+    "description": "Return a Prometheus-formatted snapshot of all observability metrics.",
+    "input_schema": {
+     "properties": {},
+     "title": "metrics_toolArguments",
+     "type": "object"
+    },
+    "name": "metrics"
+   },
+   {
+    "description": "Create, reinforce, or supersede a belief proposition with evidence.\n\n    Args:\n        proposition: The belief proposition text.\n        confidence: Confidence score 0.0-1.0 (default 0.5).\n        sources: JSON array of evidence source dicts with source_type, source_id, weight.\n        tags: JSON array of tag strings.\n        source: Source identifier (default \"system\").\n        replace_belief_id: If set, supersede the referenced belief and link this new one.\n    ",
+    "input_schema": {
+     "properties": {
+      "confidence": {
+       "default": 0.5,
+       "title": "Confidence",
+       "type": "number"
+      },
+      "proposition": {
+       "title": "Proposition",
+       "type": "string"
+      },
+      "replace_belief_id": {
+       "default": "",
+       "title": "Replace Belief Id",
+       "type": "string"
+      },
+      "source": {
+       "default": "system",
+       "title": "Source",
+       "type": "string"
+      },
+      "sources": {
+       "default": "[]",
+       "title": "Sources",
+       "type": "string"
+      },
+      "tags": {
+       "default": "[]",
+       "title": "Tags",
+       "type": "string"
+      }
+     },
+     "required": [
+      "proposition"
+     ],
+     "title": "set_belief_toolArguments",
+     "type": "object"
+    },
+    "name": "set_belief"
+   },
+   {
+    "description": "Search beliefs with optional filters.\n\n    Args:\n        proposition: Search proposition text (FTS5 full-text search).\n        lifecycle_state: Filter by lifecycle state (default \"active\").\n        min_confidence: Minimum confidence threshold 0.0-1.0.\n        tags: JSON array of tag strings to filter by.\n        source: Filter by source identifier.\n        creator: Filter by creator identifier.\n        source_id: Filter by source_id in the belief's source_ids list.\n        limit: Maximum number of results (default 10, max 100).\n    ",
+    "input_schema": {
+     "properties": {
+      "creator": {
+       "default": "",
+       "title": "Creator",
+       "type": "string"
+      },
+      "lifecycle_state": {
+       "default": "active",
+       "title": "Lifecycle State",
+       "type": "string"
+      },
+      "limit": {
+       "default": 10,
+       "title": "Limit",
+       "type": "integer"
+      },
+      "min_confidence": {
+       "default": 0.0,
+       "title": "Min Confidence",
+       "type": "number"
+      },
+      "proposition": {
+       "default": "",
+       "title": "Proposition",
+       "type": "string"
+      },
+      "source": {
+       "default": "",
+       "title": "Source",
+       "type": "string"
+      },
+      "source_id": {
+       "default": "",
+       "title": "Source Id",
+       "type": "string"
+      },
+      "tags": {
+       "default": "",
+       "title": "Tags",
+       "type": "string"
+      }
+     },
+     "title": "get_belief_toolArguments",
+     "type": "object"
+    },
+    "name": "get_belief"
+   },
+   {
+    "description": "Resolve a conflict between two beliefs using a transition matrix.\n\n    Args:\n        belief_a_id: UUID of the first belief in the conflict.\n        belief_b_id: UUID of the second belief in the conflict.\n        resolution: Strategy: keep_a, keep_b, merge, discard_both.\n        new_proposition: Proposition for a new merged belief (required for merge).\n        auto_resolve: When True, auto-resolve by confidence threshold\n                      (never uses 'discarded' state).\n    ",
+    "input_schema": {
+     "properties": {
+      "auto_resolve": {
+       "default": false,
+       "title": "Auto Resolve",
+       "type": "boolean"
+      },
+      "belief_a_id": {
+       "title": "Belief A Id",
+       "type": "string"
+      },
+      "belief_b_id": {
+       "title": "Belief B Id",
+       "type": "string"
+      },
+      "new_proposition": {
+       "default": "",
+       "title": "New Proposition",
+       "type": "string"
+      },
+      "resolution": {
+       "title": "Resolution",
+       "type": "string"
+      }
+     },
+     "required": [
+      "belief_a_id",
+      "belief_b_id",
+      "resolution"
+     ],
+     "title": "resolve_conflict_toolArguments",
+     "type": "object"
+    },
+    "name": "resolve_conflict"
+   },
+   {
+    "description": "Analyse the belief store and produce structured insights.\n\n    Provides 6 analysis modes:\n    - overview: High-level summary of the belief store (counts, confidence, states)\n    - contradictions: Find beliefs with keyword-based semantic conflicts\n    - decay: Analyse which beliefs are approaching lifecycle transitions\n    - topics: Cluster beliefs by tags with counts and avg confidence\n    - evidence_audit: Audit evidence quality across beliefs\n    - confidence: Detailed confidence histogram with sorted belief list\n\n    Args:\n        mode: Analysis mode (overview, contradictions, decay, topics, evidence_audit, confidence).\n        topic: Optional topic/tag filter.\n        min_confidence: Minimum confidence threshold 0.0-1.0.\n        limit: Max beliefs to analyse (0 = all).\n    ",
+    "input_schema": {
+     "properties": {
+      "limit": {
+       "default": 50,
+       "title": "Limit",
+       "type": "integer"
+      },
+      "min_confidence": {
+       "default": 0.0,
+       "title": "Min Confidence",
+       "type": "number"
+      },
+      "mode": {
+       "default": "overview",
+       "title": "Mode",
+       "type": "string"
+      },
+      "topic": {
+       "default": "",
+       "title": "Topic",
+       "type": "string"
+      }
+     },
+     "title": "reflect_toolArguments",
+     "type": "object"
+    },
+    "name": "reflect"
+   }
+  ]
+ },
+ "native": {
+  "calls": {
+   "learn": "{\"facts\": [], \"decisions\": [], \"skills\": [], \"beliefs\": [], \"receipts\": []}",
+   "remember": "{\"receipt\": {\"id\": \"a7fa5430-c9b3-4b8d-87e4-35f8ad212c7b\", \"memory_type\": \"fact\", \"source\": \"baseline\", \"created_by\": \"user\", \"timestamp\": \"2026-10-16T00:58:00.781473\", \"confidence\": 1.0, \"verification_status\": \"candidate\", \"history\": [], \"updated_at\": \"2026-10-16T00:58:01.428466\", \"lifecycle_state\": \"active\", \"version\": \"0.1.0\"}, \"fact\": {\"id\": \"a7fa5430-c9b3-4b8d-87e4-35f8ad212c7b\", \"subject\": \"baseline-native\", \"predicate\": \"records\", \"object\": \"canonical rows\", \"dedup_key\": \"baseline-native\\u001frecords\\u001fcanonical rows\", \"confidence\": 1.0, \"source\": \"baseline\", \"creator\": \"system\", \"created_at\": \"2026-10-16T00:58:00.781473\", \"updated_at\": \"2026-10-16T00:58:01.421891\", \"verification_status\": \"candidate\", \"lifecycle_state\": \"active\", \"version\": 1}}"
+  },
+  "canonical_effects": {
+   "beliefs": [],
+   "facts": [
+    [
+     "baseline-native",
+     "records",
+     "canonical rows",
+     1.0,
+     "active"
+    ]
+   ],
+   "lifecycle_events": 0,
+   "outbox_by_record_and_operation": {
+    "fact:index_fact": 1
+   },
+   "receipts_by_memory_type": {
+    "fact": 1
+   }
+  },
+  "envelopes": {
+   "close_failed": "{\"error\": \"HermesProvider cleanup failed (close-failed); resources retained\"}",
+   "generic_error": "{\"error\": \"Both belief_a and belief_b must exist in the store\", \"tool\": \"resolve_conflict\"}",
+   "not_initialized": "{\"error\": \"HermesProvider not initialized\"}",
+   "projection_unavailable": "{\"error\": \"E_PROJECTION_UNAVAILABLE\", \"message\": \"E_PROJECTION_UNAVAILABLE: graph requires migration\", \"hint\": \"Run `memory-server migrate-profile-storage` to rebuild unavailable projections.\"}"
+  },
+  "schemas": [
+   {
+    "description": "Connectivity check — returns OK if CMMS is alive",
+    "input_schema": {},
+    "name": "ping"
+   },
+   {
+    "description": "Search stored facts by keyword text with optional subject/predicate filters",
+    "input_schema": {},
+    "name": "search"
+   },
+   {
+    "description": "Store a fact with provenance receipt. Writes to SQL and queues async indexing",
+    "input_schema": {},
+    "name": "remember"
+   },
+   {
+    "description": "Retrieve structured context about a task — facts and decisions relevant to the turn",
+    "input_schema": {},
+    "name": "get_context"
+   },
+   {
+    "description": "Extract and store facts, decisions, skills, and optionally beliefs from text",
+    "input_schema": {},
+    "name": "learn"
+   },
+   {
+    "description": "Semantic search — embed a query and find similar facts by vector similarity",
+    "input_schema": {},
+    "name": "semantic_search"
+   },
+   {
+    "description": "Search the knowledge graph for entities/relations by node lookup, pathfinding, or text",
+    "input_schema": {},
+    "name": "graph_search"
+   },
+   {
+    "description": "Route query through 4-stage router (rules->embeddings->graph->LLM) per ADR-005",
+    "input_schema": {},
+    "name": "route"
+   },
+   {
+    "description": "Run a memory audit for consistency, orphans, confidence distribution, and drift",
+    "input_schema": {},
+    "name": "audit"
+   },
+   {
+    "description": "Return a Prometheus-formatted snapshot of observability metrics",
+    "input_schema": {},
+    "name": "metrics"
+   },
+   {
+    "description": "Create/reinforce/supersede a belief with evidence. Matching beliefs get reinforced",
+    "input_schema": {},
+    "name": "set_belief"
+   },
+   {
+    "description": "Search beliefs — filter by proposition, lifecycle, confidence, tags, source, creator",
+    "input_schema": {},
+    "name": "get_belief"
+   },
+   {
+    "description": "Resolve a conflict between two beliefs (keep_a/b/merge/discard_both, or auto-resolve)",
+    "input_schema": {},
+    "name": "resolve_conflict"
+   },
+   {
+    "description": "Analyse belief store (overview, contradictions, decay, topics, audit, confidence)",
+    "input_schema": {},
+    "name": "reflect"
+   }
+  ],
+  "unknown_tool_error": {
+   "message": "Unknown CMMS tool: not_a_cmms_tool",
+   "type": "ValueError"
+  }
+ },
+ "provenance": {
+  "base_commit": "3c5f11a7cbe76f11a85116699e9b0b5d97c3c59e",
+  "capture_mode": true,
+  "capture_run_id": "d932d507-a91c-4299-84f4-8cc42d38446b",
+  "card": "C00",
+  "entry_digest": "62314879b41a78eb7c1dbc487446ca8d0804ffff6ac2cff3a879a11b810f736d",
+  "entry_keys": [
+   "happy.0.ping",
+   "happy.1.search",
+   "happy.10.add_relation",
+   "happy.11.graph_search",
+   "happy.12.learn",
+   "happy.13.set_belief",
+   "happy.14.set_belief",
+   "happy.15.get_belief",
+   "happy.16.reflect",
+   "happy.17.audit",
+   "happy.18.metrics",
+   "happy.2.get_context",
+   "happy.3.semantic_search",
+   "happy.4.graph_search",
+   "happy.5.route",
+   "happy.6.get_belief",
+   "happy.7.reflect",
+   "happy.8.remember",
+   "happy.9.remember",
+   "happy.invalidate",
+   "happy.resolve_conflict",
+   "invalid.add_relation",
+   "invalid.audit",
+   "invalid.get_belief",
+   "invalid.get_context",
+   "invalid.graph_search",
+   "invalid.invalidate",
+   "invalid.learn",
+   "invalid.metrics",
+   "invalid.ping",
+   "invalid.reflect",
+   "invalid.remember",
+   "invalid.resolve_conflict",
+   "invalid.route",
+   "invalid.search",
+   "invalid.semantic_search",
+   "invalid.set_belief"
+  ],
+  "entry_transcript_hashes": {
+   "happy.0.ping": "08e2c358ce13cb67f94ebb35b0f67c8763190a857c0db68da6eb196dfe9da46a",
+   "happy.1.search": "0debf9852a210eb23eaa6a4ff7cffcf14c2456fe884771264e88b4c6af8313a3",
+   "happy.10.add_relation": "3655333e8d74c4e79bd1f948116a599d62274a2725c5a63a6820c51c7f089af6",
+   "happy.11.graph_search": "bc25461de206526a3323575681c61ab4c0cbae5e831840b520ec5af5b44ea6ce",
+   "happy.12.learn": "d2f6d636d20fc8c01d6b9a1120918ae75178e158222ea667428d1fd0aa1325ba",
+   "happy.13.set_belief": "52d7158c36eea7f4fc1e666be0ceb311f1943f9dc2a43118a90a182f84f007d5",
+   "happy.14.set_belief": "46efa56fb7f5dcb2daa967cbb25f77b66d9d2b9504bdc669f8f7c9f5bf9d8c2b",
+   "happy.15.get_belief": "0e88c0f195e9ba4e15da4a6cde6eace23cef6e7b64358b55bec6a35c08b01d94",
+   "happy.16.reflect": "c423cbea8a4534f5488f69d158c916a56085291a4976e674c46d926c3ceba050",
+   "happy.17.audit": "6b21e3e86dade73b3b448c626d9bb98297cd55e74123f8b1c063685f1a6b892a",
+   "happy.18.metrics": "782448cdc05151d06c3190a715e4fb64f4ebdb26f65e8714a24e443080e47802",
+   "happy.2.get_context": "90accd70f0310b4405205f7f12403f78af39b413e191d8215d7c95d1326a238e",
+   "happy.3.semantic_search": "71aed11a1d3f6ea2aeee74eb908f6305b112ee8a8f11762ab46ce7f84a1ac3ca",
+   "happy.4.graph_search": "f06590efca4b4019af121b595ea10f97dd45b8ab2e316849fd8c5d27021c7e78",
+   "happy.5.route": "9f9b6829eaff081a0819e6097f602d7caf2ae56eccbce4ce3450af7094eabb8e",
+   "happy.6.get_belief": "0c7a0fee4698fa3e0498dd1ca56b30b972834e0aaa3b69f293d366767315d97c",
+   "happy.7.reflect": "a115abe27293daaa3091c547a5c41faabb8c6b638b36008e6acc38fd586bda5e",
+   "happy.8.remember": "9c84b972328fd079c9ac5e2acf5adb44b2fc8fe6bebb1915328d7c772ce17ca6",
+   "happy.9.remember": "b4fa67a5344246b588cbac88bbb549c029216fb50e2e0c1740a92853593c0a4c",
+   "happy.invalidate": "84767cd8425b9981396f34f858156917789c849dceddcc7b4c397c3a1cb17328",
+   "happy.resolve_conflict": "69e434538edf44bd876e3d8522e9e5730bec83e732d9fb375d458a8b23f74ed5",
+   "invalid.add_relation": "a1c083213241e9834789f378ea92252228e93b32f22f3a2057c5461b2846d97a",
+   "invalid.audit": "215b84f8a665a466237e6827bd14d6387dba672bc9c37c0a0b2aef06619a6f75",
+   "invalid.get_belief": "f2c02cfe970e0c98c23d34c40d9de0483a71a750c63866d47a6b7e1b449b9423",
+   "invalid.get_context": "d5ed3da8aa2ff4c645d889777b8f666e6a7c7b4f724d7e6c8815f59a70480c30",
+   "invalid.graph_search": "b6550da0bc2764f9e04552dc1fe67173a903a769d0623798b80bcddabec009cf",
+   "invalid.invalidate": "24a27c486234701030b08929e3ce5bae9c631cb430d097d83de6d6528d6a851d",
+   "invalid.learn": "868f86a401ad21d2c50f71595af3c8f10e00caa66544c9886ad42901f63a809a",
+   "invalid.metrics": "7b56bace338685026d9ad7e7119be168a513caaa0c869191980f46b65b4625e2",
+   "invalid.ping": "08e2c358ce13cb67f94ebb35b0f67c8763190a857c0db68da6eb196dfe9da46a",
+   "invalid.reflect": "7699fbd34d3d8f829996aa871e992e3e0eb0aa904687a1ecc9d5f281577a7d68",
+   "invalid.remember": "3c6ab304d8c0e1970267adc45ebc26c91a148f2f7df16eb358686affe8b543ab",
+   "invalid.resolve_conflict": "3a4b9944a6deb7df3b88ef3a7bfc17ceb2763999b9606690e125c6c8c09f3df2",
+   "invalid.route": "1b20d1307ac9f770bdfb33d5e1fd1125cda7b1d78e3a4f6270421c3f7a92267f",
+   "invalid.search": "236ccadb609afd55cf910663760953aba2b82b6bdf41651a0be1e1c808fef51b",
+   "invalid.semantic_search": "1920887245a221af483504f7fe7cf20a74d52e66e82f33d13e62da88fb69a97f",
+   "invalid.set_belief": "affb508fbb5c3d2a1c51b9cc2f99022c1fe5706d464167b001c2cbc4be71930f"
+  },
+  "live_data_roots": [
+   "/home/shtorm/.hermes/data",
+   "/home/shtorm/memory-server/data"
+  ],
+  "native_tool_names": [
+   "ping",
+   "search",
+   "remember",
+   "get_context",
+   "learn",
+   "semantic_search",
+   "graph_search",
+   "route",
+   "audit",
+   "metrics",
+   "set_belief",
+   "get_belief",
+   "resolve_conflict",
+   "reflect"
+  ],
+  "normalization_whitelist": [
+   "rfc4122-uuid -> <uuid>",
+   "iso8601-timestamp -> <timestamp>",
+   "unix-epoch-gauge (>=1e8) -> <epoch>",
+   "prometheus-*_sum-latency-sample -> <number>",
+   "prometheus-sample-values -> family/label projection (metrics entry only)",
+   "scratch-absolute-path -> <scratch>"
+  ],
+  "projection_entry_hashes": {
+   "add_relation": "215666fbe7c74bd73288a6409618ea3da3ab81abed4e04663b4a1344dcbb4847",
+   "graph_search": "215666fbe7c74bd73288a6409618ea3da3ab81abed4e04663b4a1344dcbb4847"
+  },
+  "provenance": {
+   "base_repo": "/home/shtorm/.hermes/profiles/coder/cache/scratch/cmms-runtime-refactor-exclusive/C00/base-3c5f11a7",
+   "dependency_versions": {
+    "aiosqlite": "0.22.1",
+    "mcp": null,
+    "pydantic": "2.13.5",
+    "sqlalchemy": "2.0.52",
+    "sqlite3": null
+   },
+   "interpreter": {
+    "implementation": "CPython",
+    "path": "/home/shtorm/memory-server/.venv/bin/python",
+    "version": "3.12.3"
+   },
+   "repo_root": "/home/shtorm/.hermes/profiles/coder/cache/scratch/cmms-runtime-refactor-exclusive/C00/base-3c5f11a7",
+   "scratch_root": "/home/shtorm/.hermes/profiles/coder/cache/scratch/cmms-runtime-refactor-exclusive/C00",
+   "server_command": [
+    "/home/shtorm/memory-server/.venv/bin/memory-server",
+    "serve"
+   ],
+   "transport": "mcp.client.stdio.stdio_client"
+  },
+  "scratch_root": "/home/shtorm/.hermes/profiles/coder/cache/scratch/cmms-runtime-refactor-exclusive/C00",
+  "seed_graph": {
+   "snapshot_path": "/home/shtorm/.hermes/profiles/coder/cache/scratch/cmms-runtime-refactor-exclusive/C00/wire/data/graph.json",
+   "source_node": "seed-node-alpha",
+   "target_node": "seed-node-beta"
+  },
+  "tool_names": [
+   "ping",
+   "search",
+   "get_context",
+   "remember",
+   "learn",
+   "semantic_search",
+   "graph_search",
+   "add_relation",
+   "invalidate",
+   "route",
+   "audit",
+   "metrics",
+   "set_belief",
+   "get_belief",
+   "resolve_conflict",
+   "reflect"
+  ]
+ },
+ "schema": "cmms.runtime_contracts.v1"
+}
