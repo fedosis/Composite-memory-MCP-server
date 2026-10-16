@@ -13,13 +13,14 @@ import copy
 import inspect
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable
 from uuid import uuid4
 
-from memory_server.runtime.dependencies import RuntimeDependencies
+from memory_server.paths import StorageLayoutError
+from memory_server.runtime.dependencies import CLOSE_ORDER, RuntimeDependencies
 from memory_server.runtime.errors import (
     CMMSRuntimeError,
     RuntimeCleanupFailed,
@@ -31,9 +32,81 @@ from memory_server.runtime.errors import (
 )
 from memory_server.storage_lock import RuntimeStorageLock, StorageLockError
 
+# O2/D1 codes. They stay OUTSIDE the closed migration catalogue
+# (profile_migration.py:431-448) and are never registered in it.
+E_QDRANT_REMOTE_NAMESPACE_UNCONFIRMED = "E_QDRANT_REMOTE_NAMESPACE_UNCONFIRMED"
+E_RUNTIME_WRITABLE_SPLIT_LAYOUT = "E_RUNTIME_WRITABLE_SPLIT_LAYOUT"
+E_RUNTIME_AMBIGUOUS_SQL_URI = "E_RUNTIME_AMBIGUOUS_SQL_URI"
+E_RUNTIME_UNPROVABLE_RESOURCE_OWNERSHIP = "E_RUNTIME_UNPROVABLE_RESOURCE_OWNERSHIP"
+_AMBIGUOUS_SQL_KINDS = frozenset({"file_uri", "remote"})
+
+
+def ensure_layout_eligible(layout: Any) -> None:
+    """O2/§2.1 eligibility, evaluated from the frozen layout only (no I/O).
+
+    Called before the EX acquisition and before every recipe/constructor, so a
+    refusal can never create a lock entry or open a resource.
+
+    * Remote Qdrant outside profile mode is ALWAYS refused (owner decision Q1):
+      no confirmation mechanism exists and none may be invented, so the runtime
+      fails closed with ``E_QDRANT_REMOTE_NAMESPACE_UNCONFIRMED``. Profile mode
+      keeps its unchanged ``E_QDRANT_PROFILE_NAMESPACE_UNDEFINED`` refusal at
+      resolution time (``paths.py:366-367``).
+    * A writable ``legacy-split-layout:<label>`` alias is refused; a projection
+      that is marked unavailable is NOT one, because it stays unopened
+      (``paths.py:325-334``), and ``ephemeral-projection:vector`` is not an
+      alias at all (``paths.py:368-369``).
+    * An ambiguous/opaque SQL target (``file_uri``/``remote``) and unprovable
+      local resource ownership are refused; ``sqlite.kind == "memory"`` stays
+      supported.
+    """
+    if not (hasattr(layout, "mode") or hasattr(layout, "data_root")):
+        # A bare root path (the C02 unit-level seam) declares no store, no
+        # alias and no ownership claim, so there is nothing to refuse.
+        return
+    mode = getattr(layout, "mode", None)
+    vector = getattr(layout, "vector", None)
+    sqlite = getattr(layout, "sqlite", None)
+    if (
+        vector is not None
+        and getattr(vector, "backend", None) == "qdrant"
+        and getattr(vector, "kind", None) == "remote"
+        and mode != "profile"
+    ):
+        raise StorageLayoutError(
+            E_QDRANT_REMOTE_NAMESPACE_UNCONFIRMED,
+            "remote Qdrant has no confirmable namespace exclusivity outside profile mode",
+        )
+    if sqlite is not None and getattr(sqlite, "kind", None) in _AMBIGUOUS_SQL_KINDS:
+        raise StorageLayoutError(
+            E_RUNTIME_AMBIGUOUS_SQL_URI,
+            f"ambiguous SQLite target kind: {getattr(sqlite, 'kind', None)}",
+        )
+    if sqlite is not None and getattr(sqlite, "kind", None) == "file" and getattr(sqlite, "local_path", None) is None:
+        raise StorageLayoutError(E_RUNTIME_UNPROVABLE_RESOURCE_OWNERSHIP, "sqlite file target has no provable path")
+    unavailable = getattr(layout, "unavailable_projections", None) or frozenset()
+    for flag in getattr(layout, "compatibility", ()) or ():
+        if not str(flag).startswith("legacy-split-layout:"):
+            continue  # ephemeral-projection:vector and other flags are not aliases
+        if str(flag).split(":", 1)[1] in unavailable:
+            continue  # unopened/degraded projection: no writable alias can be opened
+        raise StorageLayoutError(
+            E_RUNTIME_WRITABLE_SPLIT_LAYOUT,
+            f"writable split layout rejected before construction: {flag}",
+        )
+    if vector is not None and getattr(vector, "kind", None) == "local" and getattr(vector, "local_path", None) is None:
+        raise StorageLayoutError(E_RUNTIME_UNPROVABLE_RESOURCE_OWNERSHIP, "local vector target has no provable path")
+    if not getattr(layout, "data_root", None):
+        raise StorageLayoutError(E_RUNTIME_UNPROVABLE_RESOURCE_OWNERSHIP, "layout owns no provable root")
+
 
 def _freeze(value: Any) -> Any:
     if is_dataclass(value):
+        # A FROZEN dataclass config snapshot (RuntimeConfig) is already deep
+        # immutable and must keep attribute access; a plain/nested structure is
+        # copied into MappingProxyType as before.
+        if getattr(type(value), "__dataclass_params__", None) is not None and type(value).__dataclass_params__.frozen:
+            return value
         value = {f.name: getattr(value, f.name) for f in fields(value)}
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
@@ -125,6 +198,7 @@ class CMMSRuntime:
             self._steps.clear()
             self._start_error = None
             self._rollback = self._restart_safe = False
+        self.preflight()
         if self._start_task is None:
             self.state = "STARTING"
             self._start_task = asyncio.create_task(self._start())
@@ -152,7 +226,7 @@ class CMMSRuntime:
                     raise RuntimeClosingError()
                 resource = await self._maybe(build(self))
                 self._built.append((name, resource))
-                self.dependencies = replace(self.dependencies, **{name: resource})
+                self.dependencies = self.dependencies.with_resource(name, resource)
             if self.state != "STARTING":
                 raise RuntimeClosingError()
             self.state = "READY"
@@ -192,6 +266,16 @@ class CMMSRuntime:
     def register_admitted(self, task: asyncio.Task) -> None:
         self._check_admission()
         self._admitted.add(task)
+
+    def preflight(self) -> None:
+        """O2/§2.1 eligibility gate.
+
+        Runs in the caller before the retained start task is created, hence
+        strictly before the EX acquisition and before every recipe: a refusal
+        leaves the runtime in ``NEW``, with no lock entry and no constructed
+        resource.
+        """
+        ensure_layout_eligible(self.layout)
 
     def register_executor(self, future: Any) -> None:
         self._check_admission()
@@ -322,7 +406,7 @@ class CMMSRuntime:
             order = (
                 list(reversed(self._built))
                 if rollback
-                else [(n, getattr(self.dependencies, n)) for n in ("vector", "embedder", "graph", "sqlite")]
+                else [(n, getattr(self.dependencies, n)) for n in CLOSE_ORDER]
             )
             for name, obj in order:
                 if obj is None or name in self._closed or name not in self.dependencies.owns_close:

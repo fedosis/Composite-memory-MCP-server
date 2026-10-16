@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
+
+# Close order of the resources the runtime OWNS: SQLite last, because the outbox
+# worker borrows its engine (``outbox_worker.py:140-143``) and a borrowed engine
+# must never be disposed by the borrower. Construction follows the reverse path.
+CLOSE_ORDER: tuple[str, ...] = ("vector", "embedder", "graph", "sqlite")
 
 
 class RuntimeHooks(Protocol):
@@ -41,3 +46,13 @@ class RuntimeDependencies:
         names = [name for name, _ in self.recipes]
         if len(names) != len(set(names)) or any(name not in self.__dataclass_fields__ for name in names):
             raise ValueError("invalid dependency recipes")
+
+    def with_resource(self, name: str, resource: Any) -> "RuntimeDependencies":
+        """Return a NEW frozen container holding ``resource`` under ``name``.
+
+        The runtime never mutates the snapshot it was created with; a recipe
+        result becomes visible only through the returned container.
+        """
+        if name not in self.__dataclass_fields__:
+            raise ValueError(f"unknown dependency: {name}")
+        return replace(self, **{name: resource})
