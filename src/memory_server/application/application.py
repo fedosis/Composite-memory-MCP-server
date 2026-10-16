@@ -17,8 +17,9 @@ transport.
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
+from memory_server.application.audit_service import AuditService
 from memory_server.application.belief_service import BeliefService
 from memory_server.application.contracts import (
     BeliefPolicy,
@@ -54,6 +55,11 @@ class MemoryApplication:
         reflection_policy: ReflectionPolicy | None = None,
         relation_provider: Any | None = None,
         lifecycle_provider: Any | None = None,
+        audit_validator: Any | None = None,
+        audit_confidence_engine: Any | None = None,
+        audit_sqlite: Any | None = None,
+        audit_vector_provider: Any | None = None,
+        audit_state: Mapping[str, Any] | None = None,
     ) -> None:
         self._session_factory = session_factory
         # Captured once here; MemoryService never re-reads it.
@@ -101,6 +107,16 @@ class MemoryApplication:
                 lifecycle_provider,
                 get_graph=get_graph,
             )
+        self._audit = None
+        if audit_validator is not None and audit_confidence_engine is not None and audit_state is not None:
+            self._audit = AuditService(
+                validator=audit_validator,
+                confidence_engine=audit_confidence_engine,
+                get_graph=get_graph,
+                sqlite=audit_sqlite,
+                vector_provider=audit_vector_provider,
+                persisted_state=audit_state,
+            )
 
     @classmethod
     def from_provider(
@@ -118,6 +134,9 @@ class MemoryApplication:
         reflection_policy: ReflectionPolicy | None = None,
         relation_provider: Any | None = None,
         lifecycle_provider: Any | None = None,
+        audit_validator: Any | None = None,
+        audit_confidence_engine: Any | None = None,
+        audit_state: Mapping[str, Any] | None = None,
     ) -> MemoryApplication:
         """Build from any object exposing ``_session_factory`` (duck-typed)."""
         return cls(
@@ -136,6 +155,10 @@ class MemoryApplication:
             reflection_policy=reflection_policy,
             relation_provider=provider,
             lifecycle_provider=provider,
+            audit_validator=audit_validator,
+            audit_confidence_engine=audit_confidence_engine,
+            audit_sqlite=provider,
+            audit_state=audit_state,
         )
 
     @property
@@ -177,6 +200,12 @@ class MemoryApplication:
         if self._lifecycle is None:
             raise UnknownDependencyError("lifecycle service")
         return self._lifecycle
+
+    @property
+    def audit(self) -> AuditService:
+        if self._audit is None:
+            raise UnknownDependencyError("audit service")
+        return self._audit
 
     def describe(self) -> dict[str, Any]:
         """Secrets-free by construction: no paths, no provider handles."""

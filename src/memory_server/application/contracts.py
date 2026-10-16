@@ -94,6 +94,11 @@ class LifecycleCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditCommand:
+    audit_type: str = "full"
+
+
+@dataclass(frozen=True, slots=True)
 class RememberCommand:
     """Input DTO for the ``remember`` use case."""
 

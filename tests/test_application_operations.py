@@ -728,3 +728,78 @@ async def test_lifecycle_characterization_graph_fallback_and_rollback(provider, 
             },
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_audit_application_boundary_real_persisted_report(provider, monkeypatch):
+    from memory_server.application.application import MemoryApplication
+    from memory_server.application.contracts import AuditCommand
+    from memory_server.evaluation.auditor import MemoryAuditor, collect_persisted_audit_state
+    from memory_server.evaluation.confidence import ConfidenceEngine
+    from memory_server.evaluation.validator import Validator
+    from memory_server.models import Fact
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    fact = Fact(id="c-audit-fact", subject="C", predicate="is", object="real")
+    await provider.create_fact(fact)
+    validator = Validator()
+    validator.register(fact.id, confidence=0.8)
+    engine = ConfidenceEngine()
+    graph = SimpleGraph()
+    graph.add_node(id=fact.id, type="fact", name="C")
+    persisted = await collect_persisted_audit_state(sqlite=provider)
+    calls = []
+    original = MemoryAuditor.audit_report
+
+    def probe(self, *args, **kwargs):
+        calls.append(__import__("inspect").stack())
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(MemoryAuditor, "audit_report", probe)
+
+    async def get_graph():
+        return graph
+
+    app = MemoryApplication(
+        object(),
+        audit_validator=validator,
+        audit_confidence_engine=engine,
+        audit_sqlite=provider,
+        audit_state=persisted,
+        get_graph=get_graph,
+    )
+    report = await app.audit.audit(AuditCommand())
+    assert report["audit_type"] == "full"
+    assert calls and any(
+        "memory_server.application.audit_service" == frame.frame.f_globals.get("__name__")
+        for frame in calls[0]
+    )
+    assert await provider.get_fact(fact.id) is not None
+
+    invalid = await app.audit.audit(AuditCommand(audit_type="invalid"))
+    assert invalid["audit_type"] == "invalid"
+
+
+@pytest.mark.asyncio
+async def test_audit_application_missing_optional_resources_and_composition(provider):
+    from memory_server.application.application import MemoryApplication
+    from memory_server.application.contracts import AuditCommand, MemoryPolicy
+    from memory_server.application.errors import UnknownDependencyError
+    from memory_server.evaluation.auditor import collect_persisted_audit_state
+    from memory_server.evaluation.confidence import ConfidenceEngine
+    from memory_server.evaluation.validator import Validator
+
+    persisted = await collect_persisted_audit_state(sqlite=provider)
+    app = MemoryApplication(
+        object(),
+        policy=MemoryPolicy(max_active_beliefs=500),
+        audit_validator=Validator(),
+        audit_confidence_engine=ConfidenceEngine(),
+        audit_state=persisted,
+    )
+    result = await app.audit.audit(AuditCommand())
+    assert result["audit_type"] == "full"
+    assert app.describe() == {"policy": {"max_active_beliefs": 500}}
+    missing = MemoryApplication(object())
+    with pytest.raises(UnknownDependencyError, match="audit service"):
+        _ = missing.audit
