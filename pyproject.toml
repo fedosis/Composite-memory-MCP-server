@@ -67,6 +67,7 @@ testpaths = ["tests"]
 packages = [
     "memory_server",
     "memory_server.api",
+    "memory_server.application",
     "memory_server.benchmarks",
     "memory_server.evaluation",
     "memory_server.extractors",

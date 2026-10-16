@@ -279,8 +279,27 @@ class MemoryIngestionService:
     If any part fails, the entire operation rolls back — no orphaned data.
     """
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        max_active_beliefs: int | None = None,
+    ) -> None:
+        """Bind the session factory and capture the belief soft limit once.
+
+        ``None`` means "not injected": the ambient value is captured HERE, at
+        construction (legacy default preserved), and never consulted again.
+        An explicit value is used verbatim. The positional-only usage
+        ``MemoryIngestionService(provider._session_factory)`` stays
+        source-compatible (``api/remember.py:98``, ``api/learn.py:57`` and the
+        ``tests/test_llm_extraction.py`` call sites).
+        """
         self._session_factory = session_factory
+        if max_active_beliefs is None:
+            from memory_server.settings import get_settings
+
+            max_active_beliefs = get_settings().max_active_beliefs
+        self._max_active_beliefs = max_active_beliefs
 
     async def remember(
         self,
@@ -913,10 +932,9 @@ class MemoryIngestionService:
             belief_repo = BeliefRepository(session)
             ev_repo = EvidenceRepository(session)
 
-            # 1. Check soft limit (Settings-fed; env MEMORY_SERVER_MAX_ACTIVE_BELIEFS)
-            from memory_server.settings import get_settings
-
-            max_active_beliefs = get_settings().max_active_beliefs
+            # 1. Check soft limit (captured once at construction; ambient
+            #    MEMORY_SERVER_MAX_ACTIVE_BELIEFS is no longer read here)
+            max_active_beliefs = self._max_active_beliefs
             active_beliefs = await belief_repo.search(
                 lifecycle_state="active",
                 limit=0,
