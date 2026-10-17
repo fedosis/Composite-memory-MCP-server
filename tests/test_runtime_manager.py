@@ -2,8 +2,11 @@
 
 import asyncio
 import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +17,7 @@ from memory_server.paths import (
     VectorLocation,
 )
 from memory_server.runtime.config import RuntimeConfig
+from memory_server.runtime.runtime import ShutdownReport
 from memory_server.runtime.runtime_factory import RECIPE_ORDER, RuntimeFactory
 from memory_server.runtime.runtime_manager import RuntimeDescriptor, RuntimeManager, RuntimeManagerError
 
@@ -55,6 +59,37 @@ def manager(calls, gate=None):
         calls.append(value)
         overrides = {name: (slow if name == "sqlite" and gate else (lambda _runtime: None)) for name in RECIPE_ORDER}
         return RuntimeFactory.create(value, overrides=overrides, **kwargs)
+
+    return RuntimeManager(loop=asyncio.get_running_loop(), factory_builder=build)
+
+
+class ControlledRuntime:
+    def __init__(self, reports, gate=None):
+        self.reports, self.gate = reports, gate
+        self.state, self.started, self.close_calls = "NEW", False, 0
+        self.close_started = asyncio.Event()
+
+    async def start(self):
+        self.state, self.started = "READY", True
+        return self
+
+    async def close(self):
+        self.close_calls += 1
+        self.state = "CLOSING"
+        self.close_started.set()
+        if self.gate is not None:
+            await self.gate.wait()
+        report = self.reports.pop(0)
+        self.state = "CLOSED" if report.code in {None, "E_RUNTIME_FLUSH_FAILED"} else "FAILED"
+        return report
+
+
+def controlled_manager(runtimes, reports=None, gates=None):
+    reports, gates = {key: list(value) for key, value in (reports or {}).items()}, gates or {}
+
+    def build(value, **_):
+        name = value.data_root.name; runtime = ControlledRuntime(reports.get(name, [ShutdownReport()]), gates.get(name))  # noqa: E702
+        runtimes.setdefault(name, []).append(runtime); return SimpleNamespace(runtime=runtime)  # noqa: E702
 
     return RuntimeManager(loop=asyncio.get_running_loop(), factory_builder=build)
 
@@ -214,3 +249,160 @@ async def test_manager_never_mutates_ambient_environment_or_settings_cache(tmp_p
     assert os.environ["MEMORY_SERVER_DATA_ROOT"] == before
     assert runtime.layout.data_root == value.data_root
     await runtime.close()
+
+
+async def test_stop_absent_profile_is_idempotent_without_resource_work(tmp_path):
+    runtimes = {}
+    manager_a = controlled_manager(runtimes)
+    assert await manager_a.stop_profile("missing") is None
+    assert runtimes == {}
+
+
+async def test_stop_during_start_settles_without_late_ready_publication(tmp_path):
+    gate, calls = asyncio.Event(), []
+    manager_a = manager(calls, gate)
+    descriptor, value, config = request(tmp_path / "a")
+    owner = asyncio.create_task(manager_a.get(descriptor, layout=value, config=config))
+    await asyncio.sleep(0)
+    stopper = asyncio.create_task(manager_a.stop_profile("p"))
+    report = await stopper
+    result = await asyncio.gather(owner, return_exceptions=True)
+    assert report.code is None
+    assert not any(getattr(item, "state", None) == "READY" for item in result)
+
+
+async def test_close_all_closes_admission_before_awaiting_profiles(tmp_path):
+    gate, runtimes = asyncio.Event(), {}
+    manager_a = controlled_manager(runtimes, gates={"a": gate})
+    descriptor, value, config = request(tmp_path / "a", profile="a")
+    await manager_a.get(descriptor, layout=value, config=config)
+    closing = asyncio.create_task(manager_a.close_all())
+    await runtimes["a"][0].close_started.wait()
+    with pytest.raises(RuntimeManagerError) as caught:
+        await manager_a.get(descriptor, layout=value, config=config)
+    assert caught.value.code == "E_RUNTIME_MANAGER_CLOSED"
+    gate.set()
+    assert (await closing).complete
+
+
+async def test_close_all_attempts_later_profiles_after_one_failure(tmp_path):
+    unsafe = ShutdownReport(code="E_RUNTIME_CLEANUP_FAILED", retained_resources=("sqlite",))
+    runtimes = {}
+    manager_a = controlled_manager(runtimes, reports={"a": [ShutdownReport()], "b": [unsafe], "c": [ShutdownReport()]})
+    for name in ("c", "a", "b"):
+        descriptor, value, config = request(tmp_path / name, profile=name)
+        await manager_a.get(descriptor, layout=value, config=config)
+    report = await manager_a.close_all()
+    assert [outcome.profile_id for outcome in report.outcomes] == ["a", "b", "c"]
+    assert all(runtimes[name][0].close_calls == 1 for name in "abc")
+    assert not report.complete
+
+
+async def test_close_all_aggregate_order_is_deterministic_and_redacted(tmp_path):
+    runtimes = {}; manager_a = controlled_manager(runtimes)  # noqa: E702
+    for name in ("z", "m", "a"):
+        descriptor, value, config = request(tmp_path / name, profile=name)
+        await manager_a.get(descriptor, layout=value, config=config)
+    report = await manager_a.close_all()
+    assert tuple(item.profile_id for item in report.outcomes) == ("a", "m", "z")
+    assert "password" not in repr(report)
+
+
+async def test_close_all_waiter_cancellation_does_not_cancel_owned_cleanup(tmp_path):
+    gate, runtimes = asyncio.Event(), {}
+    manager_a = controlled_manager(runtimes, gates={"a": gate})
+    descriptor, value, config = request(tmp_path / "a", profile="a")
+    await manager_a.get(descriptor, layout=value, config=config)
+    owner = asyncio.create_task(manager_a.close_all())
+    await runtimes["a"][0].close_started.wait()
+    waiter = asyncio.create_task(manager_a.close_all())
+    await asyncio.sleep(0)
+    assert not waiter.done()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    gate.set()
+    assert (await owner).complete
+
+
+async def test_unsafe_cleanup_retains_owner_and_denies_replacement(tmp_path):
+    unsafe = ShutdownReport(code="E_RUNTIME_CLEANUP_FAILED", retained_resources=("sqlite",))
+    runtimes = {}
+    manager_a = controlled_manager(runtimes, reports={"a": [unsafe, ShutdownReport()]})
+    descriptor, value, config = request(tmp_path / "a", profile="a")
+    original = await manager_a.get(descriptor, layout=value, config=config)
+    assert (await manager_a.stop_profile("a")).code == "E_RUNTIME_CLEANUP_FAILED"
+    with pytest.raises(RuntimeManagerError) as caught:
+        await manager_a.get(descriptor, layout=value, config=config)
+    assert caught.value.code == "E_RUNTIME_CLEANUP_FAILED"
+    assert (await manager_a.stop_profile("a")).code is None
+    replacement = await manager_a.get(descriptor, layout=value, config=config)
+    assert replacement is not original
+    assert runtimes["a"][0].close_calls == 2
+
+
+async def test_lock_release_uncertain_retains_owner_and_reservation(tmp_path):
+    uncertain = ShutdownReport(code="E_LOCK_RELEASE_UNCERTAIN", lock_retained=True)
+    runtimes = {}
+    manager_a = controlled_manager(runtimes, reports={"a": [uncertain, ShutdownReport()]})
+    descriptor, value, config = request(tmp_path / "a", profile="a")
+    owner = await manager_a.get(descriptor, layout=value, config=config)
+    report = await manager_a.stop_profile("a")
+    assert report.lock_retained and runtimes["a"][0].state == "FAILED"
+    with pytest.raises(RuntimeManagerError) as caught:
+        await manager_a.get(descriptor, layout=value, config=config)
+    assert caught.value.code == "E_LOCK_RELEASE_UNCERTAIN"
+    await manager_a.stop_profile("a")
+    assert await manager_a.get(descriptor, layout=value, config=config) is not owner
+
+
+async def test_safe_flush_failure_is_reported_before_replacement(tmp_path):
+    flushed = ShutdownReport(code="E_RUNTIME_FLUSH_FAILED", failed=1)
+    runtimes = {}
+    manager_a = controlled_manager(runtimes, reports={"a": [flushed, ShutdownReport()]})
+    descriptor, value, config = request(tmp_path / "a", profile="a")
+    original = await manager_a.get(descriptor, layout=value, config=config)
+    report = await manager_a.stop_profile("a")
+    replacement = await manager_a.get(descriptor, layout=value, config=config)
+    assert report.code == "E_RUNTIME_FLUSH_FAILED"
+    assert replacement is not original
+
+
+async def test_repeated_stop_and_close_all_do_not_double_close_or_flush(tmp_path):
+    runtimes = {}; manager_a = controlled_manager(runtimes)  # noqa: E702
+    descriptor, value, config = request(tmp_path / "a", profile="a")
+    await manager_a.get(descriptor, layout=value, config=config)
+    first = await manager_a.stop_profile("a")
+    second = await manager_a.stop_profile("a")
+    aggregate = await manager_a.close_all()
+    again = await manager_a.close_all()
+    assert first is second
+    assert aggregate is again and aggregate.complete
+    assert runtimes["a"][0].close_calls == 1
+
+
+async def test_independent_profile_stop_does_not_close_other_ready_profile(tmp_path):
+    runtimes = {}; manager_a = controlled_manager(runtimes)  # noqa: E702
+    for name in ("a", "b"):
+        descriptor, value, config = request(tmp_path / name, profile=name)
+        await manager_a.get(descriptor, layout=value, config=config)
+    await manager_a.stop_profile("a")
+    assert runtimes["a"][0].state == "CLOSED"
+    assert runtimes["b"][0].state == "READY"
+    assert runtimes["b"][0].close_calls == 0
+
+
+async def test_real_subprocess_contender_is_blocked_until_verified_release(tmp_path):
+    manager_a = manager([])
+    descriptor, value, config = request(tmp_path / "a", profile="a")
+    await manager_a.get(descriptor, layout=value, config=config)
+    lock = value.root_lock_path
+    before = lock.stat().st_ino
+    code = "from pathlib import Path; import sys; from memory_server.storage_lock import RuntimeStorageLock; print('ready', flush=True); owner=RuntimeStorageLock.acquire_exclusive(Path(sys.argv[1]), timeout=3); owner.release_exclusive(); print('acquired', flush=True)"  # noqa: E501
+    contender = subprocess.Popen([sys.executable, "-c", code, str(value.data_root)], stdout=subprocess.PIPE, text=True)
+    assert contender.stdout.readline().strip() == "ready"
+    assert contender.poll() is None
+    await manager_a.stop_profile("a")
+    stdout, _ = contender.communicate(timeout=5)
+    assert contender.returncode == 0 and "acquired" in stdout
+    assert lock.stat().st_ino == before

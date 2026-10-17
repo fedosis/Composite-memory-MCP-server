@@ -14,7 +14,7 @@ from memory_server.paths import StorageLayoutError, inspect_component_chain_nofo
 from memory_server.runtime.config import RuntimeConfig
 from memory_server.runtime.dependencies import RuntimeDependencies
 from memory_server.runtime.errors import CMMSRuntimeError
-from memory_server.runtime.runtime import CMMSRuntime, ensure_layout_eligible
+from memory_server.runtime.runtime import CMMSRuntime, ShutdownReport, ensure_layout_eligible
 from memory_server.runtime.runtime_factory import RuntimeFactory
 
 E_RUNTIME_MANAGER_LOOP_REQUIRED = "E_RUNTIME_MANAGER_LOOP_REQUIRED"
@@ -25,6 +25,8 @@ E_RUNTIME_RESOURCE_ALIAS = "E_RUNTIME_RESOURCE_ALIAS"
 E_RUNTIME_RESOURCE_IDENTITY_CHANGED = "E_RUNTIME_RESOURCE_IDENTITY_CHANGED"
 E_RUNTIME_FACTORY_BUILD_FAILED = "E_RUNTIME_FACTORY_BUILD_FAILED"
 E_RUNTIME_START_FAILED = "E_RUNTIME_START_FAILED"
+E_RUNTIME_MANAGER_CLOSED = "E_RUNTIME_MANAGER_CLOSED"
+E_RUNTIME_CLOSE_ALL_FAILED = "E_RUNTIME_CLOSE_ALL_FAILED"
 
 
 class RuntimeManagerError(CMMSRuntimeError):
@@ -32,6 +34,22 @@ class RuntimeManagerError(CMMSRuntimeError):
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class ProfileCloseOutcome:
+    profile_id: str
+    report: ShutdownReport | None
+    error_code: str | None
+    retained: bool
+
+
+@dataclass(frozen=True)
+class CloseAllReport:
+    outcomes: tuple[ProfileCloseOutcome, ...]
+    admission_closed: bool
+    complete: bool
+    error_code: str | None
 
 
 def _unsupported() -> RuntimeManagerError:
@@ -163,6 +181,8 @@ class _Entry:
     state: str = "STARTING"
     failure_code: str | None = None
     evidence: dict[Path, tuple] | None = None
+    cleanup_task: asyncio.Task | None = None
+    report: ShutdownReport | None = None
 
 
 class RuntimeManager:
@@ -182,6 +202,9 @@ class RuntimeManager:
         self._loop = loop
         self._factory_builder = factory_builder
         self._entries: list[_Entry] = []
+        self._admission_closed = False
+        self._close_all_task: asyncio.Task | None = None
+        self._terminal_close_all: CloseAllReport | None = None
 
     def _check_loop(self) -> None:
         try:
@@ -202,6 +225,7 @@ class RuntimeManager:
         candidate_paths = _resource_paths(layout)
         candidate_evidence = _evidence(candidate_paths)
         _reject_unsafe(candidate_evidence)
+        self._entries[:] = [entry for entry in self._entries if entry.state != "CLOSED"]
         for entry in self._entries:
             if entry.descriptor.profile_id == descriptor.profile_id and entry.descriptor != descriptor:
                 raise RuntimeManagerError(E_RUNTIME_DESCRIPTOR_CONFLICT)
@@ -234,7 +258,13 @@ class RuntimeManager:
         try:
             assert entry.factory is not None
             runtime = await entry.factory.runtime.start()
-            if runtime.state != "READY" or not runtime.started:
+            if (
+                entry.state != "STARTING"
+                or self._admission_closed
+                or runtime.state != "READY"
+                or not runtime.started
+            ):
+                await runtime.close()
                 raise RuntimeManagerError(E_RUNTIME_START_FAILED)
             entry.state = "READY"
             entry.evidence = _evidence(tuple(entry.evidence or {}))
@@ -253,6 +283,8 @@ class RuntimeManager:
         dependencies: RuntimeDependencies | None = None,
     ) -> CMMSRuntime:
         self._check_loop()
+        if self._admission_closed:
+            raise RuntimeManagerError(E_RUNTIME_MANAGER_CLOSED)
         candidate = self._validate(descriptor, layout, config)
         entry = self._reserve(candidate, layout)
         if entry.state == "READY":
@@ -260,6 +292,8 @@ class RuntimeManager:
             return entry.factory.runtime
         if entry.state == "FAILED":
             raise RuntimeManagerError(entry.failure_code or E_RUNTIME_START_FAILED)
+        if entry.state == "CLOSING":
+            raise RuntimeManagerError(E_RUNTIME_START_FAILED)
         if entry.task is None:
             try:
                 entry.factory = self._factory_builder(layout, config=config, dependencies=dependencies)
@@ -269,6 +303,90 @@ class RuntimeManager:
                 raise RuntimeManagerError(E_RUNTIME_FACTORY_BUILD_FAILED) from exc
             entry.task = asyncio.create_task(self._start(entry))
         return await asyncio.shield(entry.task)
+
+    async def _stop_entry(self, entry: _Entry) -> ShutdownReport:
+        if entry.state == "CLOSED" and entry.report is not None:
+            return entry.report
+        if entry.cleanup_task is not None and not entry.cleanup_task.done():
+            return await asyncio.shield(entry.cleanup_task)
+        entry.state = "CLOSING"
+
+        async def owned_close() -> ShutdownReport:
+            report: ShutdownReport
+            try:
+                if entry.factory is None:
+                    report = ShutdownReport()
+                else:
+                    report = await entry.factory.runtime.close()
+            except BaseException:
+                report = ShutdownReport(code="E_RUNTIME_CLEANUP_FAILED")
+            if entry.task is not None and not entry.task.done():
+                try:
+                    await asyncio.shield(entry.task)
+                except BaseException:
+                    if not entry.task.cancelled():
+                        entry.task.exception()
+            entry.report = report
+            safe = (
+                entry.factory is not None
+                and entry.factory.runtime.state == "CLOSED"
+                and not report.lock_retained
+                and not report.retained_resources
+                and report.code in {None, "E_RUNTIME_FLUSH_FAILED"}
+            )
+            entry.failure_code = report.code
+            entry.state = "CLOSED" if safe else "FAILED"
+            return report
+
+        entry.cleanup_task = asyncio.create_task(owned_close())
+        return await asyncio.shield(entry.cleanup_task)
+
+    async def stop_profile(self, profile_id: str) -> ShutdownReport | None:
+        self._check_loop()
+        entry = next((item for item in self._entries if item.descriptor.profile_id == profile_id), None)
+        if entry is None:
+            return None
+        return await self._stop_entry(entry)
+
+    async def _close_all_owned(self) -> CloseAllReport:
+        outcomes: list[ProfileCloseOutcome] = []
+        for entry in sorted(self._entries, key=lambda item: item.descriptor.profile_id):
+            try:
+                report = await self._stop_entry(entry)
+                outcomes.append(
+                    ProfileCloseOutcome(
+                        entry.descriptor.profile_id,
+                        report,
+                        report.code,
+                        entry.state != "CLOSED",
+                    )
+                )
+            except BaseException:
+                outcomes.append(
+                    ProfileCloseOutcome(
+                        entry.descriptor.profile_id,
+                        ShutdownReport(code="E_RUNTIME_CLEANUP_FAILED"),
+                        "E_RUNTIME_CLEANUP_FAILED",
+                        True,
+                    )
+                )
+        retained = any(outcome.retained for outcome in outcomes)
+        error_code = next((outcome.error_code for outcome in outcomes if outcome.error_code), None)
+        if retained and error_code is None:
+            error_code = E_RUNTIME_CLOSE_ALL_FAILED
+        result = CloseAllReport(tuple(outcomes), True, not retained, error_code)
+        if result.complete:
+            self._terminal_close_all = result
+        return result
+
+    async def close_all(self) -> CloseAllReport:
+        self._check_loop()
+        if self._terminal_close_all is not None:
+            return self._terminal_close_all
+        self._admission_closed = True
+        if self._close_all_task is None or self._close_all_task.done():
+            self._close_all_task = asyncio.create_task(self._close_all_owned())
+        return await asyncio.shield(self._close_all_task)
 
     async def start_profile(
         self,
