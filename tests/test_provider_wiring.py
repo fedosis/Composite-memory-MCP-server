@@ -1653,21 +1653,7 @@ def test_shutdown_twice_harmless(tmp_path, monkeypatch):
 def s1_server(synthetic_storage_env, monkeypatch):
     from memory_server import server
     monkeypatch.setattr(server, "get_settings", lambda: synthetic_storage_env.settings)
-    for name in (
-        "_provider", "_qdrant", "_lancedb", "_embedder", "_router", "_graph", "_graph_router",
-        "_hybrid_router", "_outbox_worker", "_outbox_task", "_storage_layout", "_root_lock",
-    ):
-        monkeypatch.setattr(server, name, None)
-    monkeypatch.setattr(server, "_storage_settings", None, raising=False)
-    monkeypatch.setattr(server, "_storage_cleanup_failed", False, raising=False)
     yield server
-    # Always release test-owned resources, even on RED: live loops cannot escape.
-    task = server._outbox_task
-    if task is not None and not task.done():
-        task.cancel()
-    if server._root_lock is not None:
-        server._root_lock.release()
-        server._root_lock = None
 
 
 @pytest.mark.asyncio
@@ -1703,15 +1689,24 @@ async def test_s1_standalone_lifespan_exception_closes_all_handles(s1_server, sy
 async def test_s1_standalone_lazy_provider_creates_validated_parent_and_holds_lock(s1_server, synthetic_storage_env):
     from memory_server.storage_lock import MaintenanceStorageLocks, StorageLockError
     server = s1_server
+    (synthetic_storage_env.root / "data").mkdir()
     try:
-        provider = await server._get_provider()
-        assert provider._url == server._get_storage_layout().sqlite.effective_url
-        with pytest.raises(StorageLockError):
-            MaintenanceStorageLocks.acquire([synthetic_storage_env.root], timeout=0)
-        assert server._root_lock is not None
+        async with server.lifespan(server.mcp):
+            provider = await server._get_provider()
+            assert provider._url == server._get_storage_layout().sqlite.effective_url
+            assert all((
+                provider.engine is not None, server._lancedb is not None,
+                server._graph is not None, server._outbox_worker is not None,
+            ))
+            with pytest.raises(StorageLockError):
+                MaintenanceStorageLocks.acquire([synthetic_storage_env.root], timeout=0)
+            assert server._root_lock is not None
+        assert all(
+            getattr(server, name) is None
+            for name in ("_provider", "_lancedb", "_graph", "_outbox_task", "_root_lock")
+        )
     finally:
-        if server._provider is not None:
-            await server._provider.close()
+        assert server._provider is None
 
 
 @pytest.mark.asyncio

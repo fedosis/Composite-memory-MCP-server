@@ -73,3 +73,10 @@ def graph_test_isolation(tmp_path, monkeypatch):
         server_module._graph_router = None
         get_settings.cache_clear()
         assert_not_live(snapshot, label="graph_test_isolation snapshot")
+
+
+@pytest.fixture(autouse=True)
+def _clear_profile_storage_env(request, monkeypatch):
+    if request.module.__name__.endswith("test_profile_data_isolation"):
+        for key in ("MEMORY_SERVER_STORAGE_MODE", "MEMORY_SERVER_DATA_ROOT"):
+            monkeypatch.delenv(key, raising=False)

@@ -2,9 +2,9 @@
 
 The first two tests intentionally cross the real MCP stdio lifespan.  They are
 behavioral RED selectors against the immutable pre-C10 server; a collection or
-import error is not an acceptable result.  The remaining five tests document
-candidate-only assertions and stay explicitly disabled until I4-G enables the
-future implementation side.
+import error is not an acceptable result.  The remaining five tests are
+candidate-only assertions and are enabled only by the candidate-side
+C10_ENABLE_FUTURE_TESTS gate after I4-G.
 """
 from __future__ import annotations
 
@@ -57,25 +57,6 @@ def _driver_env(root: Path, extra: dict[str, str] | None = None) -> dict[str, st
     return env
 
 
-async def _call_ping(command: list[str], root: Path, env: dict[str, str]) -> bool:
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-
-    started = False
-    params = StdioServerParameters(command=command[0], args=command[1:], env=env, cwd=str(root / "stdio"))
-    (root / "stdio").mkdir(parents=True, exist_ok=True)
-    try:
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await asyncio.wait_for(session.initialize(), timeout=12)
-                started = True
-                result = await asyncio.wait_for(session.call_tool("ping", arguments={}), timeout=12)
-                assert result.content[0].text == '{"status": "ok"}'
-    except Exception:
-        started = False
-    return started
-
-
 @pytest.mark.asyncio
 async def test_mcp_exclusive_startup_blocks_l1_before_provider_construction(tmp_path):
     """Real L1 SH holder must block old MCP startup before SQLite construction."""
@@ -124,11 +105,15 @@ def mark(self, *args, **kwargs):
     sentinel.write_text('constructed')
     return original(self, *args, **kwargs)
 server.SQLiteProvider.__init__ = mark
-server.run()
+server.mcp.run(transport='stdio')
 """
-    started = False
+    (root / "stdio").mkdir(parents=True, exist_ok=True)
+    contender = await asyncio.create_subprocess_exec(
+        str(PYTHON), "-c", driver, cwd=str(root / "stdio"), env=env,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
     try:
-        started = await _call_ping([str(PYTHON), "-c", driver], root, env)
+        stdout, stderr = await asyncio.wait_for(contender.communicate(), timeout=15)
     finally:
         assert l1.stdin is not None
         l1.stdin.write(b"release\n")
@@ -136,9 +121,23 @@ server.run()
         l1.stdin.close()
         await asyncio.wait_for(l1.wait(), timeout=5)
     inode_after = lock_path.stat().st_ino
-    assert started is False, "old SH MCP path coexisted with L1; EX startup RED was not captured"
+    next_owner = root / "evidence" / "next-owner"
+    owner_code = (
+        "from pathlib import Path; from memory_server.storage_lock import RuntimeStorageLock; "
+        f"root=Path({str(lock_root)!r}); lock=RuntimeStorageLock.acquire_exclusive(root, timeout=0); "
+        f"Path({str(next_owner)!r}).write_text(str((root / '.cmms-storage.lock').stat().st_ino)); lock.release()"
+    )
+    owner = await asyncio.create_subprocess_exec(
+        str(PYTHON), "-c", owner_code, cwd=str(root / "stdio"), env=env,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _owner_stdout, owner_stderr = await asyncio.wait_for(owner.communicate(), timeout=5)
+    assert owner.returncode == 0, owner_stderr.decode(errors="replace")
+    assert contender.returncode != 0, stdout.decode(errors="replace")
+    assert b"E_LOCK_TIMEOUT" in stderr, stderr.decode(errors="replace")
     assert not sentinel.exists(), "provider construction crossed the lock boundary"
     assert inode_before == inode_after
+    assert next_owner.read_text() == str(inode_after)
 
 
 @pytest.mark.asyncio
@@ -207,12 +206,15 @@ def test_mcp_borrowed_sqlite_engine_is_closed_once_and_worker_is_not_closed():
 @_FUTURE
 @pytest.mark.asyncio
 async def test_mcp_admission_errors_use_existing_fastmcp_channel():
+    from memory_server import server
     from memory_server.runtime.errors import RuntimeClosingError, RuntimeFailedError, RuntimeNotReadyError
     from memory_server.runtime.runtime import CMMSRuntime
-
-    assert RuntimeNotReadyError.code == "E_RUNTIME_NOT_READY"
-    assert RuntimeClosingError.code == "E_RUNTIME_CLOSING"
-    assert RuntimeFailedError.code == "E_RUNTIME_FAILED"
+    for error, code in ((RuntimeNotReadyError, "E_RUNTIME_NOT_READY"),
+                        (RuntimeClosingError, "E_RUNTIME_CLOSING"),
+                        (RuntimeFailedError, "E_RUNTIME_FAILED")):
+        assert error().code == code
+    with pytest.raises(RuntimeNotReadyError, match="E_RUNTIME_NOT_READY"):
+        await getattr(server, "ping")()
     assert callable(CMMSRuntime.admit)
 
 
