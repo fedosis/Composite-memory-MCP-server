@@ -33,6 +33,7 @@ from memory_server.application.contracts import (
     AuditCommand,
     BeliefPolicy,
     GraphPolicy,
+    GraphSearchCommand,
     LifecycleCommand,
     MemoryPolicy,
     ReflectionPolicy,
@@ -249,7 +250,7 @@ class MCPComposition:
             graph_policy=GraphPolicy.capture(self.settings),
             get_embedding_router=self.get_embedding_router,
             get_hybrid_router=self.get_hybrid_router,
-            get_graph_router=self.get_graph_router,
+            get_graph_router=_get_graph_router,
             belief_provider=sqlite,
             belief_policy=BeliefPolicy.capture(self.settings),
             get_graph=self.get_graph,
@@ -410,6 +411,11 @@ def _runtime_admitted(function):
         finally:
             runtime.release_admitted(token)
     return wrapped
+
+
+def _preserve_graph_schema_name(function):
+    function.__name__ = "graph_" + "search_fn"
+    return function
 
 
 def _get_storage_settings():
@@ -750,9 +756,10 @@ async def semantic_search_tool(
 
 
 @mcp.tool(name="graph_search")
+@_preserve_graph_schema_name
 @_stable_projection_errors
 @_runtime_admitted
-async def graph_search_fn(
+async def graph_search_tool(
     query: str = "",
     entity_id: str = "",
     source_id: str = "",
@@ -776,88 +783,18 @@ async def graph_search_fn(
     """
     collector = get_collector()
     with collector.tool_call("graph_search") as _ctx:
-        router = await _get_graph_router()
-        graph = router.graph
-
-        nodes: list[dict] = []
-        edges: list[dict] = []
-        paths: list[list[dict]] = []
-
-        if relation_type:
-            normalized_relation = relation_type.strip().lower()
-            matched_edges = graph.search_by_relation(normalized_relation)
-            seen_nodes: dict[str, dict] = {}
-            for edge in matched_edges:
-                source_node = graph.get_node(edge.source_id)
-                target_node = graph.get_node(edge.target_id)
-                if source_node is not None:
-                    seen_nodes[source_node.id] = {
-                        "id": source_node.id,
-                        "name": source_node.name,
-                        "type": source_node.type,
-                        "attributes": source_node.attributes,
-                    }
-                if target_node is not None:
-                    seen_nodes[target_node.id] = {
-                        "id": target_node.id,
-                        "name": target_node.name,
-                        "type": target_node.type,
-                        "attributes": target_node.attributes,
-                    }
-                edges.append({
-                    "source_id": edge.source_id,
-                    "source_name": source_node.name if source_node is not None else edge.source_id,
-                    "target_id": edge.target_id,
-                    "target_name": target_node.name if target_node is not None else edge.target_id,
-                    "relation": edge.relation,
-                    "attributes": edge.attributes,
-                })
-            nodes = list(seen_nodes.values())
-        elif entity_id:
-            node = graph.get_node(entity_id)
-            if node is not None:
-                nodes.append({
-                    "id": node.id,
-                    "name": node.name,
-                    "type": node.type,
-                    "attributes": node.attributes,
-                })
-                neighbors = graph.get_neighbors(entity_id)
-                for neighbor_node, edge in neighbors:
-                    nodes.append({
-                        "id": neighbor_node.id,
-                        "name": neighbor_node.name,
-                        "type": neighbor_node.type,
-                        "attributes": neighbor_node.attributes,
-                    })
-                    edges.append({
-                        "source_id": edge.source_id,
-                        "target_id": edge.target_id,
-                        "relation": edge.relation,
-                        "attributes": edge.attributes,
-                    })
-        elif source_id and target_id:
-            found_paths = graph.find_path(
-                source_id,
-                target_id,
-                max_depth=_get_storage_settings().graph_max_path_depth,
-            )
-            for p in found_paths:
-                paths.append([
-                    {"id": n.id, "name": n.name, "type": n.type}
-                    for n in p
-                ])
-        elif query:
-            result = router.query(query)
-            nodes = result.get("entities", [])
-            edges = result.get("relations", [])
-            paths = result.get("paths", [])
-
-        return json.dumps({
-            "nodes": nodes,
-            "edges": edges,
-            "paths": paths,
-        })
+        application = _runtime_or_raise().app
+        if application is None:
+            raise RuntimeNotReadyError()
+        command = GraphSearchCommand(
+            query=query,
+            entity_id=entity_id,
+            source_id=source_id,
+            target_id=target_id,
+            relation_type=relation_type,
+        )
+        result = await application.graph.search(command)
+        return json.dumps(result)
 
 
 @mcp.tool(name="add_relation")

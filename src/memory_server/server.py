@@ -10,3 +10,4 @@ import sys as _sys
 from memory_server.transports import mcp_stdio as _mcp_stdio
 
 _sys.modules[__name__] = _mcp_stdio
+setattr(_sys.modules["memory_server"], "server", _mcp_stdio)
