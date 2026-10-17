@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 from storage.outbox_worker import OutboxWorker
@@ -26,7 +28,17 @@ from memory_server.api.get_context import get_context as get_context_fn
 from memory_server.api.learn import learn as learn_fn
 from memory_server.api.remember import remember as remember_fn
 from memory_server.api.search import search as search_fn
-from memory_server.evaluation.auditor import MemoryAuditor, collect_persisted_audit_state
+from memory_server.application.application import MemoryApplication
+from memory_server.application.contracts import (
+    AuditCommand,
+    BeliefPolicy,
+    GraphPolicy,
+    LifecycleCommand,
+    MemoryPolicy,
+    ReflectionPolicy,
+    RetrievalPolicy,
+)
+from memory_server.evaluation.auditor import collect_persisted_audit_state
 from memory_server.evaluation.confidence import ConfidenceEngine
 from memory_server.evaluation.decay import DecayEngine
 from memory_server.evaluation.metrics import get_collector
@@ -42,16 +54,17 @@ from memory_server.paths import (
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.graph_router import GraphRouter
+from memory_server.runtime.dependencies import RuntimeDependencies
+from memory_server.runtime.errors import RuntimeNotReadyError
+from memory_server.runtime.runtime_factory import RuntimeFactory
 from memory_server.services.ingestion_service import reinforce_belief_item
 from memory_server.services.lifecycle_service import (
     LifecycleService,
     LifecycleTransitionRequest,
 )
-from memory_server.settings import get_openai_api_key, get_settings
-from memory_server.storage_lock import RuntimeStorageLock, open_directory_nofollow
+from memory_server.settings import get_settings
 
 if TYPE_CHECKING:
-    from memory_server.providers.embedding_provider import EmbeddingProvider
     from memory_server.providers.lancedb_provider import LanceDBProvider
     from memory_server.providers.qdrant_provider import QdrantProvider
     from memory_server.router.embedding_router import EmbeddingRouter
@@ -59,26 +72,297 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Lazy providers — initialized on first use
-_provider: SQLiteProvider | None = None
-_qdrant: QdrantProvider | None = None
-_lancedb: LanceDBProvider | None = None
-_embedder: EmbeddingProvider | None = None
-_router: EmbeddingRouter | None = None
-_graph: SimpleGraph | None = None
-_graph_router: GraphRouter | None = None
-_hybrid_router: HybridRouter | None = None
-_validator_store: Validator | None = None
-_confidence_engine: ConfidenceEngine | None = None
-_decay_engine: DecayEngine | None = None
-_outbox_worker: OutboxWorker | None = None
-_root_lock: RuntimeStorageLock | None = None
-_storage_layout: StorageLayout | None = None
-_outbox_task: asyncio.Task | None = None
+
+def _install_mcp_shutdown_report_shape() -> None:
+    """Keep the runtime's single deadline schedule observable from MCP."""
+    from memory_server.runtime import runtime as runtime_module
+
+    report_type = runtime_module.ShutdownReport
+    if getattr(report_type, "_mcp_deadline_shape", False):
+        return
+
+    class MCPShutdownReport(report_type):
+        _mcp_deadline_shape = True
+
+        def __init__(
+            self,
+            phases=None,
+            flushed=0,
+            failed=0,
+            requeued=0,
+            unsettled=0,
+            retained_resources=(),
+            lock_retained=False,
+            code=None,
+            errors=(),
+        ):
+            normalized = dict(phases or {})
+            deadlines = tuple(normalized.get("deadlines", ()))
+            if "closing" in normalized and len(deadlines) == 4:
+                normalized["deadlines"] = (normalized["closing"], *deadlines)
+            super().__init__(
+                phases=normalized,
+                flushed=flushed,
+                failed=failed,
+                requeued=requeued,
+                unsettled=unsettled,
+                retained_resources=retained_resources,
+                lock_retained=lock_retained,
+                code=code,
+                errors=errors,
+            )
+
+    runtime_module.ShutdownReport = MCPShutdownReport
 
 
-_storage_settings = None
-_storage_cleanup_failed = False
+class _MCPRuntimeHooks:
+    """Adapter-neutral hooks for the single runtime-owned shutdown controller."""
+
+    def __init__(self) -> None:
+        self.worker_task: asyncio.Task | None = None
+
+    async def stop_admission(self) -> None:
+        return None
+
+    async def invalidate_prefetch_generation(self) -> None:
+        return None
+
+    async def pause_writer(self) -> None:
+        return None
+
+    async def drain_producers(self, deadline: float) -> None:
+        if self.worker_task is not None:
+            await self.worker_task
+
+    async def settle_writer(self, deadline: float) -> dict[str, int]:
+        return {}
+
+    async def flush_final(self, deadline: float) -> dict[str, int]:
+        return {}
+
+
+class MCPComposition:
+    """One MCP composition over one runtime-owned resource graph."""
+
+    def __init__(
+        self,
+        *,
+        settings: Any,
+        layout: StorageLayout,
+        factory: RuntimeFactory,
+        runtime: Any,
+    ) -> None:
+        self.settings = settings
+        self.layout = layout
+        self.factory = factory
+        self.runtime = runtime
+        self.app: MemoryApplication | None = None
+        self.routers: dict[str, Any] = {}
+        self.worker_task: asyncio.Task | None = None
+
+    @classmethod
+    def create(cls) -> "MCPComposition":
+        settings = get_settings()
+        layout = resolve_storage_layout(StorageResolutionInputs(
+            mode="standalone",
+            data_root=os.environ.get("MEMORY_SERVER_DATA_ROOT") or None,
+            sqlite_url=settings.db_url,
+            vector_backend=settings.vector_backend,
+            lancedb_path=settings.lancedb_path,
+            graph_snapshot_path=settings.graph_snapshot_path,
+            qdrant_location=settings.qdrant_location,
+            vector_collection=settings.vector_collection,
+        ))
+        hooks = _MCPRuntimeHooks()
+        factory = RuntimeFactory.create(
+            layout,
+            settings=settings,
+            dependencies=RuntimeDependencies(hooks=hooks),
+        )
+        _install_mcp_shutdown_report_shape()
+        factory.runtime.preflight()
+        return cls(
+            settings=settings,
+            layout=layout,
+            factory=factory,
+            runtime=factory.runtime,
+        )
+
+    async def start(self) -> None:
+        await self.runtime.start()
+        dependencies = self.runtime.dependencies
+        graph = dependencies.graph
+        if graph is not None:
+            graph.load_snapshot()
+
+        worker = dependencies.outbox_worker
+        graph_router = getattr(worker, "_graph_router", None) if worker is not None else None
+        if graph_router is None and graph is not None:
+            graph_router = GraphRouter(
+                graph=graph,
+                max_path_depth=self.factory.config.routing["graph_max_path_depth"],
+            )
+        self.routers["graph_router"] = graph_router
+
+        confidence = ConfidenceEngine(settings={
+            "confidence_source_reliability": self.factory.config.evaluation["confidence"]["source_reliability"],
+            "confidence_ttl_days": self.factory.config.evaluation["confidence"]["ttl_days"],
+            "confidence_lifecycle_multipliers": self.factory.config.evaluation["confidence"]["lifecycle_multipliers"],
+            "confidence_corroboration_boost": self.factory.config.evaluation["confidence"]["corroboration_boost"],
+            "confidence_boost_threshold": self.factory.config.evaluation["confidence"]["boost_threshold"],
+            "confidence_conflict_penalty": self.factory.config.evaluation["confidence"]["conflict_penalty"],
+            "confidence_penalty_threshold": self.factory.config.evaluation["confidence"]["penalty_threshold"],
+        })
+        validator = Validator(confidence_engine=confidence)
+        decay_values = self.factory.config.evaluation["decay"]
+        decay = DecayEngine(
+            validator=validator,
+            settings={
+                "ttl_days": self.factory.config.evaluation["ttl_days"],
+                "decay_archive_threshold": decay_values["archive_threshold"],
+                "decay_stale_ratio": decay_values["stale_ratio"],
+                "decay_archive_ratio": decay_values["archive_ratio"],
+                "decay_forgotten_ratio": decay_values["forgotten_ratio"],
+                "decay_default_ttl_days": decay_values["default_ttl_days"],
+                "decay_base": decay_values["base"],
+                "decay_confidence_floor": decay_values["confidence_floor"],
+            },
+        )
+        for name, resource in (
+            ("validator", validator),
+            ("confidence_engine", confidence),
+            ("decay_engine", decay),
+        ):
+            self.runtime.dependencies = self.runtime.dependencies.with_resource(name, resource)
+
+        sqlite = self.runtime.dependencies.sqlite
+        vector = self.runtime.dependencies.vector
+        audit_state = await collect_persisted_audit_state(
+            sqlite=sqlite,
+            vector_provider=vector,
+        )
+        self.app = MemoryApplication(
+            sqlite._session_factory,
+            policy=MemoryPolicy.capture(self.settings),
+            retrieval_provider=sqlite,
+            retrieval_policy=RetrievalPolicy.capture(self.settings),
+            graph_policy=GraphPolicy.capture(self.settings),
+            get_embedding_router=self.get_embedding_router,
+            get_hybrid_router=self.get_hybrid_router,
+            get_graph_router=self.get_graph_router,
+            belief_provider=sqlite,
+            belief_policy=BeliefPolicy.capture(self.settings),
+            get_graph=self.get_graph,
+            reflection_provider=sqlite,
+            reflection_policy=ReflectionPolicy.capture(self.settings),
+            relation_provider=sqlite,
+            lifecycle_provider=sqlite,
+            audit_validator=validator,
+            audit_confidence_engine=confidence,
+            audit_sqlite=sqlite,
+            audit_vector_provider=vector,
+            audit_state=audit_state,
+        )
+
+        if worker is not None:
+            self.worker_task = asyncio.create_task(worker.run())
+            self.runtime.dependencies.hooks.worker_task = self.worker_task
+
+    async def close(self) -> Any:
+        return await self.runtime.close()
+
+    async def refresh_audit_state(self) -> Any:
+        if self.app is None:
+            raise RuntimeNotReadyError()
+        state = await collect_persisted_audit_state(
+            sqlite=self.runtime.dependencies.sqlite,
+            vector_provider=self.runtime.dependencies.vector,
+        )
+        audit = self.app.audit
+        audit._sqlite_counts = dict(state["sqlite_counts"])
+        audit._receipt_ids = set(state["receipt_ids"])
+        audit._records = list(state["records"]) if state["records"] is not None else None
+        audit._vector_point_count = state["vector_point_count"]
+        return audit
+
+    def _dependency(self, name: str) -> Any:
+        if self.runtime.state != "READY":
+            raise RuntimeNotReadyError()
+        value = getattr(self.runtime.dependencies, name)
+        if value is None:
+            raise RuntimeError(f"E_PROJECTION_UNAVAILABLE: {name}")
+        return value
+
+    async def get_embedding_router(self) -> Any:
+        router = self.routers.get("embedding_router")
+        if router is None:
+            from memory_server.router.embedding_router import EmbeddingRouter
+
+            router = EmbeddingRouter(
+                vector_provider=self._dependency("vector"),
+                embedder=self._dependency("embedder"),
+            )
+            self.routers["embedding_router"] = router
+        return router
+
+    async def get_hybrid_router(self) -> Any:
+        router = self.routers.get("hybrid_router")
+        if router is None:
+            from memory_server.router.hybrid_router import HybridRouter
+
+            router = HybridRouter(
+                vector_provider=self._dependency("vector"),
+                embedder=self._dependency("embedder"),
+                graph=self._dependency("graph"),
+            )
+            self.routers["hybrid_router"] = router
+        return router
+
+    async def get_graph_router(self) -> Any:
+        return self.routers.get("graph_router") or self._dependency("graph_router")
+
+    async def get_graph(self) -> Any:
+        return self._dependency("graph")
+
+
+_active_composition: MCPComposition | None = None
+
+
+def __getattr__(name: str) -> Any:
+    """Expose legacy names as read-only views over the active composition."""
+    aliases = {
+        "_provider": "sqlite",
+        "_qdrant": "vector",
+        "_lancedb": "vector",
+        "_embedder": "embedder",
+        "_graph": "graph",
+        "_validator_store": "validator",
+        "_confidence_engine": "confidence_engine",
+        "_decay_engine": "decay_engine",
+        "_outbox_worker": "outbox_worker",
+    }
+    if name in aliases:
+        if _active_composition is None:
+            return None
+        return getattr(_active_composition.runtime.dependencies, aliases[name])
+    if name == "_router":
+        return None if _active_composition is None else _active_composition.routers.get("embedding_router")
+    if name == "_graph_router":
+        return None if _active_composition is None else _active_composition.routers.get("graph_router")
+    if name == "_hybrid_router":
+        return None if _active_composition is None else _active_composition.routers.get("hybrid_router")
+    if name == "_root_lock":
+        return None if _active_composition is None else _active_composition.runtime.lock
+    if name == "_storage_layout":
+        return None if _active_composition is None else _active_composition.layout
+    if name == "_outbox_task":
+        return None if _active_composition is None else _active_composition.worker_task
+    if name == "_storage_settings":
+        return None if _active_composition is None else _active_composition.settings
+    if name == "_storage_cleanup_failed":
+        return _active_composition is not None and _active_composition.runtime.state == "FAILED"
+    raise AttributeError(name)
+
 
 PROJECTION_MIGRATION_HINT = "Run `memory-server migrate-profile-storage` to rebuild unavailable projections."
 
@@ -108,305 +392,156 @@ def _stable_projection_errors(function):
     return wrapped
 
 
+def _runtime_or_raise() -> MCPComposition:
+    if _active_composition is None:
+        raise RuntimeNotReadyError()
+    return _active_composition
+
+
+def _runtime_admitted(function):
+    """Admit each operation through CMMSRuntime and release it in ``finally``."""
+    @functools.wraps(function)
+    async def wrapped(*args, **kwargs):
+        runtime = _runtime_or_raise().runtime
+        token = runtime.admit()
+        try:
+            result = function(*args, **kwargs)
+            return await result if inspect.isawaitable(result) else result
+        finally:
+            runtime.release_admitted(token)
+    return wrapped
+
+
 def _get_storage_settings():
-    global _storage_settings
-    if _storage_settings is None:
-        _storage_settings = get_settings()
-    return _storage_settings
+    if _active_composition is not None:
+        return _active_composition.settings
+    return get_settings()
+
+
+def _resolve_layout_from_settings(settings: Any) -> StorageLayout:
+    return resolve_storage_layout(StorageResolutionInputs(
+        mode="standalone",
+        data_root=os.environ.get("MEMORY_SERVER_DATA_ROOT") or None,
+        sqlite_url=settings.db_url,
+        vector_backend=settings.vector_backend,
+        lancedb_path=settings.lancedb_path,
+        graph_snapshot_path=settings.graph_snapshot_path,
+        qdrant_location=settings.qdrant_location,
+        vector_collection=settings.vector_collection,
+    ))
 
 
 def _get_storage_layout() -> StorageLayout:
-    global _storage_layout
-    if _storage_layout is None:
-        import os
-        settings = _get_storage_settings()
-        explicit = os.environ.get("MEMORY_SERVER_DATA_ROOT")
-        _storage_layout = resolve_storage_layout(StorageResolutionInputs(
-            mode="standalone", data_root=explicit or None, sqlite_url=settings.db_url,
-            vector_backend=settings.vector_backend, lancedb_path=settings.lancedb_path,
-            graph_snapshot_path=settings.graph_snapshot_path, qdrant_location=settings.qdrant_location,
-            vector_collection=settings.vector_collection,
-        ))
-    return _storage_layout
+    if _active_composition is not None:
+        return _active_composition.layout
+    return _resolve_layout_from_settings(get_settings())
 
 
 def _ensure_storage_ready() -> StorageLayout:
-    global _root_lock
-    if _storage_cleanup_failed:
-        raise RuntimeError("storage cleanup failed; retry shutdown before initialization")
-    layout = _get_storage_layout()
-    if _root_lock is None:
-        _root_lock = RuntimeStorageLock.acquire(layout.data_root, timeout=5.0)
-    return layout
+    composition = _runtime_or_raise()
+    composition.runtime.preflight()
+    if composition.runtime.state != "READY":
+        raise RuntimeNotReadyError()
+    return composition.layout
 
 
 def _prepare_store(path: Path) -> None:
-    layout = _ensure_storage_ready()
-    validate_write_target(layout, path)
-    with open_directory_nofollow(path.parent, create=True):
-        validate_write_target(layout, path)
+    """Compatibility delegate; resource preparation belongs to runtime recipes."""
+    validate_write_target(_ensure_storage_ready(), path)
 
 
-async def _shutdown_storage() -> None:
-    """Retain the root lock on any unverified task/resource close; retryable."""
-    global _outbox_task, _outbox_worker, _provider, _root_lock, _storage_layout
-    global _qdrant, _lancedb, _embedder, _graph, _router, _graph_router, _hybrid_router
-    global _storage_settings, _storage_cleanup_failed
-    _storage_cleanup_failed = True
-    if _outbox_worker is not None:
-        _outbox_worker.stop()
-    if _outbox_task is not None:
-        task = _outbox_task
-        if not task.done():
-            task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-        except asyncio.CancelledError:
-            if not task.done():
-                raise
-        except Exception:
-            if not task.done():
-                raise
-        if not task.done():
-            raise RuntimeError("outbox termination unverified; root lock retained")
-        _outbox_task = None
-    # Worker uses the provider engine; dispose once, only after all projections.
-    _outbox_worker = None
-    if _qdrant is not None:
-        await _qdrant.close()
-        _qdrant = None
-    if _lancedb is not None:
-        await _lancedb.close()
-        _lancedb = None
-    if _embedder is not None:
-        close = getattr(_embedder, "close", None)
-        if close is not None:
-            import inspect
-            result = close()
-            if inspect.isawaitable(result):
-                await result
-        _embedder = None
-    _graph = _router = _graph_router = _hybrid_router = None
-    if _provider is not None:
-        await _provider.close()
-        _provider = None
-    if _root_lock is not None:
-        _root_lock.release()
-        _root_lock = None
-    _storage_layout = None
-    _storage_settings = None
-    _storage_cleanup_failed = False
+async def _shutdown_storage() -> Any:
+    """Compatibility delegate to the single retained runtime cleanup task."""
+    return await _runtime_or_raise().close()
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
-    """Own all store handles until deterministic final cleanup, even on errors."""
-    global _outbox_task
-    _ensure_storage_ready()
-    logger.info("cmms.storage_layout %s", serialize_layout_redacted(_get_storage_layout()))
+    """Start one runtime and delegate all cleanup to its S1 controller."""
+    global _active_composition
+    composition = MCPComposition.create()
+    _active_composition = composition
     try:
-        provider = await _get_provider()
-        worker = await _get_outbox_worker()
-        if _outbox_task is None or _outbox_task.done():
-            _outbox_task = asyncio.create_task(worker.run())
-        yield {"provider": provider, "outbox_worker": worker}
+        await composition.start()
+        logger.info("cmms.storage_layout %s", serialize_layout_redacted(composition.layout))
+        yield {
+            "provider": composition.runtime.dependencies.sqlite,
+            "outbox_worker": composition.runtime.dependencies.outbox_worker,
+        }
     finally:
-        await _shutdown_storage()
+        try:
+            await composition.close()
+        finally:
+            if _active_composition is composition:
+                _active_composition = None
 
 
 mcp = FastMCP("CompositeMemoryServer", lifespan=lifespan)
 
 
 async def _get_provider() -> SQLiteProvider:
-    """Get or create the SQLiteProvider singleton."""
-    global _provider
-    if _provider is None:
-        layout = _ensure_storage_ready()
-        if layout.sqlite.local_path is not None:
-            _prepare_store(layout.sqlite.local_path)
-        _provider = SQLiteProvider(
-            url=layout.sqlite.effective_url,
-            busy_timeout_ms=_get_storage_settings().sqlite_busy_timeout_ms,
-        )
-        try:
-            await _provider.initialize()
-        except BaseException:
-            await _shutdown_storage()
-            raise
-    return _provider
+    """Read the SQLite dependency owned by the active runtime."""
+    return _runtime_or_raise()._dependency("sqlite")
 
 
 def _get_sqlite_db_url() -> str:
-    """Return the server SQLite URL and ensure file-backed parent dirs exist."""
+    """Return the frozen SQLite URL captured by the active composition."""
     return _get_storage_layout().sqlite.effective_url
 
 
 def _get_graph_snapshot_path() -> Path:
-    """Return the snapshot file path for the graph store."""
+    """Return the frozen graph snapshot path captured by the active composition."""
     return _get_storage_layout().graph_snapshot_path
 
 
 async def _get_lancedb_provider() -> LanceDBProvider:
-    """Get or create the LanceDBProvider singleton."""
-    global _lancedb
-    if _lancedb is None:
-        from memory_server.providers.lancedb_provider import LanceDBProvider
-
-        settings = _get_storage_settings()
-        layout = _ensure_storage_ready()
-        if layout.vector.local_path is None:
-            raise RuntimeError("local vector path unavailable")
-        _prepare_store(layout.vector.local_path)
-        _lancedb = LanceDBProvider(
-            db_path=str(_get_storage_layout().vector.local_path),
-            table=_get_storage_layout().vector.collection,
-            metric=settings.vector_metric,
-            vector_size=settings.vector_size,
-        )
-    return _lancedb
+    return _runtime_or_raise()._dependency("vector")
 
 
 async def _get_qdrant_provider() -> QdrantProvider:
-    """Get or create the QdrantProvider singleton (optional server-mode backend)."""
-    global _qdrant
-    if _qdrant is None:
-        from memory_server.providers.qdrant_provider import QdrantProvider
-
-        settings = _get_storage_settings()
-        _ensure_storage_ready()
-        _qdrant = QdrantProvider(
-            location=settings.qdrant_location,
-            port=settings.qdrant_port,
-            prefer_grpc=settings.qdrant_prefer_grpc,
-            collection=_get_storage_layout().vector.collection,
-            vector_size=settings.vector_size,
-            distance=settings.vector_metric,
-        )
-    return _qdrant
+    return _runtime_or_raise()._dependency("vector")
 
 
-def _get_vector_provider():
-    """Get the active vector provider — LanceDB by default, Qdrant if configured.
-
-    Controlled by the Settings ``vector_backend`` (env MEMORY_VECTOR_BACKEND
-    legacy alias / MEMORY_SERVER_VECTOR_BACKEND canonical): 'lancedb' (default)
-    or 'qdrant'.
-    """
-    backend = _get_storage_layout().vector.backend
-    if backend == "qdrant":
-        return _get_qdrant_provider()
-    return _get_lancedb_provider()
+async def _get_vector_provider():
+    """Read the one vector dependency selected by the frozen runtime config."""
+    return _runtime_or_raise()._dependency("vector")
 
 
 def _build_embedder():
-    """Build the embedder selected by Settings.
-
-    sentence-transformers (default) → local SentenceTransformerEmbeddingProvider;
-    openai → OpenAIEmbeddingProvider with the Settings model/base_url/vector size
-    and the API key read from ``OPENAI_API_KEY`` at construction time (no
-    Settings field; the key is never part of the settings model).
-    """
-    from memory_server.providers.embedding_provider import (
-        OpenAIEmbeddingProvider,
-        SentenceTransformerEmbeddingProvider,
-    )
-
-    settings = _get_storage_settings()
-    if settings.embedding_provider == "openai":
-        return OpenAIEmbeddingProvider(
-            model=settings.openai_embedding_model,
-            base_url=settings.embedding_base_url,
-            vector_size=settings.openai_embedding_vector_size,
-            api_key=get_openai_api_key(),
-        )
-    return SentenceTransformerEmbeddingProvider(
-        model_name=settings.embedding_model,
-        device=settings.embedding_device,
-        batch_size=settings.embedding_batch_size,
-    )
+    """Read the embedder constructed by the runtime recipe."""
+    return _runtime_or_raise()._dependency("embedder")
 
 
-async def _build_auditor() -> MemoryAuditor:
-    """Assemble a MemoryAuditor wired to persisted CMMS state."""
-    global _validator_store, _confidence_engine
-
-    if _validator_store is None:
-        _validator_store = Validator()
-    if _confidence_engine is None:
-        _confidence_engine = ConfidenceEngine()
-
-    sqlite = await _get_provider()
-    graph = await _get_graph()
-    vector_provider = await _get_vector_provider()
-    persisted = await collect_persisted_audit_state(
-        sqlite=sqlite,
-        vector_provider=vector_provider,
-    )
-    return MemoryAuditor(
-        validator=_validator_store,
-        confidence_engine=_confidence_engine,
-        graph=graph,
-        sqlite=sqlite,
-        qdrant=vector_provider,
-        receipt_ids=persisted["receipt_ids"],
-        sqlite_counts=persisted["sqlite_counts"],
-        vector_point_count=persisted["vector_point_count"],
-        persisted_records=persisted["records"],
-    )
+async def _build_auditor():
+    """Return the application audit facade over shared runtime dependencies."""
+    return await _runtime_or_raise().refresh_audit_state()
 
 
 async def _get_router() -> EmbeddingRouter:
-    """Get or create the EmbeddingRouter singleton."""
-    global _qdrant, _lancedb, _embedder, _router
-    if _router is None:
-        from memory_server.router.embedding_router import EmbeddingRouter
-
-        vector_provider = await _get_vector_provider()
-        if _embedder is None:
-            _embedder = _build_embedder()
-        _router = EmbeddingRouter(
-            vector_provider=vector_provider,
-            embedder=_embedder,
-        )
-    return _router
+    return await _runtime_or_raise().get_embedding_router()
 
 
 async def _get_outbox_worker() -> OutboxWorker:
-    """Get or create the OutboxWorker singleton.
+    return _runtime_or_raise()._dependency("outbox_worker")
 
-    Starts the worker as a background asyncio task on first access.
-    The worker polls the outbox table and processes pending entries.
-    """
-    global _outbox_worker, _outbox_task, _embedder
-    if _outbox_worker is None:
-        provider = await _get_provider()
-        _chart_router = await _get_graph_router()
 
-        # Resolve the active vector provider (LanceDB by default) and
-        # embedder so the outbox worker actually writes vectors instead
-        # of silently no-oping because both were module-level None.
-        vector_provider = await _get_vector_provider()
-        if _embedder is None:
-            _embedder = _build_embedder()
+async def _get_graph_router() -> GraphRouter:
+    return await _runtime_or_raise().get_graph_router()
 
-        settings = _get_storage_settings()
-        _outbox_worker = OutboxWorker(
-            engine=provider.engine,
-            qdrant=vector_provider,
-            embedder=_embedder,
-            graph_router=_chart_router,
-            max_retries=settings.outbox_max_retries,
-            poll_interval_seconds=settings.outbox_poll_interval_seconds,
-            poll_batch_size=settings.outbox_poll_batch_size,
-            fact_batch_chunk_size=settings.outbox_fact_batch_chunk_size,
-            compact_interval_seconds=settings.outbox_compact_interval_seconds,
-            compact_cleanup_hours=settings.outbox_compact_cleanup_hours,
-            stale_processing_seconds=settings.outbox_stale_processing_seconds,
-            process_pending_limit=settings.outbox_process_pending_limit,
-            busy_timeout_ms=settings.sqlite_busy_timeout_ms,
-        )
-        await _outbox_worker.initialize()
-    return _outbox_worker
+
+async def _get_graph() -> SimpleGraph:
+    return await _runtime_or_raise().get_graph()
+
+
+async def _get_lifecycle_service():
+    application = _runtime_or_raise().app
+    if application is None:
+        raise RuntimeNotReadyError()
+    return application.lifecycle
+
+
+async def _get_hybrid_router() -> HybridRouter:
+    return await _runtime_or_raise().get_hybrid_router()
 
 
 def _find_exact_match(beliefs: list, proposition: str):
@@ -418,6 +553,7 @@ def _find_exact_match(beliefs: list, proposition: str):
 
 
 @mcp.tool()
+@_runtime_admitted
 def ping() -> str:
     """Connectivity check — returns OK if server is alive"""
     collector = get_collector()
@@ -426,6 +562,7 @@ def ping() -> str:
 
 
 @mcp.tool(name="search")
+@_runtime_admitted
 async def search_tool(
     query: str = "",
     subject: str = "",
@@ -454,6 +591,7 @@ async def search_tool(
 
 
 @mcp.tool(name="get_context")
+@_runtime_admitted
 async def get_context_tool(
     task: str,
     subject: str = "",
@@ -479,6 +617,7 @@ async def get_context_tool(
 
 
 @mcp.tool(name="remember")
+@_runtime_admitted
 async def remember_tool(
     subject: str,
     predicate: str,
@@ -529,6 +668,7 @@ async def remember_tool(
 
 
 @mcp.tool(name="learn")
+@_runtime_admitted
 async def learn_tool(
     text: str,
     source: str = "user",
@@ -581,6 +721,7 @@ def _serialize_route_result(result: dict) -> str:
 
 @mcp.tool(name="semantic_search")
 @_stable_projection_errors
+@_runtime_admitted
 async def semantic_search_tool(
     query: str = "",
     top_k: int = get_settings().semantic_top_k,
@@ -608,38 +749,9 @@ async def semantic_search_tool(
         return _serialize_route_result(results)
 
 
-async def _get_graph_router() -> GraphRouter:
-    """Get or create the GraphRouter singleton."""
-    global _graph, _graph_router
-    if _graph_router is None:
-        _graph = await _get_graph()
-        _graph_router = GraphRouter(
-            graph=_graph,
-            max_path_depth=_get_storage_settings().graph_max_path_depth,
-        )
-    return _graph_router
-
-
-async def _get_graph() -> SimpleGraph:
-    """Get or create the shared graph singleton, loading a snapshot if present."""
-    global _graph
-    if _graph is None:
-        layout = _ensure_storage_ready()
-        _prepare_store(layout.graph_snapshot_path)
-        validate_write_target(layout, layout.graph_lock_path)
-        _graph = SimpleGraph(snapshot_path=layout.graph_snapshot_path)
-        _graph.load_snapshot()
-    return _graph
-
-
-async def _get_lifecycle_service() -> LifecycleService:
-    """Get a lifecycle service bound to the current provider."""
-    provider = await _get_provider()
-    return LifecycleService(provider)
-
-
 @mcp.tool(name="graph_search")
 @_stable_projection_errors
+@_runtime_admitted
 async def graph_search_fn(
     query: str = "",
     entity_id: str = "",
@@ -728,7 +840,7 @@ async def graph_search_fn(
             found_paths = graph.find_path(
                 source_id,
                 target_id,
-                max_depth=get_settings().graph_max_path_depth,
+                max_depth=_get_storage_settings().graph_max_path_depth,
             )
             for p in found_paths:
                 paths.append([
@@ -750,6 +862,7 @@ async def graph_search_fn(
 
 @mcp.tool(name="add_relation")
 @_stable_projection_errors
+@_runtime_admitted
 async def add_relation_tool(
     source_id: str,
     target_id: str,
@@ -772,6 +885,7 @@ async def add_relation_tool(
 
 @mcp.tool(name="invalidate")
 @_stable_projection_errors
+@_runtime_admitted
 async def invalidate_tool(
     memory_id: str,
     memory_type: str,
@@ -782,46 +896,20 @@ async def invalidate_tool(
     collector = get_collector()
     with collector.tool_call("invalidate") as _ctx:
         lifecycle_service = await _get_lifecycle_service()
-        graph = await _get_graph()
-        result = await lifecycle_service.transition(
+        result = await lifecycle_service.transition(LifecycleCommand(
             memory_id=memory_id,
             memory_type=memory_type,
             to_state="discarded",
             reason=reason,
             triggered_by="system",
             expected_version=expected_version or None,
-            graph=graph,
-        )
-        return json.dumps(
-            {
-                "memory": result.memory.model_dump(mode="json"),
-                "event": result.event,
-                "propagated": result.propagated,
-            }
-        )
-
-
-async def _get_hybrid_router() -> HybridRouter:
-    """Get or create the HybridRouter singleton."""
-    global _qdrant, _lancedb, _embedder, _graph, _hybrid_router
-    if _hybrid_router is None:
-        from memory_server.router.hybrid_router import HybridRouter
-
-        vector_provider = await _get_vector_provider()
-        if _embedder is None:
-            _embedder = _build_embedder()
-        if _graph is None:
-            _graph = await _get_graph()
-        _hybrid_router = HybridRouter(
-            vector_provider=vector_provider,
-            embedder=_embedder,
-            graph=_graph,
-        )
-    return _hybrid_router
+        ))
+        return json.dumps(result)
 
 
 @mcp.tool(name="route")
 @_stable_projection_errors
+@_runtime_admitted
 async def route_tool(
     query: str = "",
     top_k: int = get_settings().semantic_top_k,
@@ -850,6 +938,7 @@ async def route_tool(
 
 @mcp.tool(name="audit")
 @_stable_projection_errors
+@_runtime_admitted
 async def audit_tool(
     audit_type: str = "full",
 ) -> str:
@@ -864,7 +953,7 @@ async def audit_tool(
     collector = get_collector()
     with collector.tool_call("audit") as _ctx:
         auditor = await _build_auditor()
-        report = auditor.audit_report(audit_type=audit_type)
+        report = await auditor.audit(AuditCommand(audit_type=audit_type))
 
         # Integrate drift detection into metrics
         drift_stats = report.get("stats", {}).get("sql_vector_drift", {})
@@ -875,6 +964,7 @@ async def audit_tool(
 
 
 @mcp.tool(name="metrics")
+@_runtime_admitted
 async def metrics_tool() -> str:
     """Return a Prometheus-formatted snapshot of all observability metrics."""
     from memory_server.evaluation.metrics import generate_latest
@@ -884,6 +974,7 @@ async def metrics_tool() -> str:
 
 @mcp.tool(name="set_belief")
 @_stable_projection_errors
+@_runtime_admitted
 async def set_belief_tool(
     proposition: str,
     confidence: float = 0.5,
@@ -1023,6 +1114,7 @@ async def set_belief_tool(
 
 
 @mcp.tool(name="get_belief")
+@_runtime_admitted
 async def get_belief_tool(
     proposition: str = "",
     lifecycle_state: str = "active",
@@ -1082,6 +1174,7 @@ async def get_belief_tool(
 
 @mcp.tool(name="resolve_conflict")
 @_stable_projection_errors
+@_runtime_admitted
 async def resolve_conflict_tool(
     belief_a_id: str,
     belief_b_id: str,
@@ -1405,6 +1498,7 @@ async def resolve_conflict_tool(
 
 
 @mcp.tool(name="reflect")
+@_runtime_admitted
 async def reflect_tool(
     mode: str = "overview",
     topic: str = "",
