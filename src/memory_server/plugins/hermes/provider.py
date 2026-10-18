@@ -2014,8 +2014,8 @@ class HermesProvider:
             return [((messages, turn_id), False, error) for messages, turn_id in batch]
 
         provider = self._require_provider()
-        runtime = self._bridge.runtime
-        token = runtime.admit()
+        runtime = getattr(getattr(self, "_bridge", None), "runtime", None)
+        token = runtime.admit() if runtime is not None else None
         try:
             for messages, turn_id in batch:
                 error_text: str | None = None
@@ -2038,7 +2038,9 @@ class HermesProvider:
                             llm_timeout_seconds=self._extractor_runtime.llm_timeout_seconds,
                             llm_max_input_chars=self._extractor_runtime.llm_max_input_chars,
                             llm_confidence_gate=self._extractor_runtime.llm_confidence_gate,
-                            native_submitter=runtime.submit_native,
+                            native_submitter=(
+                                runtime.submit_native if runtime is not None else None
+                            ),
                         )
                     ok = True
                 except Exception as exc:
@@ -2050,7 +2052,8 @@ class HermesProvider:
                 outcomes.append(((messages, turn_id), ok, error_text))
             return outcomes
         finally:
-            runtime.release_admitted(token)
+            if runtime is not None:
+                runtime.release_admitted(token)
 
     @staticmethod
     def _extract_turn_text(messages: list | dict) -> str:
