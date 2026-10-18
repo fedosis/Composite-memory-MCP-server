@@ -15,9 +15,15 @@ from storage.outbox_worker import OutboxWorker
 from memory_server.plugins.hermes import provider as provider_mod
 from memory_server.plugins.hermes.provider import HermesProvider
 from memory_server.providers.embedding_provider import MockEmbeddingProvider
+from memory_server.runtime import runtime as runtime_module
 from memory_server.transports.hermes import HermesRuntimeBridge, _get_loop, _run_async
 from tests.test_runtime_factory import isolated  # noqa: F401
 from tests.test_runtime_lifecycle import Clock, held, pump
+
+# Stock Hermes ShutdownReport, captured at pytest collection/import time.
+# Collection always precedes test execution, so this alias is the 4-tuple
+# class even when a later MCP composition replaces the module global.
+_HERMES_SHUTDOWN_REPORT = runtime_module.ShutdownReport
 
 
 def _on_owner(awaitable, timeout=5.0):
@@ -71,6 +77,7 @@ def _spy(events, obj, name, label=None):
 
 
 def test_hermes_s1_deadlines_match_mcp_offsets(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_module, "ShutdownReport", _HERMES_SHUTDOWN_REPORT)
     provider = _init_cutover_provider(tmp_path, monkeypatch)
     try:
         runtime = provider._bridge.runtime
