@@ -425,6 +425,15 @@ class TestHermesProviderToolRouting:
             MockEmbeddingProvider,
         )
 
+        from storage.outbox_worker import OutboxWorker
+        close_n = {"n": 0}
+        orig_close = OutboxWorker.close
+
+        async def spy_close(self):
+            close_n["n"] += 1
+            return await orig_close(self)
+
+        monkeypatch.setattr(OutboxWorker, "close", spy_close)
         provider = HermesProvider()
         provider.initialize(
             session_id="shutdown-outbox",
@@ -443,6 +452,7 @@ class TestHermesProviderToolRouting:
 
         assert provider._outbox_worker is None
         assert provider._outbox_task is None
+        assert close_n["n"] == 0
 
     def test_route_serializes_rank_results_after_native_indexing(self, tmp_path, monkeypatch):
         """route() should return JSON-serializable ranked results once vectors exist."""

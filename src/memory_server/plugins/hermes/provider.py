@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -41,7 +40,7 @@ from memory_server.plugins.hermes.resolver import (
     resolve_extractor_settings,
 )
 from memory_server.plugins.hermes.writer import WriterQueue
-from memory_server.settings import get_openai_api_key, get_settings
+from memory_server.settings import get_settings
 from memory_server.storage_lock import RuntimeStorageLock, open_directory_nofollow
 
 logger = logging.getLogger(__name__)
@@ -75,41 +74,6 @@ def _projection_error(exc: BaseException) -> str | None:
     })
 
 # ---------------------------------------------------------------------------
-# Background event loop — one per process, reused across sessions.
-# ---------------------------------------------------------------------------
-
-_loop: asyncio.AbstractEventLoop | None = None
-_loop_thread: threading.Thread | None = None
-_loop_lock = threading.Lock()
-
-
-def _get_loop() -> asyncio.AbstractEventLoop:
-    """Return a long-lived event loop running on a background thread."""
-    global _loop, _loop_thread
-    with _loop_lock:
-        if _loop is not None and _loop.is_running():
-            return _loop
-        _loop = asyncio.new_event_loop()
-
-        def _run() -> None:
-            asyncio.set_event_loop(_loop)
-            _loop.run_forever()
-
-        _loop_thread = threading.Thread(
-            target=_run, daemon=True, name="cmms-provider-loop"
-        )
-        _loop_thread.start()
-        return _loop
-
-
-def _run_async(coro, timeout: float = 30.0):
-    """Schedule *coro* on the shared loop and block until done."""
-    loop = _get_loop()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=timeout)
-
-
-# ---------------------------------------------------------------------------
 # Default config
 # ---------------------------------------------------------------------------
 
@@ -118,18 +82,34 @@ def _run_async(coro, timeout: float = 30.0):
 DEFAULT_DB_URL = get_settings().db_url
 
 
-def _supports_background_outbox(db_url: str) -> bool:
-    """Return whether the DB URL can safely host a second polling session.
+def _bind_adapter_symbols() -> None:
+    import memory_server.transports.hermes as hermes_transport
+    globals()["_get_loop"] = hermes_transport._get_loop
+    globals()["_run_async"] = hermes_transport._run_async
+    globals()["_supports_background_outbox"] = hermes_transport._supports_background_outbox
+    globals()["_hermes_runtime_config"] = hermes_transport._hermes_runtime_config
+    globals()["HermesRuntimeBridge"] = hermes_transport.HermesRuntimeBridge
+    globals()["HermesRuntimeHooks"] = hermes_transport.HermesRuntimeHooks
 
-    The transient in-memory SQLite URLs used by unit tests do not behave like
-    the real profile-backed file database; starting a second session against
-    them can break basic CRUD flows. Skip the outbox worker there.
-    """
-    normalized = db_url.strip().lower()
-    return normalized not in {
-        "sqlite+aiosqlite://",
-        "sqlite+aiosqlite:///:memory:",
-    }
+
+HermesRuntimeBridge = None
+HermesRuntimeHooks = None
+_hermes_runtime_config = None
+
+
+def _get_loop():
+    _bind_adapter_symbols()
+    return _get_loop()
+
+
+def _run_async(coro, timeout: float = 30.0):
+    _bind_adapter_symbols()
+    return _run_async(coro, timeout=timeout)
+
+
+def _supports_background_outbox(db_url: str) -> bool:
+    _bind_adapter_symbols()
+    return _supports_background_outbox(db_url)
 
 
 def _resolve_cmms_data_path(
@@ -163,18 +143,12 @@ def _prepare_store_path(provider: "HermesProvider", path: Path) -> None:
 
 async def _get_graph(provider: "HermesProvider"):
     """Return a snapshot-backed graph instance for Hermes audit/tools."""
-    from memory_server.providers.graph_provider import SimpleGraph
-
     if provider._storage_layout is None:
         raise RuntimeError("storage layout is not initialized")
     if "graph" in provider._storage_layout.unavailable_projections:
         raise RuntimeError("E_PROJECTION_UNAVAILABLE: graph requires migration")
     if provider._graph is None:
-        snapshot_path = provider._storage_layout.graph_snapshot_path
-        _prepare_store_path(provider, snapshot_path)
-        validate_write_target(provider._storage_layout, provider._storage_layout.graph_lock_path)
-        provider._graph = SimpleGraph(snapshot_path=snapshot_path)
-        provider._graph.load_snapshot()
+        raise RuntimeError("E_PROJECTION_UNAVAILABLE: graph is not bound")
     return provider._graph
 
 
@@ -188,61 +162,17 @@ async def _get_vector_provider(provider: "HermesProvider"):
 
     if backend == "qdrant":
         if provider._qdrant is None:
-            from memory_server.providers.qdrant_provider import QdrantProvider
-
-            # Persistent Qdrant only when a host URL is configured; otherwise
-            # fall back to in-memory (parity with the MCP server path, where
-            # indexes are process-local by default).
-            settings = provider._settings
-            provider._qdrant = QdrantProvider(
-                location=provider._storage_layout.vector.qdrant_location,
-                port=settings.qdrant_port,
-                prefer_grpc=settings.qdrant_prefer_grpc,
-                collection=provider._storage_layout.vector.collection,
-                vector_size=settings.vector_size,
-                distance=settings.vector_metric,
-            )
+            raise RuntimeError("E_PROJECTION_UNAVAILABLE: vector is not bound")
         return provider._qdrant
-
     if provider._lancedb is None:
-        from memory_server.providers.lancedb_provider import LanceDBProvider
-
-        settings = provider._settings
-        db_path = provider._storage_layout.vector.local_path
-        if db_path is None:
-            raise RuntimeError("E_PROJECTION_UNAVAILABLE: local vector path missing")
-        _prepare_store_path(provider, db_path)
-        provider._lancedb = LanceDBProvider(
-            db_path=str(db_path),
-            table=provider._storage_layout.vector.collection,
-            metric=settings.vector_metric,
-            vector_size=settings.vector_size,
-        )
+        raise RuntimeError("E_PROJECTION_UNAVAILABLE: vector is not bound")
     return provider._lancedb
 
 
 async def _get_embedder(provider: "HermesProvider"):
     """Resolve the active embedding provider for Hermes tools/workers."""
     if provider._embedder is None:
-        from memory_server.providers.embedding_provider import (
-            OpenAIEmbeddingProvider,
-            SentenceTransformerEmbeddingProvider,
-        )
-
-        settings = provider._settings
-        if settings.embedding_provider == "openai":
-            provider._embedder = OpenAIEmbeddingProvider(
-                model=settings.openai_embedding_model,
-                base_url=settings.embedding_base_url,
-                vector_size=settings.openai_embedding_vector_size,
-                api_key=get_openai_api_key(),
-            )
-        else:
-            provider._embedder = SentenceTransformerEmbeddingProvider(
-                model_name=settings.embedding_model,
-                device=settings.embedding_device,
-                batch_size=settings.embedding_batch_size,
-            )
+        raise RuntimeError("E_PROJECTION_UNAVAILABLE: embedder is not bound")
     return provider._embedder
 
 
@@ -310,6 +240,7 @@ class HermesProvider:
 
     def __init__(self):
         self._initialized = False
+        self._bridge = None
         self._shut_down = False
         self._provider: Any | None = None  # SQLiteProvider
         self._qdrant: Any | None = None
@@ -371,6 +302,9 @@ class HermesProvider:
             return False
         if self._cleanup_failed:                      # T15/T17 CLOSE_FAILED guard (NEW)
             return False
+        runtime = getattr(getattr(self, "_bridge", None), "runtime", None)
+        if runtime is not None and runtime.state == "FAILED":
+            return False
         if self._initialized:
             return self._provider is not None
         if self._shut_down:
@@ -407,6 +341,7 @@ class HermesProvider:
         self._hermes_home = kwargs.get("hermes_home", "")
 
         try:
+            _bind_adapter_symbols()
             # STEP 1 — config. When MEMORY_SERVER_DB_URL is unset and
             # data["db_url"] is falsy, HermesPluginConfig.from_dict invokes the
             # config-module get_settings alias (config.py:96-99 internal
@@ -426,7 +361,7 @@ class HermesProvider:
                 hermes_home=self._hermes_home, settings=self._settings
             )
             self._projection_degraded_reason = "; ".join(self._storage_layout.compatibility) or None
-            self._root_lock = RuntimeStorageLock.acquire(self._storage_layout.data_root, timeout=5.0)
+            self._root_lock = None
             if self._storage_layout.sqlite.local_path is not None:
                 _prepare_store_path(self, self._storage_layout.sqlite.local_path)
 
@@ -443,23 +378,39 @@ class HermesProvider:
                 self._extractor_runtime, hermes_home=self._hermes_home
             )
 
-            # STEP 6 — SQLiteProvider(busy_timeout_ms=60000) BEFORE
-            # await initialize(); engine created at sqlite_provider.py:98 and
-            # NEVER rebuilt or replaced.
-            self._provider = _run_async(self._init_provider(db_url), timeout=60.0)
-
-            # STEP 7 — writer, then outbox — ONLY after provider success.
-            self._writer = WriterQueue(
+            start_outbox = (
+                not self._storage_layout.unavailable_projections
+                and _supports_background_outbox(db_url)
+            )
+            config = _hermes_runtime_config(self._storage_layout, self._settings)
+            hooks = HermesRuntimeHooks()
+            hooks.bind_generation(self._bump_prefetch_generation)
+            self._bridge = HermesRuntimeBridge(
+                layout=self._storage_layout,
+                settings=self._settings,
+                config=config,
+                hooks=hooks,
+                profile_id=str(self._storage_layout.data_root),
                 write_callback=self._handle_batch_write,
                 flush_interval=self._config.writer.flush_interval,
                 max_batch=self._config.writer.max_batch,
+                start_outbox=start_outbox,
             )
-            # Start the writer's background task on the shared loop
-            _run_async(self._writer.start())
-            if not self._storage_layout.unavailable_projections and _supports_background_outbox(db_url):
-                _run_async(self._start_outbox_worker(), timeout=60.0)
-
-            # STEP 8 — only now signal ready.
+            runtime = _run_async(self._bridge.start(), timeout=60.0)
+            deps = runtime.dependencies
+            self._provider = deps.sqlite
+            self._graph = deps.graph
+            self._embedder = deps.embedder
+            vector = deps.vector
+            if vector is not None and type(vector).__name__ == "LanceDBProvider":
+                self._lancedb = vector
+                self._qdrant = None
+            else:
+                self._qdrant = vector
+                self._lancedb = None
+            self._writer = self._bridge.writer
+            self._outbox_worker = deps.outbox_worker
+            self._outbox_task = self._bridge.worker_task
             self._initialized = True
             report = serialize_layout_redacted(self._storage_layout)
             logger.log(
@@ -471,48 +422,28 @@ class HermesProvider:
         except Exception:
             logger.exception("HermesProvider: initialization failed — rolling back")
             try:
-                _run_async(self._teardown_async(), timeout=30.0)
+                if getattr(self, "_bridge", None) is not None:
+                    _run_async(self._bridge.close(), timeout=30.0)
             except Exception:
-                self._mark_poisoned_if_live_task()             # T6 guard
-            raise                                              # ORIGINAL exception, always
-
-    async def _init_provider(self, db_url: str):
-        """Async initialization of the SQLiteProvider on the background loop."""
-        from memory_server.providers.sqlite_provider import SQLiteProvider
-
-        provider = SQLiteProvider(url=db_url, busy_timeout_ms=60000)
-        try:
-            await provider.initialize()
-        except Exception:
-            # FP1 local cleanup: the engine may already exist (created at
-            # sqlite_provider.py:98 before PRAGMA/DDL can raise) while
-            # self._provider is NOT assigned (assignment happens only on
-            # success). Dispose it here — no later shutdown() can see it.
-            try:
-                await provider.close()
-            except Exception:
-                # T15 close-failure: the local dispose failed, so the engine
-                # may STILL BE LIVE. Retain the provider on the instance for
-                # the close-retry path (a later shutdown() re-runs teardown
-                # step 4 and retries provider.close()); the ORIGINAL
-                # initialize exception still propagates below.
-                logger.exception(
-                    "HermesProvider: FP1 local engine dispose failed — "
-                    "provider retained for close retry"
-                )
-                self._provider = provider
                 self._cleanup_failed = True
+                self._initialized = False
+            else:
+                runtime = getattr(getattr(self, "_bridge", None), "runtime", None)
+                if runtime is None or runtime.lock is None:
+                    self._extractor_runtime = None
+                    self._llm_extractor = None
+                    self._settings = None
             raise
-        return provider
 
     def _require_provider(self):
         """Return the initialized SQLite provider or fail fast."""
-        if self._outbox_stop_failed:                  # T12 poison guard
+        if self._outbox_stop_failed or self._cleanup_failed:
             raise RuntimeError(
-                "HermesProvider is poisoned (outbox stop failed); "
+                "HermesProvider cleanup failed (close-failed); "
                 "resources retained — call shutdown() to retry"
             )
-        if self._cleanup_failed:                      # T15/T17 CLOSE_FAILED guard (NEW)
+        runtime = getattr(getattr(self, "_bridge", None), "runtime", None)
+        if runtime is not None and runtime.state == "FAILED":
             raise RuntimeError(
                 "HermesProvider cleanup failed (close-failed); "
                 "resources retained — call shutdown() to retry"
@@ -521,295 +452,36 @@ class HermesProvider:
             raise RuntimeError("HermesProvider is not initialized")
         return self._provider
 
-    async def _start_outbox_worker(self) -> None:
-        """Start the persistent outbox worker on the shared loop."""
-        if self._outbox_worker is not None and self._outbox_task is not None:
-            return
-
-        from storage.outbox_worker import OutboxWorker
-
-        from memory_server.router.graph_router import GraphRouter
-
-        vector_provider = await _get_vector_provider(self)
-        embedder = await _get_embedder(self)
-        graph = await _get_graph(self)
-        settings = self._settings
-        graph_router = GraphRouter(
-            graph=graph,
-            max_path_depth=settings.graph_max_path_depth,
-        )
-        assert self._provider is not None
-
-        self._outbox_worker = OutboxWorker(
-            engine=self._provider.engine,
-            qdrant=vector_provider,
-            embedder=embedder,
-            graph_router=graph_router,
-            max_retries=settings.outbox_max_retries,
-            poll_interval_seconds=settings.outbox_poll_interval_seconds,
-            poll_batch_size=settings.outbox_poll_batch_size,
-            fact_batch_chunk_size=settings.outbox_fact_batch_chunk_size,
-            compact_interval_seconds=settings.outbox_compact_interval_seconds,
-            compact_cleanup_hours=settings.outbox_compact_cleanup_hours,
-            stale_processing_seconds=settings.outbox_stale_processing_seconds,
-            process_pending_limit=settings.outbox_process_pending_limit,
-            busy_timeout_ms=60000,
-        )
-        await self._outbox_worker.initialize()
-
-        # Schedule the run task on the shared loop. The task is stored as the
-        # REAL asyncio.Task (not a concurrent.futures.Future): task.cancel()
-        # delivers CancelledError to the coroutine at its next await point and
-        # task.done() reflects the ACTUAL run() state — the only trustworthy
-        # verified-termination evidence for the fail-closed stop procedure
-        # (a run_coroutine_threadsafe future would report done()==True after
-        # its own cancel() while the coroutine is STILL running — verified
-        # empirically; same pattern as server.py:65,78-92).
-        self._schedule_outbox_task()
-
-    def _schedule_outbox_task(self) -> None:
-        """Schedule the outbox run task on the shared loop (thread-safe).
-
-        Kept as a separate seam so the FP3(c) failure-injection test can raise
-        exactly at the run-task scheduling boundary (worker constructed +
-        initialized, task never scheduled).
-        """
-        loop = _get_loop()
-
-        def _schedule() -> None:
-            self._outbox_task = asyncio.ensure_future(self._outbox_worker.run())
-
-        loop.call_soon_threadsafe(_schedule)
-
-    async def _teardown_async(self) -> None:
-        """Canonical reverse-order teardown (PLAN §4 rollback order, [R4-F1]).
-
-        Reverse of acquisition: outbox -> auxiliary -> writer -> provider ->
-        cached state. Every step is None-guarded; every OWNED close is wrapped
-        in try/except (log, do not raise) so cleanup can never mask the
-        original exception. CLOSE-FAILURE SEMANTICS (T15): when an owned close
-        raises, the handle is RETAINED (attribute NOT cleared — the resource
-        may remain live), ``_cleanup_failed`` is set, and the remaining steps
-        still run so every other owned resource is released; the caller
-        (``shutdown()``) must not report CLEAN until ``_cleanup_failed`` is
-        False. Raises ONLY when the outbox stop enters POISONED (T5/T6) — the
-        caller then re-raises the original exception (initialize rollback) or
-        propagates the contract breach (shutdown). Embedder/graph reference
-        drops cannot fail and stay unconditional.
-        """
-        run_failed = False
-
-        # 1. Outbox — fail-closed stop; NO worker.close(); NO engine dispose here.
-        if self._outbox_worker is not None or self._outbox_task is not None:
-            await self._stop_outbox_worker()
-
-        # 2. Auxiliary resources (row 3 of the matrix; only created on
-        #    outbox-capable URLs). Each close: on success the attribute is
-        #    cleared; on failure it is RETAINED for the close retry (T15/T16).
-        if self._qdrant is not None:
-            try:
-                await self._qdrant.close()            # qdrant_provider.py:427 (async)
-                self._qdrant = None
-            except Exception:
-                logger.exception("HermesProvider: error closing Qdrant provider")
-                self._cleanup_failed = True           # handle retained
-                run_failed = True
-        if self._lancedb is not None:
-            try:
-                await self._lancedb.close()           # lancedb_provider.py:585 (async)
-                self._lancedb = None
-            except Exception:
-                logger.exception("HermesProvider: error closing LanceDB provider")
-                self._cleanup_failed = True           # handle retained
-                run_failed = True
-        if self._embedder is not None:
-            try:
-                if hasattr(self._embedder, "close"):
-                    await self._embedder.close()
-                self._embedder = None
-            except Exception:
-                logger.exception("HermesProvider: error closing embedder")
-                self._cleanup_failed = True           # handle retained
-                run_failed = True
-        self._graph = None                            # reference release — cannot fail
-
-        # 3. Writer — final flush on the LIVE engine (dispose is step 4).
-        if self._writer is not None:
-            try:
-                await self._writer.shutdown()         # writer.py:120-140
-                self._writer = None
-            except Exception:
-                logger.exception("HermesProvider: error shutting down writer")
-                self._cleanup_failed = True           # handle retained
-                run_failed = True
-
-        # 4. Provider — the SOLE engine-dispose path; exactly once per
-        #    lifecycle on the clean path, retried ONLY after a recorded close
-        #    failure (T15/T16 — never an idempotent second call).
-        if self._provider is not None:
-            try:
-                await self._provider.close()          # sqlite_provider.py:179-182
-                self._provider = None
-            except Exception:
-                logger.exception("HermesProvider: error closing provider")
-                self._cleanup_failed = True           # handle retained
-                run_failed = True
-
-        # 5. Cached extraction state.
-        self._extractor_runtime = None
-        self._llm_extractor = None
-        self._settings = None
-        self._initialized = False
-
-        # 6. Marker reset — the FINAL step, only after verified termination AND
-        #    completed cleanup (T8/T16). A run where every owned close
-        #    succeeded clears the close-failure marker (a retry released every
-        #    retained handle) and, with it clear, the POISONED-retry marker
-        #    (T16). A run where any close failed keeps ``_cleanup_failed`` set
-        #    so the retained handles are retried by the next teardown.
-        if not run_failed:
-            if self._root_lock is not None:
-                self._root_lock.release()
-                self._root_lock = None
-            self._storage_layout = None
-            self._cleanup_failed = False
-            self._outbox_stop_failed = False
-
-    def _mark_poisoned_if_live_task(self) -> bool:
-        """T6 guard: a stop attempt's OUTER bound expired while an outbox task
-        is still tracked — cannot verify termination. Enters POISONED; returns
-        True when POISONED was entered (or already was)."""
-        if self._outbox_stop_failed:
-            return True
-        if self._outbox_worker is not None or self._outbox_task is not None:
-            self._outbox_stop_failed = True
-            self._initialized = False
-            # _shut_down stays False — T7 retry must remain reachable.
-            logger.error(
-                "HermesProvider: outbox stop outer bound expired — "
-                "resources retained (poisoned)"
-            )
-            return True
-        return False
-
-    async def _stop_outbox_worker(self) -> None:
-        """Fail-closed outbox stop: STOPPING -> CANCELLING -> STOPPED, else POISONED.
-
-        [R4-F1] OutboxWorker.close() is NEVER invoked in the HermesProvider
-        lifecycle: outbox_worker.py:131-134 disposes self._engine, which here
-        IS the SHARED provider engine (constructed with engine=self._provider.engine,
-        provider.py:393); engine disposal is owned SOLELY by provider.close()
-        (sqlite_provider.py:179-182). The worker releases nothing beyond the
-        shared engine, so reference drop after verified termination is its
-        entire release.
-        """
-        # Signal first so the run loop exits on its next cycle. The task is a
-        # REAL asyncio.Task scheduled on the shared loop (same pattern as
-        # server.py:65,78-92); only the stop flag is needed for cooperative
-        # workers, and task.cancel() below is the backstop for flag-ignoring
-        # coroutines (it delivers CancelledError at the next await point).
-        if self._outbox_worker is not None:
-            self._outbox_worker.stop()            # idempotent flag (outbox_worker.py:102-110)
-
-        if self._outbox_task is None:             # FP3(c): worker created, task never scheduled
-            self._outbox_worker = None            # reference drop — NO worker.close()
-            return
-
-        # STOPPING — await #1 (10s bound). Verified termination has THREE
-        # completion shapes: normal result, raised exception, or
-        # CancelledError. The await re-raises the task's stored exception and
-        # re-raises CancelledError for a cancelled task — BOTH are caught here
-        # SEPARATELY from the timeout and fall through to the done() check; a
-        # non-timeout exception at this await PROVES the task is done. The
-        # only case that must NOT be consumed is the teardown's OWN
-        # cancellation (CancelledError with the task NOT done) — that is
-        # re-raised so the outer bound/T6 semantics hold. asyncio.shield()
-        # protects the outbox task from wait_for's timeout cancellation.
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(self._outbox_task), timeout=10.0
-            )
-        except (asyncio.TimeoutError, TimeoutError):
-            pass                                  # not done within bound -> CANCELLING (T3)
-        except asyncio.CancelledError:
-            if not self._outbox_task.done():
-                raise                             # our own cancellation — propagate
-            # task completed by cancellation -> verified termination (T2/T4)
-        except Exception:
-            # task completed WITH AN EXCEPTION -> verified termination (T2):
-            # run() is no longer executing. The stored exception is CONSUMED
-            # (already delivered to the run-task owner) and never re-raised —
-            # re-raising would push the teardown into POISONED for an
-            # already-terminated task and make retries non-terminating.
-            logger.debug(
-                "HermesProvider: outbox run task terminated with exception",
-                exc_info=True,
-            )
-        if self._outbox_task.done():              # verified termination (T2)
-            self._outbox_task = None
-            self._outbox_worker = None            # reference drop — NO worker.close()
-            return
-
-        # CANCELLING — cancel + await #2 (5s bound) (T3). Same exception
-        # handling as await #1: the CancelledError delivered by task.cancel()
-        # is verified termination; a raised task is verified termination; the
-        # teardown's own cancellation (task NOT done) propagates.
-        self._outbox_task.cancel()
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(self._outbox_task), timeout=5.0
-            )
-        except (asyncio.TimeoutError, TimeoutError):
-            pass                                  # still not done -> POISONED (T5)
-        except asyncio.CancelledError:
-            if not self._outbox_task.done():
-                raise                             # our own cancellation — propagate
-            # task cancelled -> verified termination incl. CancelledError (T4)
-        except Exception:
-            logger.debug(
-                "HermesProvider: outbox run task terminated with exception",
-                exc_info=True,
-            )
-        if self._outbox_task.done():              # verified termination incl. CancelledError (T4)
-            self._outbox_task = None
-            self._outbox_worker = None            # reference drop — NO worker.close()
-            return
-
-        # POISONED entry (T5)
-        self._outbox_stop_failed = True
-        self._initialized = False
-        # _shut_down stays False — T7 must remain reachable.
-        logger.error(
-            "HermesProvider: outbox worker failed to stop within bounds — "
-            "resources retained (poisoned)"
-        )
-        raise RuntimeError(
-            "outbox worker failed to stop; resources retained (poisoned)"
-        )
-
     def shutdown(self) -> None:
         """Flush writer queue and close the database connection (reverse order)."""
-        if self._shut_down:                              # T13 / T8-completed
+        if self._shut_down:
             return
         logger.info("HermesProvider: shutting down")
-        # HERM-3/4: invalidate any in-flight prefetch loads by bumping the
-        # generation (see on_session_switch for why we do not hard-cancel).
-        self._prefetch_generation += 1
         try:
-            _run_async(self._teardown_async(), timeout=30.0)   # T6 outer bound
-        except Exception as exc:
-            if self._outbox_stop_failed:
-                raise                                    # T5/T9: contract-breach RuntimeError
-            if self._mark_poisoned_if_live_task():
-                raise RuntimeError(                      # T6: outer bound expired, live task
-                    "outbox worker failed to stop; resources retained (poisoned)"
-                ) from exc
+            report = _run_async(self._bridge.close(), timeout=30.0) if getattr(self, "_bridge", None) else None
+        except Exception:
+            self._cleanup_failed = True
+            self._outbox_stop_failed = True
+            self._initialized = False
             raise
-        if self._cleanup_failed:                         # T15: close failed — NOT CLEAN
-            raise RuntimeError(
-                "cleanup failed; resources retained (close-failed)"
-            )
-        self._shut_down = True                           # reached only on verified termination + verified closes
+        runtime = getattr(getattr(self, "_bridge", None), "runtime", None)
+        retained = report is not None and (
+            report.lock_retained
+            or report.retained_resources
+            or (report.code not in {None, "E_RUNTIME_FLUSH_FAILED"})
+        )
+        if retained or (runtime is not None and runtime.state == "FAILED"):
+            self._cleanup_failed = True
+            self._outbox_stop_failed = True
+            self._initialized = False
+            raise RuntimeError("cleanup failed; resources retained (close-failed)")
+        self._provider = self._writer = self._outbox_worker = self._outbox_task = None
+        self._qdrant = self._lancedb = self._embedder = self._graph = None
+        self._extractor_runtime = self._llm_extractor = self._settings = None
+        self._cleanup_failed = False
+        self._outbox_stop_failed = False
+        self._shut_down = True
+        self._initialized = False
         self._context_cache.clear()
         logger.info("HermesProvider: shutdown complete")
 
@@ -858,26 +530,22 @@ class HermesProvider:
             self._prefetch_seq = seq + 1
             gen = self._prefetch_generation
 
-            async def _spawn() -> None:
-                task = asyncio.create_task(
-                    self._queue_prefetch_async(
-                        query,
-                        session=effective_session,
-                        gen=gen,
-                        seq=seq,
-                        max_results=self._max_facts(),
-                    )
+            def _factory():
+                return self._queue_prefetch_async(
+                    query, session=effective_session, gen=gen, seq=seq,
+                    max_results=self._max_facts(),
                 )
-                self._prefetch_tasks[seq] = task
-                try:
-                    await task
-                finally:
-                    if self._prefetch_tasks.get(seq) is task:
-                        self._prefetch_tasks.pop(seq, None)
 
-            asyncio.run_coroutine_threadsafe(_spawn(), loop)
+            def _schedule() -> None:
+                task = self._bridge.spawn_prefetch(_factory)
+                self._prefetch_tasks[seq] = task
+
+            loop.call_soon_threadsafe(_schedule)
         except Exception:
             logger.exception("HermesProvider: queue_prefetch failed")
+
+    def _bump_prefetch_generation(self) -> None:
+        self._prefetch_generation += 1
 
     def _cancel_prefetch_tasks(self) -> None:
         """Cancel in-flight background prefetch loads (test/utility seam).
@@ -1562,7 +1230,13 @@ class HermesProvider:
             raise ValueError(f"Unknown CMMS tool: {tool_name}")
 
         try:
-            result = _run_async(handler(**args), timeout=60.0)
+            async def _call():
+                token = self._bridge.runtime.admit()
+                try:
+                    return await handler(**args)
+                finally:
+                    self._bridge.runtime.release_admitted(token)
+            result = _run_async(_call(), timeout=60.0)
             return result if isinstance(result, str) else json.dumps(result)
         except Exception as exc:
             projection_error = _projection_error(exc)
@@ -2327,38 +2001,43 @@ class HermesProvider:
             return [((messages, turn_id), False, error) for messages, turn_id in batch]
 
         provider = self._require_provider()
+        runtime = self._bridge.runtime
+        token = runtime.admit()
+        try:
+            for messages, turn_id in batch:
+                error_text: str | None = None
+                ok = False
+                try:
+                    # Extract text from the turn for CMMS ingestion
+                    text_content = self._extract_turn_text(messages)
+                    if text_content:
+                        from memory_server.api.learn import learn as learn_fn
 
-        for messages, turn_id in batch:
-            error_text: str | None = None
-            ok = False
-            try:
-                # Extract text from the turn for CMMS ingestion
-                text_content = self._extract_turn_text(messages)
-                if text_content:
-                    from memory_server.api.learn import learn as learn_fn
-
-                    await learn_fn(
-                        provider=provider,
-                        text=text_content,
-                        source=f"hermes_turn_{turn_id or 'unknown'}",
-                        extract_beliefs=False,
-                        # NEW — four explicit kwargs, read ONLY from cached init
-                        # state; the provider performs NO truncation, validation,
-                        # filtering, retry, or fallback (SPEC line 21).
-                        llm_extractor=self._llm_extractor,
-                        llm_timeout_seconds=self._extractor_runtime.llm_timeout_seconds,
-                        llm_max_input_chars=self._extractor_runtime.llm_max_input_chars,
-                        llm_confidence_gate=self._extractor_runtime.llm_confidence_gate,
+                        await learn_fn(
+                            provider=provider,
+                            text=text_content,
+                            source=f"hermes_turn_{turn_id or 'unknown'}",
+                            extract_beliefs=False,
+                            # NEW — four explicit kwargs, read ONLY from cached init
+                            # state; the provider performs NO truncation, validation,
+                            # filtering, retry, or fallback (SPEC line 21).
+                            llm_extractor=self._llm_extractor,
+                            llm_timeout_seconds=self._extractor_runtime.llm_timeout_seconds,
+                            llm_max_input_chars=self._extractor_runtime.llm_max_input_chars,
+                            llm_confidence_gate=self._extractor_runtime.llm_confidence_gate,
+                            native_submitter=runtime.submit_native,
+                        )
+                    ok = True
+                except Exception as exc:
+                    error_text = f"{type(exc).__name__}: {exc}"
+                    logger.exception(
+                        "HermesProvider: failed to write turn %s in batch",
+                        turn_id,
                     )
-                ok = True
-            except Exception as exc:
-                error_text = f"{type(exc).__name__}: {exc}"
-                logger.exception(
-                    "HermesProvider: failed to write turn %s in batch",
-                    turn_id,
-                )
-            outcomes.append(((messages, turn_id), ok, error_text))
-        return outcomes
+                outcomes.append(((messages, turn_id), ok, error_text))
+            return outcomes
+        finally:
+            runtime.release_admitted(token)
 
     @staticmethod
     def _extract_turn_text(messages: list | dict) -> str:

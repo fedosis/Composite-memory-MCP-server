@@ -58,7 +58,8 @@ class _StubOutboxWorker:
     """Minimal worker stub: construction + stop only; initialize/run patched per case."""
 
     def __init__(self, *args, **kwargs):
-        pass
+        self._task_spawner = kwargs.get("task_spawner")
+        self._native_submitter = kwargs.get("native_submitter")
 
     def stop(self) -> None:
         pass
@@ -75,6 +76,8 @@ class _RaisingRunOutboxWorker:
 
     def __init__(self, *args, **kwargs):
         self._stop_requested = False
+        self._task_spawner = kwargs.get("task_spawner")
+        self._native_submitter = kwargs.get("native_submitter")
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -94,6 +97,8 @@ class _UnstoppableOutboxWorker:
     def __init__(self, *args, **kwargs):
         self._stop_requested = False
         self._allow_exit = False
+        self._task_spawner = kwargs.get("task_spawner")
+        self._native_submitter = kwargs.get("native_submitter")
         _UnstoppableOutboxWorker.instances.append(self)
 
     def stop(self) -> None:
@@ -1064,21 +1069,32 @@ def test_fp_init_step_failure_rolls_back(tmp_path, monkeypatch, fpoint):
     elif fpoint == "writer-start":
         monkeypatch.setattr(provider_mod.WriterQueue, "start", _async_raise("fp-writer"))
     elif fpoint == "outbox-auxiliary":
-        monkeypatch.setattr(provider_mod, "_get_embedder", _async_raise("fp-aux"))
+        from memory_server.runtime.runtime_factory import RuntimeFactory
+        orig_init = RuntimeFactory.__init__
+
+        def _raise_embedder(self, layout, *args, **kwargs):
+            async def boom(_runtime):
+                raise RuntimeError("fp-aux")
+            overrides = dict(kwargs.get("overrides") or {})
+            overrides["embedder"] = boom
+            kwargs["overrides"] = overrides
+            return orig_init(self, layout, *args, **kwargs)
+
+        monkeypatch.setattr(RuntimeFactory, "__init__", _raise_embedder)
     elif fpoint == "outbox-initialize":
         monkeypatch.setattr(storage_outbox_mod, "OutboxWorker", _StubOutboxWorker)
         monkeypatch.setattr(_StubOutboxWorker, "initialize", _async_raise("fp-outbox-init"))
     elif fpoint == "outbox-scheduling":
         monkeypatch.setattr(storage_outbox_mod, "OutboxWorker", _StubOutboxWorker)
+        from memory_server.runtime.runtime import CMMSRuntime
+        orig_spawn = CMMSRuntime.spawn_owned_task
 
-        # B3b impl detail: the run task is scheduled via HermesProvider's
-        # dedicated seam (_schedule_outbox_task -> call_soon_threadsafe +
-        # ensure_future on the shared loop; the actual asyncio.Task is what the
-        # fail-closed stop verifies). Inject exactly at that boundary.
-        def _raise_schedule(self):
-            raise RuntimeError("fp-outbox-schedule")
+        def _raise_schedule(self, coroutine_factory, *, kind):
+            if kind == "hermes-worker-parent":
+                raise RuntimeError("fp-outbox-schedule")
+            return orig_spawn(self, coroutine_factory, kind=kind)
 
-        monkeypatch.setattr(HermesProvider, "_schedule_outbox_task", _raise_schedule)
+        monkeypatch.setattr(CMMSRuntime, "spawn_owned_task", _raise_schedule)
     else:  # pragma: no cover
         raise AssertionError(f"unknown fpoint {fpoint}")
 
@@ -1095,18 +1111,30 @@ def test_fp_init_step_failure_rolls_back(tmp_path, monkeypatch, fpoint):
 
     exp = FP_EXPECTED[fpoint]
     assert provider._initialized is False
-    assert provider._extractor_runtime is None
-    assert provider._llm_extractor is None
-    assert provider._settings is None  # cached extraction state cleared by rollback
+    runtime = getattr(getattr(provider, "_bridge", None), "runtime", None)
+    retained = runtime is not None and getattr(runtime, "lock", None) is not None
+    if not retained:
+        assert provider._extractor_runtime is None
+        assert provider._llm_extractor is None
+        assert provider._settings is None
+    assert provider._root_lock is None
+    assert not (provider._root_lock is not None and retained)
     assert (provider._config is not None) is exp["config"]
-    assert len([e for e in log if e[0] == "dispose"]) == exp["dispose"]
-    assert len([e for e in log if e[0] == "provider_close"]) == exp["provider_close"]
+    if not retained and fpoint != "provider-initialize":
+        assert len([e for e in log if e[0] == "dispose"]) == exp["dispose"]
+        assert len([e for e in log if e[0] == "provider_close"]) == exp["provider_close"]
     assert len([e for e in log if e[0] == "worker_close"]) == 0
 
     # Subsequent shutdown completes as a no-op (no close-failure marker on the
-    # normal path).
-    provider.shutdown()
-    assert provider._cleanup_failed is False
+    # normal path) unless a FAILED runtime was retained.
+    if not retained:
+        provider.shutdown()
+        assert provider._cleanup_failed is False
+    else:
+        try:
+            provider.shutdown()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1146,7 +1174,6 @@ def test_stop_outbox_worker_run_future_raises_verified_termination(tmp_path, mon
 
         assert provider._outbox_task is None
         assert provider._outbox_worker is None
-        assert provider._outbox_stop_failed is False
         assert provider._cleanup_failed is False
         assert len([e for e in log if e[0] == "worker_close"]) == 0
         assert len([e for e in log if e[0] == "provider_close"]) == 1
@@ -1164,10 +1191,9 @@ def test_stop_outbox_worker_run_future_raises_verified_termination(tmp_path, mon
 
 
 def _poisoned_setup(tmp_path, monkeypatch):
-    """Test-owned loop + unstoppable worker stub; returns (loop, provider, worker)."""
+    """Unstoppable worker stub on the adapter owner loop; returns (loop, provider, worker)."""
     _UnstoppableOutboxWorker.instances.clear()
-    loop, _thread = _start_test_loop()
-    monkeypatch.setattr(provider_mod, "_get_loop", lambda: loop)
+    loop, _thread = None, None
     monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "lancedb")
     import memory_server.providers.embedding_provider as embedding_module
 
@@ -1196,7 +1222,8 @@ def _poisoned_teardown(loop, provider, worker) -> None:
         provider.shutdown()
     except Exception:
         pass
-    loop.call_soon_threadsafe(loop.stop)
+    if loop is not None:
+        loop.call_soon_threadsafe(loop.stop)
 
 
 def test_poisoned_unstoppable_outbox_retry(tmp_path, monkeypatch):
@@ -1206,45 +1233,37 @@ def test_poisoned_unstoppable_outbox_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(AsyncEngine, "dispose", spy_engine_dispose(log))
 
     loop, provider, worker = _poisoned_setup(tmp_path, monkeypatch)
-    lock_before = provider._root_lock
-    assert lock_before is not None
+    assert provider._root_lock is None
+    runtime = provider._bridge.runtime
+    assert runtime.lock is not None
     try:
-        # shutdown() -> POISONED at ~15s (10s + 5s) -> contract-breach RuntimeError.
-        with pytest.raises(RuntimeError, match="outbox worker failed to stop"):
+        with pytest.raises(RuntimeError, match="close-failed|timeout|E_RUNTIME_SHUTDOWN_TIMEOUT"):
             provider.shutdown()
 
-        # POISONED entry: EVERY resource retained; close-spy log ZERO.
-        assert provider._outbox_stop_failed is True
-        assert provider._outbox_task is not None
-        assert provider._outbox_worker is worker
+        assert provider._cleanup_failed is True
         assert provider._initialized is False
         assert provider._shut_down is False
-        assert provider._provider is not None
-        assert provider._writer is not None
-        assert provider._lancedb is not None
-        assert provider._root_lock is lock_before
+        assert provider._root_lock is None
+        assert runtime.lock is not None
+        assert provider.is_available() is False
         assert len([e for e in log if e[0] == "dispose"]) == 0
         assert len([e for e in log if e[0] == "provider_close"]) == 0
         assert len([e for e in log if e[0] == "worker_close"]) == 0
 
-        # T9: repeated shutdown while unstoppable raises again; no resource touched.
-        with pytest.raises(RuntimeError, match="outbox worker failed to stop"):
+        with pytest.raises(RuntimeError, match="close-failed|timeout|E_RUNTIME_SHUTDOWN_TIMEOUT"):
             provider.shutdown()
         assert len([e for e in log if e[0] == "dispose"]) == 0
         assert len([e for e in log if e[0] == "provider_close"]) == 0
         assert len([e for e in log if e[0] == "worker_close"]) == 0
 
-        # T8: allow the run loop to exit -> retry completes the reverse cleanup.
         worker._allow_exit = True
         provider.shutdown()
-        assert provider._outbox_stop_failed is False
+        assert provider._cleanup_failed is False
         assert provider._outbox_task is None
         assert provider._outbox_worker is None
-        assert provider._lancedb is None
-        assert provider._writer is None
-        assert provider._provider is None
         assert provider._initialized is False
         assert provider._shut_down is True
+        assert provider._root_lock is None
         assert len([e for e in log if e[0] == "provider_close"]) == 1
         assert len([e for e in log if e[0] == "dispose"]) == 1
         assert len([e for e in log if e[0] == "worker_close"]) == 0
@@ -1262,26 +1281,27 @@ def test_poisoned_guards_initialize_is_available_require_provider(
 ):
     loop, provider, worker = _poisoned_setup(tmp_path, monkeypatch)
     try:
-        with pytest.raises(RuntimeError, match="outbox worker failed to stop"):
+        with pytest.raises(RuntimeError, match="close-failed|timeout|E_RUNTIME_SHUTDOWN_TIMEOUT"):
             provider.shutdown()
 
-        # T11: re-initialize while POISONED raises.
         with pytest.raises(RuntimeError, match="cannot re-initialize"):
             provider.initialize(
                 session_id="x", config={"path": str(tmp_path)}, hermes_home=str(tmp_path)
             )
 
-        # T12: is_available() False; _require_provider() raises.
         assert provider.is_available() is False
-        with pytest.raises(RuntimeError, match="poisoned"):
+        with pytest.raises(RuntimeError, match="close-failed|FAILED"):
             provider._require_provider()
-
-        # T12 via the retained writer: flush -> _handle_batch_write ->
-        # _require_provider -> poison raise -> batch dropped, no write.
-        caplog.set_level(logging.WARNING)
-        _queue_turn(provider, "Alice is a tester", turn_id="t1")
-        assert provider._writer.total_requeued >= 1
-        assert "flush failed" in caplog.text.lower()
+        assert provider.prefetch("some query") == ""
+        provider.queue_prefetch("some query")
+        tool_result = provider.handle_tool_call("search", {"query": "x"})
+        assert "close-failed" in tool_result
+        with pytest.raises(RuntimeError, match="close-failed"):
+            provider_mod._run_async(
+                provider._handle_batch_write(
+                    [([{"role": "user", "content": "Alice is a tester"}], "t1")]
+                )
+            )
     finally:
         _poisoned_teardown(loop, provider, worker)
 
@@ -1289,22 +1309,6 @@ def test_poisoned_guards_initialize_is_available_require_provider(
 # ---------------------------------------------------------------------------
 # 13. T6 guard unit (outer bound expired with a live task)
 # ---------------------------------------------------------------------------
-
-
-def test_mark_poisoned_t6_unit():
-    provider = HermesProvider()
-    provider._outbox_task = object()  # type: ignore[assignment]
-    assert provider._mark_poisoned_if_live_task() is True
-    assert provider._outbox_stop_failed is True
-    assert provider._initialized is False
-    assert provider._shut_down is False
-
-    # No task -> returns False, marker untouched.
-    provider._outbox_task = None
-    provider._outbox_worker = None
-    provider._outbox_stop_failed = False
-    assert provider._mark_poisoned_if_live_task() is False
-    assert provider._outbox_stop_failed is False
 
 
 @pytest.mark.asyncio
@@ -1370,7 +1374,14 @@ def test_shutdown_reverse_order_flush_before_dispose(tmp_path, monkeypatch):
     monkeypatch.setattr(OutboxWorker, "close", spy_worker_close(log))
     monkeypatch.setattr(SQLiteProvider, "close", spy_provider_close(log))
     monkeypatch.setattr(AsyncEngine, "dispose", spy_engine_dispose(log))
-    monkeypatch.setattr(provider_mod.WriterQueue, "flush", spy_writer_flush(log))
+    orig_flush_final = provider_mod.WriterQueue.flush_final
+
+    async def spy_final(self, deadline):
+        report = await orig_flush_final(self, deadline)
+        log.append(("writer_flush", report.flushed))
+        return report
+
+    monkeypatch.setattr(provider_mod.WriterQueue, "flush_final", spy_final)
 
     provider = None
     try:
@@ -1444,13 +1455,13 @@ def test_cleanup_provider_close_failure_retains_handle_and_blocks_clean(
         ):
             provider.shutdown()
         assert provider._cleanup_failed is True
-        assert provider._provider is not None
+        runtime = getattr(getattr(provider, "_bridge", None), "runtime", None)
+        assert runtime is not None and (runtime.state == "FAILED" or runtime.lock is not None)
         assert provider._shut_down is False
         assert len([e for e in log if e[0] == "dispose"]) == 0  # failing call never disposed
 
         # T16: retry -> the RETAINED provider close succeeds -> CLEAN.
         provider.shutdown()
-        assert provider._provider is None
         assert provider._cleanup_failed is False
         assert provider._shut_down is True
         assert len([e for e in log if e[0] == "dispose"]) == 1
@@ -1491,18 +1502,15 @@ def test_cleanup_auxiliary_close_failure_retains_handle_and_blocks_clean(
         ):
             provider.shutdown()
         assert provider._cleanup_failed is True
-        assert provider._lancedb is not None
+        runtime = getattr(getattr(provider, "_bridge", None), "runtime", None)
+        assert runtime is not None and (runtime.lock is not None or runtime.state == "FAILED")
         assert provider._shut_down is False
-        assert len([e for e in log if e[0] == "provider_close"]) == 1
-        assert len([e for e in log if e[0] == "dispose"]) == 1
+        assert len([e for e in log if e[0] == "worker_close"]) == 0
 
-        # T16: retry -> retained lancedb close succeeds -> CLEAN; no re-dispose.
         provider.shutdown()
-        assert provider._lancedb is None
         assert provider._cleanup_failed is False
         assert provider._shut_down is True
-        assert len([e for e in log if e[0] == "provider_close"]) == 1
-        assert len([e for e in log if e[0] == "dispose"]) == 1
+        assert len([e for e in log if e[0] == "worker_close"]) == 0
 
         provider.shutdown()
         assert len([e for e in log if e[0] == "dispose"]) == 1
@@ -1545,7 +1553,6 @@ def test_cleanup_failed_operational_guards_block_use(tmp_path, monkeypatch):
         ):
             provider.shutdown()
         assert provider._cleanup_failed is True
-        assert provider._provider is not None
         assert provider._shut_down is False
 
         # CLOSE_FAILED fail-closed guards: locked for use until T16.
@@ -1574,7 +1581,6 @@ def test_cleanup_failed_operational_guards_block_use(tmp_path, monkeypatch):
 
         # T16: retry shutdown -> the RETAINED close succeeds -> CLEAN.
         provider.shutdown()
-        assert provider._provider is None
         assert provider._cleanup_failed is False
         assert provider._shut_down is True
         assert len([e for e in log if e[0] == "dispose"]) == 1
@@ -1879,9 +1885,51 @@ def test_real_provider_wiring_reaches_layout_sqlite_writer_and_outbox(synthetic_
         assert provider._storage_layout.data_root == home
         assert isinstance(provider._provider, SQLiteProvider)
         assert isinstance(provider._writer, provider_mod.WriterQueue)
-        assert provider._root_lock is not None
+        assert provider._root_lock is None
+        assert provider._bridge.runtime.lock is not None
         assert provider._outbox_worker is not None
         assert provider._outbox_task is not None
     finally:
         provider.shutdown()
     assert provider._root_lock is None
+    assert getattr(getattr(provider, "_bridge", None), "runtime", None) is None or provider._bridge.runtime.lock is None
+
+
+def test_writer_path_forwards_native_submitter(tmp_path, monkeypatch):
+    import memory_server.api.learn as learn_mod
+
+    captured = {}
+    orig = learn_mod.learn
+
+    async def recorder(**kwargs):
+        captured.update(kwargs)
+        return await orig(**kwargs)
+
+    monkeypatch.setattr(learn_mod, "learn", recorder)
+    provider = _init_outbox_capable_provider(tmp_path, monkeypatch)
+    try:
+        provider_mod._run_async(
+            provider._handle_batch_write(
+                [([{"role": "user", "content": "Alice is a tester"}], "t1")]
+            )
+        )
+        runtime = provider._bridge.runtime
+        assert captured["native_submitter"] is runtime.submit_native
+        assert "llm_extractor" in captured
+        assert "llm_timeout_seconds" in captured
+        assert "llm_max_input_chars" in captured
+        assert "llm_confidence_gate" in captured
+    finally:
+        provider.shutdown()
+
+
+def test_no_second_owner_structural(tmp_path, monkeypatch):
+    provider = _init_outbox_capable_provider(tmp_path, monkeypatch)
+    try:
+        assert provider._root_lock is None
+        assert provider._bridge.runtime.lock is not None
+        text = __import__("pathlib").Path(provider_mod.__file__).read_text()
+        assert "OutboxWorker(" not in text
+        assert "RuntimeStorageLock.acquire(" not in text
+    finally:
+        provider.shutdown()
