@@ -31,6 +31,14 @@ Publication boundary for `v0.11.0b1`:
 5. **Hermes community** — optional integration documentation only; not a
    distribution channel for this release.
 
+### This branch (unreleased)
+
+The latest public GitHub release remains `v0.11.0b1`. Branch
+`refactor/runtime-architecture` declares package version `0.12.0` and contains
+the runtime-ownership refactor: implemented and independently verified, but
+**not merged** and **not released**. Do not treat this branch as a published
+GitHub release.
+
 ## First-run install
 
 ### Prerequisites
@@ -185,7 +193,7 @@ memory-server --help
 
 - [Agent Discovery](docs/AGENT_DISCOVERY.md) — concise MCP/client/directory metadata, capabilities, transports, and limitations
 - [Directory Submission Text](docs/DIRECTORY_SUBMISSIONS.md) — Smithery/Glama-ready draft copy; no external publication performed
-- [ADR](docs/ADR.md) — Architecture Decision Records (13 ADRs)
+- [ADR](docs/ADR.md) — Architecture Decision Records
 - [Changelog](CHANGELOG.md) — Release notes and known limitations
 - [Integration Guide](docs/INTEGRATION.md) — Hermes MemoryProvider plugin
 - [Agent Spec](docs/agent-spec.md) — Implementation specification
@@ -196,7 +204,7 @@ memory-server --help
 - [LongMemEval Harness](docs/longmemeval-harness.md) — v0.11 raw/source/canonical retrieval scoring
 - [Comparative Analysis](docs/comparative-metrics.md) — Comparative analysis with ChromaDB/SQLite
 - [Drift Matrix](docs/drift-matrix.md) — Contract audit
-- [Development Plans](docs/plans/) — planned evolution: v0.13 runtime/architecture refactor, HTTP Gateway + Neural Studio (proposals, not implemented)
+- [Development Plans](docs/plans/) — runtime architecture refactor is complete on this branch (not merged/released); HTTP Gateway / Neural Studio remain proposals
 - [Contracts](contracts/) — JSON Schema 2020-12 tool contracts
 
 ## API Reference

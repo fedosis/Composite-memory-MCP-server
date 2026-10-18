@@ -2,10 +2,13 @@
 
 Раздел содержит планы развития Composite Memory MCP Server (CMMS), которые
 описывают будущие изменения архитектуры и продукта. Документы в этом разделе —
-**планы и спецификации, а не описание текущего поведения**.
+**планы и спецификации**. Исторический текст планов и заявленные целевые
+релизы сохранены.
 
 Текущий код на момент добавления раздела: `bdebd4e` (release 0.12.0).
-Ни один из планов ниже ещё не реализован.
+На ветке `refactor/runtime-architecture` рефакторинг runtime-архитектуры
+**реализован и независимо integration-verified**, но **не влит и не
+опубликован**. HTTP Gateway и Neural Studio по-прежнему proposals.
 
 ## Статусы
 
@@ -21,7 +24,7 @@
 
 | План | Целевой релиз | Статус | Зависит от |
 |---|---|---|---|
-| [CMMS Runtime Architecture Refactor](CMMS_Runtime_Architecture_Refactor_Plan.md) | `v0.13.x` | `proposal` | — |
+| [CMMS Runtime Architecture Refactor](CMMS_Runtime_Architecture_Refactor_Plan.md) | `v0.13.x` | implemented on `refactor/runtime-architecture` (not merged/released) | — |
 | [HTTP Gateway и Neural Studio](CMMS_HTTP_Gateway_Neural_Studio_Spec.md) | после `v0.13.x` | `proposal` | Runtime Architecture Refactor |
 
 ## Порядок реализации
@@ -89,7 +92,8 @@ CMMS; control plane (profile registry, токены, RBAC, HTTP audit, jobs) х�
 
 - [PLAN.md](../../PLAN.md) — фактическая история исполненных фаз v0.1–v0.6.
 - [docs/architecture.md](../architecture.md) — текущая архитектура.
-- [docs/ADR.md](../ADR.md) — принятые архитектурные решения; после реализации
-  планов сюда стоит добавить ADR «Transport-independent runtime ownership»
-  (см. раздел 78 плана рефакторинга).
+- [docs/ADR.md](../ADR.md) — принятые архитектурные решения, включая
+  [ADR-017](../ADR.md#adr-017-transport-independent-runtime-ownership)
+  (transport-independent runtime ownership; ветка, не релиз). Историческая
+  формулировка решения — раздел 78 плана рефакторинга.
 - [specs/](../../specs/) — спецификации отдельных карточек реализации.

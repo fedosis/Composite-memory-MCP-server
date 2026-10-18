@@ -1,9 +1,14 @@
 # Hermes Integration Guide
 
-> **Version:** v0.11.0b1 — optional `[hermes]` Native MemoryProvider Plugin
-> **Status:** ✅ Implemented for beta / early integration testing; Hermes v0.19
-> provider discovery compatibility is documented in the changelog
-> **ADR:** [ADR-013](ADR.md#adr-013-hermes-memoryprovider-integration--dual-access-path)
+> **Latest public GitHub release:** `v0.11.0b1` — optional `[hermes]` Native
+> MemoryProvider Plugin. Hermes v0.19 provider discovery compatibility is
+> documented in the changelog.
+> **This branch:** `refactor/runtime-architecture` implements the
+> transport-independent runtime ownership below. That work is implemented and
+> independently verified, but **not merged and not released**. Package metadata
+> on this branch is `0.12.0`; it is not a published GitHub release.
+> **ADR:** [ADR-013](ADR.md#adr-013-hermes-memoryprovider-integration--dual-access-path),
+> [ADR-017](ADR.md#adr-017-transport-independent-runtime-ownership)
 
 ## Overview
 
@@ -193,18 +198,46 @@ memory-server install-hermes-plugin --uninstall --dry-run
 
 ### Architecture
 
+MCP stdio and the optional Hermes native provider are **separate adapters**.
+Each composition reaches CMMS through `RuntimeFactory` (Hermes also uses
+`RuntimeManager`). `CMMSRuntime` owns lifecycle, the storage lock, and
+resources. The two adapters do **not** share one runtime object; running both
+against the same profile root is still one-writer-per-root because of that lock.
+
 ```
-External Agents              Hermes Agent
-     |                            |
-     MCP                     MemoryProvider
-     |                            |
-     v                            v
-server.py                  plugins/hermes/provider.py
-     |                            |
-     +------ CMMS Service Layer --+
+External Agents                 Hermes Agent
+     |                               |
+     MCP stdio                  MemoryProvider ABC
+     |                          (in-process; not a network transport)
+     v                               v
+transports/mcp_stdio.py         plugins/hermes/provider.py
+MCPComposition                  HermesRuntimeBridge
+     |                               |
+     RuntimeFactory            RuntimeManager + RuntimeFactory
+     |                               |
+     +--------- CMMSRuntime ---------+
                     |
-           Storage (SQLite/Qdrant/Graph)
+         runtime-owned resources
+         SQLite (canonical)
+         vector / graph (secondary projections)
+         OutboxWorker (borrows the SQLite engine; no second worker)
 ```
+
+`initialize()` does not start `SQLiteProvider` or `WriterQueue` itself. It
+resolves a frozen storage layout, then `HermesRuntimeBridge.start()` admits a
+runtime through `RuntimeManager` / `RuntimeFactory`. Runtime recipes construct
+SQLite, graph, embedder, vector, and the optional outbox worker. After the
+runtime is ready, the bridge starts `WriterQueue` and binds it to runtime
+shutdown hooks. The provider then uses those runtime-owned handles.
+
+Native extraction is forwarded with the runtime's `submit_native`. Prefetch and
+the outbox parent task are runtime-owned (`spawn_owned_task`). The provider does
+not create a second outbox worker or lock owner.
+
+MCP stdio follows the same ownership model via `MCPComposition` +
+`RuntimeFactory` and wires `MemoryApplication` over the runtime dependencies.
+Public MCP tool contracts and config/hooks are unchanged. There is no remote
+HTTP/SSE transport.
 
 ### Lifecycle Flow
 
@@ -213,13 +246,15 @@ Session Start
      │
      ▼
   initialize(session_id, **kwargs)
-  ├─ Start SQLiteProvider
-  └─ Start WriterQueue (background flusher)
+  ├─ Resolve frozen storage layout
+  ├─ HermesRuntimeBridge → RuntimeManager → RuntimeFactory → CMMSRuntime.start()
+  ├─ Runtime recipes open SQLite / projections / optional outbox worker
+  └─ Bridge starts WriterQueue after the runtime is READY
      │
      ▼  (per turn)
   prefetch(query)
   ├─ Returns cached context from previous queue_prefetch()
-  └─ Non-blocking: queued → loaded asynchronously
+  └─ Non-blocking: queued as a runtime-owned task
      │
      ▼  (after model response)
   sync_turn(user_content, assistant_content)
@@ -237,24 +272,30 @@ Session Start
      │
      ▼
   shutdown()
-  ├─ Flush + stop writer
-  └─ Close SQLite provider
+  └─ bridge.close() → runtime.close()
+     ├─ Stop admission; pause writer; stop outbox; drain producers
+     ├─ Wait for owned tasks and live native work (native work is not
+     │  cancelled to justify releasing the root lock)
+     ├─ Settle writer custody, then final flush
+     └─ If work is still live or custody did not settle: fail closed and
+        retain the storage lock / unclosed resources. Otherwise close
+        owned stores and release the lock.
 ```
 
 ### Contract Mapping
 
 | Hermes Method | CMMS Service | Description |
 |--------------|--------------|-------------|
-| `initialize(session_id, **kwargs)` | Connect + start writer queue | kwargs: `hermes_home`, `platform`, `agent_context` |
+| `initialize(session_id, **kwargs)` | Runtime bridge + factory | kwargs: `hermes_home`, `platform`, `agent_context`. Starts `CMMSRuntime`; does not open SQLite/WriterQueue directly. |
 | `system_prompt_block()` | Static provider info | Memory usage tips |
 | `prefetch(query)` | `get_context()` | Fast cached recall |
-| `queue_prefetch(query)` | Queue next-turn context load | Background, non-blocking |
-| `sync_turn(user, asst, *, messages)` | `learn()` via writer queue | Async batch |
+| `queue_prefetch(query)` | Queue next-turn context load | Runtime-owned background task |
+| `sync_turn(user, asst, *, messages)` | `learn()` via writer queue | Async batch; native extraction uses `submit_native` |
 | `get_tool_schemas()` | All 14 CMMS tools | No `mcp_` prefix |
 | `handle_tool_call(name, args, **kwargs)` | Route to service layer | In-process |
 | `on_session_end(messages)` | Flush writer queue | Cleanup |
 | `on_session_switch(new_id, *, ...)` | Flush + update cache | Rotation |
-| `shutdown()` | Flush, stop, close | Clean exit |
+| `shutdown()` | `runtime.close()` | Stop admission, settle/flush custody, fail closed and retain the lock if work is still live |
 
 ### Writer Queue
 
@@ -265,6 +306,13 @@ The `WriterQueue` (in `plugins/hermes/writer.py`) implements the **non-blocking 
 3. Explicit `flush()` calls drain the queue immediately (session hooks)
 4. Batches are limited to `max_batch` items (default: 50)
 5. Failed writes are counted (not retried — logged for observability)
+
+The queue is started by `HermesRuntimeBridge` after `CMMSRuntime` is ready, not
+by `HermesProvider.initialize()` directly. On shutdown the runtime stops
+admission, pauses the flusher, settles queue custody
+(`WriterQueue.settle_custody()` / `QueueCustodySnapshot`), then runs a final
+flush. Those types are implementation details of custody tracking; public Hermes
+hooks and writer config are unchanged.
 
 ## Tools
 

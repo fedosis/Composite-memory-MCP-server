@@ -870,7 +870,10 @@ Composite Memory MCP Server must be:
 -   auditable;
 -   capable of knowledge evolution.
 
-# ADR-014: Profile-owned coherent CMMS storage roots
+# ADR-016: Profile-owned coherent CMMS storage roots
+
+Formerly misnumbered as a second ADR-014. ADR-014 remains the ternary
+relation model.
 
 Status: Accepted. SQLite remains authoritative; vector and graph stores are
 rebuildable projections. Native profile mode resolves all local stores under
@@ -883,3 +886,78 @@ A.6 bounded divergence carried forward: rebuild creates the "decides" edge
 whenever BOTH endpoints exist in the eligible corpus, which can include edges
 the runtime incremental path would have dropped; runtime/outbox semantics are
 unchanged.
+
+------------------------------------------------------------------------
+
+# ADR-017: Transport-independent runtime ownership
+
+## Status
+
+Accepted on branch `refactor/runtime-architecture`. Implemented and
+independently verified on this branch; **not merged and not released**.
+Latest public GitHub release remains `v0.11.0b1`.
+
+Grounded in `docs/plans/CMMS_Runtime_Architecture_Refactor_Plan.md` §78
+and the implemented source (`runtime/runtime.py`, `runtime_factory.py`,
+`runtime_manager.py`, `transports/mcp_stdio.py`, `transports/hermes.py`,
+`plugins/hermes/provider.py`).
+
+## Context
+
+MCP stdio and the optional in-process Hermes MemoryProvider previously
+constructed storage, outbox workers, and shutdown paths independently.
+That made it possible for adapters to own parallel writers, diverge on
+lifecycle, or drop in-flight work on close.
+
+§78 of the runtime architecture plan records the intended decision:
+transports access memory through `CMMSRuntime` and application services
+so writers, storage, and semantics are not transport-specific.
+
+## Decision
+
+All transports access memory through `CMMSRuntime` plus application
+services. `CMMSRuntime` is the lifecycle and resource owner.
+
+Adapters use composition (`MCPComposition`, `HermesRuntimeBridge`) and
+`RuntimeFactory` / `RuntimeManager`; they do not create parallel storage
+owners, a second outbox worker, or a second root-lock owner.
+
+Hermes remains optional and in-process. `HermesRuntimeBridge` adapts the
+native provider to the runtime. Native extraction is forwarded to the
+runtime `submit_native`; queued writer work and owned tasks are tracked
+by the runtime.
+
+On shutdown the runtime stops admission, settles and flushes writer
+custody, and waits for live native work. Live native work is not
+forgotten or cancelled in order to release the root lock. If work is
+still live or custody did not settle, shutdown fails closed and retains
+the storage lock.
+
+Public MCP tool contracts and network transport scope are unchanged:
+MCP stdio remains the external transport; there is no remote HTTP/SSE
+endpoint. SQLite remains canonical; vector and graph stores remain
+secondary projections.
+
+MCP and Hermes are separate compositions. They do not share one runtime
+object instance.
+
+## Reasons
+
+Prevent duplicate writers, storage divergence, and transport-specific
+semantics.
+
+## Consequences
+
+Advantages:
+
+- HTTP Gateway and a multi-profile daemon become straightforward later
+  without giving transports direct storage ownership.
+- Resource ownership and shutdown are easier to reason about.
+- Testing can target the runtime without a transport.
+
+Disadvantages:
+
+- Additional abstraction layer.
+- Temporary refactor complexity.
+
+This ADR does not add public hooks, config, or network transports.

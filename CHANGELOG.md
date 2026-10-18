@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/)
 versioning with SemVer-like semantics.
 
+## Unreleased
+
+Branch `refactor/runtime-architecture` only — **not merged, not published**.
+Latest public GitHub release remains `v0.11.0b1`. Package metadata on this
+branch declares `0.12.0`; that version is not a GitHub release.
+
+### Changed
+
+- **Transport-independent runtime ownership** — `CMMSRuntime` is the lifecycle
+  and resource owner. MCP stdio (`MCPComposition` + `RuntimeFactory`) and the
+  optional in-process Hermes path (`HermesRuntimeBridge` + `RuntimeManager`)
+  are adapters; they do not create parallel storage owners, a second outbox
+  worker, or an extra root lock. Public MCP tool contracts and network
+  transport scope are unchanged (stdio only; no HTTP/SSE endpoint).
+- **Hermes bridge cutover** — `HermesProvider.initialize()` / `shutdown()` go
+  through `HermesRuntimeBridge` instead of starting `SQLiteProvider` and
+  `WriterQueue` directly. Native extraction is submitted via the runtime's
+  `submit_native`; prefetch and outbox work are runtime-owned tasks.
+- **Queue and native-task custody** — queued writer work is settled
+  (`WriterQueue.settle_custody`) before final flush. Live native work is
+  tracked and must finish or keep the runtime fail-closed; it is not
+  cancelled in order to release the storage lock.
+- **Shutdown safety** — close stops admission, drains producers, settles and
+  flushes custody, then closes owned resources. If work is still live or
+  custody did not settle, the runtime fails closed and retains the storage
+  lock.
+
 ## 0.12.0 — 2026-09-14
 
 Profile isolation series (cards S1..S5 plus the S5 fix loop): storage is

@@ -1,9 +1,13 @@
 # Composite Memory MCP Server — Architecture Overview
 
-> **Current status:** updated for `v0.11.0b1`. GitHub prerelease is published;
-> PyPI, the official MCP Registry, Smithery, and Glama are not published. This
-> document describes the current MCP stdio runtime plus optional `[hermes]`
-> integration; Neo4j is not wired into the v0.11 runtime.
+> **Current status:** GitHub's latest published prerelease is `v0.11.0b1`.
+> PyPI, the official MCP Registry, Smithery, and Glama are not published.
+> Branch `refactor/runtime-architecture` adds a transport-independent
+> runtime/factory/application layer and an optional in-process Hermes native
+> provider; that work is implemented and verified here but **not merged or
+> released**. This document describes MCP stdio as the external transport plus
+> that optional `[hermes]` path. There is no remote HTTP/SSE implementation.
+> Neo4j is not wired into the v0.11 runtime.
 
 ```mermaid
 flowchart TB
@@ -15,9 +19,16 @@ flowchart TB
 
     subgraph CMMS["Composite Memory MCP Server"]
         direction TB
-        
+
         MCP["MCP Interface\n(stdio transport)"]
-        
+        HERMES["Optional Hermes native provider\n(in-process; not a network transport)"]
+
+        subgraph RuntimeLayer["Transport-independent runtime"]
+            RF["RuntimeFactory / RuntimeManager"]
+            RT["CMMSRuntime\n(lifecycle + resource owner)"]
+            APP["Application services"]
+        end
+
         subgraph Tools["MCP Tools (14)"]
             PING["ping 🔊"]
             REM["remember 💾"]
@@ -69,7 +80,12 @@ flowchart TB
     end
 
     Clients -->|MCP stdio| MCP
-    MCP --> Tools
+    HC -.->|in-process MemoryProvider| HERMES
+    MCP --> RF
+    HERMES --> RF
+    RF --> RT
+    RT --> APP
+    APP --> Tools
     
     REM --> SQL
     REM --> AI_REM
@@ -98,6 +114,14 @@ flowchart TB
     Eval --> DECAY
     DECAY --> AI_DECAY
 ```
+
+## Runtime and transports (this branch)
+
+`CMMSRuntime` owns lifecycle, the storage lock, and resources. Adapters reach
+it through `RuntimeFactory` (Hermes also uses `RuntimeManager`). MCP stdio is
+the external transport. The Hermes native provider is an optional in-process
+integration, not a new network transport and not a remote HTTP/SSE endpoint.
+MCP and Hermes are separate compositions; they do not share one runtime object.
 
 ## Data Model (ADR-006)
 

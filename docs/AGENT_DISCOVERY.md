@@ -14,6 +14,8 @@ This document is intentionally concise and machine-readable by agents and direct
 - Official MCP Registry: not published; root `server.json` is schema-valid draft metadata only.
 - Smithery / Glama: not published; submission copy is drafted in `docs/DIRECTORY_SUBMISSIONS.md` only.
 
+Development branch `refactor/runtime-architecture` contains the runtime-ownership refactor (package metadata `0.12.0`). It is implemented and independently verified, but **not merged or released**. The Hermes provider remains an in-process integration, not a new transport. Latest public GitHub release remains `v0.11.0b1`.
+
 Publication channel order for public docs is: GitHub source/release first, PyPI only after verified package publication, official MCP Registry only after accepted registry submission, Smithery/Glama only after explicit directory publication, then Hermes community documentation for optional Hermes users.
 
 ## Implemented transports and integration paths
