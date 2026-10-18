@@ -305,7 +305,7 @@ The `WriterQueue` (in `plugins/hermes/writer.py`) implements the **non-blocking 
 2. A background task flushes every `flush_interval` seconds (default: 5.0)
 3. Explicit `flush()` calls drain the queue immediately (session hooks)
 4. Batches are limited to `max_batch` items (default: 50)
-5. Failed writes are counted (not retried — logged for observability)
+5. Failed writes are retried up to 3 attempts with backoff, then counted as failed and logged.
 
 The queue is started by `HermesRuntimeBridge` after `CMMSRuntime` is ready, not
 by `HermesProvider.initialize()` directly. On shutdown the runtime stops
