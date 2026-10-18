@@ -266,7 +266,19 @@ def test_worker_parent_kind_is_hermes_worker_parent(tmp_path, monkeypatch):
 
 def test_prefetch_spawn_owned_kind_and_generation_is_not_termination(tmp_path, monkeypatch):
     provider = _init_file_provider(tmp_path, monkeypatch)
+    gate = None
     try:
+        async def _prefetch_gate():
+            return asyncio.Event()
+
+        gate = _run_on_owner(_prefetch_gate())
+        original = provider._queue_prefetch_async
+
+        async def _held_prefetch(*args, **kwargs):
+            await gate.wait()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(provider, "_queue_prefetch_async", _held_prefetch)
         provider.queue_prefetch("who is Alice")
         deadline = __import__("time").monotonic() + 5
         rec = None
@@ -283,6 +295,8 @@ def test_prefetch_spawn_owned_kind_and_generation_is_not_termination(tmp_path, m
         live = next(item for item in records if item.kind == "hermes-prefetch")
         assert live.task is task and task.done() is False
     finally:
+        if gate is not None:
+            _get_loop().call_soon_threadsafe(gate.set)
         provider.shutdown()
 
 
