@@ -223,3 +223,41 @@ def test_factory_container_is_immutable_after_create(tmp_path):
     # create() is zero-I/O: no lock entry and no store, only the pre-made parent dir.
     assert {path.name for path in layout.data_root.iterdir()} == {"data"}
     assert not layout.root_lock_path.exists() and not (layout.data_root / "data" / "memory.db").exists()
+
+
+async def test_factory_injects_spawner_and_submitter_into_runtime_worker_and_lancedb(tmp_path):
+    runtime = factory_api().create(coherent_layout(tmp_path)).runtime
+    await runtime.start()
+    worker, vector = runtime.dependencies.outbox_worker, runtime.dependencies.vector
+    assert worker._task_spawner is runtime.spawn_owned_task
+    assert worker._native_submitter is runtime.submit_native
+    assert vector._native_submitter is runtime.submit_native
+    await runtime.close()
+async def test_factory_runtime_worker_missing_submitter_fails_startup(tmp_path):
+    from storage.outbox_worker import OutboxWorker
+    from memory_server.router.graph_router import GraphRouter
+    async def bare(rt):
+        worker = OutboxWorker(engine=rt.dependencies.sqlite.engine, qdrant=rt.dependencies.vector, embedder=rt.dependencies.embedder, graph_router=GraphRouter(graph=rt.dependencies.graph, max_path_depth=4))
+        await worker.initialize()
+        return worker
+    factory = factory_api().create(coherent_layout(tmp_path), overrides={"outbox_worker": bare})
+    with pytest.raises(RuntimeError, match="missing task_spawner/native_submitter"):
+        await factory.runtime.start()
+    assert factory.runtime.state == "FAILED"
+async def test_factory_runtime_lancedb_missing_submitter_fails_startup(tmp_path):
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+    factory = factory_api().create(coherent_layout(tmp_path), overrides={"vector": lambda rt: LanceDBProvider(db_path=str(rt.config.vector_local_path), table=rt.config.vector_collection, metric=rt.config.vector_metric, vector_size=rt.config.vector_size)})
+    with pytest.raises(RuntimeError, match="missing native_submitter"):
+        await factory.runtime.start()
+    assert factory.runtime.state == "FAILED"
+async def test_factory_qdrant_recipe_does_not_require_lancedb_submitter(tmp_path, monkeypatch):
+    removed = block_optional(monkeypatch)
+    try:
+        layout = coherent_layout(tmp_path, name="qdrant-root", vector_backend="qdrant", qdrant_location=":memory:")
+        factory = factory_api().create(layout)
+        with pytest.raises(ImportError, match="blocked optional dependency: qdrant_client"):
+            await factory.runtime.start()
+        assert factory.runtime.state == "FAILED"
+        assert factory.runtime.dependencies.vector is None
+    finally:
+        sys.modules.update(removed)

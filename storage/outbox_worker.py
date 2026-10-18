@@ -81,6 +81,8 @@ class OutboxWorker:
         stale_processing_seconds: int = 600,
         process_pending_limit: int = 500,
         busy_timeout_ms: int = 5000,
+        task_spawner=None,
+        native_submitter=None,
     ):
         self._db_url = db_url
         self._engine = engine
@@ -96,6 +98,9 @@ class OutboxWorker:
         self._stale_processing_seconds = stale_processing_seconds
         self._process_pending_limit = process_pending_limit
         self._busy_timeout_ms = validate_busy_timeout_ms(busy_timeout_ms)
+        self._task_spawner = task_spawner
+        self._native_submitter = native_submitter
+        self._compact_task = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
         self._stop_requested = False
         self._last_compact_at: float = 0.0
@@ -168,6 +173,13 @@ class OutboxWorker:
                 await asyncio.sleep(0)
         logger.info("Outbox worker stopped")
 
+    async def _blocking(self, function, /, *args, kind: str, **kwargs):
+        submitter = self._native_submitter
+        if submitter is None:
+            return await asyncio.to_thread(function, *args, **kwargs)
+        handle = await submitter(function, *args, kind=kind, **kwargs)
+        return await handle.result()
+
     async def _maybe_compact(self) -> None:
         """Schedule LanceDB compaction when due, without blocking the loop.
 
@@ -202,7 +214,10 @@ class OutboxWorker:
             except Exception:
                 logger.exception("Outbox worker: LanceDB compaction failed")
 
-        asyncio.create_task(_compact())
+        if self._task_spawner is None:
+            asyncio.create_task(_compact())
+        else:
+            self._compact_task = self._task_spawner(_compact, kind="outbox-compact")
 
     async def _poll_once(self) -> int:
         """Single poll cycle: fetch pending entries and process them.
@@ -326,7 +341,7 @@ class OutboxWorker:
 
         # Embed all texts in one batch call (sync, run in thread)
         if self._embedder:
-            vectors = await asyncio.to_thread(self._embedder.embed_batch, texts)
+            vectors = await self._blocking(self._embedder.embed_batch, texts, kind="outbox-embed-batch")
             if len(vectors) != len(texts):
                 raise RuntimeError(
                     f"embed_batch returned {len(vectors)} vectors for {len(texts)} texts"
@@ -364,8 +379,8 @@ class OutboxWorker:
         # Sync to graph in one batch (single snapshot write for the chunk
         # instead of ~6 per fact).
         if self._graph_router:
-            result = await asyncio.to_thread(
-                self._graph_router.sync_facts_batch, payloads
+            result = await self._blocking(
+                self._graph_router.sync_facts_batch, payloads, kind="outbox-sync-facts-batch"
             )
             if result is False:
                 raise _provider_write_error(
@@ -451,7 +466,7 @@ class OutboxWorker:
 
         # Embed (sync call, run in thread to avoid blocking)
         if self._embedder:
-            vector = await asyncio.to_thread(self._embedder.embed, fact_text)
+            vector = await self._blocking(self._embedder.embed, fact_text, kind="outbox-embed")
 
             # Upsert into Qdrant (idempotent) — use deterministic UUID from record_id
             if self._qdrant:
@@ -477,8 +492,8 @@ class OutboxWorker:
 
         # Sync to graph (idempotent — additive)
         if self._graph_router:
-            result = await asyncio.to_thread(
-                self._graph_router.sync_fact, subject, predicate, obj
+            result = await self._blocking(
+                self._graph_router.sync_fact, subject, predicate, obj, kind="outbox-sync-fact"
             )
             if result is False:
                 raise _provider_write_error(
@@ -496,8 +511,9 @@ class OutboxWorker:
 
         payload = entry.payload
 
-        await asyncio.to_thread(
+        await self._blocking(
             self._graph_router.sync_decision,
+            kind="outbox-sync-decision",
             choice=payload.get("choice", ""),
             reason=payload.get("reason", ""),
             entities=[payload.get("context", "")],
@@ -514,8 +530,9 @@ class OutboxWorker:
 
         payload = entry.payload
 
-        await asyncio.to_thread(
+        await self._blocking(
             self._graph_router.sync_skill,
+            kind="outbox-sync-skill",
             purpose=payload.get("purpose", ""),
             steps=payload.get("steps", []),
         )
@@ -542,7 +559,7 @@ class OutboxWorker:
 
         # Embed and index into Qdrant
         if self._embedder and proposition:
-            vector = await asyncio.to_thread(self._embedder.embed, proposition)
+            vector = await self._blocking(self._embedder.embed, proposition, kind="outbox-embed")
 
             if self._qdrant:
                 point_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"belief:{belief_id}"))

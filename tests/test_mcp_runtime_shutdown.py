@@ -250,3 +250,58 @@ def test_every_resolved_storage_lock_queue_and_stdio_path_is_inside_scratch():
     assert _contained(Path(os.environ["MEMORY_SERVER_GRAPH_SNAPSHOT_PATH"]))
     assert Path("/home/shtorm/.hermes/data") not in ROOT.parents
     assert Path("/home/shtorm/memory-server/data") not in ROOT.parents
+
+
+
+def _mcp_env(tmp_path, monkeypatch, name):
+    from memory_server import settings
+    root = tmp_path / name; (root / "data").mkdir(parents=True)
+    monkeypatch.setenv("MEMORY_SERVER_DATA_ROOT", str(root / "data"))
+    monkeypatch.setenv("MEMORY_SERVER_DB_URL", f"sqlite+aiosqlite:///{root / 'data' / 'memory.db'}")
+    monkeypatch.setenv("MEMORY_SERVER_LANCEDB_PATH", str(root / "data" / "lancedb"))
+    monkeypatch.setenv("MEMORY_SERVER_GRAPH_SNAPSHOT_PATH", str(root / "data" / "graph.json"))
+    monkeypatch.setenv("MEMORY_SERVER_VECTOR_BACKEND", "lancedb")
+    settings.get_settings.cache_clear()
+    return settings
+@pytest.mark.asyncio
+async def test_mcp_worker_parent_is_spawn_owned_task(tmp_path, monkeypatch):
+    from memory_server.transports.mcp_stdio import MCPComposition
+    settings = _mcp_env(tmp_path, monkeypatch, "mcp-spawn")
+    composition = MCPComposition.create(); await composition.start()
+    rec = next(t for t in composition.runtime.owned_snapshot()[1] if t.kind == "mcp-worker-parent")
+    assert rec.task is composition.worker_task is composition.runtime.dependencies.hooks.worker_task
+    composition.runtime.dependencies.outbox_worker.stop(); await composition.close(); settings.get_settings.cache_clear()
+@pytest.mark.asyncio
+async def test_mcp_shutdown_retains_parent_compaction_and_native_without_writerqueue(tmp_path, monkeypatch):
+    import threading, time
+    from memory_server.transports.mcp_stdio import MCPComposition
+    from tests.test_runtime_lifecycle import Clock, held, pump
+    settings = _mcp_env(tmp_path, monkeypatch, "mcp-retain")
+    composition = MCPComposition.create()
+    clock = Clock(); composition.runtime._clock = clock; composition.runtime._sleep = clock.sleep
+    await composition.start()
+    runtime, worker, provider = composition.runtime, composition.runtime.dependencies.outbox_worker, composition.runtime.dependencies.vector
+    table = await provider._get_table()
+    cls, orig_opt, barrier, held_thread = type(table), type(table).optimize, threading.Event(), {}
+    def wrapped(self, *a, **kw):
+        held_thread["t"] = threading.current_thread(); barrier.wait(); return orig_opt(self, *a, **kw)
+    cls.optimize = wrapped
+    try:
+        worker._last_compact_at = time.monotonic() - worker._compact_interval_seconds - 1
+        await worker._maybe_compact()
+        for _ in range(200):
+            if held_thread.get("t") is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert held_thread.get("t") is not None
+        closer = asyncio.create_task(composition.close()); await pump(); await clock.advance(15); report = await closer
+        assert held_thread["t"].is_alive() and runtime.lock is not None and report.code == "E_RUNTIME_SHUTDOWN_TIMEOUT"
+        held(runtime.root); assert "WriterQueue" not in type(runtime).__name__
+    finally:
+        cls.optimize = orig_opt
+        barrier.set()
+    held_thread["t"].join(timeout=5); worker.stop(); await composition.close(); settings.get_settings.cache_clear()
+def test_mcp_missing_spawn_is_not_create_task_fallback():
+    from memory_server.transports import mcp_stdio
+    source = Path(mcp_stdio.__file__).read_text(encoding="utf-8")
+    assert "create_task(worker.run())" not in source and "spawn_owned_task(worker.run" in source

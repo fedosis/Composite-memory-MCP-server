@@ -1107,6 +1107,109 @@ class TestOutboxWorker:
         result = await outbox_worker.process_all_pending()
         assert result == {"processed": 1, "failed": 0}
 
+    async def test_maybe_compact_uses_spawner_when_injected(self, tmp_path):
+        import time
+        from storage.outbox_worker import OutboxWorker
+        seen, invoked = [], []
+        class FakeOptimize:
+            async def optimize(self, **kwargs):
+                return True
+        def spawner(factory, *, kind):
+            seen.append(kind)
+            assert invoked == []
+            invoked.append(1)
+            return asyncio.get_running_loop().create_task(factory())
+        worker = OutboxWorker(db_url=f"sqlite+aiosqlite:///{tmp_path / 'spawner.db'}", qdrant=FakeOptimize(), task_spawner=spawner)
+        worker._last_compact_at = time.monotonic() - worker._compact_interval_seconds - 1
+        await worker._maybe_compact()
+        assert seen == ["outbox-compact"]
+    async def test_legacy_worker_without_submitter_keeps_to_thread(self, outbox_worker, monkeypatch):
+        recorded, original = [], asyncio.to_thread
+        async def wrapped(fn, *args, **kwargs):
+            recorded.append(getattr(fn, "__name__", str(fn)))
+            return await original(fn, *args, **kwargs)
+        monkeypatch.setattr(asyncio, "to_thread", wrapped)
+        await self._insert_entry(outbox_worker, "index_fact", str(uuid.uuid4()), {"subject": "A", "predicate": "is", "object": "B", "source": "t"})
+        await outbox_worker._poll_once()
+        assert recorded
+    async def test_red_compaction_close_retains_ex_while_optimize_thread_alive(self, tmp_path):
+        import threading, time
+        from tests.test_runtime_factory import coherent_layout, factory_api
+        from tests.test_runtime_lifecycle import Clock, held, pump
+        clock = Clock()
+        runtime = factory_api().create(coherent_layout(tmp_path), clock=clock, sleep=clock.sleep).runtime
+        await runtime.start()
+        worker, provider = runtime.dependencies.outbox_worker, runtime.dependencies.vector
+        table = await provider._get_table()
+        cls, orig_opt, held_thread, calls, barrier = type(table), type(table).optimize, {}, [], threading.Event()
+        def wrapped(self, *a, **kw):
+            held_thread["t"] = threading.current_thread(); calls.append(1); barrier.wait(); return orig_opt(self, *a, **kw)
+        cls.optimize = wrapped
+        try:
+            worker._last_compact_at = time.monotonic() - worker._compact_interval_seconds - 1
+            await worker._maybe_compact()
+            for _ in range(200):
+                if held_thread.get("t") is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert held_thread.get("t") is not None, "optimize wrap never fired"
+            closer = asyncio.create_task(runtime.close()); await pump(); await clock.advance(15); report = await closer
+            assert held_thread["t"].is_alive() and runtime.lock is not None and report.code == "E_RUNTIME_SHUTDOWN_TIMEOUT"
+            held(runtime.root)
+        finally:
+            cls.optimize = orig_opt
+            barrier.set()
+        held_thread["t"].join(timeout=5)
+        assert (await runtime.close()).code is None and calls == [1]
+    async def test_red_outbox_native_embedder_close_retains_ex_while_thread_alive(self, tmp_path, monkeypatch):
+        await self._red_outbox_native(tmp_path, monkeypatch, "embedder")
+    async def test_red_outbox_native_graph_snapshot_close_retains_ex_while_thread_alive(self, tmp_path, monkeypatch):
+        await self._red_outbox_native(tmp_path, monkeypatch, "graph")
+    async def _red_outbox_native(self, tmp_path, monkeypatch, target):
+        import threading
+        from memory_server import settings
+        from memory_server.transports.mcp_stdio import MCPComposition
+        from tests.test_runtime_lifecycle import Clock, held, pump
+        root = tmp_path / f"red-{target}"; (root / "data").mkdir(parents=True)
+        monkeypatch.setenv("MEMORY_SERVER_DATA_ROOT", str(root / "data"))
+        monkeypatch.setenv("MEMORY_SERVER_DB_URL", f"sqlite+aiosqlite:///{root / 'data' / 'memory.db'}")
+        monkeypatch.setenv("MEMORY_SERVER_LANCEDB_PATH", str(root / "data" / "lancedb"))
+        monkeypatch.setenv("MEMORY_SERVER_GRAPH_SNAPSHOT_PATH", str(root / "data" / "graph.json"))
+        monkeypatch.setenv("MEMORY_SERVER_VECTOR_BACKEND", "lancedb")
+        settings.get_settings.cache_clear()
+        composition = MCPComposition.create()
+        clock = Clock(); composition.runtime._clock = clock; composition.runtime._sleep = clock.sleep
+        await composition.start()
+        worker = composition.runtime.dependencies.outbox_worker
+        worker._poll_interval_seconds = 0.01
+        if target == "graph":
+            from memory_server.providers.embedding_provider import MockEmbeddingProvider
+            worker._embedder = MockEmbeddingProvider(vector_size=getattr(worker._qdrant, "_vector_size", 384))
+        held_thread, calls, barrier = {}, [], threading.Event()
+        if target == "embedder":
+            orig = worker._embedder.embed_batch
+            worker._embedder.embed_batch = lambda texts: (held_thread.update(t=threading.current_thread()), calls.append(1), barrier.wait(), orig(texts))[-1]
+        else:
+            orig = worker._graph_router.graph.save_snapshot
+            worker._graph_router.graph.save_snapshot = lambda *a, **k: (held_thread.update(t=threading.current_thread()), calls.append(1), barrier.wait(), orig(*a, **k))[-1]
+        await self._insert_entry(worker, "index_fact", str(uuid.uuid4()), {"subject": "Red", "predicate": "is", "object": "hot", "source": "t"})
+        for _ in range(800):
+            if held_thread.get("t") is not None:
+                break
+            await asyncio.sleep(0.01)
+        if held_thread.get("t") is None:
+            pytest.fail("ENV_BLOCKED: production wrap never fired")
+        try:
+            closer = asyncio.create_task(composition.close()); await pump(); await clock.advance(15); report = await closer
+            assert held_thread["t"].is_alive() and composition.runtime.lock is not None
+            held(composition.runtime.root)
+            assert getattr(worker, "_native_submitter", None) is not None
+            assert report.code == "E_RUNTIME_SHUTDOWN_TIMEOUT"
+        finally:
+            barrier.set()
+        held_thread["t"].join(timeout=5)
+        assert (await composition.close()).code is None and calls == [1]
+        settings.get_settings.cache_clear()
 
 # =============================================================================
 # Server Integration Tests

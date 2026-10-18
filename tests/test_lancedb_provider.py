@@ -902,3 +902,78 @@ async def test_s305_seam_consumes_the_duplicate_id_diagnostic(tmp_path: Path) ->
 
     assert verdict.valid is False, "a duplicated row must refuse the artifact"
     assert any("duplicate IDs" in error for error in verdict.errors), verdict.errors
+
+
+
+class _RecHandle:
+    def __init__(self, value):
+        self._value = value
+        self.terminated = False
+    async def result(self):
+        return self._value
+@pytest.mark.asyncio
+async def test_runtime_submitter_is_used_for_connect_table_list_create_open(tmp_path, monkeypatch):
+    import asyncio
+    calls, to_thread_calls, original = [], [], asyncio.to_thread
+    async def submitter(fn, /, *args, kind, **kwargs):
+        calls.append((kind, getattr(fn, "__name__", None)))
+        return _RecHandle(fn(*args, **kwargs))
+    async def wrapped(fn, *args, **kwargs):
+        to_thread_calls.append(getattr(fn, "__name__", str(fn)))
+        return await original(fn, *args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", wrapped)
+    await LanceDBProvider(db_path=str(tmp_path / "ldb"), table="memories", native_submitter=submitter)._get_table()
+    names = {kind for kind, _ in calls}
+    assert {"lancedb-connect", "lancedb-table_names", "lancedb-open_table"} <= names and to_thread_calls == []
+@pytest.mark.asyncio
+async def test_runtime_submitter_is_used_for_upsert_search_delete_describe_validate_optimize(tmp_path):
+    calls = []
+    async def submitter(fn, /, *args, kind, **kwargs):
+        calls.append(kind)
+        return _RecHandle(fn(*args, **kwargs))
+    provider = LanceDBProvider(db_path=str(tmp_path / "ldb2"), table="memories", vector_size=4, native_submitter=submitter)
+    await provider.upsert(point_id="p1", vector=[0.1, 0.2, 0.3, 0.4], payload={"subject": "a", "predicate": "b", "object": "c", "source": "s", "memory_type": "fact"})
+    await provider.search(vector=[0.1, 0.2, 0.3, 0.4], limit=1)
+    await provider.delete(point_id="p1")
+    await provider.describe_collection()
+    await provider.validate_collection(expected_ids=set(), expected_vector_size=4)
+    await provider.optimize()
+    assert "lancedb-optimize" in calls and any("execute" in k for k in calls)
+@pytest.mark.asyncio
+async def test_direct_provider_without_submitter_keeps_to_thread(tmp_path, monkeypatch):
+    import asyncio
+    recorded, original = [], asyncio.to_thread
+    async def wrapped(fn, *args, **kwargs):
+        recorded.append(getattr(fn, "__name__", str(fn)))
+        return await original(fn, *args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", wrapped)
+    await LanceDBProvider(db_path=str(tmp_path / "ldb3"), table="memories")._get_db()
+    assert recorded
+@pytest.mark.asyncio
+async def test_cancelled_optimize_waiter_leaves_native_record(tmp_path):
+    import asyncio, threading
+    from tests.test_runtime_lifecycle import runtime as make_runtime
+    r = make_runtime(tmp_path); await r.start(); handles = []
+    async def capturing(fn, /, *args, kind, **kwargs):
+        handle = await r.submit_native(fn, *args, kind=kind, **kwargs)
+        handles.append(handle)
+        return handle
+    provider = LanceDBProvider(db_path=str(tmp_path / "ldb4"), table="memories", native_submitter=capturing)
+    db, barrier = await provider._get_db(), threading.Event()
+    orig_open = db.open_table
+    def open_and_wrap(name, *args, **kwargs):
+        table = orig_open(name, *args, **kwargs)
+        orig_opt = table.optimize
+        table.optimize = lambda *a, **kw: (barrier.wait(), orig_opt(*a, **kw))[-1]
+        return table
+    db.open_table = open_and_wrap
+    waiter = asyncio.create_task(provider.optimize())
+    for _ in range(400):
+        if handles and handles[-1].thread.is_alive():
+            break
+        await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert handles and handles[-1].terminated is False
+    barrier.set(); await handles[-1].result(); await r.close()

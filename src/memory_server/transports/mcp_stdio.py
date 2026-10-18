@@ -266,7 +266,7 @@ class MCPComposition:
         )
 
         if worker is not None:
-            self.worker_task = asyncio.create_task(worker.run())
+            self.worker_task = self.runtime.spawn_owned_task(worker.run, kind="mcp-worker-parent")
             self.runtime.dependencies.hooks.worker_task = self.worker_task
 
     async def close(self) -> Any:

@@ -181,6 +181,8 @@ async def test_s1_never_calls_outbox_worker_close(tmp_path):
     worker = OutboxWorker.__new__(OutboxWorker)
     worker.stop = lambda: None
     worker.close = lambda: pytest.fail('borrowed engine disposed by worker')
+    worker._task_spawner = object()
+    worker._native_submitter = object()
     resource = Resource('sqlite', [])
     r, _, _ = await running(tmp_path, outbox_worker=worker, sqlite=resource, borrowed_engine=True)
     assert (await r.close()).code is None and resource.closed
@@ -286,7 +288,8 @@ async def integration(path):
 
     h.flush_final = flush
     d = RuntimeDependencies(hooks=h, borrowed_engine=True, recipes=(
-        ('sqlite', build), ('outbox_worker', lambda r: OutboxWorker(engine=r.dependencies.sqlite.engine))))
+        ('sqlite', build), ('outbox_worker', lambda r: OutboxWorker(
+            engine=r.dependencies.sqlite.engine, task_spawner=r.spawn_owned_task, native_submitter=r.submit_native))))
     r = runtime(path, d)
     await r.start()
     assert (await r.close()).code is None
@@ -301,5 +304,284 @@ async def integration(path):
     print('SQLITE commits=1 disposals=1 post_close_denied=1')
 
 
+import contextvars
+import threading
+from memory_server.runtime.errors import RuntimeClosingError
+from memory_server.runtime.runtime import _OWNED_LINEAGE
+async def test_spawn_owned_task_reserves_before_factory_and_create_task(tmp_path):
+    r, _, _ = await running(tmp_path)
+    seen = {}
+    def factory():
+        seen['factory'] = [t.state for t in r.owned_snapshot()[1]]
+        async def body():
+            return None
+        return body()
+    loop, orig = asyncio.get_running_loop(), asyncio.get_running_loop().create_task
+    def wrapped(coro, **kw):
+        seen.setdefault('create', [t.state for t in r.owned_snapshot()[1]])
+        return orig(coro, **kw)
+    loop.create_task = wrapped
+    try:
+        task = r.spawn_owned_task(factory, kind='k')
+    finally:
+        loop.create_task = orig
+    rec = next(t for t in r.owned_snapshot()[1] if t.kind == 'k')
+    assert rec.task is task and rec.state == 'ATTACHED' and seen['factory'] == ['RESERVED'] and 'RESERVED' in seen['create']
+    await task
+async def test_spawn_owned_task_eager_factory_runs_after_reservation(tmp_path):
+    r, _, _ = await running(tmp_path)
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)
+    seen = {}
+    async def body():
+        seen['lineage'] = _OWNED_LINEAGE.get()
+        seen['states'] = [t.state for t in r.owned_snapshot()[1]]
+    try:
+        await r.spawn_owned_task(body, kind='eager')
+    finally:
+        loop.set_task_factory(None)
+    assert seen['lineage'] and set(seen['states']) <= {'RESERVED', 'ATTACHED'}
+async def test_spawn_owned_task_rejected_in_closing_does_not_create_coro(tmp_path):
+    r, h, clock = await running(tmp_path)
+    gate, called = asyncio.Event(), []
+    h.drain_producers = lambda deadline: gate.wait()
+    closer = asyncio.create_task(r.close())
+    await pump()
+    def factory():
+        called.append(1)
+        async def body():
+            return None
+        return body()
+    with pytest.raises(RuntimeClosingError):
+        r.spawn_owned_task(factory, kind='late')
+    assert called == []
+    gate.set()
+    await clock.advance(15)
+    await closer
+async def test_spawn_owned_task_factory_failure_is_never_created(tmp_path):
+    r, _, _ = await running(tmp_path)
+    with pytest.raises(ValueError, match='nope'):
+        r.spawn_owned_task(lambda: (_ for _ in ()).throw(ValueError('nope')), kind='fail')
+    assert r.owned_snapshot()[1] == ()
+async def test_spawn_owned_task_attach_unknown_retains_lock(tmp_path):
+    r, _, clock = await running(tmp_path)
+    loop = asyncio.get_running_loop()
+    def factory(loop, coro):
+        try:
+            coro.send(None)
+        except StopIteration:
+            pass
+        raise RuntimeError('no task')
+    loop.set_task_factory(factory)
+    try:
+        with pytest.raises(RuntimeError, match='no task'):
+            r.spawn_owned_task(lambda: asyncio.sleep(0), kind='unk')
+    finally:
+        loop.set_task_factory(None)
+    assert any(t.state == 'ATTACH_UNKNOWN' for t in r.owned_snapshot()[1])
+    closer = asyncio.create_task(r.close())
+    await pump()
+    await clock.advance(15)
+    assert (await closer).code == 'E_RUNTIME_SHUTDOWN_TIMEOUT'
+    held(tmp_path)
+async def test_submit_native_registers_before_thread_start(tmp_path):
+    r, _, _ = await running(tmp_path)
+    seen, inside, orig = {}, {}, threading.Thread.start
+    def wrapped(self):
+        if str(self.name).startswith('cmms-native-'):
+            seen['before'] = [n.state for n in r.owned_snapshot()[2] if n.thread is self]
+        return orig(self)
+    threading.Thread.start = wrapped
+    try:
+        handle = await r.submit_native(lambda: inside.update(states=[n.state for n in r.owned_snapshot()[2]]), kind='reg')
+        await handle.result()
+    finally:
+        threading.Thread.start = orig
+    assert seen['before'] == ['REGISTERED'] and set(inside['states']) <= {'REGISTERED', 'RUNNING'}
+async def test_submit_native_capacity_cancel_starts_no_thread(tmp_path):
+    r, _, _ = await running(tmp_path)
+    r._native_capacity = asyncio.Semaphore(1)
+    hold, started = threading.Event(), threading.Event()
+    handle = await r.submit_native(lambda: (started.set(), hold.wait()), kind='hold')
+    assert started.wait(timeout=2)
+    waiter = asyncio.create_task(r.submit_native(lambda: 1, kind='wait'))
+    await pump()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    hold.set()
+    await handle.result()
+    assert await (await r.submit_native(lambda: 2, kind='ok')).result() == 2
+async def test_submit_native_capacity_never_exceeds_captured_limit(tmp_path):
+    r, _, _ = await running(tmp_path)
+    cap = r._max_native_workers
+    holds, started = [threading.Event() for _ in range(cap)], [threading.Event() for _ in range(cap)]
+    def make(i):
+        def fn():
+            started[i].set()
+            holds[i].wait()
+        return fn
+    handles = [await r.submit_native(make(i), kind='cap') for i in range(cap)]
+    assert all(ev.wait(timeout=2) for ev in started) and sum(h.thread.is_alive() for h in handles) <= cap
+    extra = asyncio.create_task(r.submit_native(lambda: 1, kind='extra'))
+    await pump()
+    assert not extra.done()
+    for ev in holds:
+        ev.set()
+    for handle in handles:
+        await handle.result()
+    assert await (await extra).result() == 1
+async def test_submit_native_contextvars_match_caller(tmp_path):
+    r, _, _ = await running(tmp_path)
+    var, seen = contextvars.ContextVar('card_a_probe'), {}
+    var.set('from-caller')
+    await (await r.submit_native(lambda: seen.update(v=var.get()), kind='ctx')).result()
+    assert seen['v'] == 'from-caller'
+async def test_submit_native_future_done_before_thread_death_does_not_release(tmp_path):
+    r, _, _ = await running(tmp_path)
+    ready, hold, after = threading.Event(), threading.Event(), threading.Event()
+    handle = await r.submit_native(lambda: (ready.set(), hold.wait(), 7)[2], kind='fd')
+    assert ready.wait(timeout=2)
+    orig = handle.native_future.set_result
+    handle.native_future.set_result = lambda value: (orig(value), after.wait())
+    hold.set()
+    while not handle.native_future.done():
+        await asyncio.sleep(0)
+    rec = next(n for n in r.owned_snapshot()[2] if n.thread is handle.thread)
+    assert handle.native_future.done() and handle.thread.is_alive() and handle.terminated is False
+    assert rec.state != 'TERMINATED' and rec.capacity_held
+    after.set()
+    assert await handle.result() == 7
+async def test_submit_native_start_failure_ident_none_releases_and_reraises(tmp_path, monkeypatch):
+    r, _, _ = await running(tmp_path)
+    orig = threading.Thread.start
+    monkeypatch.setattr(threading.Thread, 'start', lambda self: (_ for _ in ()).throw(RuntimeError('start fail')))
+    with pytest.raises(RuntimeError, match='start fail'):
+        await r.submit_native(lambda: 1, kind='sf')
+    await pump()
+    assert [n for n in r.owned_snapshot()[2] if n.state != 'TERMINATED'] == []
+    monkeypatch.setattr(threading.Thread, 'start', orig)
+    assert await (await r.submit_native(lambda: 3, kind='ok')).result() == 3
+async def test_submit_native_start_unknown_retains(tmp_path, monkeypatch):
+    r, _, clock = await running(tmp_path)
+    def boom(self):
+        self._ident = 99
+        raise RuntimeError('ambiguous')
+    monkeypatch.setattr(threading.Thread, 'start', boom)
+    with pytest.raises(RuntimeError, match='ambiguous'):
+        await r.submit_native(lambda: 1, kind='su')
+    assert any(n.state == 'START_UNKNOWN' for n in r.owned_snapshot()[2])
+    closer = asyncio.create_task(r.close())
+    await pump()
+    await clock.advance(15)
+    assert (await closer).code == 'E_RUNTIME_SHUTDOWN_TIMEOUT'
+    held(tmp_path)
+async def test_submit_native_diagnostics_are_type_only(tmp_path):
+    r, _, _ = await running(tmp_path)
+    def boom():
+        raise ValueError('SECRET')
+    handle = await r.submit_native(boom, kind='diag')
+    rec = None
+    for _ in range(400):
+        found = [n for n in r.owned_snapshot()[2] if n.kind == 'diag' and n.terminal_type]
+        if found:
+            rec = found[0]
+            break
+        await asyncio.sleep(0)
+    assert rec is not None and rec.terminal_type == 'ValueError' and 'SECRET' not in repr(rec)
+    with pytest.raises(ValueError, match='SECRET'):
+        await handle.result()
+    report = await r.close()
+    assert 'SECRET' not in repr(report) and all('SECRET' not in e for e in report.errors)
+async def test_owned_snapshot_epoch_bumps_on_late_native_and_blocks_quiescence(tmp_path):
+    r, _, clock = await running(tmp_path)
+    gate, hold = asyncio.Event(), threading.Event()
+    async def child():
+        await gate.wait()
+        await r.submit_native(lambda: hold.wait() or 1, kind='late')
+    r.spawn_owned_task(child, kind='lineage')
+    closer = asyncio.create_task(r.close())
+    await pump()
+    epoch1 = r.owned_snapshot()[0]
+    gate.set()
+    while not r._owned_natives:
+        await asyncio.sleep(0)
+    epoch2, _, natives = r.owned_snapshot()
+    assert epoch2 != epoch1 and any(n.kind == 'late' for n in natives)
+    hold.set()
+    await clock.advance(15)
+    await closer
+async def test_closing_lineage_allows_nested_native_anonymous_rejected(tmp_path):
+    r, _, clock = await running(tmp_path)
+    gate, hold = asyncio.Event(), threading.Event()
+    async def child():
+        await gate.wait()
+        await (await r.submit_native(lambda: hold.wait() or 1, kind='nested')).result()
+    r.spawn_owned_task(child, kind='compact-like')
+    closer = asyncio.create_task(r.close())
+    await pump()
+    gate.set()
+    while not any(n.kind == 'nested' for n in r.owned_snapshot()[2]):
+        await asyncio.sleep(0)
+    with pytest.raises(RuntimeClosingError):
+        await r.submit_native(lambda: 1, kind='anon')
+    assert not any(n.kind == 'anon' for n in r.owned_snapshot()[2])
+    hold.set()
+    await clock.advance(15)
+    await closer
+async def test_cleanup_t15_live_native_retains_vector_sqlite_ex(tmp_path):
+    sqlite, vector, hold = Resource('sqlite', []), Resource('vector', []), threading.Event()
+    r, _, clock = await running(tmp_path, sqlite=sqlite, vector=vector)
+    await r.submit_native(lambda: hold.wait() or 1, kind='live')
+    closer = asyncio.create_task(r.close())
+    await pump()
+    await clock.advance(15)
+    report = await closer
+    assert report.code == 'E_RUNTIME_SHUTDOWN_TIMEOUT' and not sqlite.closed and not vector.closed and r.lock is not None
+    held(tmp_path)
+    hold.set()
+async def test_cleanup_same_owner_retry_reuses_native_record(tmp_path):
+    r, _, clock = await running(tmp_path)
+    hold, calls = threading.Event(), []
+    handle = await r.submit_native(lambda: (calls.append(1), hold.wait()), kind='retry')
+    closer = asyncio.create_task(r.close())
+    await pump()
+    await clock.advance(15)
+    assert (await closer).code == 'E_RUNTIME_SHUTDOWN_TIMEOUT'
+    rec_id = next(n.id for n in r.owned_snapshot()[2])
+    hold.set()
+    handle.thread.join(timeout=2)
+    await pump()
+    assert (await r.close()).code is None and calls == [1] and rec_id not in {n.id for n in r.owned_snapshot()[2]}
+async def test_wrapper_cancel_is_not_native_death(tmp_path):
+    r, _, _ = await running(tmp_path)
+    hold = threading.Event()
+    handle = await r.submit_native(lambda: hold.wait() or 1, kind='wrap')
+    waiter = asyncio.create_task(handle.result())
+    await pump()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert handle.terminated is False and handle.thread.is_alive()
+    hold.set()
+    await handle.result()
+    await r.close()
+async def test_reaper_survives_owned_task_cancel(tmp_path):
+    r, _, clock = await running(tmp_path)
+    hold = threading.Event()
+    async def owner():
+        await (await r.submit_native(lambda: hold.wait() or 1, kind='nested')).result()
+    r.spawn_owned_task(owner, kind='owner')
+    while not r.owned_snapshot()[2]:
+        await asyncio.sleep(0)
+    rec, reaper = r.owned_snapshot()[2][0], r.owned_snapshot()[2][0].reaper
+    closer = asyncio.create_task(r.close())
+    await pump()
+    await clock.advance(10)
+    await pump()
+    assert reaper is not None and not reaper.done() and rec.thread.is_alive()
+    hold.set()
+    await clock.advance(5)
+    await closer
 if __name__ == '__main__':
     asyncio.run(integration(Path(sys.argv[1])))

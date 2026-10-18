@@ -357,6 +357,7 @@ class LanceDBProvider:
         vector_size: int | None = None,
         *,
         settings: Settings | None = None,
+        native_submitter=None,
     ) -> None:
         # None → resolve from Settings (defaults equal the previous module
         # constants; explicit args still win).
@@ -371,13 +372,23 @@ class LanceDBProvider:
             vector_size if vector_size is not None else settings.vector_size
         )
         self._db: Any = None  # lazy-init
+        self._native_submitter = native_submitter
+
+    async def _blocking(self, function, /, *args, kind: str | None = None, **kwargs):
+        if kind is None:
+            kind = f"lancedb-{function.__name__}"
+        submitter = self._native_submitter
+        if submitter is None:
+            return await asyncio.to_thread(function, *args, **kwargs)
+        handle = await submitter(function, *args, kind=kind, **kwargs)
+        return await handle.result()
 
     async def _get_db(self):
         """Lazy-init the LanceDB database connection."""
         if self._db is None:
             import lancedb
 
-            self._db = await asyncio.to_thread(lancedb.connect, self._db_path)
+            self._db = await self._blocking(lancedb.connect, self._db_path)
             # Ensure default table exists
             await self._ensure_table(self._table_name, db=self._db)
         return self._db
@@ -391,7 +402,7 @@ class LanceDBProvider:
         if db is None:
             db = await self._get_db()
         try:
-            table_names = await asyncio.to_thread(db.table_names)
+            table_names = await self._blocking(db.table_names)
             if name in table_names:
                 return True
 
@@ -403,7 +414,7 @@ class LanceDBProvider:
                 pa.field("vector", pa.list_(pa.float32(), self._vector_size)),
                 pa.field("_metadata", pa.utf8()),  # JSON-encoded payload
             ])
-            await asyncio.to_thread(
+            await self._blocking(
                 db.create_table, name, schema=schema, exist_ok=True,
             )
             logger.info(
@@ -419,16 +430,16 @@ class LanceDBProvider:
                 f"failed to ensure lancedb table '{name}': {exc}"
             ) from exc
 
-    async def _run(self, func, *args, **kwargs):
+    async def _run(self, func, *args, kind: str | None = None, **kwargs):
         """Run a blocking LanceDB call in a thread."""
-        return await asyncio.to_thread(func, *args, **kwargs)
+        return await self._blocking(func, *args, kind=kind, **kwargs)
 
     async def _get_table(self, name: str | None = None):
         """Get a LanceDB table by name (or default)."""
         table_name = name or self._table_name
         db = await self._get_db()
         await self._ensure_table(table_name)
-        return await asyncio.to_thread(db.open_table, table_name)
+        return await self._blocking(db.open_table, table_name)
 
     # ------------------------------------------------------------------
     # Table (collection) management
@@ -453,7 +464,7 @@ class LanceDBProvider:
         """
         try:
             db = await self._get_db()
-            table_names = await asyncio.to_thread(db.table_names)
+            table_names = await self._blocking(db.table_names)
             if name in table_names:
                 return False
 
@@ -465,7 +476,7 @@ class LanceDBProvider:
                 pa.field("vector", pa.list_(pa.float32(), vs)),
                 pa.field("_metadata", pa.utf8()),
             ])
-            await asyncio.to_thread(
+            await self._blocking(
                 db.create_table, name, schema=schema, exist_ok=True,
             )
             return True
@@ -485,7 +496,7 @@ class LanceDBProvider:
         """
         try:
             db = await self._get_db()
-            await asyncio.to_thread(db.drop_table, name, ignore_missing=True)
+            await self._blocking(db.drop_table, name, ignore_missing=True)
             return True
         except ProviderWriteError:
             raise
@@ -499,7 +510,7 @@ class LanceDBProvider:
         """List all table names."""
         try:
             db = await self._get_db()
-            return await asyncio.to_thread(db.table_names)
+            return await self._blocking(db.table_names)
         except Exception as exc:
             logger.error("Failed to list tables: %s", exc)
             raise ProviderSearchError(
@@ -510,7 +521,7 @@ class LanceDBProvider:
         """Return the number of vector rows in the collection/table."""
         try:
             table = await self._get_table(collection)
-            return int(await asyncio.to_thread(table.count_rows))
+            return int(await self._blocking(table.count_rows))
         except Exception as exc:
             logger.error("Failed to count points: %s", exc)
             raise ProviderSearchError(
@@ -956,6 +967,7 @@ class LanceDBProvider:
                 table.optimize,
                 cleanup_older_than=cleanup_older_than,
                 delete_unverified=delete_unverified,
+                kind="lancedb-optimize",
             )
             logger.info(
                 "LanceDB table '%s' optimized (compaction + prune)",

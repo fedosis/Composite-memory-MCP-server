@@ -147,6 +147,7 @@ def build_vector(runtime: Any) -> Any:
         metric=config.vector_metric,
         vector_size=config.vector_size,
         settings=settings,
+        native_submitter=runtime.submit_native,
     )
 
 
@@ -172,6 +173,8 @@ async def build_outbox_worker(runtime: Any) -> Any:
         embedder=dependencies.embedder,
         graph_router=graph_router,
         **dict(config.outbox),
+        task_spawner=runtime.spawn_owned_task,
+        native_submitter=runtime.submit_native,
     )
 
     await worker.initialize()
