@@ -82,16 +82,6 @@ def _projection_error(exc: BaseException) -> str | None:
 DEFAULT_DB_URL = get_settings().db_url
 
 
-def _bind_adapter_symbols() -> None:
-    import memory_server.transports.hermes as hermes_transport
-    globals()["_get_loop"] = hermes_transport._get_loop
-    globals()["_run_async"] = hermes_transport._run_async
-    globals()["_supports_background_outbox"] = hermes_transport._supports_background_outbox
-    globals()["_hermes_runtime_config"] = hermes_transport._hermes_runtime_config
-    globals()["HermesRuntimeBridge"] = hermes_transport.HermesRuntimeBridge
-    globals()["HermesRuntimeHooks"] = hermes_transport.HermesRuntimeHooks
-
-
 HermesRuntimeBridge = None
 HermesRuntimeHooks = None
 _hermes_runtime_config = None
@@ -110,6 +100,29 @@ def _run_async(coro, timeout: float = 30.0):
 def _supports_background_outbox(db_url: str) -> bool:
     _bind_adapter_symbols()
     return _supports_background_outbox(db_url)
+
+
+def _bind_adapter_symbols(
+    _stub_get_loop=_get_loop,
+    _stub_run_async=_run_async,
+    _stub_supports=_supports_background_outbox,
+) -> None:
+    # Bind each name only while it is still this module's placeholder/stub so a
+    # pre-initialize monkeypatch of a provider global survives initialize().
+    import memory_server.transports.hermes as hermes_transport
+    g = globals()
+    if g["_get_loop"] is _stub_get_loop:
+        g["_get_loop"] = hermes_transport._get_loop
+    if g["_run_async"] is _stub_run_async:
+        g["_run_async"] = hermes_transport._run_async
+    if g["_supports_background_outbox"] is _stub_supports:
+        g["_supports_background_outbox"] = hermes_transport._supports_background_outbox
+    if g["_hermes_runtime_config"] is None:
+        g["_hermes_runtime_config"] = hermes_transport._hermes_runtime_config
+    if g["HermesRuntimeBridge"] is None:
+        g["HermesRuntimeBridge"] = hermes_transport.HermesRuntimeBridge
+    if g["HermesRuntimeHooks"] is None:
+        g["HermesRuntimeHooks"] = hermes_transport.HermesRuntimeHooks
 
 
 def _resolve_cmms_data_path(
