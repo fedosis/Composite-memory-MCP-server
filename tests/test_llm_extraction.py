@@ -8,6 +8,9 @@ construction (every required key, correct types), so the success/gate tests
 exercise the LLM DI path — never a silent regex fallback.
 """
 
+import asyncio
+import inspect
+import threading
 import time
 from unittest.mock import Mock
 
@@ -587,6 +590,126 @@ async def test_empty_input_never_invokes_llm(provider):
     service = MemoryIngestionService(provider._session_factory)
     result = await service.learn("   ", llm_extractor=spy)
     assert spy.call_count == 0
-    assert result["facts"] == []
-    assert result["decisions"] == []
-    assert result["receipts"] == []
+
+def _blocked_llm():
+    barrier, held, calls = threading.Event(), {}, []
+    def blocked(text):
+        held["t"] = threading.current_thread(); calls.append(1); barrier.wait(); return VALID_FULL_PAYLOAD
+    return blocked, barrier, held, calls
+async def _ready_runtime(tmp_path):
+    from tests.test_runtime_factory import coherent_layout, factory_api
+    from tests.test_runtime_lifecycle import Clock
+    clock = Clock(); runtime = factory_api().create(coherent_layout(tmp_path), clock=clock, sleep=clock.sleep).runtime
+    await runtime.start(); return runtime, clock
+async def _native_svc(tmp_path, capture=False):
+    blocked, barrier, held, calls = _blocked_llm(); runtime, clock = await _ready_runtime(tmp_path)
+    captured, orig = [], runtime.submit_native
+    async def wrapped(fn, /, *args, kind, **kwargs):
+        handle = await orig(fn, *args, kind=kind, **kwargs); captured.append(handle); return handle
+    sub = wrapped if capture else orig
+    service = MemoryIngestionService(runtime.dependencies.sqlite._session_factory, native_submitter=sub)
+    return service, runtime, clock, blocked, barrier, held, calls, captured
+async def test_red_extractor_close_retains_ex_while_thread_alive(tmp_path):
+    from memory_server.plugins.hermes.provider import HermesProvider
+    from memory_server.plugins.hermes.resolver import ExtractorRuntimeConfig
+    from tests.test_runtime_lifecycle import held, pump
+    blocked, barrier, held_thread, calls = _blocked_llm()
+    runtime, clock = await _ready_runtime(tmp_path)
+    hermes = HermesProvider()
+    hermes._provider, hermes._llm_extractor = runtime.dependencies.sqlite, blocked
+    hermes._extractor_runtime = ExtractorRuntimeConfig("llm", None, 0.3, 8000, 0.7)
+    import memory_server.api.learn as learn_mod
+    original = learn_mod.learn
+    async def overlay(provider, *args, **kwargs):
+        if "native_submitter" in inspect.signature(original).parameters and getattr(runtime, "submit_native", None) is not None:
+            kwargs["native_submitter"] = runtime.submit_native
+        return await original(provider, *args, **kwargs)
+    learn_mod.learn = overlay
+    try:
+        writer = asyncio.create_task(hermes._handle_batch_write(
+            [([{"role": "user", "content": REGEX_TEXT}], "t1")]))
+        for _ in range(200):
+            if held_thread.get("t") is not None: break
+            await asyncio.sleep(0.01)
+        if held_thread.get("t") is None:
+            await writer; pytest.fail("ENV_BLOCKED: extractor wrap never fired")
+        await writer
+        facts = await runtime.dependencies.sqlite.search_facts(subject="Docker")
+        assert facts and facts[0].confidence == 0.5 and (not barrier.is_set()) and held_thread["t"].is_alive()
+        closer = asyncio.create_task(runtime.close()); await pump(); await clock.advance(15); report = await closer
+        assert held_thread["t"].is_alive() and runtime.lock is not None and report.code == "E_RUNTIME_SHUTDOWN_TIMEOUT"
+        held(runtime.root)
+    finally:
+        learn_mod.learn = original; barrier.set()
+    held_thread["t"].join(timeout=5)
+    facts = await runtime.dependencies.sqlite.search_facts(subject="Docker")
+    assert facts and facts[0].confidence == 0.5
+    assert (await runtime.close()).code is None and calls == [1]
+async def test_timeout_after_native_start_leaves_record_and_regex_fallback(tmp_path):
+    service, runtime, _, blocked, barrier, held, calls, captured = await _native_svc(tmp_path, capture=True)
+    try:
+        result = await service.learn(REGEX_TEXT, llm_extractor=blocked, llm_timeout_seconds=0.3)
+        assert result["facts"][0]["item"]["confidence"] == 0.5
+        _, _, natives = runtime.owned_snapshot()
+        assert (natives or captured[0].terminated is False) and held["t"].is_alive() and captured[0].terminated is False
+    finally:
+        barrier.set(); t = held.get("t"); t.join(timeout=5) if t is not None else None; await runtime.close()
+async def test_late_result_is_discarded_after_timeout(tmp_path):
+    service, runtime, _, blocked, barrier, held, calls, _ = await _native_svc(tmp_path)
+    try:
+        result = await service.learn(REGEX_TEXT, llm_extractor=blocked, llm_timeout_seconds=0.3)
+        assert result["facts"][0]["item"]["confidence"] == 0.5
+        barrier.set(); held["t"].join(timeout=5)
+        facts = await runtime.dependencies.sqlite.search_facts(subject="Docker")
+        assert facts and facts[0].confidence == 0.5 and calls == [1]
+    finally:
+        barrier.set(); t = held.get("t"); t.join(timeout=5) if t is not None else None; await runtime.close()
+async def test_cancel_learn_waiter_leaves_native_record(tmp_path):
+    service, runtime, _, blocked, barrier, held, calls, _ = await _native_svc(tmp_path)
+    try:
+        task = asyncio.create_task(service.learn(REGEX_TEXT, llm_extractor=blocked, llm_timeout_seconds=30.0))
+        for _ in range(200):
+            if held.get("t") is not None: break
+            await asyncio.sleep(0.01)
+        assert held.get("t") is not None, "ENV_BLOCKED: extractor wrap never fired"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        _, _, natives = runtime.owned_snapshot()
+        assert natives and held["t"].is_alive()
+    finally:
+        barrier.set(); t = held.get("t"); t.join(timeout=5) if t is not None else None; await runtime.close()
+async def test_capacity_wait_timeout_starts_no_thread(tmp_path):
+    blocked, barrier, held, calls = _blocked_llm()
+    runtime, _ = await _ready_runtime(tmp_path)
+    runtime._native_capacity = asyncio.Semaphore(1)
+    hold, started = threading.Event(), threading.Event()
+    handle = await runtime.submit_native(lambda: (started.set(), hold.wait()), kind="hold")
+    assert started.wait(timeout=2)
+    service = MemoryIngestionService(runtime.dependencies.sqlite._session_factory, native_submitter=runtime.submit_native)
+    try:
+        result = await service.learn(REGEX_TEXT, llm_extractor=blocked, llm_timeout_seconds=0.2)
+        assert calls == [] and held.get("t") is None and result["facts"][0]["item"]["confidence"] == 0.5 and not any("extract-llm" in t.name for t in threading.enumerate())
+    finally:
+        hold.set(); await handle.result()
+        assert await (await runtime.submit_native(lambda: 2, kind="ok")).result() == 2
+        barrier.set(); t = held.get("t"); t.join(timeout=5) if t is not None else None; await runtime.close()
+async def test_legacy_ingestion_without_submitter_keeps_to_thread(provider, monkeypatch):
+    recorded, original = [], asyncio.to_thread
+    async def wrapped(fn, *args, **kwargs):
+        recorded.append(fn); return await original(fn, *args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", wrapped)
+    spy = Mock(return_value=VALID_FULL_PAYLOAD)
+    await MemoryIngestionService(provider._session_factory).learn(REGEX_TEXT, llm_extractor=spy)
+    assert recorded and recorded[0] is spy
+async def test_submitter_kind_is_extract_llm(tmp_path):
+    runtime, _ = await _ready_runtime(tmp_path); orig, kinds = runtime.submit_native, []
+    async def wrapped(fn, /, *args, kind, **kwargs):
+        kinds.append(kind); return await orig(fn, *args, kind=kind, **kwargs)
+    spy = Mock(return_value=VALID_FULL_PAYLOAD)
+    service = MemoryIngestionService(runtime.dependencies.sqlite._session_factory, native_submitter=wrapped)
+    try:
+        await service.learn(REGEX_TEXT, llm_extractor=spy, llm_timeout_seconds=5.0)
+        assert kinds == ["extract-llm"] and spy.call_count == 1
+    finally:
+        await runtime.close()

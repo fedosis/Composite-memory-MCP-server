@@ -23,6 +23,8 @@ async def learn(
     llm_timeout_seconds: Optional[float] = None,
     llm_max_input_chars: Optional[int] = None,
     llm_confidence_gate: Optional[float] = None,
+    *,
+    native_submitter=None,
 ) -> dict:
     """Extract facts, decisions, skills, and optionally beliefs from natural language text.
 
@@ -68,4 +70,7 @@ async def learn(
         llm_max_input_chars=llm_max_input_chars,
         llm_confidence_gate=llm_confidence_gate,
     )
-    return await MemoryService(provider._session_factory).learn(command)
+    return await MemoryService(
+        provider._session_factory,
+        native_submitter=native_submitter,
+    ).learn(command)

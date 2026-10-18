@@ -284,6 +284,7 @@ class MemoryIngestionService:
         session_factory: async_sessionmaker[AsyncSession],
         *,
         max_active_beliefs: int | None = None,
+        native_submitter=None,
     ) -> None:
         """Bind the session factory and capture the belief soft limit once.
 
@@ -300,6 +301,7 @@ class MemoryIngestionService:
 
             max_active_beliefs = get_settings().max_active_beliefs
         self._max_active_beliefs = max_active_beliefs
+        self._native_submitter = native_submitter
 
     async def remember(
         self,
@@ -553,10 +555,14 @@ class MemoryIngestionService:
                     raise ValueError(
                         f"llm_timeout_seconds must be finite and > 0, got {llm_timeout_seconds!r}"
                     )
-                raw = await asyncio.wait_for(
-                    asyncio.to_thread(llm_extractor, call_text),
-                    timeout=timeout,
-                )
+                async def _invoke_llm():
+                    submitter = self._native_submitter
+                    if submitter is None:
+                        return await asyncio.to_thread(llm_extractor, call_text)
+                    handle = await submitter(llm_extractor, call_text, kind="extract-llm")
+                    return await handle.result()
+
+                raw = await asyncio.wait_for(_invoke_llm(), timeout=timeout)
                 # Validation sits INSIDE the guarded path: a validator
                 # exception falls back to regex exactly like a callable
                 # exception (review #1).

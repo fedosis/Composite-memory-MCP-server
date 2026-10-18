@@ -51,6 +51,19 @@ class FlushReport:
     requeued: int
 
 
+@dataclass(frozen=True, slots=True)
+class QueueCustodySnapshot:
+    total: int
+    flushed: int
+    failed: int
+    requeued: int
+    safe_queued_items: int
+    safe_retry_items: int
+    unknown_in_flight_items: int
+    raw_unsettled: int
+    invariant_ok: bool
+
+
 class WriterQueue:
     """Non-blocking batch writer with flush-on-switch semantics.
 
@@ -321,6 +334,28 @@ class WriterQueue:
         async with self._flush_lock:
             await self._settle_locked()
             return self._report()
+
+    async def settle_custody(self) -> QueueCustodySnapshot:
+        async with self._flush_lock:
+            await self._settle_locked()
+            safe_queued_items = self._queue.qsize()
+            safe_retry_items = len(self._retry_heap)
+            unknown_in_flight_items = sum(len(batch.items) for batch in self._in_flight.values())
+            raw_unsettled = self._total_queued - self._total_flushed - self._total_failed
+            invariant_ok = raw_unsettled == (
+                safe_queued_items + safe_retry_items + unknown_in_flight_items
+            )
+            return QueueCustodySnapshot(
+                total=self._total_queued,
+                flushed=self._total_flushed,
+                failed=self._total_failed,
+                requeued=self._total_requeued,
+                safe_queued_items=safe_queued_items,
+                safe_retry_items=safe_retry_items,
+                unknown_in_flight_items=unknown_in_flight_items,
+                raw_unsettled=raw_unsettled,
+                invariant_ok=invariant_ok,
+            )
 
     async def flush_final(self, deadline: float) -> FlushReport:
         """Drain under one lock until an absolute monotonic deadline.

@@ -107,9 +107,16 @@ class MemoryService:
     construction, and never again.
     """
 
-    def __init__(self, session_factory: Any, *, policy: MemoryPolicy | None = None) -> None:
+    def __init__(
+        self,
+        session_factory: Any,
+        *,
+        policy: MemoryPolicy | None = None,
+        native_submitter=None,
+    ) -> None:
         self._session_factory = session_factory
         self._policy = policy if policy is not None else MemoryPolicy.capture()
+        self._native_submitter = native_submitter
 
     @property
     def session_factory(self) -> Any:
@@ -250,6 +257,7 @@ class MemoryService:
         service = MemoryIngestionService(
             self._session_factory,
             max_active_beliefs=self._policy.max_active_beliefs,
+            native_submitter=self._native_submitter,
         )
         return await service.learn(**kwargs)
 

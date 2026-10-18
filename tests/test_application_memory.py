@@ -598,3 +598,57 @@ def test_every_scratch_path_used_by_this_module_is_inside_basetemp(tmp_path, tmp
         resolved = Path(candidate).resolve()
         assert resolved.is_relative_to(basetemp), f"scratch path outside basetemp: {resolved}"
         assert not any(resolved == r or resolved.is_relative_to(r) for r in LIVE_DATA_ROOTS), resolved
+
+
+async def test_learn_forwards_native_submitter_to_ingestion(live_env, monkeypatch) -> None:
+    from memory_server.application import LearnCommand, MemoryService
+    from memory_server.application import memory_service as ms
+    from tests.test_llm_extraction import REGEX_TEXT
+    _, provider = live_env
+    captured, seen = [], []
+    real = ms.MemoryIngestionService
+    class Capturing(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k); captured.append(self)
+        async def learn(self, **kwargs):
+            seen.append(kwargs.get("llm_extractor")); return await super().learn(**kwargs)
+    monkeypatch.setattr(ms, "MemoryIngestionService", Capturing)
+    marker, spy = object(), (lambda text: {"facts": [], "decisions": []})
+    await MemoryService(provider._session_factory, native_submitter=marker).learn(
+        LearnCommand(text=REGEX_TEXT, llm_extractor=spy))
+    assert captured[0]._native_submitter is marker and seen[0] is spy
+
+async def test_api_learn_forwards_keyword_only_submitter(live_env, monkeypatch) -> None:
+    from memory_server.application import LearnCommand
+    from memory_server.application import memory_service as ms
+    _, provider = live_env
+    captured = []
+    real = ms.MemoryIngestionService
+    class Capturing(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k); captured.append(self)
+        async def learn(self, **kwargs):
+            return {"facts": [], "decisions": [], "skills": [], "beliefs": [], "receipts": []}
+    monkeypatch.setattr(ms, "MemoryIngestionService", Capturing)
+    marker, spy = object(), (lambda text: {"facts": [], "decisions": []})
+    await api_learn(provider, text="Docker is container", llm_extractor=spy, native_submitter=marker)
+    assert captured[0]._native_submitter is marker
+    assert "native_submitter" not in LearnCommand.__dataclass_fields__
+    assert not hasattr(LearnCommand(text="t"), "native_submitter")
+
+def test_api_learn_public_parameters_unchanged() -> None:
+    import inspect as inspect_module
+    from memory_server.api.learn import learn
+    params = list(inspect_module.signature(learn).parameters.values())
+    assert [p.name for p in params[:9]] == [
+        "provider", "text", "source", "extract_beliefs", "min_belief_confidence",
+        "llm_extractor", "llm_timeout_seconds", "llm_max_input_chars", "llm_confidence_gate"]
+    empty = inspect_module.Parameter.empty
+    assert [p.default for p in params[:9]] == [empty, empty, "user", False, 0.6, None, None, None, None]
+    assert params[9].name == "native_submitter" and params[9].kind is inspect_module.Parameter.KEYWORD_ONLY
+    assert params[9].default is None
+    assert all(p.kind is inspect_module.Parameter.POSITIONAL_OR_KEYWORD for p in params[:9])
+
+async def test_memory_application_legacy_path_has_no_submitter(live_env) -> None:
+    app, _ = live_env
+    assert app.memory._native_submitter is None

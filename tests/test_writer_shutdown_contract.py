@@ -290,3 +290,100 @@ async def test_no_duplicate_item_is_flushed_by_two_passes():
     report = await finish(queue)
     assert report.flushed == 12 and report.unsettled == 0
     assert sorted(seen) == sorted(str(i) for i in range(12))
+
+
+async def test_settle_custody_counts_multi_item_in_flight():
+    from memory_server.plugins.hermes.writer import QueueCustodySnapshot
+    seen = []
+    async def callback(batch):
+        seen.extend(batch); raise asyncio.CancelledError
+    queue = WriterQueue(callback, max_batch=3)
+    for i in range(3):
+        await queue.add_turn(f'item-{i}', str(i))
+    await queue.flush(); original = next(iter(queue._in_flight.values())).callback_task
+    queue.stop_admission(); await queue.pause(); snap = await queue.settle_custody()
+    assert isinstance(snap, QueueCustodySnapshot)
+    assert snap.unknown_in_flight_items == 3 and snap.safe_queued_items == 0
+    assert snap.raw_unsettled == 3 and snap.invariant_ok
+    assert next(iter(queue._in_flight.values())).callback_task is original and len(seen) == 3
+async def test_settle_custody_counts_retry_heap():
+    queue = WriterQueue(lambda batch: [(item, False, 'retry') for item in batch])
+    await queue.add_turn('r', 'retry'); await queue.flush(); assert len(queue._retry_heap) == 1
+    queue.stop_admission(); await queue.pause(); snap = await queue.settle_custody()
+    assert snap.safe_retry_items == 1 and snap.unknown_in_flight_items == 0
+    assert len(queue._retry_heap) == 1 and queue._queue.empty() and snap.invariant_ok
+async def test_settle_custody_counts_safe_backlog():
+    queue = WriterQueue(lambda batch: None)
+    await queue.add_turn('a', '1'); await queue.add_turn('b', '2')
+    queue.stop_admission(); await queue.pause(); snap = await queue.settle_custody()
+    assert snap.safe_queued_items == 2 and snap.unknown_in_flight_items == 0
+    assert queue._queue.qsize() == 2 and snap.raw_unsettled == 2 and snap.invariant_ok
+async def test_settle_custody_terminal_failure_keeps_provenance_and_counts_only():
+    secret = 'private-message-token'
+    queue = WriterQueue(lambda batch: [(batch[0], False, secret)])
+    await queue.add_turn(secret, 'private-turn'); await finish(queue)
+    queue.stop_admission(); await queue.pause(); snap = await queue.settle_custody()
+    assert snap.failed == 1 and snap.unknown_in_flight_items == 0
+    assert all(type(value) in (int, bool) for value in asdict(snap).values())
+    assert secret not in repr(snap) and 'private-turn' not in repr(snap)
+    assert queue.failed_items == [dict(messages=secret, turn_id='private-turn', attempts=3, error=secret)]
+async def test_settle_custody_conservation_mismatch_sets_invariant_ok_false():
+    queue = WriterQueue(lambda batch: None)
+    await queue.add_turn('x', 'x'); queue.stop_admission(); await queue.pause()
+    queued_before = queue._total_queued; queue._total_flushed += 1
+    snap = await queue.settle_custody()
+    assert snap.invariant_ok is False
+    assert queue._queue.qsize() == 1 or queue._in_flight or queue._retry_heap
+    assert queue._total_queued == queued_before != 0 and queue._total_flushed == 1
+async def test_flush_final_raw_unsettled_includes_residual():
+    entered, release, attempts = asyncio.Event(), asyncio.Event(), {}
+    async def callback(batch):
+        item = batch[0]; tid = item[1]; attempts[tid] = attempts.get(tid, 0) + 1
+        if tid == 'retry' and attempts[tid] == 1:
+            return [(item, False, 'retry')]
+        if tid == 'inflight':
+            entered.set(); await release.wait()
+        return [(item, True, None)]
+    queue = WriterQueue(callback, max_batch=1)
+    await queue.add_turn('r', 'retry'); await queue.flush()
+    await queue.add_turn('i', 'inflight')
+    caller = asyncio.create_task(queue.flush())
+    await asyncio.wait_for(entered.wait(), 1); await cancelled(caller)
+    await queue.add_turn('q', 'queued')
+    report = await queue.flush_final(time.monotonic() + 0.01)
+    assert report.unsettled == report.total - report.flushed - report.failed == 3
+    queue.stop_admission(); await queue.pause(); release.set()
+    snap = await queue.settle_custody()
+    assert snap.safe_queued_items == 1 and snap.safe_retry_items == 1
+    assert (await finish(queue)).unsettled == 0
+async def test_settle_custody_under_flush_lock_after_pause():
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def callback(batch):
+        entered.set(); await release.wait()
+    queue = WriterQueue(callback)
+    await queue.add_turn('x', 'x')
+    starter = asyncio.create_task(queue.flush())
+    await asyncio.wait_for(entered.wait(), 1); await cancelled(starter)
+    await queue.pause(); assert await queue.flush() == 0
+    queue.stop_admission()
+    with pytest.raises(RuntimeError):
+        await queue.add_turn('rejected', '3')
+    settler = asyncio.create_task(queue.settle_custody())
+    for _ in range(40):
+        if queue._flush_lock.locked():
+            break
+        await asyncio.sleep(0)
+    assert queue._flush_lock.locked()
+    waiting = asyncio.create_task(queue.flush())
+    done, _ = await asyncio.wait([waiting], timeout=0.05)
+    assert not done, 'flush() must wait while settle_custody holds _flush_lock'
+    release.set(); await settler; assert await waiting == 0
+async def test_settle_and_flush_final_and_flushreport_unchanged():
+    import inspect as inspect_module
+    from memory_server.plugins.hermes.writer import FlushReport
+    assert list(FlushReport.__dataclass_fields__) == [
+        'total', 'flushed', 'failed', 'unsettled', 'failed_records', 'requeued']
+    params = inspect_module.signature(WriterQueue.flush_final).parameters
+    assert list(params) == ['self', 'deadline']
+    report = await WriterQueue(lambda batch: None).settle()
+    assert type(report) is FlushReport
