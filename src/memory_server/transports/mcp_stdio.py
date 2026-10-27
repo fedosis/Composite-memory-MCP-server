@@ -57,6 +57,7 @@ from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.graph_router import GraphRouter
 from memory_server.runtime.dependencies import RuntimeDependencies
 from memory_server.runtime.errors import RuntimeNotReadyError
+from memory_server.runtime.runtime import ShutdownReport
 from memory_server.runtime.runtime_factory import RuntimeFactory
 from memory_server.services.ingestion_service import reinforce_belief_item
 from memory_server.services.lifecycle_service import (
@@ -74,46 +75,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _install_mcp_shutdown_report_shape() -> None:
-    """Keep the runtime's single deadline schedule observable from MCP."""
-    from memory_server.runtime import runtime as runtime_module
-
-    report_type = runtime_module.ShutdownReport
-    if getattr(report_type, "_mcp_deadline_shape", False):
-        return
-
-    class MCPShutdownReport(report_type):
-        _mcp_deadline_shape = True
-
-        def __init__(
-            self,
-            phases=None,
-            flushed=0,
-            failed=0,
-            requeued=0,
-            unsettled=0,
-            retained_resources=(),
-            lock_retained=False,
-            code=None,
-            errors=(),
-        ):
-            normalized = dict(phases or {})
-            deadlines = tuple(normalized.get("deadlines", ()))
-            if "closing" in normalized and len(deadlines) == 4:
-                normalized["deadlines"] = (normalized["closing"], *deadlines)
-            super().__init__(
-                phases=normalized,
-                flushed=flushed,
-                failed=failed,
-                requeued=requeued,
-                unsettled=unsettled,
-                retained_resources=retained_resources,
-                lock_retained=lock_retained,
-                code=code,
-                errors=errors,
-            )
-
-    runtime_module.ShutdownReport = MCPShutdownReport
+def _mcp_shutdown_report(*, phases: dict[str, Any] | None = None, **kwargs: Any) -> ShutdownReport:
+    """Include closing in MCP's internal report without changing neutral reports."""
+    normalized = dict(phases or {})
+    deadlines = tuple(normalized.get("deadlines", ()))
+    if "closing" in normalized and len(deadlines) == 4:
+        normalized["deadlines"] = (normalized["closing"], *deadlines)
+    return ShutdownReport(phases=normalized, **kwargs)
 
 
 class _MCPRuntimeHooks:
@@ -178,9 +146,8 @@ class MCPComposition:
         factory = RuntimeFactory.create(
             layout,
             settings=settings,
-            dependencies=RuntimeDependencies(hooks=hooks),
+            dependencies=RuntimeDependencies(hooks=hooks, report_factory=_mcp_shutdown_report),
         )
-        _install_mcp_shutdown_report_shape()
         factory.runtime.preflight()
         return cls(
             settings=settings,
