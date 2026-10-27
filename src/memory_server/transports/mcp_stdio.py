@@ -797,6 +797,10 @@ async def graph_search_tool(
         return json.dumps(result)
 
 
+# Compatibility for callers that imported the former public tool symbol.
+graph_search_fn = graph_search_tool
+
+
 @mcp.tool(name="add_relation")
 @_stable_projection_errors
 @_runtime_admitted
