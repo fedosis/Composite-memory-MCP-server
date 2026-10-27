@@ -14,6 +14,11 @@ from pathlib import Path
 
 import pytest
 
+_REQUIRED_HARNESS_ENV = ('C07_SUBJECT', 'C07_ORACLE', 'C07_SCRATCH')
+_MISSING_HARNESS_ENV = [key for key in _REQUIRED_HARNESS_ENV if not os.environ.get(key)]
+if _MISSING_HARNESS_ENV:
+    pytest.skip("requires harness environment variables: " + ", ".join(_MISSING_HARNESS_ENV), allow_module_level=True)
+
 from memory_server.api.get_context import get_context
 from memory_server.api.search import search
 from memory_server.models import Decision, Fact

@@ -10,6 +10,11 @@ from types import SimpleNamespace
 
 import pytest
 
+_REQUIRED_HARNESS_ENV = ('C09_SUBJECT', 'C09_ORACLE', 'C09_SCRATCH')
+_MISSING_HARNESS_ENV = [key for key in _REQUIRED_HARNESS_ENV if not os.environ.get(key)]
+if _MISSING_HARNESS_ENV:
+    pytest.skip("requires harness environment variables: " + ", ".join(_MISSING_HARNESS_ENV), allow_module_level=True)
+
 import memory_server
 from memory_server.api import reflect as reflect_api
 from memory_server.api.reflect import ReflectEngine

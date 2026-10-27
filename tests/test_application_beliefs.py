@@ -13,6 +13,11 @@ from typing import Any
 
 import pytest
 
+_REQUIRED_HARNESS_ENV = ('C08_SUBJECT', 'C08_ORACLE', 'C08_SCRATCH')
+_MISSING_HARNESS_ENV = [key for key in _REQUIRED_HARNESS_ENV if not os.environ.get(key)]
+if _MISSING_HARNESS_ENV:
+    pytest.skip("requires harness environment variables: " + ", ".join(_MISSING_HARNESS_ENV), allow_module_level=True)
+
 _SUBJECT = os.environ.get("C08_SUBJECT")
 if _SUBJECT not in {"legacy", "application"}:
     raise RuntimeError("C08_SUBJECT must be exactly 'legacy' or 'application'")
