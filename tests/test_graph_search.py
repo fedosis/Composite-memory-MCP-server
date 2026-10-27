@@ -5,16 +5,44 @@ import json
 import pytest
 
 from memory_server.server import _get_graph_router, graph_search_fn
+from memory_server.transports import mcp_stdio
+
+
+@pytest.fixture(autouse=True)
+async def graph_composition(tmp_path, monkeypatch):
+    """Own a real MCP runtime over one disposable, non-split storage root."""
+    from memory_server.settings import get_settings
+    from tests.synthetic_storage_env import assert_not_live
+
+    root = tmp_path / "profile"
+    (root / "data").mkdir(parents=True)
+    paths = {
+        "MEMORY_SERVER_DATA_ROOT": root,
+        "MEMORY_SERVER_LANCEDB_PATH": root / "data" / "lancedb",
+        "MEMORY_SERVER_GRAPH_SNAPSHOT_PATH": root / "data" / "graph.json",
+    }
+    for name, path in paths.items():
+        assert_not_live(path, label=name)
+        monkeypatch.setenv(name, str(path))
+    monkeypatch.setenv("MEMORY_SERVER_DB_URL", f"sqlite+aiosqlite:///{root / 'data' / 'memory.db'}")
+    monkeypatch.setenv("MEMORY_SERVER_VECTOR_BACKEND", "lancedb")
+    get_settings.cache_clear()
+    try:
+        async with mcp_stdio.lifespan(mcp_stdio.mcp):
+            layout = mcp_stdio._get_storage_layout()
+            assert not layout.compatibility
+            assert not layout.unavailable_projections
+            assert layout.data_root == root
+            yield
+    finally:
+        get_settings.cache_clear()
+        for name, path in paths.items():
+            assert_not_live(path, label=name)
 
 
 @pytest.mark.asyncio
 class TestGraphSearchTool:
     """Test graph_search MCP tool."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_graph(self, graph_test_isolation):
-        """Give every graph test its own persisted snapshot and singletons."""
-        yield
 
     async def test_search_by_entity_name(self):
         """Search for entity by name finds neighbors."""
@@ -113,13 +141,9 @@ class TestGraphSearchTool:
 class TestGraphSearchDiamondAndCycle:
     """PROV-6 via the server tool: pathfinding must keep all simple paths.
 
-    Uses the graph_test_isolation fixture (tmp_path snapshot), so the live
-    data/graph.json is never touched.
+    Each test owns a real MCP lifespan and a complete disposable storage root;
+    no live graph snapshot or process singleton is reused.
     """
-
-    @pytest.fixture(autouse=True)
-    async def setup_graph(self, graph_test_isolation):
-        yield
 
     @staticmethod
     def _path_ids(path):
