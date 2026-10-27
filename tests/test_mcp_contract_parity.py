@@ -19,6 +19,11 @@ from typing import Any
 
 import pytest
 
+_REQUIRED_HARNESS_ENV = ('MEMORY_SERVER_DATA_ROOT', 'TMPDIR', 'CMMS_C00_ORACLE')
+_MISSING_HARNESS_ENV = [key for key in _REQUIRED_HARNESS_ENV if not os.environ.get(key)]
+if _MISSING_HARNESS_ENV:
+    pytest.skip("requires harness environment variables: " + ", ".join(_MISSING_HARNESS_ENV), allow_module_level=True)
+
 EXPECTED_TOOLS = (
     "ping", "search", "get_context", "remember", "learn", "semantic_search",
     "graph_search", "add_relation", "invalidate", "route", "audit", "metrics",
