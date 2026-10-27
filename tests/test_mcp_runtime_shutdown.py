@@ -11,6 +11,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,8 +25,48 @@ if _MISSING_HARNESS_ENV:
 
 ROOT = Path(os.environ["MEMORY_SERVER_DATA_ROOT"]).absolute().parent
 ORACLE = Path(os.environ["CMMS_C00_ORACLE"])
-PYTHON = Path("/home/shtorm/memory-server/.venv/bin/python")
-SERVER_BIN = Path("/home/shtorm/memory-server/.venv/bin/memory-server")
+def _python() -> str:
+    """Resolve and probe the stdio interpreter, never silently skip a bad one."""
+    configured = os.environ.get("CMMS_MCP_PYTHON", sys.executable)
+    executable = shutil.which(configured)
+    message = f"CMMS_MCP_PYTHON={configured!r} unusable; configure an executable Python interpreter"
+    if executable is None:
+        pytest.fail(message)
+    try:
+        probe = subprocess.run(
+            [executable, "-c", "import sys; assert sys.version_info >= (3, 11)"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        pytest.fail(f"{message}: {exc}")
+    if probe.returncode != 0:
+        pytest.fail(f"{message}: exit={probe.returncode}, stderr={probe.stderr}")
+    return executable
+
+
+def test_mcp_interpreter_defaults_to_current_python(monkeypatch):
+    import sys
+
+    monkeypatch.delenv("CMMS_MCP_PYTHON", raising=False)
+    assert _python() == sys.executable
+
+
+def test_mcp_interpreter_accepts_explicit_override(monkeypatch):
+    import sys
+
+    monkeypatch.setenv("CMMS_MCP_PYTHON", sys.executable)
+    assert _python() == sys.executable
+
+
+@pytest.mark.parametrize("kind", ["missing", "not-executable", "broken"])
+def test_mcp_interpreter_rejects_unusable_override(tmp_path, monkeypatch, kind):
+    executable = tmp_path / "python"
+    if kind != "missing":
+        executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        executable.chmod(0o755 if kind == "broken" else 0o644)
+    monkeypatch.setenv("CMMS_MCP_PYTHON", str(executable))
+    with pytest.raises(pytest.fail.Exception, match="CMMS_MCP_PYTHON.*unusable"):
+        _python()
 
 
 def _contained(path: Path) -> bool:
@@ -83,7 +126,7 @@ sys.stdin.read()
 lock.release()
 """
     l1 = await asyncio.create_subprocess_exec(
-        str(PYTHON), "-c", l1_code, cwd=str(root / "stdio"), env=env,
+        _python(), "-c", l1_code, cwd=str(root / "stdio"), env=env,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     for _ in range(120):
@@ -114,7 +157,7 @@ server.mcp.run(transport='stdio')
 """
     (root / "stdio").mkdir(parents=True, exist_ok=True)
     contender = await asyncio.create_subprocess_exec(
-        str(PYTHON), "-c", driver, cwd=str(root / "stdio"), env=env,
+        _python(), "-c", driver, cwd=str(root / "stdio"), env=env,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
@@ -133,7 +176,7 @@ server.mcp.run(transport='stdio')
         f"Path({str(next_owner)!r}).write_text(str((root / '.cmms-storage.lock').stat().st_ino)); lock.release()"
     )
     owner = await asyncio.create_subprocess_exec(
-        str(PYTHON), "-c", owner_code, cwd=str(root / "stdio"), env=env,
+        _python(), "-c", owner_code, cwd=str(root / "stdio"), env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     _owner_stdout, owner_stderr = await asyncio.wait_for(owner.communicate(), timeout=5)
@@ -175,7 +218,7 @@ server.run()
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
-    params = StdioServerParameters(command=str(PYTHON), args=["-c", driver], env=env, cwd=str(root / "stdio"))
+    params = StdioServerParameters(command=_python(), args=["-c", driver], env=env, cwd=str(root / "stdio"))
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await asyncio.wait_for(session.initialize(), timeout=30)
