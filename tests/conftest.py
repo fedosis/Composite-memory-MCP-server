@@ -45,6 +45,67 @@ def synthetic_storage_env(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def seam02_composition(tmp_path, monkeypatch):
+    """Enter a real MCP lifespan with frozen env settings and optional recipes."""
+    from contextlib import asynccontextmanager
+    from itertools import count
+
+    from memory_server.settings import Settings
+    from memory_server.transports import mcp_stdio
+    from tests.synthetic_storage_env import assert_not_live
+
+    serial = count()
+
+    @asynccontextmanager
+    async def compose(*, env=None, overrides=None, dependencies=None):
+        root = tmp_path / f"composition-{next(serial)}"
+        (root / "data").mkdir(parents=True)
+        with monkeypatch.context() as patch:
+            values = {
+                "MEMORY_SERVER_DATA_ROOT": str(root),
+                "MEMORY_SERVER_DB_URL": f"sqlite+aiosqlite:///{root / 'data/memory.db'}",
+                "MEMORY_SERVER_LANCEDB_PATH": str(root / "data/lancedb"),
+                "MEMORY_SERVER_GRAPH_SNAPSHOT_PATH": str(root / "data/graph.json"),
+                "MEMORY_SERVER_VECTOR_BACKEND": "lancedb",
+            }
+            values.update(env or {})
+            for name, value in values.items():
+                patch.setenv(name, str(value))
+            settings = Settings(_env_file=None)
+            for path in (root, settings.lancedb_path, settings.graph_snapshot_path):
+                assert_not_live(path)
+            patch.setattr(mcp_stdio, "get_settings", lambda: settings)
+            if overrides is not None or dependencies is not None:
+                from dataclasses import replace
+
+                create = mcp_stdio.RuntimeFactory.create
+
+                def injected_factory(layout, **kwargs):
+                    if dependencies is not None:
+                        # Preserve transport shutdown hooks/report construction.
+                        transport = kwargs["dependencies"]
+                        kwargs["dependencies"] = replace(
+                            dependencies, hooks=transport.hooks,
+                            report_factory=transport.report_factory,
+                        )
+                    return create(layout, overrides=overrides, **kwargs)
+
+                patch.setattr(mcp_stdio.RuntimeFactory, "create", injected_factory)
+            try:
+                async with mcp_stdio.lifespan(mcp_stdio.mcp):
+                    composition = mcp_stdio._runtime_or_raise()
+                    assert composition.settings is settings
+                    assert composition.layout.data_root == root
+                    assert not composition.layout.compatibility
+                    yield composition
+            finally:
+                assert mcp_stdio._active_composition is None
+                assert_not_live(root)
+
+    return compose
+
+
+@pytest.fixture
 def graph_test_isolation(tmp_path, monkeypatch):
     """Isolate graph tests from the process singleton and live snapshot.
 
