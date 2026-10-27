@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
+
+if TYPE_CHECKING:
+    from memory_server.runtime.runtime import ShutdownReport
 
 # Close order of the resources the runtime OWNS: SQLite last, because the outbox
 # worker borrows its engine (``outbox_worker.py:140-143``) and a borrowed engine
@@ -39,6 +42,8 @@ class RuntimeDependencies:
     borrowed_engine: bool = False
     # Neutral construction seam only. Concrete backend recipes belong to C03.
     recipes: tuple[tuple[str, Any], ...] = ()
+    # Per-runtime report construction; transports may supply their own shape.
+    report_factory: Callable[..., ShutdownReport] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "owns_close", frozenset(self.owns_close))

@@ -71,6 +71,67 @@ async def test_s1_phase_ceilings_are_absolute_and_scheduling_delay_counts(tmp_pa
     assert (await r.close()).code is None
 
 
+@pytest.fixture(scope='module')
+def report_shape_transport():
+    # Import optional transport dependencies before the per-test storage guard.
+    from memory_server.transports import mcp_stdio
+    return mcp_stdio
+
+
+@pytest.mark.parametrize('order', [('neutral', 'mcp'), ('mcp', 'neutral')],
+                         ids=['neutral-first', 'mcp-first'])
+async def test_two_runtimes_keep_report_shapes_in_either_creation_order(
+        tmp_path, monkeypatch, order, report_shape_transport):
+    """Real composition -> RuntimeFactory -> runtime close -> internal _cleanup."""
+    from memory_server.runtime import runtime as runtime_module
+    from memory_server.settings import Settings
+
+    mcp_stdio = report_shape_transport
+
+    root = tmp_path / 'mcp'
+    monkeypatch.setenv('MEMORY_SERVER_DATA_ROOT', str(root))
+    settings = Settings(
+        _env_file=None,
+        db_url=f'sqlite+aiosqlite:///{root / "memory.db"}',
+        lancedb_path=root / 'lancedb', graph_snapshot_path=root / 'graph.json',
+        vector_backend='lancedb',
+    )
+    monkeypatch.setattr(mcp_stdio, 'get_settings', lambda: settings)
+    report_type = runtime_module.ShutdownReport
+    internal = {}
+    original = runtime_module.CMMSRuntime._cleanup
+
+    async def capture(self, t0, *, rollback=False):
+        report = await original(self, t0, rollback=rollback)
+        internal[self.runtime_id] = report
+        return report
+
+    monkeypatch.setattr(runtime_module.CMMSRuntime, '_cleanup', capture)
+    runtimes = {}
+    for name in order:
+        runtimes[name] = (runtime(tmp_path / 'neutral') if name == 'neutral'
+                          else mcp_stdio.MCPComposition.create().runtime)
+    reports = {}
+    try:
+        for name in order:
+            await runtimes[name].start()
+        for name in reversed(order):
+            reports[name] = await runtimes[name].close()
+    finally:
+        for instance in runtimes.values():
+            await instance.close()
+    for name, count in (('neutral', 4), ('mcp', 5)):
+        report = reports[name]
+        assert report is internal[runtimes[name].runtime_id]
+        assert report.code is None and not report.lock_retained
+        deadlines = report.phases['deadlines']
+        t0 = report.phases['closing']
+        assert len(deadlines) == count
+        assert tuple(round(value - t0) for value in deadlines) == (
+            (10, 15, 25, 30) if name == 'neutral' else (0, 10, 15, 25, 30))
+    assert runtime_module.ShutdownReport is report_type
+
+
 async def test_s1_cooperative_drain_stops_at_ceiling_not_sleep(tmp_path):
     r, h, clock = await running(tmp_path)
     gate = asyncio.Event()

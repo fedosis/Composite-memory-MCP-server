@@ -230,6 +230,9 @@ class CMMSRuntime:
         self.runtime_id = uuid4().hex
         self.profile_id = profile_id or str(self.root)
         self.dependencies = dependencies or RuntimeDependencies()
+        self._report_factory = (
+            ShutdownReport if self.dependencies.report_factory is None else self.dependencies.report_factory
+        )
         self._acquire_lock = acquire_lock or RuntimeStorageLock.acquire_exclusive_async
         self._clock, self._sleep = clock, sleep
         self.state = "NEW"
@@ -681,7 +684,7 @@ class CMMSRuntime:
         if self.state == "CLOSED":
             return self._report
         if self.state == "NEW":
-            self.state, self._report = "CLOSED", ShutdownReport()
+            self.state, self._report = "CLOSED", self._report_factory()
             return self._report
         self._begin_close()
         return await asyncio.shield(self._cleanup_task)
@@ -733,7 +736,7 @@ class CMMSRuntime:
             raise
 
     async def _cleanup(self, t0: float, *, rollback: bool = False) -> ShutdownReport:
-        report = ShutdownReport(phases={"closing": t0, "deadlines": (t0 + 10, t0 + 15, t0 + 25, t0 + 30)})
+        report = self._report_factory(phases={"closing": t0, "deadlines": (t0 + 10, t0 + 15, t0 + 25, t0 + 30)})
         try:
             if not rollback and self._start_task is not None and not self._start_task.done():
                 self._start_task.cancel()
