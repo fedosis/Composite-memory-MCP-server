@@ -406,3 +406,112 @@ async def test_real_subprocess_contender_is_blocked_until_verified_release(tmp_p
     stdout, _ = contender.communicate(timeout=5)
     assert contender.returncode == 0 and "acquired" in stdout
     assert lock.stat().st_ino == before
+
+
+@pytest.mark.parametrize("shape", ["symlink", "hardlink"])
+@pytest.mark.parametrize(
+    "resource", ["sqlite", "-wal", "-shm", "-journal", "vector", "graph", "graph_lock", "root_lock"]
+)
+async def test_writable_resource_alias_still_rejected_before_factory(tmp_path, resource, shape):
+    root = tmp_path / "root"
+    root.mkdir()
+    value = layout(root, root / "db.sqlite")
+    value = replace(value, vector=replace(value.vector, kind="local", local_path=root / "vector"))
+    paths = {
+        "sqlite": value.sqlite.local_path,
+        "vector": value.vector.local_path,
+        "graph": value.graph_snapshot_path,
+        "graph_lock": value.graph_lock_path,
+        "root_lock": value.root_lock_path,
+        **{suffix: Path(str(value.sqlite.local_path) + suffix) for suffix in ("-wal", "-shm", "-journal")},
+    }
+    target = tmp_path / "external"
+    target.write_bytes(b"untouched")
+    path = paths[resource]
+    if shape == "symlink":
+        path.symlink_to(target)
+    else:
+        os.link(target, path)
+        assert path.lstat().st_nlink == 2
+    config = config_for(value)
+    descriptor = RuntimeDescriptor.from_layout("alias", layout=value, config=config)
+    calls = []
+    manager_a = manager(calls)
+    with pytest.raises(RuntimeManagerError) as caught:
+        await manager_a.get(descriptor, layout=value, config=config)
+    assert caught.value.code == "E_RUNTIME_RESOURCE_ALIAS"
+    assert calls == []
+    assert target.read_bytes() == b"untouched"
+    if resource != "root_lock":
+        assert not value.root_lock_path.exists()
+
+
+@pytest.mark.parametrize("projection", ["vector", "graph"])
+async def test_resolver_unavailable_projection_never_resolved_or_opened(tmp_path, monkeypatch, projection):
+    import builtins
+    import io
+
+    from memory_server.paths import StorageResolutionInputs, resolve_storage_layout
+    from memory_server.providers import graph_provider, lancedb_provider
+
+    home = tmp_path / "home"
+    root = home / "data"
+    root.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_bytes(b"untouched")
+    link = root / ("lancedb" if projection == "vector" else "graph.json")
+    link.symlink_to(external, target_is_directory=True)
+    value = resolve_storage_layout(StorageResolutionInputs(mode="profile", profile_home=home))
+    assert value.unavailable_projections == frozenset({projection})
+    assert f"legacy-split-layout:{projection}" in value.compatibility
+    config = replace(config_for(value), sqlite_url=value.sqlite.effective_url)
+    descriptor = RuntimeDescriptor.from_layout("degraded", layout=value, config=config)
+    blocked = [link, external]
+    if projection == "graph":
+        blocked.append(value.graph_lock_path)
+    accesses, constructors = [], []
+
+    def guard(original):
+        def checked(path, *args, **kwargs):
+            if isinstance(path, (str, bytes, os.PathLike)):
+                candidate = Path(os.path.abspath(os.fsdecode(path)))
+                if any(candidate == item or item in candidate.parents for item in blocked):
+                    accesses.append(candidate)
+                    raise AssertionError(f"unavailable projection resolved/opened: {candidate}")
+            return original(path, *args, **kwargs)
+        return checked
+
+    def forbidden_constructor(*args, **kwargs):
+        constructors.append((args, kwargs))
+        raise AssertionError("unavailable projection constructor called")
+
+    module, name = (lancedb_provider, "LanceDBProvider") if projection == "vector" else (graph_provider, "SimpleGraph")
+    monkeypatch.setattr(module, name, forbidden_constructor)
+    real_io_open = io.open
+    monkeypatch.setattr(builtins, "open", guard(builtins.open))
+    monkeypatch.setattr(io, "open", guard(io.open))
+    monkeypatch.setattr(os, "open", guard(os.open))
+    monkeypatch.setattr(Path, "resolve", guard(Path.resolve))
+
+    def build(value, **kwargs):
+        # Keep the unavailable projection's REAL recipe and real SQLite/lock.
+        other = "graph" if projection == "vector" else "vector"
+        return RuntimeFactory.create(value, overrides={"embedder": lambda _: None, other: lambda _: None}, **kwargs)
+
+    manager_a = RuntimeManager(factory_builder=build)
+    try:
+        runtime = await manager_a.get(descriptor, layout=value, config=config)
+        assert runtime.started
+        assert getattr(runtime.dependencies, projection) is None
+        assert runtime.dependencies.outbox_worker is None
+        assert await manager_a.get(descriptor, layout=value, config=config) is runtime
+    finally:
+        await manager_a.close_all()
+    assert accesses == []
+    assert constructors == []
+    # Use the saved reader only for post-shutdown sentinel inspection.
+    with real_io_open(sentinel, "rb") as stream:
+        assert stream.read() == b"untouched"
+    assert link.is_symlink()
