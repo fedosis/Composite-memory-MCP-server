@@ -1,11 +1,4 @@
-"""C10 I4-R0 lifecycle REDs and future-side characterization seams.
-
-The first two tests intentionally cross the real MCP stdio lifespan.  They are
-behavioral RED selectors against the immutable pre-C10 server; a collection or
-import error is not an acceptable result.  The remaining five tests are
-candidate-only assertions and are enabled only by the candidate-side
-C10_ENABLE_FUTURE_TESTS gate after I4-G.
-"""
+"""MCP lifecycle contracts over disposable storage, without an oracle harness."""
 from __future__ import annotations
 
 import asyncio
@@ -18,13 +11,7 @@ from pathlib import Path
 
 import pytest
 
-_REQUIRED_HARNESS_ENV = ('MEMORY_SERVER_DATA_ROOT', 'CMMS_C00_ORACLE')
-_MISSING_HARNESS_ENV = [key for key in _REQUIRED_HARNESS_ENV if not os.environ.get(key)]
-if _MISSING_HARNESS_ENV:
-    pytest.skip("requires harness environment variables: " + ", ".join(_MISSING_HARNESS_ENV), allow_module_level=True)
 
-ROOT = Path(os.environ["MEMORY_SERVER_DATA_ROOT"]).absolute().parent
-ORACLE = Path(os.environ["CMMS_C00_ORACLE"])
 def _python() -> str:
     """Resolve and probe the stdio interpreter, never silently skip a bad one."""
     configured = os.environ.get("CMMS_MCP_PYTHON", sys.executable)
@@ -69,15 +56,15 @@ def test_mcp_interpreter_rejects_unusable_override(tmp_path, monkeypatch, kind):
         _python()
 
 
-def _contained(path: Path) -> bool:
-    path, root = path.absolute(), ROOT
+def _contained(path: Path, root: Path) -> bool:
+    path = path.absolute()
     return path == root or root in path.parents
 
 
 def _env(root: Path) -> dict[str, str]:
     repo = Path(__file__).resolve().parents[1]
     values = {
-        "PATH": os.environ["PATH"], "PYTHONHASHSEED": "0", "LC_ALL": "C", "TZ": "UTC",
+        "PATH": os.environ["PATH"], "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C", "TZ": "UTC",
         "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
         "HOME": str(root / "home"), "HERMES_HOME": str(root / "hermes"), "TMPDIR": str(root / "tmp"),
         "PYTHONPATH": f"{repo / 'src'}:{repo}",
@@ -86,7 +73,6 @@ def _env(root: Path) -> dict[str, str]:
         "MEMORY_SERVER_LANCEDB_PATH": str(root / "data" / "lancedb"),
         "MEMORY_SERVER_GRAPH_SNAPSHOT_PATH": str(root / "data" / "graph.json"),
         "MEMORY_SERVER_VECTOR_BACKEND": "lancedb",
-        "CMMS_C00_ORACLE": str(ORACLE),
     }
     # Keep the spelling of the storage paths explicit and fail closed on an
     # accidental live-root substitution.
@@ -94,7 +80,7 @@ def _env(root: Path) -> dict[str, str]:
     for key in ("HOME", "HERMES_HOME", "TMPDIR", "MEMORY_SERVER_DATA_ROOT", "MEMORY_SERVER_LANCEDB_PATH"):
         Path(values[key]).mkdir(parents=True, exist_ok=True)
     Path(values["MEMORY_SERVER_GRAPH_SNAPSHOT_PATH"]).parent.mkdir(parents=True, exist_ok=True)
-    assert all(_contained(Path(values[key])) for key in ("HOME", "HERMES_HOME", "TMPDIR", "MEMORY_SERVER_DATA_ROOT", "MEMORY_SERVER_LANCEDB_PATH", "MEMORY_SERVER_GRAPH_SNAPSHOT_PATH"))
+    assert all(_contained(Path(values[key]), root) for key in ("HOME", "HERMES_HOME", "TMPDIR", "MEMORY_SERVER_DATA_ROOT", "MEMORY_SERVER_LANCEDB_PATH", "MEMORY_SERVER_GRAPH_SNAPSHOT_PATH"))
     return values
 
 
@@ -108,7 +94,7 @@ def _driver_env(root: Path, extra: dict[str, str] | None = None) -> dict[str, st
 @pytest.mark.asyncio
 async def test_mcp_exclusive_startup_blocks_l1_before_provider_construction(tmp_path):
     """Real L1 SH holder must block old MCP startup before SQLite construction."""
-    root = ROOT / "l1-red"
+    root = tmp_path / "l1-red"
     root.mkdir(parents=True, exist_ok=True)
     env = _driver_env(root)
     lock_root = root / "data"
@@ -161,7 +147,7 @@ server.mcp.run(transport='stdio')
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(contender.communicate(), timeout=15)
+        stdout, stderr = await asyncio.wait_for(contender.communicate(input=b""), timeout=15)
     finally:
         assert l1.stdin is not None
         l1.stdin.write(b"release\n")
@@ -189,9 +175,9 @@ server.mcp.run(transport='stdio')
 
 
 @pytest.mark.asyncio
-async def test_mcp_s1_trace_has_one_schedule_and_retains_uncertain_owner():
+async def test_mcp_s1_trace_has_one_schedule_and_retains_uncertain_owner(tmp_path):
     """Real stdio shutdown must expose one runtime S1 schedule and owner state."""
-    root = ROOT / "s1-red"
+    root = tmp_path / "s1-red"
     root.mkdir(parents=True, exist_ok=True)
     trace = root / "evidence" / "runtime-cleanup.json"
     trace.parent.mkdir(parents=True, exist_ok=True)
@@ -237,13 +223,6 @@ server.run()
         assert observed["lock_retained"] is False
 
 
-_FUTURE = pytest.mark.skipif(
-    os.environ.get("C10_ENABLE_FUTURE_TESTS") != "1",
-    reason="candidate-side assertion; enable only after I1-I3 and I4-G",
-)
-
-
-@_FUTURE
 def test_mcp_borrowed_sqlite_engine_is_closed_once_and_worker_is_not_closed():
     from memory_server.runtime.dependencies import CLOSE_ORDER
 
@@ -251,7 +230,6 @@ def test_mcp_borrowed_sqlite_engine_is_closed_once_and_worker_is_not_closed():
     assert "outbox_worker" not in CLOSE_ORDER
 
 
-@_FUTURE
 @pytest.mark.asyncio
 async def test_mcp_admission_errors_use_existing_fastmcp_channel():
     from memory_server import server
@@ -266,7 +244,6 @@ async def test_mcp_admission_errors_use_existing_fastmcp_channel():
     assert callable(CMMSRuntime.admit)
 
 
-@_FUTURE
 def test_mcp_graph_stdio_reaches_c07_graph_service():
     from memory_server import server
 
@@ -278,7 +255,6 @@ def test_mcp_graph_stdio_reaches_c07_graph_service():
     assert "router.query" not in source
 
 
-@_FUTURE
 def test_mcp_stdio_clean_shutdown_exits_zero_and_cli_smoke_is_unchanged():
     from memory_server import cli, server
 
@@ -287,17 +263,18 @@ def test_mcp_stdio_clean_shutdown_exits_zero_and_cli_smoke_is_unchanged():
     assert Path(cli.__file__).read_text(encoding="utf-8").count("from .server import run") == 1
 
 
-@_FUTURE
-def test_every_resolved_storage_lock_queue_and_stdio_path_is_inside_scratch():
-    assert _contained(ROOT)
-    assert _contained(Path(os.environ["TMPDIR"]))
-    assert _contained(Path(os.environ["HOME"]))
-    assert _contained(Path(os.environ["HERMES_HOME"]))
-    assert _contained(Path(os.environ["MEMORY_SERVER_DATA_ROOT"]))
-    assert _contained(Path(os.environ["MEMORY_SERVER_LANCEDB_PATH"]))
-    assert _contained(Path(os.environ["MEMORY_SERVER_GRAPH_SNAPSHOT_PATH"]))
-    assert Path("/home/shtorm/.hermes/data") not in ROOT.parents
-    assert Path("/home/shtorm/memory-server/data") not in ROOT.parents
+def test_every_resolved_storage_lock_queue_and_stdio_path_is_inside_scratch(tmp_path):
+    root = tmp_path / "contained"
+    env = _env(root)
+    assert _contained(root, root)
+    assert _contained(Path(env["TMPDIR"]), root)
+    assert _contained(Path(env["HOME"]), root)
+    assert _contained(Path(env["HERMES_HOME"]), root)
+    assert _contained(Path(env["MEMORY_SERVER_DATA_ROOT"]), root)
+    assert _contained(Path(env["MEMORY_SERVER_LANCEDB_PATH"]), root)
+    assert _contained(Path(env["MEMORY_SERVER_GRAPH_SNAPSHOT_PATH"]), root)
+    assert Path("/home/shtorm/.hermes/data") not in root.parents
+    assert Path("/home/shtorm/memory-server/data") not in root.parents
 
 
 
