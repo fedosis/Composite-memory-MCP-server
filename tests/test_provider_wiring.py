@@ -1655,219 +1655,233 @@ def test_shutdown_twice_harmless(tmp_path, monkeypatch):
     assert len([e for e in log if e[0] == "dispose"]) == 1
 
 
-@pytest.fixture
-def s1_server(synthetic_storage_env, monkeypatch):
-    from memory_server import server
-    monkeypatch.setattr(server, "get_settings", lambda: synthetic_storage_env.settings)
-    yield server
+def _composition_overrides():
+    def build_embedder(runtime):
+        return MockEmbeddingProvider(vector_size=runtime.config.vector_size)
+
+    return {"embedder": build_embedder}
 
 
-@pytest.mark.asyncio
-async def test_s1_standalone_lifespan_exception_closes_all_handles(s1_server, synthetic_storage_env):
-    server = s1_server
-    # Precreate a clean parent so the RED assertion exercises teardown itself.
-    (synthetic_storage_env.root / "data").mkdir()
-    vector = None
-    try:
-        with pytest.raises(RuntimeError, match="body-failure"):
-            async with server.lifespan(server.mcp):
-                layout = server._get_storage_layout()
-                assert layout.profile_home is None
-                assert layout.data_root == synthetic_storage_env.root
-                vector = server._lancedb
-                assert vector is not None
-                raise RuntimeError("body-failure")
-        assert server._root_lock is None
-        assert server._provider is None
-        assert server._outbox_task is None
-        assert server._lancedb is None
-    finally:
-        if server._outbox_task is not None:
-            server._outbox_task.cancel()
-            await asyncio.gather(server._outbox_task, return_exceptions=True)
-        if vector is not None:
-            await vector.close()
-        if server._provider is not None:
-            await server._provider.close()
-
-
-@pytest.mark.asyncio
-async def test_s1_standalone_lazy_provider_creates_validated_parent_and_holds_lock(s1_server, synthetic_storage_env):
-    from memory_server.storage_lock import MaintenanceStorageLocks, StorageLockError
-    server = s1_server
-    (synthetic_storage_env.root / "data").mkdir()
-    try:
-        async with server.lifespan(server.mcp):
-            provider = await server._get_provider()
-            assert provider._url == server._get_storage_layout().sqlite.effective_url
-            assert all((
-                provider.engine is not None, server._lancedb is not None,
-                server._graph is not None, server._outbox_worker is not None,
-            ))
-            with pytest.raises(StorageLockError):
-                MaintenanceStorageLocks.acquire([synthetic_storage_env.root], timeout=0)
-            assert server._root_lock is not None
-        assert all(
-            getattr(server, name) is None
-            for name in ("_provider", "_lancedb", "_graph", "_outbox_task", "_root_lock")
-        )
-    finally:
-        assert server._provider is None
-
-
-@pytest.mark.asyncio
-async def test_s1_standalone_vector_consumes_frozen_layout(s1_server, synthetic_storage_env, monkeypatch):
-    server = s1_server
-    frozen = server._get_storage_layout()
-    def forbid():
-        raise AssertionError("late Settings path read")
-    monkeypatch.setattr(server, "get_settings", forbid)
-    vector = await server._get_vector_provider()
-    try:
-        assert str(vector._db_path) == str(frozen.vector.local_path)
-    finally:
-        await vector.close()
-
-
-@pytest.mark.asyncio
-async def test_s1_standalone_graph_router_consumes_frozen_settings(s1_server, monkeypatch):
-    server = s1_server
-    frozen = server._get_storage_settings()
-
-    def forbid():
-        raise AssertionError("late Settings read")
-
-    monkeypatch.setattr(server, "get_settings", forbid)
-    router = await server._get_graph_router()
-    assert router._max_path_depth == frozen.graph_max_path_depth
-
-
-@pytest.mark.asyncio
-async def test_s3_07_server_projection_dispatch_returns_stable_error(monkeypatch):
-    import memory_server.server as server
-
+def _projection_failure(message="E_PROJECTION_UNAVAILABLE: vector requires migration"):
     async def unavailable(*args, **kwargs):
-        raise RuntimeError("E_PROJECTION_UNAVAILABLE: vector requires migration")
+        raise RuntimeError(message)
 
-    monkeypatch.setattr(server, "_get_router", unavailable)
-    result = json.loads(await server.semantic_search_tool(query="x"))
-    assert result == {
-        "error": "E_PROJECTION_UNAVAILABLE",
-        "message": "E_PROJECTION_UNAVAILABLE: vector requires migration",
-        "hint": server.PROJECTION_MIGRATION_HINT,
-    }
+    return unavailable
 
 
 @pytest.mark.asyncio
-async def test_s3_07_server_remember_degraded_skips_graph_lookup(monkeypatch):
-    """The server write boundary remains usable when graph projection is down."""
-    import memory_server.server as server
+async def test_s1_standalone_lifespan_exception_closes_all_handles(
+    seam02_composition, synthetic_storage_env, monkeypatch
+):
+    disposed = []
+    monkeypatch.setattr(AsyncEngine, "dispose", spy_engine_dispose(disposed))
+    composition = None
+    with pytest.raises(RuntimeError, match="body-failure"):
+        async with seam02_composition(overrides=_composition_overrides()) as composition:
+            assert composition.layout.profile_home is None
+            assert composition.layout.data_root.parent == synthetic_storage_env.root
+            assert composition.runtime.dependencies.vector is not None
+            raise RuntimeError("body-failure")
+    assert composition.runtime.state == "CLOSED"
+    assert composition.runtime.lock is None
+    assert composition.runtime.dependencies.sqlite.engine.pool.checkedout() == 0
+    assert [engine for event, engine in disposed if event == "dispose"] == [
+        composition.runtime.dependencies.sqlite.engine
+    ]
+    assert composition.worker_task.done()
+    assert composition.runtime.dependencies.vector._db is None
 
-    class _Dumpable:
-        def __init__(self, payload):
-            self.payload = payload
 
-        def model_dump(self, mode="json"):
-            return self.payload
+@pytest.mark.asyncio
+async def test_s1_standalone_lazy_provider_creates_validated_parent_and_holds_lock(
+    seam02_composition, synthetic_storage_env, monkeypatch
+):
+    disposed = []
+    monkeypatch.setattr(AsyncEngine, "dispose", spy_engine_dispose(disposed))
+    async with seam02_composition(overrides=_composition_overrides()) as composition:
+        dependencies = composition.runtime.dependencies
+        provider = dependencies.sqlite
+        assert provider._url == composition.layout.sqlite.effective_url
+        assert all((
+            provider.engine is not None,
+            dependencies.vector is not None,
+            dependencies.graph is not None,
+            dependencies.outbox_worker is not None,
+        ))
+        from memory_server.storage_lock import MaintenanceStorageLocks, StorageLockError
+        with pytest.raises(StorageLockError):
+            MaintenanceStorageLocks.acquire([composition.layout.data_root], timeout=0)
+        assert composition.runtime.lock is not None
+    assert composition.runtime.state == "CLOSED"
+    assert composition.runtime.lock is None
+    assert composition.runtime.dependencies.sqlite.engine.pool.checkedout() == 0
+    assert [engine for event, engine in disposed if event == "dispose"] == [
+        composition.runtime.dependencies.sqlite.engine
+    ]
+    assert composition.worker_task.done()
+    assert composition.runtime.dependencies.vector._db is None
 
-    called = {}
 
-    async def fake_provider():
-        return object()
+@pytest.mark.asyncio
+async def test_s1_standalone_vector_consumes_frozen_layout(seam02_composition, monkeypatch):
+    from memory_server.transports import mcp_stdio
 
-    async def graph_unavailable():
-        raise RuntimeError("E_PROJECTION_UNAVAILABLE: graph requires migration")
+    async with seam02_composition(overrides=_composition_overrides()) as composition:
+        frozen = composition.layout
+        def forbid():
+            raise AssertionError("late Settings path read")
+        with monkeypatch.context() as patch:
+            patch.setattr(mcp_stdio, "get_settings", forbid)
+            patch.setenv("MEMORY_SERVER_LANCEDB_PATH", "late-path-must-not-be-used")
+            vector = await mcp_stdio._get_vector_provider()
+            assert vector is composition.runtime.dependencies.vector
+            assert str(vector._db_path) == str(frozen.vector.local_path)
 
-    async def fake_remember(provider, **kwargs):
-        called.update(kwargs)
-        return {
-            "receipt": _Dumpable({"id": "receipt-1"}),
-            "fact": _Dumpable({"id": "fact-1", "subject": kwargs["subject"]}),
+
+@pytest.mark.asyncio
+async def test_s1_standalone_graph_router_consumes_frozen_settings(seam02_composition, monkeypatch):
+    from memory_server.transports import mcp_stdio
+
+    async with seam02_composition(overrides=_composition_overrides()) as composition:
+        frozen = composition.settings
+        def forbid():
+            raise AssertionError("late Settings read")
+        with monkeypatch.context() as patch:
+            patch.setattr(mcp_stdio, "get_settings", forbid)
+            patch.setenv("MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH", "99")
+            router = await mcp_stdio._get_graph_router()
+            assert router is composition.routers["graph_router"]
+            assert router._max_path_depth == frozen.graph_max_path_depth
+
+
+@pytest.mark.asyncio
+async def test_s3_07_server_projection_dispatch_returns_stable_error(seam02_composition, monkeypatch):
+    from memory_server.transports import mcp_stdio
+
+    async with seam02_composition(overrides=_composition_overrides()) as composition:
+        router = await composition.get_embedding_router()
+        monkeypatch.setattr(router, "route", _projection_failure())
+        result = json.loads(await mcp_stdio.semantic_search_tool(query="x"))
+        assert result == {
+            "error": "E_PROJECTION_UNAVAILABLE",
+            "message": "E_PROJECTION_UNAVAILABLE: vector requires migration",
+            "hint": mcp_stdio.PROJECTION_MIGRATION_HINT,
         }
 
-    monkeypatch.setattr(server, "_get_provider", fake_provider)
-    monkeypatch.setattr(server, "_get_graph_router", graph_unavailable)
-    monkeypatch.setattr(server, "remember_fn", fake_remember)
 
-    result = json.loads(await server.remember_tool(
-        subject="degraded", predicate="writes", object="safely"
-    ))
-    assert result["fact"]["subject"] == "degraded"
-    assert called["subject"] == "degraded"
-    assert "graph" not in called
+@pytest.mark.asyncio
+async def test_s3_07_server_remember_degraded_skips_graph_lookup(seam02_composition, monkeypatch):
+    """The server write boundary remains usable when graph projection is down."""
+    from memory_server.transports import mcp_stdio
+
+    from memory_server.application.memory_service import MemoryService
+
+    overrides = {**_composition_overrides(), "graph": lambda runtime: None}
+    async with seam02_composition(overrides=overrides) as composition:
+        assert composition.runtime.dependencies.graph is None
+        called = {}
+        remember = MemoryService.remember
+
+        async def recorder(self, command, **kwargs):
+            called.update(kwargs)
+            called["subject"] = command.subject
+            assert self.session_factory is composition.runtime.dependencies.sqlite._session_factory
+            return await remember(self, command, **kwargs)
+
+        monkeypatch.setattr(MemoryService, "remember", recorder)
+        result = json.loads(await mcp_stdio.remember_tool(
+            subject="degraded", predicate="writes", object="safely"
+        ))
+        assert result["fact"]["subject"] == "degraded"
+        assert result["fact"]["id"]
+        assert result["receipt"]["id"]
+        assert composition.runtime.dependencies.sqlite is not None
+        assert called["subject"] == "degraded"
+        assert called["graph"] is None
 
 
 @pytest.mark.asyncio
-async def test_s3_07_server_remember_normal_path_keeps_graph_sync(monkeypatch):
+async def test_s3_07_server_remember_normal_path_keeps_graph_sync(seam02_composition, monkeypatch):
     """The normal server path still passes the graph for inline compatibility."""
-    import memory_server.server as server
+    from memory_server.transports import mcp_stdio
+    from memory_server.application.memory_service import MemoryService
 
-    class _Dumpable:
-        def model_dump(self, mode="json"):
-            return {"id": "x"}
+    async with seam02_composition(overrides=_composition_overrides()) as composition:
+        graph = composition.runtime.dependencies.graph
+        called = {}
+        remember = MemoryService.remember
 
-    graph = object()
-    called = {}
+        async def recorder(self, command, **kwargs):
+            called.update(kwargs)
+            assert self.session_factory is composition.runtime.dependencies.sqlite._session_factory
+            return await remember(self, command, **kwargs)
 
-    async def fake_provider():
-        return object()
-
-    async def graph_available():
-        return type("Router", (), {"graph": graph})()
-
-    async def fake_remember(provider, **kwargs):
-        called.update(kwargs)
-        return {"receipt": _Dumpable(), "fact": _Dumpable()}
-
-    monkeypatch.setattr(server, "_get_provider", fake_provider)
-    monkeypatch.setattr(server, "_get_graph_router", graph_available)
-    monkeypatch.setattr(server, "remember_fn", fake_remember)
-    await server.remember_tool(subject="normal", predicate="keeps", object="graph")
-    assert called["graph"] is graph
+        monkeypatch.setattr(MemoryService, "remember", recorder)
+        result = json.loads(await mcp_stdio.remember_tool(
+            subject="normal", predicate="keeps", object="graph"
+        ))
+        assert result["fact"]["subject"] == "normal"
+        assert called["graph"] is graph
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tool_name,args,dependency",
     [
-        ("add_relation_tool", {"source_id": "a", "target_id": "b", "relation_type": "supports"}, "_get_graph_router"),
-        ("invalidate_tool", {"memory_id": "m", "memory_type": "fact", "reason": "test"}, "_get_lifecycle_service"),
-        ("route_tool", {"query": "x"}, "_get_hybrid_router"),
-        ("audit_tool", {}, "_build_auditor"),
-        ("set_belief_tool", {"proposition": "x"}, "_get_provider"),
-        ("resolve_conflict_tool", {"belief_a_id": "a", "belief_b_id": "b", "resolution": "keep_a"}, "_get_provider"),
+        ("add_relation_tool", {"source_id": "a", "target_id": "b", "relation_type": "supports"}, "graph_router"),
+        ("invalidate_tool", {"memory_id": "m", "memory_type": "fact", "reason": "test"}, "lifecycle"),
+        ("route_tool", {"query": "x"}, "hybrid_router"),
+        ("audit_tool", {}, "audit"),
+        ("set_belief_tool", {"proposition": "x"}, "sqlite"),
+        ("resolve_conflict_tool", {"belief_a_id": "a", "belief_b_id": "b", "resolution": "keep_a"}, "graph"),
     ],
     ids=["add_relation", "invalidate", "route", "audit", "set_belief", "resolve_conflict"],
 )
 async def test_s3_07_server_projection_tool_returns_stable_error(
-    monkeypatch, tool_name, args, dependency
+    seam02_composition, tool_name, args, dependency, monkeypatch
 ):
-    import memory_server.server as server
+    from memory_server.transports import mcp_stdio
 
-    async def unavailable(*args, **kwargs):
-        raise RuntimeError("E_PROJECTION_UNAVAILABLE: vector requires migration")
+    async with seam02_composition(overrides=_composition_overrides()) as composition:
+        failure = _projection_failure()
+        if dependency == "graph_router":
+            def unavailable_node(*args, **kwargs):
+                raise RuntimeError("E_PROJECTION_UNAVAILABLE: vector requires migration")
+            monkeypatch.setattr(composition.runtime.dependencies.graph, "get_node", unavailable_node)
+        elif dependency == "graph":
+            monkeypatch.setattr(composition.runtime.dependencies.sqlite, "get_belief", failure)
+        elif dependency == "hybrid_router":
+            router = await composition.get_hybrid_router()
+            monkeypatch.setattr(router, "route", failure)
+        elif dependency == "lifecycle":
+            monkeypatch.setattr(composition.app.lifecycle, "transition", failure)
+        elif dependency == "audit":
+            monkeypatch.setattr(composition.app.audit, "audit", failure)
+        else:
+            provider = composition.runtime.dependencies.sqlite
 
-    monkeypatch.setattr(server, dependency, unavailable)
-    result = json.loads(await getattr(server, tool_name)(**args))
-    assert result == {
-        "error": "E_PROJECTION_UNAVAILABLE",
-        "message": "E_PROJECTION_UNAVAILABLE: vector requires migration",
-        "hint": server.PROJECTION_MIGRATION_HINT,
-    }
-    assert result not in (None, [], "")
+            async def unavailable(*args, **kwargs):
+                raise RuntimeError("E_PROJECTION_UNAVAILABLE: vector requires migration")
+
+            monkeypatch.setattr(provider, "_get_session", unavailable)
+        result = json.loads(await getattr(mcp_stdio, tool_name)(**args))
+        assert result == {
+            "error": "E_PROJECTION_UNAVAILABLE",
+            "message": "E_PROJECTION_UNAVAILABLE: vector requires migration",
+            "hint": mcp_stdio.PROJECTION_MIGRATION_HINT,
+        }
+        assert result not in (None, [], "")
 
 
 @pytest.mark.asyncio
-async def test_s3_07_server_projection_mapping_reraises_non_projection(monkeypatch):
-    import memory_server.server as server
+async def test_s3_07_server_projection_mapping_reraises_non_projection(seam02_composition, monkeypatch):
+    from memory_server.transports import mcp_stdio
 
-    async def broken(*args, **kwargs):
-        raise RuntimeError("ordinary failure")
-
-    monkeypatch.setattr(server, "_get_router", broken)
-    with pytest.raises(RuntimeError, match="ordinary failure"):
-        await server.semantic_search_tool(query="x")
-
+    async with seam02_composition(overrides=_composition_overrides()) as composition:
+        router = await composition.get_embedding_router()
+        monkeypatch.setattr(router, "route", _projection_failure("ordinary failure"))
+        with pytest.raises(RuntimeError, match="ordinary failure"):
+            await mcp_stdio.semantic_search_tool(query="x")
 
 
 def test_real_provider_wiring_reaches_layout_sqlite_writer_and_outbox(synthetic_storage_env):
