@@ -103,6 +103,19 @@ def _lexical(path: Path) -> Path:
 
 
 def _resource_paths(layout: Any) -> tuple[Path, ...]:
+    """Reserve only writable/to-be-opened resources, from resolver evidence.
+
+    paths.store marks a linked projection with BOTH of these frozen facts;
+    the factory's graph/vector recipes leave that projection unopened. Neither
+    a path spelling nor a compatibility warning alone grants an exemption.
+    Root, SQLite (including sidecars), and root lock are always guarded.
+    """
+    unavailable = getattr(layout, "unavailable_projections", ()) or ()
+    compatibility = getattr(layout, "compatibility", ()) or ()
+    unopened = {
+        label for label in ("vector", "graph")
+        if label in unavailable and f"legacy-split-layout:{label}" in compatibility
+    }
     paths: list[Path] = []
     root = getattr(layout, "data_root", None)
     if root is not None:
@@ -114,9 +127,12 @@ def _resource_paths(layout: Any) -> tuple[Path, ...]:
         paths.extend(_lexical(Path(str(sqlite_path) + suffix)) for suffix in ("-wal", "-shm", "-journal"))
     vector = getattr(layout, "vector", None)
     vector_path = getattr(vector, "local_path", None)
-    if vector_path is not None:
+    if vector_path is not None and "vector" not in unopened:
         paths.append(_lexical(vector_path))
-    for name in ("graph_snapshot_path", "graph_lock_path", "root_lock_path"):
+    names = ["root_lock_path"]
+    if "graph" not in unopened:
+        names.extend(("graph_snapshot_path", "graph_lock_path"))
+    for name in names:
         path = getattr(layout, name, None)
         if path is not None:
             paths.append(_lexical(path))
