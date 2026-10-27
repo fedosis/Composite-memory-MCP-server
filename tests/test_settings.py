@@ -27,6 +27,20 @@ from memory_server.settings import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+
+@pytest.fixture(autouse=True)
+def _isolated_settings_environment(monkeypatch, tmp_path):
+    """Defaults/precedence cases must not inherit the outer gate's store pins."""
+    for name in tuple(os.environ):
+        if name.startswith("MEMORY_SERVER_") or name in (
+            "MEMORY_VECTOR_BACKEND", "MEMORY_GRAPH_SNAPSHOT_PATH", "MEMORY_QDRANT_URL"
+        ):
+            monkeypatch.delenv(name)
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
 # ---------------------------------------------------------------------------
 # Frozen inventory — amended per plan_review (+embedding_provider,
 # +openai_embedding_vector_size). Asserted set-equal to Settings.model_fields
@@ -636,97 +650,82 @@ class TestConstructorCompat:
 # ---------------------------------------------------------------------------
 
 
-def _reset_server_singletons():
-    import memory_server.server as server_module
-
-    server_module._provider = None
-    server_module._qdrant = None
-    server_module._lancedb = None
-    server_module._embedder = None
-    server_module._router = None
-    server_module._graph = None
-    server_module._graph_router = None
-    server_module._hybrid_router = None
-    server_module._outbox_worker = None
-    server_module._outbox_task = None
-    server_module._storage_settings = None
-    server_module._storage_layout = None
-    server_module._root_lock = None
-    server_module._storage_cleanup_failed = False
+QDRANT_LOCALHOST_ENV = {
+    "MEMORY_SERVER_VECTOR_BACKEND": "qdrant",
+    "MEMORY_SERVER_QDRANT_LOCATION": "localhost",
+    "MEMORY_SERVER_QDRANT_PORT": "6334",
+    "MEMORY_SERVER_QDRANT_PREFER_GRPC": "true",
+    "MEMORY_SERVER_VECTOR_COLLECTION": "col-q",
+    "MEMORY_SERVER_VECTOR_SIZE": "256",
+    "MEMORY_SERVER_VECTOR_METRIC": "cosine",
+}
 
 
 class TestServerWiring:
-    @pytest.fixture(autouse=True)
-    def _isolate_server_data(self, tmp_path, monkeypatch):
-        """Keep server wiring tests off the repo's real data files."""
-        monkeypatch.setenv(
-            "MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///:memory:"
-        )
-        monkeypatch.setenv(
-            "MEMORY_SERVER_GRAPH_SNAPSHOT_PATH", str(tmp_path / "graph.json")
-        )
-        monkeypatch.setenv(
-            "MEMORY_SERVER_LANCEDB_PATH", str(tmp_path / "lancedb")
-        )
-        get_settings.cache_clear()
-        _reset_server_singletons()
-        yield
-        _reset_server_singletons()
-
-    def test_db_url_env_override(self, monkeypatch):
-        import memory_server.server as server_module
-
-        monkeypatch.setenv(
-            "MEMORY_SERVER_DB_URL", "sqlite+aiosqlite:///custom.db"
-        )
-        get_settings.cache_clear()
-        layout = server_module._get_storage_layout()
-        assert layout.sqlite.configured_url == "sqlite+aiosqlite:///custom.db"
-        assert layout.sqlite.effective_url.endswith("/custom.db")
-
-    def test_graph_snapshot_path_env_override(self, monkeypatch, tmp_path):
-        import memory_server.server as server_module
-
-        expected = tmp_path / "snapshots" / "graph.json"
-        monkeypatch.setenv("MEMORY_SERVER_GRAPH_SNAPSHOT_PATH", str(expected))
-        get_settings.cache_clear()
-        assert server_module._get_graph_snapshot_path() == expected
+    @pytest.mark.asyncio
+    async def test_db_url_env_override(self, seam02_composition):
+        async with seam02_composition(
+            env={"MEMORY_SERVER_DB_URL": "sqlite+aiosqlite:///custom.db"}
+        ) as composition:
+            layout = composition.layout
+            assert layout.sqlite.configured_url == "sqlite+aiosqlite:///custom.db"
+            assert layout.sqlite.effective_url.endswith("/custom.db")
 
     @pytest.mark.asyncio
-    async def test_lancedb_constructor_args_follow_settings(self, monkeypatch):
-        import memory_server.server as server_module
-
-        monkeypatch.setenv("MEMORY_SERVER_VECTOR_COLLECTION", "col-x")
-        monkeypatch.setenv("MEMORY_SERVER_VECTOR_METRIC", "dot")
-        monkeypatch.setenv("MEMORY_SERVER_VECTOR_SIZE", "512")
-        get_settings.cache_clear()
-
-        provider = await server_module._get_lancedb_provider()
-        assert provider._table_name == "col-x"
-        assert provider._vector_size == 512
-        assert provider._metric == "dot"
+    async def test_graph_snapshot_path_env_override(self, seam02_composition, tmp_path):
+        expected = tmp_path / "composition-0/data/snapshots/graph.json"
+        async with seam02_composition(
+            env={"MEMORY_SERVER_GRAPH_SNAPSHOT_PATH": str(expected)}
+        ) as composition:
+            layout = composition.layout
+            assert layout.graph_snapshot_path == expected
 
     @pytest.mark.asyncio
-    async def test_qdrant_constructor_args_follow_settings(self, monkeypatch):
+    async def test_lancedb_constructor_args_follow_settings(self, seam02_composition):
+        async with seam02_composition(
+            env={
+                "MEMORY_SERVER_VECTOR_COLLECTION": "col-x",
+                "MEMORY_SERVER_VECTOR_METRIC": "dot",
+                "MEMORY_SERVER_VECTOR_SIZE": "512",
+            }
+        ) as composition:
+            provider = composition.runtime.dependencies.vector
+            assert provider._table_name == "col-x"
+            assert provider._vector_size == 512
+            assert provider._metric == "dot"
+
+    @pytest.mark.asyncio
+    async def test_qdrant_constructor_args_follow_settings(self, tmp_path, monkeypatch):
         import memory_server.providers.qdrant_provider as qdrant_module
-        import memory_server.server as server_module
+        from memory_server.paths import StorageResolutionInputs, resolve_storage_layout
+        from memory_server.runtime.runtime_factory import RuntimeFactory
+        from memory_server.settings import Settings
 
         captured: dict[str, object] = {}
-
-        class FakeQdrant:
+        # The production recipe is the subject, not a running localhost service.
+        class SpyQdrant:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
-        monkeypatch.setattr(qdrant_module, "QdrantProvider", FakeQdrant)
-        monkeypatch.setenv("MEMORY_SERVER_QDRANT_LOCATION", "localhost")
-        monkeypatch.setenv("MEMORY_SERVER_QDRANT_PORT", "6334")
-        monkeypatch.setenv("MEMORY_SERVER_QDRANT_PREFER_GRPC", "true")
-        monkeypatch.setenv("MEMORY_SERVER_VECTOR_COLLECTION", "col-q")
-        monkeypatch.setenv("MEMORY_SERVER_VECTOR_SIZE", "256")
-        monkeypatch.setenv("MEMORY_SERVER_VECTOR_METRIC", "cosine")
-        get_settings.cache_clear()
-
-        await server_module._get_qdrant_provider()
+        monkeypatch.setattr(qdrant_module, "QdrantProvider", SpyQdrant)
+        for name, value in QDRANT_LOCALHOST_ENV.items():
+            monkeypatch.setenv(name, value)
+        settings = Settings(_env_file=None)
+        root = tmp_path / "constructor"
+        (root / "data").mkdir(parents=True)
+        layout = resolve_storage_layout(StorageResolutionInputs(
+            mode="standalone", data_root=str(root),
+            sqlite_url=settings.db_url, vector_backend=settings.vector_backend,
+            lancedb_path=str(root / "data/lancedb"),
+            graph_snapshot_path=str(root / "data/graph.json"),
+            qdrant_location=settings.qdrant_location,
+            vector_collection=settings.vector_collection,
+        ))
+        factory = RuntimeFactory.create(layout, settings=settings)
+        vector_recipe = dict(factory.runtime.dependencies.recipes)["vector"]
+        vector = await vector_recipe(factory.runtime)
+        assert isinstance(vector, SpyQdrant)
+        assert factory.built == (("vector", vector),)
         assert captured["location"] == "localhost"
         assert captured["port"] == 6334
         assert captured["prefer_grpc"] is True
@@ -734,94 +733,83 @@ class TestServerWiring:
         assert captured["vector_size"] == 256
         assert captured["distance"] == "cosine"
 
-    def test_embedder_sentence_branch_passes_settings(self, monkeypatch):
-        import memory_server.server as server_module
+    @pytest.mark.asyncio
+    async def test_qdrant_localhost_refuses_real_lifespan(self, seam02_composition):
+        from memory_server.paths import StorageLayoutError
 
-        monkeypatch.setenv("MEMORY_SERVER_EMBEDDING_MODEL", "m1")
-        monkeypatch.setenv("MEMORY_SERVER_EMBEDDING_BATCH_SIZE", "8")
-        get_settings.cache_clear()
+        with pytest.raises(StorageLayoutError) as caught:
+            async with seam02_composition(env=QDRANT_LOCALHOST_ENV):
+                pass
+        assert caught.value.code == "E_QDRANT_REMOTE_NAMESPACE_UNCONFIRMED"
 
+    @pytest.mark.asyncio
+    async def test_embedder_sentence_branch_passes_settings(self, seam02_composition):
         from memory_server.providers.embedding_provider import (
             SentenceTransformerEmbeddingProvider,
         )
+        async with seam02_composition(env={
+            "MEMORY_SERVER_EMBEDDING_MODEL": "m1",
+            "MEMORY_SERVER_EMBEDDING_BATCH_SIZE": "8",
+        }) as composition:
+            embedder = composition.runtime.dependencies.embedder
+            assert isinstance(embedder, SentenceTransformerEmbeddingProvider)
+            assert embedder._model_name == "m1"
+            assert embedder._batch_size == 8
 
-        embedder = server_module._build_embedder()
-        assert isinstance(embedder, SentenceTransformerEmbeddingProvider)
-        assert embedder._model_name == "m1"
-        assert embedder._batch_size == 8
-
-    def test_embedder_openai_branch_selected_by_env(self, monkeypatch):
-        import memory_server.server as server_module
-
-        monkeypatch.setenv("MEMORY_SERVER_EMBEDDING_PROVIDER", "openai")
-        monkeypatch.setenv("MEMORY_SERVER_OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
-        monkeypatch.setenv("MEMORY_SERVER_OPENAI_EMBEDDING_VECTOR_SIZE", "768")
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-        get_settings.cache_clear()
-
+    @pytest.mark.asyncio
+    async def test_embedder_openai_branch_selected_by_env(self, seam02_composition):
         from memory_server.providers.embedding_provider import OpenAIEmbeddingProvider
-
-        embedder = server_module._build_embedder()
-        assert isinstance(embedder, OpenAIEmbeddingProvider)
-        assert embedder._model == "text-embedding-3-large"
-        assert embedder._vector_size == 768
-        assert embedder._api_key == "sk-test"
-
-    @pytest.mark.asyncio
-    async def test_outbox_worker_kwargs_follow_settings(self, monkeypatch):
-        import memory_server.server as server_module
-
-        captured: dict[str, object] = {}
-
-        class FakeOutboxWorker:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-            async def initialize(self):
-                pass
-
-        monkeypatch.setattr(server_module, "OutboxWorker", FakeOutboxWorker)
-        monkeypatch.setenv("MEMORY_SERVER_OUTBOX_MAX_RETRIES", "5")
-        monkeypatch.setenv("MEMORY_SERVER_OUTBOX_POLL_INTERVAL_SECONDS", "2.5")
-        monkeypatch.setenv("MEMORY_SERVER_OUTBOX_POLL_BATCH_SIZE", "77")
-        monkeypatch.setenv("MEMORY_SERVER_OUTBOX_FACT_BATCH_CHUNK_SIZE", "11")
-        monkeypatch.setenv("MEMORY_SERVER_OUTBOX_COMPACT_INTERVAL_SECONDS", "3600")
-        monkeypatch.setenv("MEMORY_SERVER_OUTBOX_COMPACT_CLEANUP_HOURS", "2")
-        monkeypatch.setenv("MEMORY_SERVER_OUTBOX_STALE_PROCESSING_SECONDS", "900")
-        monkeypatch.setenv("MEMORY_SERVER_OUTBOX_PROCESS_PENDING_LIMIT", "99")
-        monkeypatch.setenv("MEMORY_SERVER_SQLITE_BUSY_TIMEOUT_MS", "9000")
-        get_settings.cache_clear()
-
-        await server_module._get_outbox_worker()
-        assert captured["max_retries"] == 5
-        assert captured["poll_interval_seconds"] == 2.5
-        assert captured["poll_batch_size"] == 77
-        assert captured["fact_batch_chunk_size"] == 11
-        assert captured["compact_interval_seconds"] == 3600
-        assert captured["compact_cleanup_hours"] == 2
-        assert captured["stale_processing_seconds"] == 900
-        assert captured["process_pending_limit"] == 99
-        assert captured["busy_timeout_ms"] == 9000
+        async with seam02_composition(env={
+            "MEMORY_SERVER_EMBEDDING_PROVIDER": "openai",
+            "MEMORY_SERVER_OPENAI_EMBEDDING_MODEL": "text-embedding-3-large",
+            "MEMORY_SERVER_OPENAI_EMBEDDING_VECTOR_SIZE": "768",
+            "OPENAI_API_KEY": "sk-test",
+        }) as composition:
+            embedder = composition.runtime.dependencies.embedder
+            assert isinstance(embedder, OpenAIEmbeddingProvider)
+            assert embedder._model == "text-embedding-3-large"
+            assert embedder._vector_size == 768
+            assert embedder._api_key == "sk-test"
 
     @pytest.mark.asyncio
-    async def test_graph_router_depth_follows_settings(self, monkeypatch):
-        import memory_server.server as server_module
-
-        monkeypatch.setenv("MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH", "9")
-        get_settings.cache_clear()
-
-        router = await server_module._get_graph_router()
-        assert router._max_path_depth == 9
+    async def test_outbox_worker_kwargs_follow_settings(self, seam02_composition):
+        env = {
+            "MEMORY_SERVER_OUTBOX_MAX_RETRIES": "5",
+            "MEMORY_SERVER_OUTBOX_POLL_INTERVAL_SECONDS": "2.5",
+            "MEMORY_SERVER_OUTBOX_POLL_BATCH_SIZE": "77",
+            "MEMORY_SERVER_OUTBOX_FACT_BATCH_CHUNK_SIZE": "11",
+            "MEMORY_SERVER_OUTBOX_COMPACT_INTERVAL_SECONDS": "3600",
+            "MEMORY_SERVER_OUTBOX_COMPACT_CLEANUP_HOURS": "2",
+            "MEMORY_SERVER_OUTBOX_STALE_PROCESSING_SECONDS": "900",
+            "MEMORY_SERVER_OUTBOX_PROCESS_PENDING_LIMIT": "99",
+            "MEMORY_SERVER_SQLITE_BUSY_TIMEOUT_MS": "9000",
+        }
+        async with seam02_composition(env=env) as composition:
+            worker = composition.runtime.dependencies.outbox_worker
+            assert worker._max_retries == 5
+            assert worker._poll_interval_seconds == 2.5
+            assert worker._poll_batch_size == 77
+            assert worker._fact_batch_chunk_size == 11
+            assert worker._compact_interval_seconds == 3600
+            assert worker._compact_cleanup_hours == 2
+            assert worker._stale_processing_seconds == 900
+            assert worker._process_pending_limit == 99
+            assert worker._busy_timeout_ms == 9000
 
     @pytest.mark.asyncio
-    async def test_graph_search_fn_path_depth_follows_env_override(self, monkeypatch):
+    async def test_graph_router_depth_follows_settings(self, seam02_composition):
+        async with seam02_composition(env={"MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH": "9"}) as composition:
+            assert composition.routers["graph_router"]._max_path_depth == 9
+
+    @pytest.mark.asyncio
+    async def test_graph_search_fn_path_depth_follows_env_override(self, seam02_composition):
         """Behavior-level regression for review finding #1: the server
         ``graph_search`` tool must pathfind with the env-overridden depth, not a
         hardcoded literal 4. A 6-node chain (5 edges) is unreachable at the
         default depth 4 but reachable with MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH=9.
         """
-        import memory_server.server as server_module
         from memory_server.providers.graph_provider import SimpleGraph
+        from memory_server.transports import mcp_stdio
 
         graph = SimpleGraph()
         for i in range(6):
@@ -829,75 +817,49 @@ class TestServerWiring:
         for i in range(5):
             graph.add_edge(source_id=f"n{i}", target_id=f"n{i + 1}", relation="next")
 
-        async def _fake_get_graph():
-            return graph
-
-        monkeypatch.setattr(server_module, "_get_graph", _fake_get_graph)
-        monkeypatch.setattr(server_module, "_graph", None)
-        monkeypatch.setattr(server_module, "_graph_router", None)
-
-        # Default depth (4) cannot reach the 5-edge target.
-        get_settings.cache_clear()
-        result = json.loads(
-            await server_module.graph_search_fn(source_id="n0", target_id="n5")
-        )
-        assert result["paths"] == []
-
-        # Env override (9) reaches it through the same production function.
-        monkeypatch.setenv("MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH", "9")
-        get_settings.cache_clear()
-        monkeypatch.setattr(server_module, "_graph_router", None)
-        result = json.loads(
-            await server_module.graph_search_fn(source_id="n0", target_id="n5")
-        )
-        assert result["paths"], "graph_search must find the 5-edge path under the env override"
-        assert result["paths"][0][-1]["id"] == "n5"
+        async with seam02_composition(
+            env={"MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH": "4"},
+            overrides={"graph": lambda runtime: graph}
+        ) as composition:
+            result = json.loads(await mcp_stdio.graph_search_fn(
+                source_id="n0", target_id="n5"
+            ))
+            assert result["paths"] == []
+        async with seam02_composition(
+            env={"MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH": "9"},
+            overrides={"graph": lambda runtime: graph},
+        ) as composition:
+            result = json.loads(await mcp_stdio.graph_search_fn(
+                source_id="n0", target_id="n5"
+            ))
+            assert result["paths"], "graph_search must find the 5-edge path under the env override"
+            assert result["paths"][0][-1]["id"] == "n5"
 
     @pytest.mark.asyncio
-    async def test_sqlite_provider_constructor_follows_settings(self, monkeypatch):
-        """The server SQLiteProvider singleton receives the Settings-configured
-        busy timeout (review finding #2)."""
-        import memory_server.server as server_module
+    async def test_sqlite_provider_constructor_follows_settings(self, seam02_composition):
+        async with seam02_composition(
+            env={"MEMORY_SERVER_SQLITE_BUSY_TIMEOUT_MS": "9000"}
+        ) as composition:
+            assert composition.runtime.dependencies.sqlite._busy_timeout_ms == 9000
 
-        captured: dict[str, object] = {}
-
-        class FakeProvider:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-            async def initialize(self):
-                pass
-
-        monkeypatch.setattr(server_module, "SQLiteProvider", FakeProvider)
-        monkeypatch.setenv("MEMORY_SERVER_SQLITE_BUSY_TIMEOUT_MS", "9000")
-        get_settings.cache_clear()
-
-        await server_module._get_provider()
-        assert captured["busy_timeout_ms"] == 9000
-
-    def test_hybrid_internal_graph_router_keeps_default_depth(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_hybrid_internal_graph_router_keeps_default_depth(self, seam02_composition):
         """Documented Card 1 exception (SPEC acceptance 7): HybridRouter's
         internal GraphRouter keeps max_path_depth=4 even when the Settings
         override is set; direct constructions DO change."""
-        from memory_server.providers.embedding_provider import MockEmbeddingProvider
-        from memory_server.providers.graph_provider import SimpleGraph
-        from memory_server.providers.lancedb_provider import LanceDBProvider
-        from memory_server.router.hybrid_router import HybridRouter
-
-        monkeypatch.setenv("MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH", "9")
-        get_settings.cache_clear()
-
-        hybrid = HybridRouter(
-            vector_provider=LanceDBProvider(db_path=str(tmp_path / "h")),
-            embedder=MockEmbeddingProvider(),
-            graph=SimpleGraph(),
-        )
-        assert hybrid._graph_router._max_path_depth == 4
+        async with seam02_composition(
+            env={"MEMORY_SERVER_GRAPH_MAX_PATH_DEPTH": "9"}
+        ) as composition:
+            hybrid = await composition.get_hybrid_router()
+            assert hybrid._graph_router._max_path_depth == 4
 
         # Sanity: the direct construction path DOES change.
+        from memory_server.providers.graph_provider import SimpleGraph
         from memory_server.router.graph_router import GraphRouter
 
-        direct = GraphRouter(graph=SimpleGraph(), max_path_depth=get_settings().graph_max_path_depth)
+        direct = GraphRouter(
+            graph=SimpleGraph(), max_path_depth=composition.settings.graph_max_path_depth
+        )
         assert direct._max_path_depth == 9
 
 
