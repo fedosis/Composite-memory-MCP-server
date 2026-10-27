@@ -418,11 +418,20 @@ class TestReflectConfidence:
 
 
 @pytest.fixture
-async def provider():
+async def provider(request):
+    if request.node.name.startswith("test_mcp_tool_"):
+        compose = request.getfixturevalue("seam02_composition")
+        async with compose() as composition:
+            p = composition.runtime.dependencies.sqlite
+            assert composition.app.reflection._engine._provider is p
+            yield p
+        return
     p = SQLiteProvider(url="sqlite+aiosqlite:///:memory:")
     await p.initialize()
-    yield p
-    await p.close()
+    try:
+        yield p
+    finally:
+        await p.close()
 
 
 @pytest.mark.asyncio
@@ -677,7 +686,7 @@ class TestReflectMToolEdgeCases:
         assert result["beliefs"][0]["evidence_count"] == 2
 
     async def test_mcp_tool_json_output(self, provider):
-        """Verify the MCP tool returns valid JSON (mocked server call)."""
+        """Verify JSON through the real MCP composition and its SQLite provider."""
         from memory_server.server import reflect_tool
         result_str = await reflect_tool(mode="overview")
         data = json.loads(result_str)
