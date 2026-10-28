@@ -218,6 +218,34 @@ class ControlStore:
             raise ControlError("E_PROFILE_NOT_FOUND")
         return self._record(row)
 
+    def _page(
+        self, scope: tuple[str, ...], *, limit: int, after: str | None, upper: str | None
+    ) -> tuple[tuple[ProfileRecord, ...], str | None]:
+        connection = self._connection
+        if connection is None:
+            raise ControlError("E_STORAGE")
+        placeholders = ",".join("?" for _ in scope) or "NULL"
+        try:
+            # Deferred/read transaction: upper and rows use the same snapshot.
+            connection.execute("BEGIN")
+            try:
+                if upper is None:
+                    row = connection.execute(
+                        f"SELECT id FROM profiles WHERE id IN ({placeholders}) ORDER BY id DESC LIMIT 1", scope
+                    ).fetchone()
+                    upper = row[0] if row else None
+                rows = connection.execute(
+                    f"SELECT * FROM profiles WHERE id IN ({placeholders}) AND id>? AND id<=? ORDER BY id LIMIT ?",
+                    (*scope, after or "", upper or "", limit + 1),
+                ).fetchall()
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        except sqlite3.Error:
+            raise ControlError("E_STORAGE") from None
+        return tuple(self._record(row) for row in rows[:limit]), upper
+
     def _mutate(
         self,
         profile_id: str,

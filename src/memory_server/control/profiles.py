@@ -165,6 +165,35 @@ class ProfileRegistry:
             self._store._get(profile_id) for profile_id in sorted(self._bindings) if profile_id in principal.profiles
         )
 
+    def _profile(self, record: ProfileRecord) -> d.Profile:
+        return d.Profile(
+            id=record.id, display_name=record.display_name, description=record.description,
+            enabled=record.enabled, generation=record.generation, runtime_state="not_started",
+            capabilities=self._bindings[record.id].profile.capabilities, storage_root=None,
+        )
+
+    async def page(
+        self, principal: Principal, *, limit: int, after: str | None, upper: str | None
+    ) -> tuple[tuple[d.Profile, ...], str | None]:
+        if "profile.read" not in principal.permissions:
+            raise ControlError("E_PERMISSION_DENIED")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ControlError("E_VALIDATION")
+        for position in (after, upper):
+            if position is not None:
+                _validate_id(position)
+        if after is not None and (upper is None or after > upper):
+            raise ControlError("E_VALIDATION")
+        scope = tuple(sorted(set(self._bindings) & principal.profiles))
+        records, bound = self._store._page(scope, limit=limit, after=after, upper=upper)
+        return tuple(self._profile(record) for record in records), bound
+
+    async def record(self, principal: Principal, profile_id: str, *, permission: d.Permission) -> ProfileRecord:
+        if permission not in {"profile.read", "profile.manage"}:
+            raise ControlError("E_VALIDATION")
+        self._authorise(principal, profile_id, permission)
+        return self._store._get(profile_id)
+
     async def set_enabled(
         self, principal: Principal, profile_id: str, *, enabled: bool, expected_generation: int | None
     ) -> ProfileRecord:

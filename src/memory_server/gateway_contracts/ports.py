@@ -124,6 +124,10 @@ class ContractCatalog(Protocol):
 
 class ProfileRegistry(Protocol):
     async def resolve(self, principal: Principal, profile_id: str) -> ProfileBinding: ...
+    async def page(
+        self, principal: Principal, *, limit: int, after: str | None, upper: str | None
+    ) -> tuple[tuple[d.Profile, ...], str | None]: ...
+    async def record(self, principal: Principal, profile_id: str, *, permission: d.Permission) -> ProfileRecord: ...
 
 
 class TokenService(Protocol):
