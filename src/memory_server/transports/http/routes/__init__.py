@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from memory_server.gateway_contracts.catalog import CATALOG
+
 from .profiles import ProfilePort, audit_ticket, control_reply, validate_profile_id, validate_query
 
 
@@ -16,16 +18,16 @@ class RouteSpec:
     permission: str
 
 
-# This tuple is intentionally exhaustive: later owner stages mount their own
-# factories and must not become reachable through the S06 application.
-S06_ROUTE_SPECS = (
-    RouteSpec("GET", "/healthz", "health", "PUBLIC"),
-    RouteSpec("GET", "/readyz", "ready", "PUBLIC"),
-    RouteSpec("GET", "/api/v1/profiles", "profiles.list", "profile.read"),
-    RouteSpec("GET", "/api/v1/profiles/{profile}", "profiles.get", "profile.read"),
-    RouteSpec("POST", "/api/v1/profiles/{profile}/enable", "profiles.enable", "profile.manage"),
-    RouteSpec("POST", "/api/v1/profiles/{profile}/disable", "profiles.disable", "profile.manage"),
-)
+    @classmethod
+    def from_operation(cls, operation: str) -> RouteSpec:
+        row = CATALOG.by_operation[operation]
+        return cls(row.method, row.route, row.operation, row.permission)
+
+
+# Only ownership is local; method/path/permission come from the catalogue.
+S06_ROUTE_SPECS = tuple(RouteSpec.from_operation(operation) for operation in (
+    "health", "ready", "profiles.list", "profiles.get", "profiles.enable", "profiles.disable",
+))
 
 
 def create_profile_routes(port: ProfilePort, guard: Any = None) -> tuple[RouteSpec, ...]:

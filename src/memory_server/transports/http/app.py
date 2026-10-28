@@ -35,10 +35,13 @@ class HttpApp:
         self.routes = []
         # Check the projection against the frozen executable catalogue.
         for spec in S06_ROUTE_SPECS:
-            assert any(row.operation == spec.operation and row.route == spec.path for row in CATALOG.entries)
-            route = Route(spec.path, self.endpoint, methods=[spec.method], name=spec.operation)
-            route.permission = spec.permission
-            route.spec = spec
+            row = CATALOG.by_operation.get(spec.operation)
+            if (row is None or row.owner != 'S06'
+                    or (spec.method, spec.path, spec.permission) != (row.method, row.route, row.permission)):
+                raise ValueError('S06 route specification does not match catalogue')
+            route = Route(row.route, self.endpoint, methods=[row.method], name=row.operation)
+            route.permission = row.permission
+            route.spec = row
             self.routes.append(route)
         self.router = Starlette(routes=self.routes)
 
