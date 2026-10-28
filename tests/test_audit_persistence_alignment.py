@@ -7,108 +7,67 @@ from memory_server.plugins.hermes.provider import HermesProvider
 from memory_server.providers.lancedb_provider import LanceDBProvider
 
 
-async def _reset_server_state(server_module):
-    if server_module._outbox_task and not server_module._outbox_task.done():
-        server_module._outbox_task.cancel()
-        try:
-            await server_module._outbox_task
-        except BaseException:
-            pass
-    if server_module._outbox_worker is not None:
-        await server_module._outbox_worker.close()
-    if server_module._provider is not None:
-        await server_module._provider.close()
-
-    server_module._provider = None
-    server_module._qdrant = None
-    server_module._lancedb = None
-    server_module._embedder = None
-    server_module._router = None
-    server_module._graph = None
-    server_module._graph_router = None
-    server_module._hybrid_router = None
-    server_module._validator_store = None
-    server_module._confidence_engine = None
-    server_module._decay_engine = None
-    server_module._outbox_worker = None
-    server_module._outbox_task = None
-
-
 @pytest.mark.asyncio
-async def test_server_audit_uses_persisted_sql_state(tmp_path, monkeypatch):
-    monkeypatch.setenv(
-        "MEMORY_SERVER_DB_URL",
-        f"sqlite+aiosqlite:///{tmp_path / 'server-memory.db'}",
-    )
-    monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "qdrant")
-
+async def test_server_audit_uses_persisted_sql_state(seam02_composition):
     import memory_server.server as server
 
-    await _reset_server_state(server)
-    provider = await server._get_provider()
-    await remember(
-        provider,
-        subject="ServerAudit",
-        predicate="verifies",
-        object="persisted state",
-        source="test",
-    )
+    async with seam02_composition() as composition:
+        provider = composition.runtime.dependencies.sqlite
+        assert provider._url == composition.layout.sqlite.effective_url
+        await remember(
+            provider,
+            subject="ServerAudit",
+            predicate="verifies",
+            object="persisted state",
+            source="test",
+        )
 
-    search_result = json.loads(await server.search_tool(query="ServerAudit", limit=5))
-    audit_result = json.loads(await server.audit_tool(audit_type="full"))
+        search_result = json.loads(await server.search_tool(query="ServerAudit", limit=5))
+        audit_result = json.loads(await server.audit_tool(audit_type="full"))
 
-    assert search_result["total"] == 1
-    assert audit_result["stats"]["total_facts"] == 1
-    assert audit_result["stats"]["total_receipts"] == 1
-    assert all(
-        "SQLite provider not configured" not in warning
-        for warning in audit_result["warnings"]
-    )
-    assert all(
-        "No receipt store available" not in warning
-        for warning in audit_result["warnings"]
-    )
-    assert all("orphan records" not in warning for warning in audit_result["warnings"])
-    assert all("MemoryReceipt" not in error for error in audit_result["errors"])
-
-    await _reset_server_state(server)
+        assert search_result["total"] == 1
+        assert audit_result["stats"]["total_facts"] == 1
+        assert audit_result["stats"]["total_receipts"] == 1
+        assert all(
+            "SQLite provider not configured" not in warning
+            for warning in audit_result["warnings"]
+        )
+        assert all(
+            "No receipt store available" not in warning
+            for warning in audit_result["warnings"]
+        )
+        assert all("orphan records" not in warning for warning in audit_result["warnings"])
+        assert all("MemoryReceipt" not in error for error in audit_result["errors"])
 
 
 @pytest.mark.asyncio
 async def test_server_full_audit_surfaces_persisted_low_confidence_and_lifecycle(
-    tmp_path, monkeypatch
+    seam02_composition
 ):
-    monkeypatch.setenv(
-        "MEMORY_SERVER_DB_URL",
-        f"sqlite+aiosqlite:///{tmp_path / 'server-persisted-audit.db'}",
-    )
-    monkeypatch.setenv("MEMORY_VECTOR_BACKEND", "qdrant")
-
     import memory_server.server as server
 
-    await _reset_server_state(server)
-    provider = await server._get_provider()
-    stored = await remember(
-        provider,
-        subject="ServerLowConfidence",
-        predicate="needs",
-        object="audit coverage",
-        confidence=0.1,
-        source="test",
-    )
-    await provider.update_fact(stored["fact"].id, lifecycle_state="invalid_state")
+    async with seam02_composition() as composition:
+        provider = composition.runtime.dependencies.sqlite
+        assert provider._url == composition.layout.sqlite.effective_url
+        stored = await remember(
+            provider,
+            subject="ServerLowConfidence",
+            predicate="needs",
+            object="audit coverage",
+            confidence=0.1,
+            source="test",
+        )
+        await provider.update_fact(stored["fact"].id, lifecycle_state="invalid_state")
 
-    audit_result = json.loads(await server.audit_tool(audit_type="full"))
+        audit_result = json.loads(await server.audit_tool(audit_type="full"))
 
-    assert audit_result["stats"]["confidence"]["total"] >= 1
-    assert stored["fact"].id in audit_result["stats"]["confidence"]["low_confidence"]
-    assert any(stored["fact"].id in warning for warning in audit_result["warnings"])
-    assert any(
-        error == f"Item '{stored['fact'].id}' has invalid lifecycle state 'invalid_state'"
-        for error in audit_result["errors"]
-    )
-
-    await _reset_server_state(server)
+        assert audit_result["stats"]["confidence"]["total"] >= 1
+        assert stored["fact"].id in audit_result["stats"]["confidence"]["low_confidence"]
+        assert any(stored["fact"].id in warning for warning in audit_result["warnings"])
+        assert any(
+            error == f"Item '{stored['fact'].id}' has invalid lifecycle state 'invalid_state'"
+            for error in audit_result["errors"]
+        )
 
 
 def test_hermes_provider_audit_uses_persisted_sql_state(tmp_path):
