@@ -270,19 +270,40 @@ async def test_cancel_during_composition_retains_shared_work(setup, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_stop_alpha_keeps_beta_sqlite_live_and_bytes_unchanged(setup):
+async def test_stop_alpha_keeps_beta_sqlite_live_and_bytes_unchanged(setup, record_property):
     daemon, _, _, bindings, _ = setup
+
+    def open_count(root):
+        count = 0
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                target = os.readlink("/proc/self/fd/" + fd)
+            except FileNotFoundError:
+                continue
+            count += target.startswith(str(root) + "/")
+        return count
+
     async with daemon.acquire(ctx("alpha")) as alpha:
         pass
     async with daemon.acquire(ctx("beta")) as beta:
         pass
+    a_before, b_before = open_count(alpha.runtime.root), open_count(beta.runtime.root)
+    record_property("alpha_fds_before", a_before)
+    record_property("beta_fds_before", b_before)
+    assert a_before >= 2 and b_before >= 2  # Real SQLite + EX owner descriptors.
     path = bindings[1].layout.sqlite.local_path
     before = path.read_bytes()
     assert (await daemon.stop_profile("alpha")).code is None
     assert alpha.runtime.state == "CLOSED" and alpha.runtime.lock is None
+    assert open_count(alpha.runtime.root) == 0
+    assert open_count(beta.runtime.root) >= 2
     assert await beta.application.retrieval.search(SearchCommand()) == {"results": [], "total": 0}
     assert beta.runtime.state == "READY" and beta.runtime.lock is not None
     assert path.read_bytes() == before
+    assert (await daemon.stop_profile("beta")).code is None
+    assert open_count(beta.runtime.root) == 0
+    record_property("alpha_fds_after", 0)
+    record_property("beta_fds_after", 0)
 
 
 @pytest.mark.asyncio
