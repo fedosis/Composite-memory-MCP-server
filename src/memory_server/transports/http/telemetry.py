@@ -121,9 +121,8 @@ class BoundedMetricsSink:
                 if value is not None:
                     gauge.labels(profile).set(value)
                 else:
-                    # prometheus_client warns on removing an absent label; avoid diagnostics.
-                    with gauge._lock:
-                        gauge._metrics.pop((profile,), None)
+                    # Public API: drop the labelled child when the lag is unknown.
+                    gauge.remove(profile)
         except Exception:
             self._failed()
 
