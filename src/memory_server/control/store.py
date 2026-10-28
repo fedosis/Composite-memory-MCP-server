@@ -8,11 +8,14 @@ with the same uid can still race that open (see S02 report). No runtime imports.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import stat
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 
@@ -27,6 +30,15 @@ _MESSAGES: dict[ErrorCode, str] = {
     "E_PROFILE_DISABLED": "Profile disabled",
     "E_VERSION_CONFLICT": "Profile generation changed",
     "E_PRECONDITION_REQUIRED": "Expected generation required",
+    "E_AUTH_REQUIRED": "Authentication required",
+    "E_IDEMPOTENCY_REQUIRED": "Idempotency key required",
+    "E_IDEMPOTENCY_CONFLICT": "Idempotency key payload conflict",
+    "E_REQUEST_IN_PROGRESS": "Request already in progress",
+    "E_PROFILE_BUSY": "Profile shutdown incomplete",
+    "E_TIMEOUT": "Profile control timed out",
+    "E_AUDIT_UNAVAILABLE": "Control publication unavailable",
+    "E_RUNTIME_CLOSING": "Profile runtime closing",
+    "E_RUNTIME_FAILED": "Profile runtime failed",
 }
 
 
@@ -71,7 +83,8 @@ class ControlStore:
 
     Registry configuration is seeded privately by ProfileRegistry. There is no
     public registration/root mutation API. Row changes and the control journal
-    share BEGIN IMMEDIATE / COMMIT. HTTP idempotency/auth/audit is S06, not here.
+    share BEGIN IMMEDIATE / COMMIT. S06 control reservations are metadata on the
+    same generation row; authentication and HTTP orchestration remain external.
     """
 
     def __init__(self, control_root: Path) -> None:
@@ -131,6 +144,31 @@ class ControlStore:
                     operation TEXT NOT NULL CHECK(operation IN ('enabled','metadata')),
                     desired_state TEXT NOT NULL CHECK(desired_state IN ('enabled','disabled')),
                     enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), display_name TEXT NOT NULL, description TEXT)""")
+                # Nullable metadata columns preserve legacy generation rows and
+                # keep exactly one journal row per effect (including local CAS).
+                columns = {row[1] for row in self._connection.execute("PRAGMA table_info(control_journal)")}
+                for name, kind in (
+                    ("subject", "TEXT"),
+                    ("http_operation", "TEXT"),
+                    ("idem_key", "TEXT"),
+                    ("payload_sha256", "TEXT"),
+                    ("request_id", "TEXT"),
+                    ("phase", "TEXT"),
+                    ("response_snapshot", "TEXT"),
+                    ("outcome_snapshot", "TEXT"),
+                    ("expires_at", "TEXT"),
+                    ("pending_publication", "INTEGER"),
+                    ("ticket_id", "TEXT"),
+                ):
+                    if name not in columns:
+                        self._connection.execute(f"ALTER TABLE control_journal ADD COLUMN {name} {kind}")
+                self._connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS control_request_key "
+                    "ON control_journal(subject,profile_id,http_operation,idem_key)"
+                )
+                self._connection.execute(
+                    "CREATE INDEX IF NOT EXISTS control_pending ON control_journal(pending_publication,generation)"
+                )
                 self._connection.execute("PRAGMA user_version=1")
         except (OSError, sqlite3.Error, ValueError):
             self.close()
@@ -279,13 +317,162 @@ class ControlStore:
                 raise ControlError("E_VERSION_CONFLICT")
             self._checkpoint("after_row")
             self._connection.execute(
-                "INSERT INTO control_journal VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO control_journal "
+                "(generation,profile_id,operation,desired_state,enabled,display_name,description) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (generation, profile_id, operation, desired, int(flag), name, desc),
             )
             self._checkpoint("after_journal")
             result = self._get(profile_id)
         self._checkpoint("after_commit")
         return result
+
+    @staticmethod
+    def control_digest(value: object) -> str:
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _request(self, subject: str, profile_id: str, operation: str, idem_key: str):
+        return self._connection.execute(
+            "SELECT *,http_operation AS request_operation FROM control_journal "
+            "WHERE subject=? AND profile_id=? AND http_operation=? AND idem_key=?",
+            (subject, profile_id, operation, idem_key),
+        ).fetchone()
+
+    @staticmethod
+    def _request_record(row) -> MappingProxyType:
+        value = dict(row)
+        value["operation"] = value["http_operation"]
+        return MappingProxyType(value)
+
+    def reserve_control(
+        self,
+        *,
+        subject: str,
+        operation: str,
+        idem_key: str,
+        digest: str,
+        request_id: str,
+        profile_id: str,
+        desired_state: str,
+        expected_generation: int,
+        expires_at: datetime,
+        ticket_id: str,
+        now: datetime,
+        capabilities: tuple[str, ...],
+        eligible: bool = True,
+    ) -> MappingProxyType:
+        """Replay lookup, reservation metadata, CAS and one generation row: one commit."""
+        with self._transaction():
+            row = self._request(subject, profile_id, operation, idem_key)
+            if row is not None:
+                expired = datetime.fromisoformat(row["expires_at"]) <= now
+                if expired and row["phase"] == "final" and not row["pending_publication"]:
+                    # Keep the generation/effect forever, release only its TTL key.
+                    self._connection.execute(
+                        "UPDATE control_journal SET idem_key=NULL WHERE generation=?", (row["generation"],)
+                    )
+                else:
+                    if row["payload_sha256"] != digest:
+                        raise ControlError("E_IDEMPOTENCY_CONFLICT")
+                    if row["phase"] != "final":
+                        raise ControlError("E_REQUEST_IN_PROGRESS")
+                    return self._request_record(row)
+            if (
+                not eligible
+                or self._connection.execute(
+                    "SELECT 1 FROM control_journal WHERE pending_publication=1 LIMIT 1"
+                ).fetchone()
+            ):
+                raise ControlError("E_PROFILE_BUSY")
+            before = self._get(profile_id)
+            if before.generation != expected_generation:
+                raise ControlError("E_VERSION_CONFLICT")
+            generation = self._connection.execute(
+                "UPDATE registry_state SET generation=generation+1 WHERE singleton=1 RETURNING generation"
+            ).fetchone()[0]
+            enabled = desired_state == "enabled"
+            changed = self._connection.execute(
+                "UPDATE profiles SET enabled=?,desired_state=?,generation=? WHERE id=? AND generation=?",
+                (int(enabled), desired_state, generation, profile_id, expected_generation),
+            )
+            if changed.rowcount != 1:
+                raise ControlError("E_VERSION_CONFLICT")
+            self._checkpoint("after_control_cas")
+            snapshot = dict(
+                id=profile_id,
+                display_name=before.display_name,
+                description=before.description,
+                enabled=enabled,
+                generation=generation,
+                runtime_state="not_started",
+                capabilities=list(capabilities),
+                storage_root=None,
+            )
+            self._connection.execute(
+                "INSERT INTO control_journal "
+                "(generation,profile_id,operation,desired_state,enabled,display_name,description,"
+                "subject,http_operation,idem_key,payload_sha256,request_id,phase,response_snapshot,"
+                "outcome_snapshot,expires_at,pending_publication,ticket_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    generation,
+                    profile_id,
+                    "enabled",
+                    desired_state,
+                    int(enabled),
+                    before.display_name,
+                    before.description,
+                    subject,
+                    operation,
+                    idem_key,
+                    digest,
+                    request_id,
+                    "committed",
+                    json.dumps(snapshot, separators=(",", ":")),
+                    None,
+                    expires_at.isoformat(),
+                    1,
+                    ticket_id,
+                ),
+            )
+            self._checkpoint("after_control_journal")
+            result = self._request_record(self._request(subject, profile_id, operation, idem_key))
+        self._checkpoint("after_control_commit")
+        return result
+
+    def finish_control(self, row, *, response: object, outcome: object) -> None:
+        with self._transaction():
+            self._connection.execute(
+                "UPDATE control_journal SET phase='final',response_snapshot=?,outcome_snapshot=? "
+                "WHERE generation=? AND phase='committed'",
+                (
+                    json.dumps(response, separators=(",", ":")),
+                    json.dumps(outcome, separators=(",", ":")),
+                    row["generation"],
+                ),
+            )
+
+    def control_requests(self, *, limit: int) -> tuple[MappingProxyType, ...]:
+        if self._connection is None:
+            raise ControlError("E_STORAGE")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ControlError("E_VALIDATION")
+        try:
+            return tuple(
+                self._request_record(row)
+                for row in self._connection.execute(
+                    "SELECT * FROM control_journal WHERE pending_publication=1 ORDER BY generation LIMIT ?", (limit,)
+                ).fetchall()
+            )
+        except sqlite3.Error:
+            raise ControlError("E_STORAGE") from None
+
+    def mark_published(self, row) -> None:
+        with self._transaction():
+            self._connection.execute(
+                "UPDATE control_journal SET pending_publication=0 WHERE generation=? AND phase='final'",
+                (row["generation"],),
+            )
 
     def journal(self, *, profile_ids: Sequence[str]) -> tuple[MappingProxyType, ...]:
         """Per-profile control journal rows, scoped exactly like ``resolve``/``list``.
@@ -304,8 +491,8 @@ class ControlStore:
             return tuple(
                 MappingProxyType(dict(row))
                 for row in self._connection.execute(
-                    f"SELECT * FROM control_journal WHERE profile_id IN ({placeholders})"
-                    " ORDER BY generation",
+                    "SELECT generation,profile_id,operation,desired_state,enabled,display_name,description "
+                    f"FROM control_journal WHERE profile_id IN ({placeholders}) ORDER BY generation",
                     ids,
                 )
             )

@@ -7,13 +7,26 @@ are reused without opening any memory database. Runtime re-admission is S04.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 
 from memory_server.gateway_contracts import dto as d
-from memory_server.gateway_contracts.ports import Principal, ProfileBinding, ProfileRecord
+from memory_server.gateway_contracts.ports import (
+    AuditOutcome,
+    AuditTicket,
+    ControlReply,
+    Principal,
+    ProfileBinding,
+    ProfileLeases,
+    ProfileRecord,
+    RequestContext,
+)
 from memory_server.paths import (
     StorageLayoutError,
     StorageResolutionInputs,
@@ -22,6 +35,8 @@ from memory_server.paths import (
 )
 
 from .store import ControlError, ControlStore
+
+_ACTIVE_CONTROLS: set[tuple[str, int]] = set()
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", re.ASCII)
 
@@ -167,9 +182,14 @@ class ProfileRegistry:
 
     def _profile(self, record: ProfileRecord) -> d.Profile:
         return d.Profile(
-            id=record.id, display_name=record.display_name, description=record.description,
-            enabled=record.enabled, generation=record.generation, runtime_state="not_started",
-            capabilities=self._bindings[record.id].profile.capabilities, storage_root=None,
+            id=record.id,
+            display_name=record.display_name,
+            description=record.description,
+            enabled=record.enabled,
+            generation=record.generation,
+            runtime_state="not_started",
+            capabilities=self._bindings[record.id].profile.capabilities,
+            storage_root=None,
         )
 
     async def page(
@@ -193,6 +213,184 @@ class ProfileRegistry:
             raise ControlError("E_VALIDATION")
         self._authorise(principal, profile_id, permission)
         return self._store._get(profile_id)
+
+    @staticmethod
+    def _safe_observation(observation) -> bool:
+        return observation is None or (
+            not observation.owned
+            and not observation.admissions
+            and not observation.stopping
+            and not observation.retained
+            and observation.state == "not_started"
+        )
+
+    async def _complete_control(self, row, leases: ProfileLeases, *, deadline: float) -> bool:
+        observation = leases.snapshot().get(row["profile_id"])
+        if row["desired_state"] == "enabled":
+            return self._safe_observation(observation) or (
+                observation.state == "ready"
+                and observation.owned
+                and not observation.stopping
+                and not observation.retained
+            )
+        async with asyncio.timeout_at(deadline):
+            # Direct await enters stop_profile before the first suspension: do
+            # not wrap it in a task/wait_for before admission is closed.
+            report = await leases.stop_profile(row["profile_id"])
+        after = leases.snapshot().get(row["profile_id"])
+        if report is None:
+            return self._safe_observation(observation) and self._safe_observation(after)
+        return (
+            report.code is None
+            and not report.failed
+            and not report.unsettled
+            and not report.errors
+            and not report.retained_resources
+            and not report.lock_retained
+            and self._safe_observation(after)
+        )
+
+    def _finalize_control(self, row, leases: ProfileLeases):
+        body = d.Profile.model_validate_json(row["response_snapshot"])
+        observation = leases.snapshot().get(row["profile_id"])
+        body = body.model_copy(
+            update={"runtime_state": observation.state if observation is not None else "not_started"}
+        )
+        outcome = {"status": 200, "error_code": None, "receipt_ids": [], "latency_ms": 0.0}
+        self._store.finish_control(row, response=body.model_dump(mode="json"), outcome=outcome)
+        return body, AuditOutcome(200, None, (), 0.0)
+
+    async def _publish_control(self, row, outcome, publish, *, deadline: float) -> None:
+        try:
+            async with asyncio.timeout_at(deadline):
+                published = await publish(AuditTicket(row["ticket_id"], row["request_id"]), outcome)
+            if published:
+                self._store.mark_published(row)
+        except Exception:
+            # The already-final result is not replaced by a publication error.
+            # Cancellation still propagates, leaving the durable marker.
+            pass
+
+    async def control(
+        self,
+        ctx: RequestContext,
+        command: d.ProfilesEnableCommand | d.ProfilesDisableCommand,
+        *,
+        ticket: AuditTicket,
+        leases: ProfileLeases,
+        publish: Callable[[AuditTicket, AuditOutcome], Awaitable[bool]],
+        now: datetime,
+        ttl_seconds: int,
+    ) -> ControlReply:
+        from uuid import UUID
+
+        from .policy import utc_now
+
+        utc_now(now)
+        if now >= ctx.principal.expires_at:
+            raise ControlError("E_AUTH_REQUIRED")
+        if not isinstance(command, (d.ProfilesEnableCommand, d.ProfilesDisableCommand)):
+            raise ControlError("E_VALIDATION")
+        try:
+            command = type(command).model_validate(command.model_dump())
+        except ValueError:
+            raise ControlError("E_VALIDATION") from None
+        profile_id = command.profile_id
+        self._authorise(ctx.principal, profile_id, "profile.manage")
+        if ctx.profile_id != profile_id or ticket.request_id != ctx.request_id:
+            raise ControlError("E_VALIDATION")
+        if ctx.idempotency_key is None:
+            raise ControlError("E_IDEMPOTENCY_REQUIRED")
+        if not isinstance(ctx.idempotency_key, UUID) or type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 604800:
+            raise ControlError("E_VALIDATION")
+        if ctx.deadline <= asyncio.get_running_loop().time():
+            raise ControlError("E_TIMEOUT")
+        enabled = isinstance(command, d.ProfilesEnableCommand)
+        observation = leases.snapshot().get(profile_id)
+        eligible = (
+            not enabled
+            or self._safe_observation(observation)
+            or (
+                observation.state == "ready"
+                and observation.owned
+                and not observation.stopping
+                and not observation.retained
+            )
+        )
+        digest = self._store.control_digest(
+            {
+                "method": "POST",
+                "route": f"/api/v1/profiles/{profile_id}/{'enable' if enabled else 'disable'}",
+                "path_ids": {"profile": profile_id},
+                "payload": command.payload.model_dump(mode="json"),
+            }
+        )
+        row = self._store.reserve_control(
+            subject=ctx.principal.subject,
+            profile_id=profile_id,
+            operation=command.operation,
+            idem_key=str(ctx.idempotency_key),
+            digest=digest,
+            request_id=ctx.request_id,
+            desired_state="enabled" if enabled else "disabled",
+            expected_generation=command.payload.expected_generation,
+            expires_at=now + timedelta(seconds=ttl_seconds),
+            ticket_id=ticket.id,
+            now=now,
+            capabilities=tuple(self._bindings[profile_id].profile.capabilities),
+            eligible=eligible,
+        )
+        marker = (str(self._store.root), row["generation"])
+        if row["phase"] == "final":
+            # Original ticket and original snapshot; never hydrate current state.
+            body = d.Profile.model_validate_json(row["response_snapshot"])
+            if row["pending_publication"]:
+                data = json.loads(row["outcome_snapshot"])
+                outcome = AuditOutcome(
+                    data["status"], data["error_code"], tuple(data["receipt_ids"]), data["latency_ms"]
+                )
+                await self._publish_control(row, outcome, publish, deadline=ctx.deadline)
+            return ControlReply(200, body, True, row["request_id"])
+        _ACTIVE_CONTROLS.add(marker)
+        try:
+            try:
+                safe = await self._complete_control(row, leases, deadline=ctx.deadline)
+            except Exception:
+                safe = False
+            if not safe:
+                raise ControlError("E_PROFILE_BUSY")
+            body, outcome = self._finalize_control(row, leases)
+            await self._publish_control(row, outcome, publish, deadline=ctx.deadline)
+            return ControlReply(200, body, False, row["request_id"])
+        finally:
+            _ACTIVE_CONTROLS.discard(marker)
+
+    async def reconcile_control(
+        self, *, leases: ProfileLeases, publish: Callable[[AuditTicket, AuditOutcome], Awaitable[bool]], limit: int
+    ) -> bool:
+        rows = self._store.control_requests(limit=limit)
+        for row in rows:
+            marker = (str(self._store.root), row["generation"])
+            if marker in _ACTIVE_CONTROLS:
+                continue
+            _ACTIVE_CONTROLS.add(marker)
+            try:
+                deadline = asyncio.get_running_loop().time() + 5.0
+                if row["phase"] == "committed":
+                    if not await self._complete_control(row, leases, deadline=deadline):
+                        continue
+                    _, outcome = self._finalize_control(row, leases)
+                else:
+                    data = json.loads(row["outcome_snapshot"])
+                    outcome = AuditOutcome(
+                        data["status"], data["error_code"], tuple(data["receipt_ids"]), data["latency_ms"]
+                    )
+                await self._publish_control(row, outcome, publish, deadline=deadline)
+            except Exception:
+                continue
+            finally:
+                _ACTIVE_CONTROLS.discard(marker)
+        return not self._store.control_requests(limit=1)
 
     async def set_enabled(
         self, principal: Principal, profile_id: str, *, enabled: bool, expected_generation: int | None

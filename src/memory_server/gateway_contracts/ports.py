@@ -83,6 +83,14 @@ class AuditOutcome:
     latency_ms: float
 
 
+@dataclass(frozen=True)
+class ControlReply:
+    status: int
+    body: d.Profile | Mapping[str, d.JSONValue]
+    replayed: bool
+    original_request_id: str
+
+
 class MetricsSink(Protocol):
     def http_completed(
         self, ctx: RequestContext, operation: d.Operation, status: int, duration_seconds: float
@@ -128,6 +136,26 @@ class ProfileRegistry(Protocol):
         self, principal: Principal, *, limit: int, after: str | None, upper: str | None
     ) -> tuple[tuple[d.Profile, ...], str | None]: ...
     async def record(self, principal: Principal, profile_id: str, *, permission: d.Permission) -> ProfileRecord: ...
+
+    async def control(
+        self,
+        ctx: RequestContext,
+        command: d.ProfilesEnableCommand | d.ProfilesDisableCommand,
+        *,
+        ticket: AuditTicket,
+        leases: ProfileLeases,
+        publish: Callable[[AuditTicket, AuditOutcome], Awaitable[bool]],
+        now: datetime,
+        ttl_seconds: int,
+    ) -> ControlReply: ...
+
+    async def reconcile_control(
+        self,
+        *,
+        leases: ProfileLeases,
+        publish: Callable[[AuditTicket, AuditOutcome], Awaitable[bool]],
+        limit: int,
+    ) -> bool: ...
 
 
 class TokenService(Protocol):

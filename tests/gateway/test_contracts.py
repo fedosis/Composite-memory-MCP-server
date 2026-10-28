@@ -1204,7 +1204,25 @@ EXPECTED_PORT_SIGNATURES = {
     },
     "GatewayPort": {"execute": ("self, ctx: RequestContext, command: GatewayCommand", "GatewayResult", True)},
     "ContractCatalog": {"validate": ("self, operation: Operation, payload: JSONValue", "GatewayCommand", False)},
-    "ProfileRegistry": {"resolve": ("self, principal: Principal, profile_id: str", "ProfileBinding", True)},
+    "ProfileRegistry": {
+        "resolve": ("self, principal: Principal, profile_id: str", "ProfileBinding", True),
+        "page": (
+            "self, principal: Principal, *, limit: int, after: str | None, upper: str | None",
+            "tuple[tuple[Profile, ...], str | None]", True,
+        ),
+        "record": ("self, principal: Principal, profile_id: str, *, permission: Permission", "ProfileRecord", True),
+        "control": (
+            "self, ctx: RequestContext, command: ProfilesEnableCommand | ProfilesDisableCommand, *, "
+            "ticket: AuditTicket, leases: ProfileLeases, "
+            "publish: Callable[[AuditTicket, AuditOutcome], Awaitable[bool]], now: datetime, ttl_seconds: int",
+            "ControlReply", True,
+        ),
+        "reconcile_control": (
+            "self, *, leases: ProfileLeases, "
+            "publish: Callable[[AuditTicket, AuditOutcome], Awaitable[bool]], limit: int",
+            "bool", True,
+        ),
+    },
     "TokenService": {
         "authenticate": ("self, bearer: str, *, now: datetime", "Principal", True),
         "verify_principal": ("self, principal: Principal, *, now: datetime", "None", False),
