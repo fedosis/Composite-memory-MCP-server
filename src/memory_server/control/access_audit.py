@@ -160,10 +160,10 @@ class AccessAuditStore:
             raise
 
     def close(self) -> None:
+        if self._denials is not None:
+            self._denials.close()
+            self._denials = None
         with self._lock:
-            if self._denials is not None:
-                self._denials.close()
-                self._denials = None
             if self._db is not None:
                 self._db.close()
                 self._db = None
@@ -249,27 +249,28 @@ class AccessAuditStore:
                 authenticated = self._db is None or self._segment_full()
             except sqlite3.Error:
                 authenticated = True
-            denials = self._denial_failed or self._denials is None
-            if self._denials is not None:
-                denials = denials or self._denials.saturation()["authenticated"]
-            return {"authenticated": authenticated, "denials": denials}
+        # A slow denial probe must not hold the authenticated lock either.
+        denials = self._denial_failed or self._denials is None
+        if self._denials is not None:
+            denials = denials or self._denials.saturation()["authenticated"]
+        return {"authenticated": authenticated, "denials": denials}
 
     async def record_unauthenticated(self, request_id: str, reason: ErrorCode) -> AuditTicket | None:
         """Best effort off-protocol seam; None means dropped, never request denial."""
         if reason != "E_AUTH_REQUIRED":
             raise AuditError("E_VALIDATION")
         _check(request_id, _REQUEST)
-        with self._lock:
-            try:
-                if self._denials is None:
-                    raise AuditError()
-                ticket = self._denials._insert(request_id, None, None, None, "authentication", "intent")
-                await self._denials.finish(ticket, AuditOutcome(401, reason, (), 0.0))
-                return ticket
-            except AuditError:
-                self.dropped_denials += 1
-                self._denial_failed = True
-                return None
+        # Never enter the authenticated lock/connection/sidecar on this path.
+        try:
+            if self._denials is None:
+                raise AuditError()
+            ticket = self._denials._insert(request_id, None, None, None, "authentication", "intent")
+            await self._denials.finish(ticket, AuditOutcome(401, reason, (), 0.0))
+            return ticket
+        except AuditError:
+            self.dropped_denials += 1
+            self._denial_failed = True
+            return None
 
     async def finish(self, ticket: AuditTicket, outcome: AuditOutcome) -> None:
         if (type(outcome.status) is not int or not 100 <= outcome.status <= 599

@@ -639,3 +639,47 @@ def test_untrusted_metadata_rejected_without_content(store, ctx, field, value, t
         begin(store, replace(ctx, **{field: value}))
     assert rows(store) == []
     assert value.encode() not in (tmp_path / "audit" / "access.sqlite").read_bytes()
+
+
+def test_n1_pinned_denial_does_not_delay_authenticated(store, ctx, tmp_path):
+    import time
+    from threading import Event
+
+    entered = Event()
+    blocker = sqlite3.connect(tmp_path / "audit" / "denials" / "access.sqlite")
+    blocker.execute("BEGIN IMMEDIATE")
+    store._denials._db.set_trace_callback(
+        lambda sql: entered.set() if sql == "BEGIN IMMEDIATE" else None)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            denial = pool.submit(run, store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED"))
+            assert entered.wait(2)
+            started = time.monotonic()
+            auth = pool.submit(lambda: run(store.finish(begin(store, ctx), SUCCESS)))
+            try:
+                auth.result(timeout=0.2)
+                elapsed = time.monotonic() - started
+                print(f"N1 pinned denial: begin+finish={elapsed:.6f}s bound=0.200s")
+                assert not denial.done()
+            finally:
+                blocker.rollback()
+            assert denial.result(timeout=2) is not None
+    finally:
+        blocker.close()
+
+
+def test_n1_concurrent_denial_and_authenticated_writes(store, ctx):
+    barrier = Barrier(4)
+
+    def write(denial):
+        barrier.wait(timeout=5)
+        for _ in range(25):
+            if denial:
+                assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is not None
+            else:
+                run(store.finish(begin(store, ctx), SUCCESS))
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(write, (True, False, True, False)))
+    assert len(rows(store)) == len(rows(store._denials)) == 50
+    assert all(r["state"] == "terminal" for target in (store, store._denials) for r in rows(target))
