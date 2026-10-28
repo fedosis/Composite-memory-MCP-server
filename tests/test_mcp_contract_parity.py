@@ -211,9 +211,9 @@ def test_mcp_stdio_tool_inventory_and_schemas_match_c00(oracle, parity_capture):
         name = data.get("tool", {}).get("name")
         if name is not None:
             contracts[name] = sorted(data.get("input", {}).get("properties", {}))
-    assert files == oracle["contracts"]["files"]
-    assert contracts == oracle["contracts"]["tool_contracts"]
-    assert oracle["contracts"]["tools_without_contract"] == ["add_relation", "invalidate", "metrics"]
+    assert files == oracle["mcp"]["contracts"]["files"]
+    assert contracts == oracle["mcp"]["contracts"]["tool_contracts"]
+    assert oracle["mcp"]["contracts"]["tools_without_contract"] == ["add_relation", "invalidate", "metrics"]
 
 
 @pytest.mark.parametrize("case", HAPPY_CASES, ids=[case[0] for case in HAPPY_CASES])
