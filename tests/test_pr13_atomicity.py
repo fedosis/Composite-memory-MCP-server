@@ -198,10 +198,11 @@ async def test_hermes_conflict_fault_rolls_back_every_sql_table(tmp_path, fault,
 
 @pytest.mark.asyncio
 async def test_reinforcement_persists_provenance_history_and_version_for_hermes_and_server(
-    tmp_path, monkeypatch
+    seam02_composition
 ):
-    provider = await _provider(tmp_path)
-    try:
+    async with seam02_composition() as composition:
+        provider = composition.runtime.dependencies.sqlite
+        assert provider._url == composition.layout.sqlite.effective_url
         original = (await _seed(provider, ("reinforce once", 0.4)))[0]
         hermes = HermesProvider()
         hermes._provider = provider
@@ -232,8 +233,6 @@ async def test_reinforcement_persists_provenance_history_and_version_for_hermes_
         assert receipt.history[-1]["confidence"] == pytest.approx(0.6)
 
         import memory_server.server as server
-        monkeypatch.setattr(server, "_provider", provider)
-        monkeypatch.setattr(server, "_graph", None)
         server_result = json.loads(
             await server.set_belief_tool(
                 proposition="reinforce once", confidence=0.8,
@@ -247,5 +246,3 @@ async def test_reinforcement_persists_provenance_history_and_version_for_hermes_
         state = await _snapshot(provider)
         assert len(state["evidence"]) == 2
         assert len(state["outbox_entries"]) >= 2
-    finally:
-        await provider.close()
