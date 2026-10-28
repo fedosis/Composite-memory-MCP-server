@@ -397,6 +397,28 @@ def test_sqlite_full_is_sanitized(store, ctx, caplog):
     assert CANARY_SECRET not in caplog.text
 
 
+@pytest.mark.parametrize("stream", ["authenticated", "denials"])
+def test_f4_retention_scrubs_file_bytes(store, ctx, clock, tmp_path, stream):
+    target = store if stream == "authenticated" else store._denials
+    if stream == "authenticated":
+        run(store.finish(begin(store, ctx), SUCCESS))
+    else:
+        run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED"))
+    root = tmp_path / "audit"
+    if stream == "denials":
+        root /= "denials"
+    canaries = [ctx.request_id.encode()]
+    if stream == "authenticated":
+        canaries.append(ctx.principal.token_id.encode())
+    raw = (root / "access.sqlite").read_bytes()
+    assert all(canary in raw for canary in canaries)
+    clock.wall += timedelta(days=31)
+    assert store.retain() == 1
+    assert rows(target) == []
+    assert all(canary not in (root / "access.sqlite").read_bytes() for canary in canaries)
+    assert not (root / "access.sqlite-journal").exists()
+
+
 def test_f2_rollback_before_first_retain(store, ctx, clock):
     watermark = clock.wall
     clock.wall -= timedelta(days=40)

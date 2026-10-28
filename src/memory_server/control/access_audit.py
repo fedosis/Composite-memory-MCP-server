@@ -127,6 +127,7 @@ class AccessAuditStore:
             self._db.row_factory = sqlite3.Row
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.execute("PRAGMA journal_mode=DELETE")
+            self._db.execute("PRAGMA secure_delete=ON")  # scrub expired identities from freed SQLite cells
             page_size = self._db.execute("PRAGMA page_size").fetchone()[0]
             self._db.execute(f"PRAGMA max_page_count={max_bytes // page_size}")
             with self._transaction():
