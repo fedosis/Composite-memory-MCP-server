@@ -370,6 +370,50 @@ def test_sqlite_full_is_sanitized(store, ctx, caplog):
     assert CANARY_SECRET not in caplog.text
 
 
+def test_f2_rollback_before_first_retain(store, ctx, clock):
+    watermark = clock.wall
+    clock.wall -= timedelta(days=40)
+    ticket = begin(store, ctx)
+    clock.wall = watermark
+    assert store.retain() == 0
+    assert rows(store)[0]["id"] == ticket.id
+    assert rows(store)[0]["created_at"] == watermark.timestamp()
+
+
+@pytest.mark.parametrize("operation", ["begin", "finish", "list", "reopen"])
+def test_f2_missing_watermark_with_rows_fails_closed(tmp_path, ctx, clock, operation):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now)
+    try:
+        ticket = begin(store, ctx)
+        (root / "retention.watermark").unlink(missing_ok=True)
+        with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$") as caught:
+            if operation == "reopen":
+                store.close()
+                AccessAuditStore(root, clock=clock.now)
+            elif operation == "begin":
+                begin(store, ctx)
+            elif operation == "finish":
+                run(store.finish(ticket, SUCCESS))
+            else:
+                store.list(ctx.principal, "alpha")
+        assert caught.value.code == "E_AUDIT_UNAVAILABLE"
+    finally:
+        store.close()
+
+
+def test_f2_first_insert_seeds_empty_store_and_advances(store, ctx, clock, tmp_path):
+    sidecar = tmp_path / "audit" / "retention.watermark"
+    sidecar.unlink(missing_ok=True)
+    clock.wall += timedelta(days=2)
+    begin(store, ctx)
+    expected = clock.wall.timestamp()
+    assert float(sidecar.read_text()) == expected
+    clock.wall += timedelta(days=2)
+    begin(store, ctx)
+    assert float(sidecar.read_text()) == clock.wall.timestamp()
+
+
 def test_rollback_watermark_survives_restart(tmp_path, ctx, clock):
     root = tmp_path / "audit"
     store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)

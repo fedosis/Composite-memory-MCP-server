@@ -140,6 +140,7 @@ class AccessAuditStore:
                     created_at REAL NOT NULL, segment INTEGER NOT NULL,
                     started REAL NOT NULL, clock_id TEXT NOT NULL)""")
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
+                self._watermark()
             os.fsync(self._fd)
             if not _denial_only:
                 try:
@@ -205,7 +206,10 @@ class AccessAuditStore:
             first = self._db.execute("SELECT MIN(segment) FROM access_audit").fetchone()[0]
             if first is not None and segment - first >= self.max_segments:
                 raise AuditError()
-            created_at = max(now.timestamp(), self._watermark())
+            watermark = self._watermark()
+            created_at = max(now.timestamp(), watermark)
+            if created_at > watermark:
+                self._write_watermark(created_at)
             self._db.execute(
                 f"INSERT INTO access_audit ({_COLUMNS},state,created_at,segment,started,clock_id) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -272,6 +276,7 @@ class AccessAuditStore:
             raise AuditError("E_VALIDATION")
         result = outcome.error_code or ("success" if outcome.status < 400 else "failure")
         with self._lock, self._transaction():
+            self._watermark()
             # request_id is checked before CAS; only the one allowed state UPDATE is issued.
             row = self._db.execute(
                 "SELECT request_id,started,clock_id FROM access_audit WHERE id=?", (ticket.id,),
@@ -308,10 +313,11 @@ class AccessAuditStore:
             raise AuditError("E_PERMISSION_DENIED")
         if type(limit) is not int or not 1 <= limit <= 200 or type(after_seq) is not int or after_seq < 0:
             raise AuditError("E_VALIDATION")
-        with self._lock:
+        with self._lock, self._transaction():
             if self._db is None:
                 raise AuditError()
             try:
+                self._watermark()
                 rows = self._db.execute(
                     f"SELECT {_COLUMNS} FROM access_audit WHERE profile_id=? AND seq>? ORDER BY seq LIMIT ?",
                     (profile_id, after_seq, limit),
@@ -327,7 +333,11 @@ class AccessAuditStore:
             try:
                 fd = os.open("retention.watermark", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self._fd)
             except FileNotFoundError:
-                return float("-inf")
+                if self._db.execute("SELECT 1 FROM access_audit LIMIT 1").fetchone() is not None:
+                    raise AuditError()
+                value = self._now().timestamp()
+                self._write_watermark(value)
+                return value
             try:
                 raw = os.read(fd, 128)
                 value = float(raw)
@@ -337,6 +347,28 @@ class AccessAuditStore:
             finally:
                 os.close(fd)
         except (OSError, ValueError):
+            raise AuditError() from None
+
+    def _write_watermark(self, value: float) -> None:
+        """Persist before INSERT/DELETE; metadata loss with rows is E_AUDIT_UNAVAILABLE."""
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+            fd = os.open("retention.next", flags, 0o600, dir_fd=self._fd)
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                    raise AuditError()
+                data = str(value).encode("ascii")
+                if os.write(fd, data) != len(data):
+                    raise AuditError()
+                os.ftruncate(fd, len(data))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace("retention.next", "retention.watermark", src_dir_fd=self._fd, dst_dir_fd=self._fd)
+            os.fsync(self._fd)
+        except OSError:
             raise AuditError() from None
 
     def retain(self) -> int:
@@ -352,22 +384,7 @@ class AccessAuditStore:
                 if now < self._watermark():
                     self.rollback_refusals += 1
                     raise AuditError("E_VALIDATION")
-                flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
-                fd = os.open("retention.next", flags, 0o600, dir_fd=self._fd)
-                try:
-                    info = os.fstat(fd)
-                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                            or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
-                        raise AuditError()
-                    data = str(now).encode("ascii")
-                    if os.write(fd, data) != len(data):
-                        raise AuditError()
-                    os.ftruncate(fd, len(data))
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                os.replace("retention.next", "retention.watermark", src_dir_fd=self._fd, dst_dir_fd=self._fd)
-                os.fsync(self._fd)
+                self._write_watermark(now)
                 removed = self._db.execute(
                     "DELETE FROM access_audit WHERE created_at < ?", (now - self.ttl_seconds,),
                 ).rowcount
