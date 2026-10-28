@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
@@ -228,6 +228,9 @@ class ControlStore:
         display_name: str | None = None,
         description: str | None = None,
     ) -> ProfileRecord:
+        connection = self._connection
+        if connection is None:
+            raise ControlError("E_STORAGE")
         with self._transaction():
             before = self._get(profile_id)
             if before.generation != expected_generation:
@@ -239,10 +242,13 @@ class ControlStore:
             name = before.display_name if operation == "enabled" else display_name
             desc = before.description if operation == "enabled" else description
             desired = "enabled" if flag else "disabled"
-            self._connection.execute(
-                "UPDATE profiles SET enabled=?,desired_state=?,display_name=?,description=?,generation=? WHERE id=?",
-                (int(flag), desired, name, desc, generation, profile_id),
+            cursor = connection.execute(
+                "UPDATE profiles SET enabled=?,desired_state=?,display_name=?,description=?,generation=?"
+                " WHERE id=? AND generation=?",
+                (int(flag), desired, name, desc, generation, profile_id, before.generation),
             )
+            if cursor.rowcount != 1:
+                raise ControlError("E_VERSION_CONFLICT")
             self._checkpoint("after_row")
             self._connection.execute(
                 "INSERT INTO control_journal VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -253,14 +259,27 @@ class ControlStore:
         self._checkpoint("after_commit")
         return result
 
-    def journal(self) -> tuple[MappingProxyType, ...]:
-        """Local control-plane diagnostics, not a wire endpoint or memory journal."""
+    def journal(self, *, profile_ids: Sequence[str]) -> tuple[MappingProxyType, ...]:
+        """Per-profile control journal rows, scoped exactly like ``resolve``/``list``.
+
+        Internal diagnostics only: not a wire endpoint and not the per-profile memory
+        request journal. The caller must pass the profiles it is authorised for, so this
+        cannot become an unfiltered dump if a later stage mounts it.
+        """
         if self._connection is None:
             raise ControlError("E_STORAGE")
+        ids = tuple(dict.fromkeys(profile_ids))
+        if not ids:
+            return ()
+        placeholders = ",".join("?" for _ in ids)
         try:
             return tuple(
                 MappingProxyType(dict(row))
-                for row in self._connection.execute("SELECT * FROM control_journal ORDER BY generation")
+                for row in self._connection.execute(
+                    f"SELECT * FROM control_journal WHERE profile_id IN ({placeholders})"
+                    " ORDER BY generation",
+                    ids,
+                )
             )
         except sqlite3.Error:
             raise ControlError("E_STORAGE") from None

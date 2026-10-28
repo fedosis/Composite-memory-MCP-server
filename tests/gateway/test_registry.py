@@ -124,7 +124,10 @@ async def test_scope_and_listing_no_disclosure(setup, caplog):
     assert exc.value.code == "E_PROFILE_NOT_FOUND"
 
 
-@pytest.mark.parametrize("bad", ["../beta", "%2f", "%2e", "/alpha", "a/b", "a\\b", "..", "a\0", "a" * 65, "", "é"])
+@pytest.mark.parametrize(
+    "bad",
+    ["../beta", "%2f", "%2e", "%61lpha", "/alpha", "a/b", "a\\b", "..", "a\0", "a" * 65, "", "é"],
+)
 @pytest.mark.asyncio
 async def test_ids_not_normalised(setup, bad):
     registry, _, error, _ = setup
@@ -151,7 +154,10 @@ async def test_disabled_cas_metadata_journal_reopen(setup):
         admin, "alpha", display_name="Display", description="Label", expected_generation=2
     )
     assert record.display_name == "Display" and record.generation == 3
-    assert [(r["generation"], r["desired_state"]) for r in store.journal()] == [(2, "disabled"), (3, "disabled")]
+    assert [(r["generation"], r["desired_state"]) for r in store.journal(profile_ids=["alpha"])] == [
+        (2, "disabled"),
+        (3, "disabled"),
+    ]
     before = await registry.list(admin)
     path = store.root
     store.close()
@@ -160,7 +166,7 @@ async def test_disabled_cas_metadata_journal_reopen(setup):
         with store_cls(path) as reopened:
             again = registry_cls(reopened, configuration(bindings))
             assert await again.list(admin) == before
-            assert len(reopened.journal()) == 2
+            assert len(reopened.journal(profile_ids=["alpha"])) == 2
 
 
 def test_concurrent_cas_real_connections(setup):
@@ -182,7 +188,7 @@ def test_concurrent_cas_real_connections(setup):
         results = [f.result(timeout=20) for f in futures]
     assert sum(isinstance(r, ProfileRecord) for r in results) == 1
     assert results.count("E_VERSION_CONFLICT") == 1
-    assert len(store.journal()) == 1
+    assert len(store.journal(profile_ids=["alpha"])) == 1
     assert asyncio.run(registry.list(principal("alpha")))[0].generation == 2
 
 
@@ -206,7 +212,7 @@ def test_transaction_failure_reopen(setup, phase):
         committed = phase == "after_commit"
         assert record.generation == (2 if committed else 1)
         assert record.enabled is not committed
-        assert len(reopened.journal()) == int(committed)
+        assert len(reopened.journal(profile_ids=["alpha"])) == int(committed)
 
 
 @pytest.mark.asyncio
@@ -223,7 +229,7 @@ async def test_permission_and_validation_leave_no_effect(setup):
         with pytest.raises(error) as exc:
             await registry.set_enabled(actor, "alpha", enabled=enabled, expected_generation=generation)
         assert exc.value.code == code
-    assert store.journal() == ()
+    assert store.journal(profile_ids=["alpha"]) == ()
 
 
 def test_configuration_only_no_root_mutator(setup):
