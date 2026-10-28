@@ -218,7 +218,7 @@ def test_metrics_family_labels_cardinality_and_registry(ctx):
     previous = set(REGISTRY._names_to_collectors)
     sink = BoundedMetricsSink(["alpha"])
     assert sink.registry_name == "cmms_gateway"
-    assert sink.registry is not REGISTRY
+    assert sink._registry is not REGISTRY
     assert set(REGISTRY._names_to_collectors) == previous
     for op in get_args(Operation):
         sink.http_completed(ctx, op, 200, 0.1)
@@ -227,10 +227,12 @@ def test_metrics_family_labels_cardinality_and_registry(ctx):
     for i in range(500):
         unknown = replace(ctx, profile_id=f"{CANARY_QUERY}_{i}")
         sink.http_completed(unknown, "search", 500, 0.1)
-        sink.http_completed(unknown, CANARY_SECRET, 500, 0.1)
-        sink.retrieval_completed(unknown, CANARY_SECRET, 0.1, "E_INTERNAL")
+        with pytest.raises(TelemetryError, match="^E_VALIDATION$"):
+            sink.http_completed(unknown, CANARY_SECRET, 500, 0.1)
+        with pytest.raises(TelemetryError, match="^E_VALIDATION$"):
+            sink.retrieval_completed(unknown, CANARY_SECRET, 0.1, "E_INTERNAL")
     # C9 version conflict family exists without adding a Protocol method.
-    sink.conflicts.labels("search", "alpha").inc()
+    sink.record_conflict("search", "alpha")
     admin = replace(ctx, principal=replace(ctx.principal, permissions=frozenset({"token.manage"})))
     content_type, body = metrics_handler(admin, sink)
     assert content_type.startswith("text/plain; version=0.0.4")
@@ -250,8 +252,33 @@ def test_metrics_family_labels_cardinality_and_registry(ctx):
         for sample in family.samples:
             assert set(sample.labels) - {"le"} == expected[base]
             assert sample.labels["profile"] in {"alpha", "_unknown"}
-    assert len(sink.requests._metrics) == len(get_args(Operation)) + 1
-    assert len(sink.retrieval_duration._metrics) == 1
+    assert len(sink._requests._metrics) == len(get_args(Operation)) + 1
+    assert len(sink._retrieval_duration._metrics) == 1
+
+
+def test_f3_public_surface_cannot_inject_labels(ctx):
+    sink = BoundedMetricsSink(["alpha"])
+    for name in ("requests", "http_duration", "retrieval_duration", "pending", "vector_lag",
+                 "graph_lag", "conflicts", "registry"):
+        assert not hasattr(sink, name)
+    assert not any(hasattr(value, "labels") or hasattr(value, "register")
+                   for name, value in vars(sink).items() if not name.startswith("_"))
+    unknown = replace(ctx, profile_id=CANARY_QUERY)
+    with pytest.raises(TelemetryError, match="^E_VALIDATION$"):
+        sink.http_completed(unknown, CANARY_SECRET, 200, 0.1)
+    with pytest.raises(TelemetryError, match="^E_VALIDATION$"):
+        sink.retrieval_completed(unknown, CANARY_SECRET, 0.1, None)
+    with pytest.raises(TelemetryError, match="^E_VALIDATION$"):
+        sink.record_conflict(CANARY_SECRET, CANARY_QUERY)
+    sink.record_conflict("search", CANARY_QUERY)
+    sink.http_completed(unknown, "search", 200, 0.1)
+    sink.retrieval_completed(unknown, "fts", 0.1, None)
+    sink.projection_snapshot(CANARY_QUERY, 0, 0, 0)
+    admin = replace(ctx, principal=replace(ctx.principal, permissions=frozenset({"token.manage"})))
+    text = metrics_handler(admin, sink)[1].decode()
+    assert CANARY_QUERY not in text and CANARY_SECRET not in text
+    samples = [s for f in text_string_to_metric_families(text) for s in f.samples]
+    assert samples and all(s.labels["profile"] == "_unknown" for s in samples)
 
 
 def test_metrics_cap_and_unknown_lag(ctx):
@@ -260,10 +287,10 @@ def test_metrics_cap_and_unknown_lag(ctx):
     sink = BoundedMetricsSink([f"p{i}" for i in range(100)])
     for i in range(1000):
         sink.projection_snapshot(f"p{i}", 1, 1, 1)
-    assert len(sink.pending._metrics) == 101
+    assert len(sink._pending._metrics) == 101
     sink.projection_snapshot("p0", 0, None, None)
-    assert ("p0",) not in sink.vector_lag._metrics
-    assert ("p0",) not in sink.graph_lag._metrics
+    assert ("p0",) not in sink._vector_lag._metrics
+    assert ("p0",) not in sink._graph_lag._metrics
 
 
 def test_production_sink_failure_is_contained(ctx, monkeypatch):
@@ -272,7 +299,7 @@ def test_production_sink_failure_is_contained(ctx, monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError(CANARY_SECRET)
 
-    monkeypatch.setattr(sink.requests, "labels", fail)
+    monkeypatch.setattr(sink._requests, "labels", fail)
     result = {"success": True}
     sink.http_completed(ctx, "search", 200, 0.25)
     assert result == {"success": True}
@@ -568,7 +595,7 @@ def test_invalid_metric_duration_no_series(ctx, duration):
     sink = BoundedMetricsSink(["alpha"])
     sink.http_completed(ctx, "search", 200, duration)
     sink.retrieval_completed(ctx, "fts", duration, None)
-    assert not sink.requests._metrics and not sink.retrieval_duration._metrics
+    assert not sink._requests._metrics and not sink._retrieval_duration._metrics
 
 
 @pytest.mark.parametrize("field,value", [("request_id", CANARY_QUERY), ("profile_id", "/absolute/path")])

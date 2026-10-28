@@ -54,25 +54,25 @@ class BoundedMetricsSink:
             for p in configured
         ):
             raise TelemetryError("E_VALIDATION")
-        self.profiles = configured
+        self._profiles = configured
         self.registry_name = "cmms_gateway"
-        self.registry = _GatewayRegistry()
+        self._registry = _GatewayRegistry()
         self._lock = Lock()
         self.failure_count = 0
-        self.requests = Counter("cmms_http_requests", "Completed HTTP requests", (
-            "operation", "status_class", "profile"), registry=self.registry)
-        self.http_duration = Histogram("cmms_http_request_duration_seconds", "HTTP latency", (
-            "operation", "status_class", "profile"), buckets=_BUCKETS, registry=self.registry)
-        self.retrieval_duration = Histogram("cmms_retrieval_duration_seconds", "Retrieval latency", (
-            "stage", "profile"), buckets=_BUCKETS, registry=self.registry)
-        self.pending = Gauge("cmms_outbox_pending", "Pending projection events", ("profile",), registry=self.registry)
-        self.vector_lag = Gauge("cmms_vector_index_lag", "Vector lag", ("profile",), registry=self.registry)
-        self.graph_lag = Gauge("cmms_graph_index_lag", "Graph lag", ("profile",), registry=self.registry)
-        self.conflicts = Counter("cmms_version_conflicts", "Version conflicts", (
-            "operation", "profile"), registry=self.registry)
+        self._requests = Counter("cmms_http_requests", "Completed HTTP requests", (
+            "operation", "status_class", "profile"), registry=self._registry)
+        self._http_duration = Histogram("cmms_http_request_duration_seconds", "HTTP latency", (
+            "operation", "status_class", "profile"), buckets=_BUCKETS, registry=self._registry)
+        self._retrieval_duration = Histogram("cmms_retrieval_duration_seconds", "Retrieval latency", (
+            "stage", "profile"), buckets=_BUCKETS, registry=self._registry)
+        self._pending = Gauge("cmms_outbox_pending", "Pending projection events", ("profile",), registry=self._registry)
+        self._vector_lag = Gauge("cmms_vector_index_lag", "Vector lag", ("profile",), registry=self._registry)
+        self._graph_lag = Gauge("cmms_graph_index_lag", "Graph lag", ("profile",), registry=self._registry)
+        self._conflicts = Counter("cmms_version_conflicts", "Version conflicts", (
+            "operation", "profile"), registry=self._registry)
 
     def _profile(self, value: str | None) -> str:
-        return value if value in self.profiles else "_unknown"
+        return value if value in self._profiles else "_unknown"
 
     def _failed(self) -> None:
         with self._lock:
@@ -85,14 +85,16 @@ class BoundedMetricsSink:
     def http_completed(
         self, ctx: RequestContext, operation: Operation, status: int, duration_seconds: float,
     ) -> None:
+        if operation not in _OPERATIONS:
+            raise TelemetryError("E_VALIDATION")
         try:
-            if operation not in _OPERATIONS or type(status) is not int or not 100 <= status <= 599:
+            if type(status) is not int or not 100 <= status <= 599:
                 return
             if not self._duration(duration_seconds):
                 return
             labels = (operation, f"{status // 100}xx", self._profile(ctx.profile_id))
-            self.requests.labels(*labels).inc()
-            self.http_duration.labels(*labels).observe(duration_seconds)
+            self._requests.labels(*labels).inc()
+            self._http_duration.labels(*labels).observe(duration_seconds)
         except Exception:
             self._failed()
 
@@ -100,10 +102,21 @@ class BoundedMetricsSink:
         self, ctx: RequestContext, stage: Literal["fts", "semantic", "graph", "merge", "context"],
         duration_seconds: float, error_code: ErrorCode | None,
     ) -> None:
+        if stage not in _STAGES:
+            raise TelemetryError("E_VALIDATION")
         try:
-            if stage not in _STAGES or not self._duration(duration_seconds):
+            if not self._duration(duration_seconds):
                 return
-            self.retrieval_duration.labels(stage, self._profile(ctx.profile_id)).observe(duration_seconds)
+            self._retrieval_duration.labels(stage, self._profile(ctx.profile_id)).observe(duration_seconds)
+        except Exception:
+            self._failed()
+
+    def record_conflict(self, operation: Operation, profile_id: str | None) -> None:
+        """Off-protocol C9 counter; arbitrary operation labels are never admitted."""
+        if operation not in _OPERATIONS:
+            raise TelemetryError("E_VALIDATION")
+        try:
+            self._conflicts.labels(operation, self._profile(profile_id)).inc()
         except Exception:
             self._failed()
 
@@ -116,8 +129,8 @@ class BoundedMetricsSink:
             if pending is None:
                 return
             profile = self._profile(profile_id)
-            self.pending.labels(profile).set(pending)
-            for gauge, value in ((self.vector_lag, vector_lag), (self.graph_lag, graph_lag)):
+            self._pending.labels(profile).set(pending)
+            for gauge, value in ((self._vector_lag, vector_lag), (self._graph_lag, graph_lag)):
                 if value is not None:
                     gauge.labels(profile).set(value)
                 else:
@@ -132,6 +145,6 @@ def metrics_handler(ctx: RequestContext, sink: BoundedMetricsSink) -> tuple[str,
     if "token.manage" not in ctx.principal.permissions:
         raise TelemetryError("E_PERMISSION_DENIED")
     try:
-        return CONTENT_TYPE, generate_latest(sink.registry)
+        return CONTENT_TYPE, generate_latest(sink._registry)
     except Exception:
         raise TelemetryError("E_INTERNAL") from None
