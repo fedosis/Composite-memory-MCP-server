@@ -556,7 +556,7 @@ def test_q8_wire_ceiling_defaults_and_bounds(tmp_path):
     config = HttpConfig(control_path=tmp_path)
     assert (config.max_header_bytes, config.header_timeout_seconds, config.max_connections) == (16384, 5.0, 128)
     bounded = HttpConfig(control_path=tmp_path, max_header_bytes=1048576,
-                         header_timeout_seconds=300.0, max_connections=65536)
+                         header_timeout_seconds=300.0, request_timeout_seconds=300.0, max_connections=65536)
     assert bounded.max_header_bytes == 1048576 and bounded.max_connections == 65536
     for name, values in {
         "max_header_bytes": (0, -1, 1048577, True, 1.0, "16384", None),
@@ -699,3 +699,31 @@ async def test_f2_pending_readiness_is_false_and_read_only(configured, monkeypat
     assert statements and all(q.startswith("SELECT") and "LIMIT 1" in q for q in statements)
     assert store._connection.total_changes == changes
     assert [tuple(row) for row in store._connection.execute("SELECT * FROM tokens")] == before
+
+
+@pytest.mark.parametrize("overrides", [
+    {"max_header_bytes": 10**9},
+    {"max_connections": 10**9},
+    {"header_timeout_seconds": 10**6},
+    {"header_timeout_seconds": 6, "request_timeout_seconds": 5},
+    {"request_timeout_seconds": float("inf")},
+    {"request_timeout_seconds": float("nan")},
+    {"request_timeout_seconds": 0},
+])
+def test_f4_use_time_validation_rejects_subclass_bypass(tmp_path, overrides):
+    from memory_server.gateway_contracts import ports
+
+    class Bypass(ports.HttpConfig):
+        def __post_init__(self):
+            pass
+
+    config = Bypass(control_path=tmp_path, **overrides)
+    with pytest.raises(ValueError, match="^E_VALIDATION:"):
+        ports.validate_http_config(config)
+
+
+def test_f4_header_timeout_cannot_exceed_request_timeout(tmp_path):
+    from memory_server.gateway_contracts.ports import HttpConfig
+
+    with pytest.raises(ValueError, match="^E_VALIDATION:"):
+        HttpConfig(control_path=tmp_path, header_timeout_seconds=300, request_timeout_seconds=30)

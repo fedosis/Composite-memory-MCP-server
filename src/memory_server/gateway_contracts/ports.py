@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager as AsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Protocol
@@ -375,10 +376,31 @@ class HttpConfig:
     idempotency_ttl_seconds: int = 86400
 
     def __post_init__(self) -> None:
-        # S06 amendment Q8: configuration only; wire enforcement is S06 limits.py.
-        if type(self.max_header_bytes) is not int or not 1 <= self.max_header_bytes <= 1048576:
-            raise ValueError("invalid max_header_bytes")
-        if type(self.max_connections) is not int or not 1 <= self.max_connections <= 65536:
-            raise ValueError("invalid max_connections")
-        if type(self.header_timeout_seconds) not in (int, float) or not 0 < self.header_timeout_seconds <= 300:
-            raise ValueError("invalid header_timeout_seconds")
+        validate_http_config(self)
+
+
+def validate_http_config(config: HttpConfig) -> None:
+    """Validate HTTP resource ceilings at construction and point of use.
+
+    Raises ``ValueError`` with an ``E_VALIDATION:`` prefix for every invalid
+    configuration, including configurations created through a subclass that
+    bypasses ``HttpConfig.__post_init__``.
+    """
+    if type(config.max_header_bytes) is not int or not 1 <= config.max_header_bytes <= 1048576:
+        raise ValueError("E_VALIDATION: invalid max_header_bytes")
+    if type(config.max_connections) is not int or not 1 <= config.max_connections <= 65536:
+        raise ValueError("E_VALIDATION: invalid max_connections")
+    if (
+        type(config.header_timeout_seconds) not in (int, float)
+        or not isfinite(config.header_timeout_seconds)
+        or not 0 < config.header_timeout_seconds <= 300
+    ):
+        raise ValueError("E_VALIDATION: invalid header_timeout_seconds")
+    if (
+        type(config.request_timeout_seconds) not in (int, float)
+        or not isfinite(config.request_timeout_seconds)
+        or config.request_timeout_seconds <= 0
+    ):
+        raise ValueError("E_VALIDATION: invalid request_timeout_seconds")
+    if config.header_timeout_seconds > config.request_timeout_seconds:
+        raise ValueError("E_VALIDATION: header_timeout_seconds exceeds request_timeout_seconds")
