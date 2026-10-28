@@ -323,10 +323,12 @@ class AccessAuditStore:
                     f"SELECT {_COLUMNS} FROM access_audit WHERE profile_id=? AND seq>? ORDER BY seq LIMIT ?",
                     (profile_id, after_seq, limit),
                 ).fetchall()
-            except sqlite3.Error:
+                return tuple(AccessAudit.model_validate(
+                    {**dict(row), "timestamp": datetime.fromisoformat(row["timestamp"])}
+                ) for row in rows)
+            except (sqlite3.Error, ValueError, TypeError):
+                # Includes Pydantic ValidationError; never expose corrupted row content.
                 raise AuditError() from None
-        return tuple(AccessAudit.model_validate({**dict(row), "timestamp": datetime.fromisoformat(row["timestamp"])})
-                     for row in rows)
 
     def _watermark(self) -> float:
         """Called only under the SQLite write lock; invalid metadata fails closed."""

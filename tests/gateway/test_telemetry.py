@@ -397,6 +397,19 @@ def test_sqlite_full_is_sanitized(store, ctx, caplog):
     assert CANARY_SECRET not in caplog.text
 
 
+@pytest.mark.parametrize("column", ["timestamp", "latency_ms"])
+def test_f5_corrupt_row_is_c5_only(store, ctx, tmp_path, column):
+    begin(store, ctx)
+    with sqlite3.connect(tmp_path / "audit" / "access.sqlite") as writer:
+        writer.execute(f"UPDATE access_audit SET {column}=?", (CANARY_SECRET,))
+    with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$") as caught:
+        store.list(ctx.principal, "alpha")
+    assert caught.value.code == "E_AUDIT_UNAVAILABLE"
+    assert CANARY_SECRET not in str(caught.value)
+    assert CANARY_SECRET not in repr(caught.value)
+    assert caught.value.__suppress_context__ is True
+
+
 @pytest.mark.parametrize("stream", ["authenticated", "denials"])
 def test_f4_retention_scrubs_file_bytes(store, ctx, clock, tmp_path, stream):
     target = store if stream == "authenticated" else store._denials
