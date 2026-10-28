@@ -71,6 +71,7 @@ packages = [
     "memory_server.benchmarks",
     "memory_server.evaluation",
     "memory_server.gateway_contracts",
+    "memory_server.control",
     "memory_server.extractors",
     "memory_server.models",
     "memory_server.plugins",
