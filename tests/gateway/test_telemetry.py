@@ -881,6 +881,26 @@ def test_m1_marker_survives_when_both_database_writes_fail(tmp_path, ctx, clock)
         store.close()
 
 
+def test_m1_successful_denial_with_failed_health_update_survives_restart(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now)
+    store._denials._db.set_authorizer(
+        lambda action, table, *args: sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_UPDATE and table == "denial_health"
+        else sqlite3.SQLITE_OK
+    )
+    ticket = run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED"))
+    assert ticket is not None
+    assert store.saturation()["denials"] is True
+    store.close()
+
+    store = AccessAuditStore(root, clock=clock.now)
+    try:
+        assert store.saturation()["denials"] is True
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("damage", ["table", "row"])
 def test_m2_missing_denial_health_refuses_parent_reopen(tmp_path, clock, damage):
     root = tmp_path / "audit"

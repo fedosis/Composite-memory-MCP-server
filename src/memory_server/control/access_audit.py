@@ -403,7 +403,7 @@ class AccessAuditStore:
                         or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
                     raise AuditError()
                 raw = os.read(fd, 128)
-                match = re.fullmatch(rb"([1-9][0-9]*) ([01])\n", raw)
+                match = re.fullmatch(rb"(0|[1-9][0-9]*) ([01])\n", raw)
                 if match is None:
                     raise AuditError()
                 return int(match[1]), int(match[2])
@@ -435,8 +435,8 @@ class AccessAuditStore:
         except OSError:
             raise AuditError() from None
 
-    def _record_denial_failure_fallback(self) -> None:
-        """Persist one loss independently, then fall back to the side marker."""
+    def _record_denial_failure_fallback(self, *, dropped: bool) -> None:
+        """Persist failed health metadata independently or in the side marker."""
         try:
             fallback = sqlite3.connect(
                 f"/proc/self/fd/{self._fd}/access.sqlite", isolation_level=None,
@@ -446,7 +446,8 @@ class AccessAuditStore:
                 fallback.execute("PRAGMA synchronous=FULL")
                 fallback.execute("BEGIN IMMEDIATE")
                 changed = fallback.execute(
-                    "UPDATE denial_health SET dropped=dropped+1,failing=1 WHERE id=1"
+                    "UPDATE denial_health SET dropped=dropped+?,failing=1 WHERE id=1",
+                    (int(dropped),),
                 ).rowcount
                 if changed != 1:
                     raise sqlite3.IntegrityError
@@ -457,8 +458,8 @@ class AccessAuditStore:
         except sqlite3.Error:
             pass
         with self._lock:
-            dropped, _ = self._denial_failure_marker()
-            self._write_denial_failure_marker(dropped + 1, 1)
+            marker_dropped, _ = self._denial_failure_marker()
+            self._write_denial_failure_marker(marker_dropped + int(dropped), 1)
 
     @property
     def dropped_denials(self) -> int:
@@ -476,8 +477,8 @@ class AccessAuditStore:
             ).rowcount
             if changed != 1:
                 raise AuditError()
-        marker_dropped, _ = self._denial_failure_marker()
-        if marker_dropped and not dropped:
+        marker_dropped, marker_failing = self._denial_failure_marker()
+        if (marker_dropped or marker_failing) and not dropped:
             self._write_denial_failure_marker(marker_dropped, 0)
 
     async def record_unauthenticated(self, request_id: str, reason: ErrorCode) -> AuditTicket | None:
@@ -498,7 +499,7 @@ class AccessAuditStore:
                     self._denials._record_denial_health(dropped=True)
                 except AuditError:
                     try:
-                        self._denials._record_denial_failure_fallback()
+                        self._denials._record_denial_failure_fallback(dropped=True)
                     except AuditError:
                         pass  # DB and marker unavailable: process-local gate stays fail-closed
             return None
@@ -507,6 +508,10 @@ class AccessAuditStore:
             self._denial_failed = False
         except AuditError:
             self._denial_failed = True
+            try:
+                self._denials._record_denial_failure_fallback(dropped=False)
+            except AuditError:
+                pass  # DB and marker unavailable: process-local gate stays fail-closed
         return ticket
 
     async def finish(self, ticket: AuditTicket, outcome: AuditOutcome) -> None:
