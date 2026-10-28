@@ -16,6 +16,8 @@ from memory_server.gateway_contracts.ports import HttpConfig
 
 from .errors import HttpError
 
+_OVERFLOW_DRAIN_MAX_BYTES = 64 * 1024
+
 
 def validate_config(config: HttpConfig) -> None:
     """Validate the frozen contract plus S06's transport-level constraints."""
@@ -150,6 +152,28 @@ def _has_conflicting_framing(raw: bytes) -> bool:
     return b"content-length" in names and b"transfer-encoding" in names
 
 
+async def _drain_overflow(
+    receive: Callable[[], Awaitable[dict[str, Any]]], deadline: float
+) -> None:
+    drained = 0
+    while drained < _OVERFLOW_DRAIN_MAX_BYTES:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return
+        try:
+            message = await asyncio.wait_for(receive(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return
+        if message.get("type") != "http.request":
+            return
+        chunk = message.get("body", b"")
+        if not isinstance(chunk, bytes):
+            return
+        drained += len(chunk)
+        if not message.get("more_body", False):
+            return
+
+
 async def read_body(
     scope: dict[str, Any],
     receive: Callable[[], Awaitable[dict[str, Any]]],
@@ -193,6 +217,11 @@ async def read_body(
             raise HttpError("E_VALIDATION")
         observed += len(chunk)
         if observed > config.max_body_bytes:
+            if transfer and message.get("more_body", False):
+                # Leave room inside the enclosing request deadline to send C5.
+                drain_deadline = min(deadline - min(0.05, config.request_timeout_seconds / 10),
+                                     monotonic() + 0.25)
+                await _drain_overflow(receive, drain_deadline)
             raise HttpError("E_REQUEST_TOO_LARGE")
         chunks.append(chunk)
         if not message.get("more_body", False):

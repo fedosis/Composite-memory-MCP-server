@@ -10,6 +10,8 @@ from time import monotonic
 import pytest
 
 from memory_server.transports.http.app import create_http_app
+from memory_server.transports.http.errors import HttpError
+from memory_server.transports.http.limits import read_body
 from tests.gateway.test_http_shell import CANARY, code, request, rows
 from tests.gateway.test_http_shell import shell as shell_fixture
 
@@ -482,3 +484,59 @@ async def test_pre_auth_source_isolation_and_process_ceiling(shell):
         await app.close()
     assert all(response.status == 200 for response in responses)
     assert app.guard.active == 0
+
+
+async def test_raw_chunked_8k_overflow_receives_413(shell):
+    config = replace(shell.config, max_body_bytes=1024)
+    app = create_http_app(config, shell.deps)
+    async with wire(app, config) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"POST /api/v1/profiles/alpha/disable HTTP/1.1\r\nHost: localhost\r\n"
+                     b"Transfer-Encoding: chunked\r\n\r\n")
+        await writer.drain()
+        try:
+            for _ in range(32):
+                writer.write(b"100\r\n" + b"x" * 256 + b"\r\n")
+                await writer.drain()
+                await asyncio.sleep(0.002)
+            writer.write(b"0\r\n\r\n")
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(), 2)
+            head, body = response.split(b"\r\n\r\n", 1)
+            assert b" 413 " in head, response
+            error = json.loads(body)["error"]
+            assert error["code"] == "E_REQUEST_TOO_LARGE"
+            assert set(error) == {"code", "message", "details", "request_id"}
+            assert rows(shell) == []
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            await app.close()
+
+
+@pytest.mark.parametrize("mode", ["cap", "deadline"])
+async def test_overflow_drain_bounded_by_cap_and_deadline(shell, mode):
+    config = replace(shell.config, max_body_bytes=1024)
+    reads = 0
+
+    async def receive():
+        nonlocal reads
+        reads += 1
+        if mode == "deadline" and reads > 1:
+            await asyncio.sleep(10)
+        return {"type": "http.request", "body": b"x" * 8192, "more_body": True}
+
+    started = monotonic()
+    with pytest.raises(HttpError) as raised:
+        await asyncio.wait_for(read_body({"headers": [(b"transfer-encoding", b"chunked")]}, receive, config), 1)
+    assert raised.value.code == "E_REQUEST_TOO_LARGE"
+    elapsed = monotonic() - started
+    if mode == "cap":
+        assert reads == 9  # One overflowing chunk plus at most 64 KiB of drain.
+        assert elapsed < 0.5
+    else:
+        assert reads == 2
+        assert 0.2 <= elapsed < 0.6
