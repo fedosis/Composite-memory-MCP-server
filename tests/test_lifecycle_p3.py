@@ -8,11 +8,9 @@ import json
 import pytest
 from sqlalchemy import text
 from storage.repositories import LifecycleRepository
-from storage.repositories.belief_repo import BeliefRepository
 
 import memory_server.server as server_module
 from memory_server.models import Belief, Fact
-from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.services.lifecycle_service import LifecycleService
 
@@ -23,6 +21,46 @@ async def provider():
     await p.initialize()
     yield p
     await p.close()
+
+
+class _CreationFailureProvider(SQLiteProvider):
+    """Fail after the real create and lifecycle callback, before SQL commit."""
+
+    async def create_in_transaction(self, **kwargs):
+        callback = kwargs.get("transaction_callback")
+
+        async def fail_before_commit(session):
+            if callback is not None:
+                await callback(session)
+            self.failure_reached = True
+            raise RuntimeError("boom")
+
+        kwargs["transaction_callback"] = fail_before_commit
+        return await super().create_in_transaction(**kwargs)
+
+
+async def _creation_failure_sqlite(runtime):
+    provider = _CreationFailureProvider(url=runtime.config.sqlite_url)
+    provider.failure_reached = False
+    await provider.initialize()
+    return provider
+
+
+async def _reinforced_at_failure_sqlite(runtime):
+    from sqlalchemy import event
+
+    provider = SQLiteProvider(url=runtime.config.sqlite_url)
+    provider.failure_reached = False
+    await provider.initialize()
+
+    def fail_reinforced_at(connection, cursor, statement, parameters, context, executemany):
+        # The injected constructor owns this engine only; no process-global patch.
+        if statement.startswith("UPDATE beliefs SET ") and "last_reinforced_at=" in statement:
+            provider.failure_reached = True
+            raise RuntimeError("reinforced_at failed")
+
+    event.listen(provider.engine.sync_engine, "before_cursor_execute", fail_reinforced_at)
+    return provider
 
 
 @pytest.mark.asyncio
@@ -289,292 +327,287 @@ class TestLifecycleServiceP3:
                 reason="invalid type",
             )
 
-    async def test_invalidate_demotes_dependent_confidence(self, provider, monkeypatch):
-        parent = Fact(
-            id="fact-parent",
-            subject="Source",
-            predicate="supports",
-            object="Claim",
-            confidence=1.0,
-        )
-        child = Fact(
-            id="fact-child",
-            subject="Derived",
-            predicate="depends_on",
-            object="Parent",
-            confidence=0.5,
-        )
-        await provider.create_fact(parent)
-        await provider.create_fact(child)
-
-        graph = SimpleGraph()
-        graph.add_node(
-            id=parent.id,
-            type="fact",
-            name="parent",
-            attributes={},
-        )
-        graph.add_node(
-            id=child.id,
-            type="fact",
-            name="child",
-            attributes={},
-        )
-        graph.add_edge(
-            source_id=child.id,
-            target_id=parent.id,
-            relation="derived_from",
-        )
-
-        monkeypatch.setattr(server_module, "_provider", provider)
-        monkeypatch.setattr(server_module, "_graph", graph)
-        monkeypatch.setattr(server_module, "_graph_router", None)
-
-        payload = json.loads(
-            await server_module.invalidate_tool(
-                memory_id=parent.id,
-                memory_type="fact",
-                reason="parent invalidated",
+    async def test_invalidate_demotes_dependent_confidence(self, seam02_composition):
+        async with seam02_composition() as composition:
+            provider = composition.runtime.dependencies.sqlite
+            assert provider._url == composition.layout.sqlite.effective_url
+            graph = composition.runtime.dependencies.graph
+            assert composition.routers["graph_router"]._graph is graph
+            parent = Fact(
+                id="fact-parent",
+                subject="Source",
+                predicate="supports",
+                object="Claim",
+                confidence=1.0,
             )
-        )
-
-        assert payload["memory"]["lifecycle_state"] == "discarded"
-        assert payload["memory"]["version"] == 2
-        assert payload["propagated"]
-        assert payload["propagated"][0]["memory_id"] == child.id
-        assert payload["propagated"][0]["reason"] == "parent_invalidated"
-
-        updated_child = await provider.get_fact(child.id)
-        assert updated_child is not None
-        assert updated_child.lifecycle_state == "active"
-        assert updated_child.confidence == pytest.approx(0.4)
-
-        async with await provider._get_session() as session:
-            repo = LifecycleRepository(session)
-            child_events = await repo.get_events(child.id)
-
-        assert len(child_events) == 1
-        assert child_events[0]["from_state"] == "active"
-        assert child_events[0]["to_state"] == "active"
-        assert child_events[0]["reason"] == "parent_invalidated"
-
-    async def test_set_belief_replace_writes_lifecycle_event(self, provider, monkeypatch):
-        old = Belief(proposition="Old policy", confidence=0.6)
-        await provider.create_belief(old)
-
-        graph = SimpleGraph()
-        monkeypatch.setattr(server_module, "_provider", provider)
-        monkeypatch.setattr(server_module, "_graph", graph)
-        monkeypatch.setattr(server_module, "_graph_router", None)
-
-        payload = json.loads(
-            await server_module.set_belief_tool(
-                proposition="New policy",
-                confidence=0.9,
-                replace_belief_id=old.id,
+            child = Fact(
+                id="fact-child",
+                subject="Derived",
+                predicate="depends_on",
+                object="Parent",
+                confidence=0.5,
             )
-        )
+            await provider.create_fact(parent)
+            await provider.create_fact(child)
 
-        assert payload["superseded"]["id"] == old.id
-        superseded = await provider.get_belief(old.id)
-        assert superseded is not None
-        assert superseded.lifecycle_state == "superseded"
-        assert superseded.version == 2
+            graph.add_node(
+                id=parent.id,
+                type="fact",
+                name="parent",
+                attributes={},
+            )
+            graph.add_node(
+                id=child.id,
+                type="fact",
+                name="child",
+                attributes={},
+            )
+            graph.add_edge(
+                source_id=child.id,
+                target_id=parent.id,
+                relation="derived_from",
+            )
 
-        async with await provider._get_session() as session:
-            repo = LifecycleRepository(session)
-            events = await repo.get_events(old.id)
+            payload = json.loads(
+                await server_module.invalidate_tool(
+                    memory_id=parent.id,
+                    memory_type="fact",
+                    reason="parent invalidated",
+                )
+            )
 
-        assert len(events) == 1
-        assert events[0]["from_state"] == "active"
-        assert events[0]["to_state"] == "superseded"
-        assert events[0]["reason"] == f"Replaced by {payload['belief']['id']}"
+            assert payload["memory"]["lifecycle_state"] == "discarded"
+            assert payload["memory"]["version"] == 2
+            assert payload["propagated"]
+            assert payload["propagated"][0]["memory_id"] == child.id
+            assert payload["propagated"][0]["reason"] == "parent_invalidated"
+
+            updated_child = await provider.get_fact(child.id)
+            assert updated_child is not None
+            assert updated_child.lifecycle_state == "active"
+            assert updated_child.confidence == pytest.approx(0.4)
+
+            async with await provider._get_session() as session:
+                repo = LifecycleRepository(session)
+                child_events = await repo.get_events(child.id)
+
+            assert len(child_events) == 1
+            assert child_events[0]["from_state"] == "active"
+            assert child_events[0]["to_state"] == "active"
+            assert child_events[0]["reason"] == "parent_invalidated"
+
+    async def test_set_belief_replace_writes_lifecycle_event(self, seam02_composition):
+        async with seam02_composition() as composition:
+            provider = composition.runtime.dependencies.sqlite
+            assert provider._url == composition.layout.sqlite.effective_url
+            old = Belief(proposition="Old policy", confidence=0.6)
+            await provider.create_belief(old)
+
+            payload = json.loads(
+                await server_module.set_belief_tool(
+                    proposition="New policy",
+                    confidence=0.9,
+                    replace_belief_id=old.id,
+                )
+            )
+
+            assert payload["superseded"]["id"] == old.id
+            superseded = await provider.get_belief(old.id)
+            assert superseded is not None
+            assert superseded.lifecycle_state == "superseded"
+            assert superseded.version == 2
+
+            async with await provider._get_session() as session:
+                repo = LifecycleRepository(session)
+                events = await repo.get_events(old.id)
+
+            assert len(events) == 1
+            assert events[0]["from_state"] == "active"
+            assert events[0]["to_state"] == "superseded"
+            assert events[0]["reason"] == f"Replaced by {payload['belief']['id']}"
 
     async def test_set_belief_replace_rolls_back_when_creation_fails(
-        self, provider, monkeypatch
+        self, seam02_composition
     ):
-        old = Belief(proposition="Rollback policy", confidence=0.6)
-        await provider.create_belief(old)
+        async with seam02_composition(overrides={"sqlite": _creation_failure_sqlite}) as composition:
+            provider = composition.runtime.dependencies.sqlite
+            assert provider._url == composition.layout.sqlite.effective_url
+            old = Belief(proposition="Rollback policy", confidence=0.6)
+            await provider.create_belief(old)
 
-        async def boom(*args, **kwargs):
-            raise RuntimeError("boom")
+            with pytest.raises(RuntimeError, match="boom"):
+                await server_module.set_belief_tool(
+                    proposition="New rollback policy",
+                    confidence=0.9,
+                    replace_belief_id=old.id,
+                )
 
-        graph = SimpleGraph()
-        monkeypatch.setattr(server_module, "_provider", provider)
-        monkeypatch.setattr(server_module, "_graph", graph)
-        monkeypatch.setattr(server_module, "_graph_router", None)
-        monkeypatch.setattr(provider, "create_in_transaction", boom)
-
-        with pytest.raises(RuntimeError, match="boom"):
-            await server_module.set_belief_tool(
-                proposition="New rollback policy",
-                confidence=0.9,
-                replace_belief_id=old.id,
-            )
-
-        reloaded = await provider.get_belief(old.id)
-        assert reloaded is not None
-        assert reloaded.lifecycle_state == "active"
-        assert reloaded.version == 1
+            assert provider.failure_reached
+            reloaded = await provider.get_belief(old.id)
+            assert reloaded is not None
+            assert reloaded.lifecycle_state == "active"
+            assert reloaded.version == 1
+            assert len(await provider.search_beliefs(limit=100)) == 1
+            async with await provider._get_session() as session:
+                assert await LifecycleRepository(session).get_events(old.id) == []
+            assert await provider.get_receipt(old.id) is None
 
     async def test_resolve_conflict_merge_rolls_back_when_creation_fails(
-        self, provider, monkeypatch
+        self, seam02_composition
     ):
-        belief_a = Belief(proposition="A policy", confidence=0.8)
-        belief_b = Belief(proposition="B policy", confidence=0.6)
-        await provider.create_belief(belief_a)
-        await provider.create_belief(belief_b)
+        async with seam02_composition(overrides={"sqlite": _creation_failure_sqlite}) as composition:
+            provider = composition.runtime.dependencies.sqlite
+            assert provider._url == composition.layout.sqlite.effective_url
+            belief_a = Belief(proposition="A policy", confidence=0.8)
+            belief_b = Belief(proposition="B policy", confidence=0.6)
+            await provider.create_belief(belief_a)
+            await provider.create_belief(belief_b)
 
-        async def boom(*args, **kwargs):
-            raise RuntimeError("boom")
+            with pytest.raises(RuntimeError, match="boom"):
+                await server_module.resolve_conflict_tool(
+                    belief_a_id=belief_a.id,
+                    belief_b_id=belief_b.id,
+                    resolution="merge",
+                    new_proposition="Combined policy",
+                )
 
-        graph = SimpleGraph()
-        monkeypatch.setattr(server_module, "_provider", provider)
-        monkeypatch.setattr(server_module, "_graph", graph)
-        monkeypatch.setattr(server_module, "_graph_router", None)
-        monkeypatch.setattr(provider, "create_in_transaction", boom)
-
-        with pytest.raises(RuntimeError, match="boom"):
-            await server_module.resolve_conflict_tool(
-                belief_a_id=belief_a.id,
-                belief_b_id=belief_b.id,
-                resolution="merge",
-                new_proposition="Combined policy",
-            )
-
-        reloaded_a = await provider.get_belief(belief_a.id)
-        reloaded_b = await provider.get_belief(belief_b.id)
-        assert reloaded_a is not None and reloaded_a.lifecycle_state == "active"
-        assert reloaded_b is not None and reloaded_b.lifecycle_state == "active"
+            assert provider.failure_reached
+            reloaded_a = await provider.get_belief(belief_a.id)
+            reloaded_b = await provider.get_belief(belief_b.id)
+            assert reloaded_a is not None and reloaded_a.lifecycle_state == "active"
+            assert reloaded_b is not None and reloaded_b.lifecycle_state == "active"
+            assert reloaded_a.version == reloaded_b.version == 1
+            assert len(await provider.search_beliefs(limit=100)) == 2
+            async with await provider._get_session() as session:
+                for belief in (belief_a, belief_b):
+                    assert await LifecycleRepository(session).get_events(belief.id) == []
 
     async def test_propagation_uses_sql_relations_when_graph_unavailable(
-        self, provider, monkeypatch
+        self, seam02_composition
     ):
-        parent = Fact(
-            id="fact-parent-sql",
-            subject="Source",
-            predicate="supports",
-            object="Claim",
-            confidence=1.0,
-        )
-        child = Fact(
-            id="fact-child-sql",
-            subject="Derived",
-            predicate="depends_on",
-            object="Parent",
-            confidence=0.5,
-        )
-        await provider.create_fact(parent)
-        await provider.create_fact(child)
-        await provider.create_in_transaction(
-            relation_entries=[
-                {
-                    "source_id": child.id,
-                    "target_id": parent.id,
-                    "relation_type": "derived_from",
-                }
-            ]
-        )
-
-        class BrokenGraph:
-            def search_by_relation(self, relation: str):
-                raise RuntimeError("graph unavailable")
-
-        monkeypatch.setattr(server_module, "_provider", provider)
-        monkeypatch.setattr(server_module, "_graph", BrokenGraph())
-        monkeypatch.setattr(server_module, "_graph_router", None)
-
-        payload = json.loads(
-            await server_module.invalidate_tool(
-                memory_id=parent.id,
-                memory_type="fact",
-                reason="parent invalidated",
+        async with seam02_composition(overrides={"graph": lambda runtime: None}) as composition:
+            provider = composition.runtime.dependencies.sqlite
+            assert provider._url == composition.layout.sqlite.effective_url
+            assert composition.runtime.state == "READY"
+            assert composition.runtime.dependencies.graph is None
+            assert composition.routers["graph_router"] is None
+            assert composition.runtime.dependencies.outbox_worker is None
+            parent = Fact(
+                id="fact-parent-sql",
+                subject="Source",
+                predicate="supports",
+                object="Claim",
+                confidence=1.0,
             )
-        )
+            child = Fact(
+                id="fact-child-sql",
+                subject="Derived",
+                predicate="depends_on",
+                object="Parent",
+                confidence=0.5,
+            )
+            await provider.create_fact(parent)
+            await provider.create_fact(child)
+            await provider.create_in_transaction(
+                relation_entries=[
+                    {
+                        "source_id": child.id,
+                        "target_id": parent.id,
+                        "relation_type": "derived_from",
+                    }
+                ]
+            )
 
-        assert payload["propagated"]
-        assert payload["propagated"][0]["memory_id"] == child.id
+            payload = json.loads(
+                await server_module.invalidate_tool(
+                    memory_id=parent.id,
+                    memory_type="fact",
+                    reason="parent invalidated",
+                )
+            )
 
-        updated_child = await provider.get_fact(child.id)
-        assert updated_child is not None
-        assert updated_child.confidence == pytest.approx(0.4)
-        assert updated_child.version == 2
+            assert "propagated" in payload, payload
+            assert payload["propagated"]
+            assert payload["propagated"][0]["memory_id"] == child.id
+
+            updated_child = await provider.get_fact(child.id)
+            assert updated_child is not None
+            assert updated_child.confidence == pytest.approx(0.4)
+            assert updated_child.version == 2
 
 
 @pytest.mark.asyncio
 class TestServerBeliefReinforcement:
     async def test_set_belief_returns_fresh_belief_and_persists_history(
-        self, provider, monkeypatch
+        self, seam02_composition
     ):
-        original = Belief(proposition="User prefers Docker", confidence=0.4)
-        await provider.create_belief(original)
+        async with seam02_composition() as composition:
+            provider = composition.runtime.dependencies.sqlite
+            assert provider._url == composition.layout.sqlite.effective_url
+            original = Belief(proposition="User prefers Docker", confidence=0.4)
+            await provider.create_belief(original)
 
-        monkeypatch.setattr(server_module, "_provider", provider)
-        monkeypatch.setattr(server_module, "_graph", None)
-        monkeypatch.setattr(server_module, "_graph_router", None)
-
-        payload = json.loads(
-            await server_module.set_belief_tool(
-                proposition="User prefers Docker",
-                confidence=0.8,
-                sources=json.dumps(
-                    [
-                        {
-                            "source_type": "fact",
-                            "source_id": "fact-1",
-                            "weight": 0.8,
-                        }
-                    ]
-                ),
-                tags=json.dumps(["docker", "infra"]),
-                source="test",
+            payload = json.loads(
+                await server_module.set_belief_tool(
+                    proposition="User prefers Docker",
+                    confidence=0.8,
+                    sources=json.dumps(
+                        [
+                            {
+                                "source_type": "fact",
+                                "source_id": "fact-1",
+                                "weight": 0.8,
+                            }
+                        ]
+                    ),
+                    tags=json.dumps(["docker", "infra"]),
+                    source="test",
+                )
             )
-        )
 
-        assert payload["reinforced"] is True
-        assert payload["belief"]["id"] == original.id
-        assert payload["belief"]["confidence"] == pytest.approx(0.6)
-        assert payload["receipt"]["confidence"] == pytest.approx(0.6)
-        assert payload["receipt"]["history"][-1]["kind"] == "reinforce"
-        assert payload["receipt"]["history"][-1]["previous_confidence"] == pytest.approx(0.4)
-        assert payload["receipt"]["history"][-1]["confidence"] == pytest.approx(0.6)
-        assert set(payload["belief"]["tags"]) == {"docker", "infra"}
-        assert set(payload["belief"]["source_ids"]) == {"fact-1"}
+            assert payload["reinforced"] is True
+            assert payload["belief"]["id"] == original.id
+            assert payload["belief"]["confidence"] == pytest.approx(0.6)
+            assert payload["receipt"]["confidence"] == pytest.approx(0.6)
+            assert payload["receipt"]["history"][-1]["kind"] == "reinforce"
+            assert payload["receipt"]["history"][-1]["previous_confidence"] == pytest.approx(0.4)
+            assert payload["receipt"]["history"][-1]["confidence"] == pytest.approx(0.6)
+            assert set(payload["belief"]["tags"]) == {"docker", "infra"}
+            assert set(payload["belief"]["source_ids"]) == {"fact-1"}
 
-        stored = await provider.get_belief(original.id)
-        fresh_receipt = await provider.get_receipt(original.id)
-        assert stored is not None
-        assert stored.confidence == pytest.approx(0.6)
-        assert set(stored.tags) == {"docker", "infra"}
-        assert set(stored.source_ids) == {"fact-1"}
-        assert fresh_receipt is not None
-        assert fresh_receipt.history[-1]["kind"] == "reinforce"
+            stored = await provider.get_belief(original.id)
+            fresh_receipt = await provider.get_receipt(original.id)
+            assert stored is not None
+            assert stored.confidence == pytest.approx(0.6)
+            assert set(stored.tags) == {"docker", "infra"}
+            assert set(stored.source_ids) == {"fact-1"}
+            assert fresh_receipt is not None
+            assert fresh_receipt.history[-1]["kind"] == "reinforce"
 
     async def test_set_belief_rolls_back_when_reinforced_at_fails(
-        self, provider, monkeypatch
+        self, seam02_composition
     ):
-        original = Belief(proposition="Rollback Docker", confidence=0.4)
-        await provider.create_belief(original)
+        async with seam02_composition(overrides={"sqlite": _reinforced_at_failure_sqlite}) as composition:
+            provider = composition.runtime.dependencies.sqlite
+            assert provider._url == composition.layout.sqlite.effective_url
+            original = Belief(proposition="Rollback Docker", confidence=0.4)
+            await provider.create_belief(original)
 
-        async def boom(self, belief_id: str):
-            raise RuntimeError("reinforced_at failed")
+            with pytest.raises(RuntimeError, match="reinforced_at failed"):
+                await server_module.set_belief_tool(
+                    proposition="Rollback Docker",
+                    confidence=0.8,
+                    sources="[]",
+                    tags="[]",
+                    source="test",
+                )
 
-        monkeypatch.setattr(BeliefRepository, "update_reinforced_at", boom)
-        monkeypatch.setattr(server_module, "_provider", provider)
-        monkeypatch.setattr(server_module, "_graph", None)
-        monkeypatch.setattr(server_module, "_graph_router", None)
-
-        with pytest.raises(RuntimeError, match="reinforced_at failed"):
-            await server_module.set_belief_tool(
-                proposition="Rollback Docker",
-                confidence=0.8,
-                sources="[]",
-                tags="[]",
-                source="test",
-            )
-
-        stored = await provider.get_belief(original.id)
-        receipt = await provider.get_receipt(original.id)
-        assert stored is not None
-        assert stored.confidence == pytest.approx(0.4)
-        assert receipt is None
+            assert provider.failure_reached
+            stored = await provider.get_belief(original.id)
+            receipt = await provider.get_receipt(original.id)
+            assert stored is not None
+            assert stored.confidence == pytest.approx(0.4)
+            assert stored.version == original.version
+            assert receipt is None
+            async with await provider._get_session() as session:
+                assert await LifecycleRepository(session).get_events(original.id) == []
