@@ -154,7 +154,10 @@ class TokenService:
             self._db.execute("SELECT generation,last_used_at FROM tokens LIMIT 1").fetchone()
         except (TokenError, sqlite3.Error):
             return False
-        return True
+        try:
+            return not self._store.control_requests(limit=1)
+        except ControlError:
+            return False
 
     async def authenticate(self, bearer: str, *, now: datetime) -> Principal:
         utc_now(now)

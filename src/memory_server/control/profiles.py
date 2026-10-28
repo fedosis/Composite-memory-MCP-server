@@ -226,7 +226,10 @@ class ProfileRegistry:
             connection.execute("SELECT id,generation FROM profiles LIMIT 1").fetchone()
         except sqlite3.Error:
             return False
-        return True
+        try:
+            return not self._store.control_requests(limit=1)
+        except ControlError:
+            return False
 
     @staticmethod
     def _safe_observation(observation) -> bool:

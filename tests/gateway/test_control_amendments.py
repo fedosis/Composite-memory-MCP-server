@@ -418,7 +418,7 @@ def test_q5_availability_is_bounded_read_only_and_fail_closed(configured, monkey
     monkeypatch.setattr(tokens, "authenticate", forbidden)
     monkeypatch.setattr(sqlite3, "connect", forbidden)
     assert registry.available() and tokens.available()
-    assert len(statements) == 2 and all(query.startswith("SELECT") and "LIMIT 1" in query for query in statements)
+    assert len(statements) == 4 and all(query.startswith("SELECT") and "LIMIT 1" in query for query in statements)
     assert store._connection.total_changes == changes
     assert [tuple(row) for row in store._connection.execute("SELECT * FROM tokens")] == before
     store._connection.execute("DROP TABLE token_journal")
@@ -659,3 +659,43 @@ async def test_f1_bounded_recovery_rotates_past_failed_profile(configured):
     assert not await registry.reconcile_control(leases=leases, publish=recover_b, limit=1)
     assert seen == [a[2].id, b[2].id]
     assert [row["profile_id"] for row in store.control_requests(limit=10)] == ["alpha"]
+
+
+async def test_f2_pending_readiness_is_false_and_read_only(configured, monkeypatch):
+    from datetime import timedelta
+
+    from memory_server.control.tokens import TokenService
+    from memory_server.gateway_contracts.ports import GatewayDependencies
+
+    registry, store, _ = configured
+    tokens = TokenService(store)
+    now = datetime.now(timezone.utc)
+    tokens._bootstrap_create(d.TokenCreate(subject="probe", profiles=["alpha"],
+        permissions=["profile.read"], expires_at=now + timedelta(hours=1)), now=now)
+
+    async def unavailable(ticket, outcome):
+        return False
+
+    await run_control(registry, control_input(), ObservedLeases(), publish=unavailable)
+    before = [tuple(row) for row in store._connection.execute("SELECT * FROM tokens")]
+    changes = store._connection.total_changes
+    statements = []
+    store._connection.set_trace_callback(statements.append)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("readiness authenticated or opened storage")
+
+    monkeypatch.setattr(tokens, "authenticate", forbidden)
+    monkeypatch.setattr(tokens, "verify_principal", forbidden)
+    monkeypatch.setattr(sqlite3, "connect", forbidden)
+
+    async def ready():
+        return registry.available() and tokens.available()
+
+    deps = GatewayDependencies(registry=registry, tokens=tokens, access=None, metrics=None, ports={}, readiness=ready)
+    assert not registry.available()
+    assert not tokens.available()
+    assert not await deps.readiness()
+    assert statements and all(q.startswith("SELECT") and "LIMIT 1" in q for q in statements)
+    assert store._connection.total_changes == changes
+    assert [tuple(row) for row in store._connection.execute("SELECT * FROM tokens")] == before
