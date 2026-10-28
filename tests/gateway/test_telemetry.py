@@ -507,8 +507,7 @@ def test_f2_rollback_before_first_retain(store, ctx, clock):
     clock.wall -= timedelta(days=40)
     ticket = begin(store, ctx)
     assert rows(store)[0]["created_at"] == clock.wall.timestamp()
-    with pytest.raises(AuditError, match="^E_VALIDATION$"):
-        store.retain()
+    assert store.retain() == 0  # a rollback must not wedge retention
     assert store.rollback_refusals == 1
     assert rows(store)[0]["id"] == ticket.id
     clock.wall = watermark
@@ -557,8 +556,7 @@ def test_rollback_watermark_survives_restart(tmp_path, ctx, clock):
     store.close()
     clock.wall -= timedelta(seconds=1)
     store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
-    with pytest.raises(AuditError, match="E_VALIDATION"):
-        store.retain()
+    assert store.retain() == 0  # counted as a rollback, yet still able to run
     assert store.rollback_refusals == 1
     assert rows(store)[0]["id"] == ticket.id
     store.close()
@@ -831,15 +829,64 @@ def test_n2_configured_step_and_normal_expiry(tmp_path, ctx, clock):
         store.close()
 
 
-def test_n2_backward_clock_refuses_without_deleting_fresh(store, ctx, clock):
+def test_n2_missing_witness_fails_closed(tmp_path, clock):
+    with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
+        AccessAuditStore(tmp_path / "audit", clock=clock.now, boottime=lambda: 0.0)
+
+
+def test_n2_foreign_boot_rows_expire_only_after_a_full_ttl_of_uptime(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=60)
+    run(store.finish(begin(store, ctx), SUCCESS))
+    store.close()
+    with sqlite3.connect(root / "access.sqlite") as writer:
+        writer.execute("UPDATE access_audit SET boot_epoch='previous-boot', booted_at=1.0")
+
+    rebooted = Clock()
+    rebooted.boot = 5.0  # five seconds of uptime
+    rebooted.wall += timedelta(days=40)
+    store = AccessAuditStore(
+        root, clock=rebooted.now, boottime=lambda: rebooted.boot, ttl_seconds=60,
+    )
+    try:
+        assert store.retain() == 0  # a wall jump cannot age another boot's rows
+        assert len(rows(store)) == 1
+        rebooted.boot = 61.0  # this boot has now outlasted the TTL
+        assert store.retain() == 1
+        assert rows(store) == []
+    finally:
+        store.close()
+
+
+def test_n2_corrected_clock_keeps_running_and_reports_pinned_rows(store, ctx, clock):
+    clock.boot_frozen = True  # the witness only moves when real time passes
+    begin(store, ctx)
+    clock.wall += timedelta(days=40)
+    store.retain()
+    clock.wall -= timedelta(days=40)  # NTP corrects the clock back
+    assert store.retain() == 0  # counted, never wedged
+    assert store.rollback_refusals == 1
+    clock.boot += store.ttl_seconds + 1  # the row is old in real time
+    store.retain()
+    state = store.saturation()
+    assert state["pinned_by_wall_clock"] == 1  # old by the witness, not yet by the wall clock
+    clock.wall += timedelta(seconds=store.ttl_seconds + 1)
+    assert store.retain() == 1
+    assert store.saturation()["pinned_by_wall_clock"] == 0
+
+
+def test_n2_backward_clock_never_deletes_fresh_and_keeps_running(store, ctx, clock):
     store.retain()
     clock.wall -= timedelta(days=40)
     fresh = begin(store, ctx)
     assert rows(store)[0]["created_at"] == clock.wall.timestamp()
-    with pytest.raises(AuditError, match="^E_VALIDATION$"):
-        store.retain()
+    assert store.retain() == 0  # counted, not wedged
     assert store.rollback_refusals == 1
     assert rows(store)[0]["id"] == fresh.id
+    # even after the clock is corrected the store keeps ageing rows normally
+    clock.wall += timedelta(days=80)
+    assert store.retain() >= 0
+    assert store.rollback_refusals >= 1
 
 
 def test_m3_wall_jump_never_expires_and_real_time_does(store, ctx, clock):

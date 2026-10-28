@@ -149,6 +149,9 @@ class AccessAuditStore:
             raise AuditError("E_VALIDATION")
         self.clock, self.monotonic, self.boottime = clock, monotonic, boottime
         self._boot_epoch = _read_boot_epoch()
+        if not self._boot_epoch or self._boottime_value() <= 0:
+            # Fail closed: without a witness, retention cannot prove age.
+            raise AuditError()
         self.ttl_seconds = ttl_seconds
         self.max_clock_step = max_clock_step
         self.clock_step_refusals = 0
@@ -162,6 +165,7 @@ class AccessAuditStore:
         self._denial_write_inflight = False
         self._denial_snapshot = (True, 0, time.monotonic(), True)
         self.rollback_refusals = 0
+        self.pinned_by_wall_clock = 0  # rows old by the witness, not yet by the wall clock
         self._fd = None
         self._db = None
         self._maintenance_db = None
@@ -360,6 +364,11 @@ class AccessAuditStore:
             raise AuditError("E_VALIDATION")
         return value
 
+    def _require_witness(self) -> None:
+        """A silent wall-clock fallback would disable the ageing guarantee."""
+        if not self._boot_epoch:
+            raise AuditError()
+
     def _boottime_value(self) -> float:
         """Boot-relative seconds, or 0.0 when the witness is unavailable."""
         try:
@@ -442,6 +451,7 @@ class AccessAuditStore:
             "age_seconds": max(0.0, time.monotonic() - observed_at),
             "clock_lag_seconds": clock_lag,
             "clock_suspect": clock_suspect,
+            "pinned_by_wall_clock": self.pinned_by_wall_clock,
         }
 
     def _refresh_denial_snapshot(self) -> None:
@@ -1034,17 +1044,18 @@ class AccessAuditStore:
                 raise AuditError() from None
 
     def retain(self) -> int:
-        """Apply min(now, watermark + min(ttl/8,max(max_clock_step,lag/8))).
+        """Age rows by the boot witness, never by wall-clock arithmetic.
 
-        Backward clocks refuse E_VALIDATION and count rollback_refusals. Forward
-        steps above the cap count clock_step_refusals but apply the bounded step;
-        repeated calls converge. Inserts never advance this retention watermark.
-        created_at is exact wall time; internal retention_at guards rollback
-        inserts until TTL after the previous watermark, including after restart.
-        The SQLite write lock serializes sidecar access; fsync precedes DELETE.
-        Each stream deletes at most 500 rows per call. The maintenance connection
-        and lock are disjoint from authenticated Python locking; legacy NONE-mode
-        stores refuse retention until explicit administrative migration.
+        A row is deleted only when created_at is past the wall-clock cut-off AND
+        its boot-relative age is at least ttl (same boot), or, for rows from a
+        previous boot, only once this boot itself has lasted a full ttl — which
+        proves such a row is old enough without trusting the wall clock.
+        Clock steps (either direction) are counted but never wedge retention:
+        rollback_refusals/clock_step_refusals are observations, not gates.
+        Inserts never advance the watermark. The SQLite write lock serializes
+        sidecar access; fsync precedes DELETE; each stream deletes at most
+        _DELETE_CHUNK_ROWS rows per call on the maintenance connection, which is
+        disjoint from authenticated Python locking.
         """
         now = self._now().timestamp()
         try:
@@ -1060,37 +1071,37 @@ class AccessAuditStore:
                 with self._transaction(db=db):
                     watermark = self._watermark(db)
                     if now < watermark:
+                        # A corrected clock must not wedge retention: the boot witness,
+                        # not the wall watermark, is what protects fresh rows.
                         self.rollback_refusals += 1
-                        raise AuditError("E_VALIDATION")
-                    lag = now - watermark
+                    lag = abs(now - watermark)
                     if lag > self.max_clock_step:
                         self.clock_step_refusals += 1
-                    # The boot-relative witness, not the wall step, decides whether a
-                    # row is old enough: wall-clock jump forward cannot age a fresh row.
                     boot_now = self._boottime_value()
-                    witnessed = bool(self._boot_epoch) and boot_now > 0 and self._boot_epoch == self._boot_epoch
                     self._write_watermark(now)
                     cutoff = now - self.ttl_seconds
-                    if witnessed:
-                        removed = db.execute(
-                            """DELETE FROM access_audit WHERE created_at < ? AND retention_at < ?
-                            AND ((boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ?) OR boot_epoch <> ?)
-                            AND seq IN (
-                                SELECT seq FROM access_audit WHERE created_at < ? AND retention_at < ?
-                                AND ((boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ?) OR boot_epoch <> ?)
-                                ORDER BY seq LIMIT ?)""",
-                            (cutoff, cutoff, self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch,
-                             cutoff, cutoff, self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch,
-                             _DELETE_CHUNK_ROWS),
-                        ).rowcount
-                    else:
-                        removed = db.execute(
-                            """DELETE FROM access_audit WHERE created_at < ? AND retention_at < ? AND seq IN (
-                                SELECT seq FROM access_audit
-                                WHERE created_at < ? AND retention_at < ?
-                                ORDER BY seq LIMIT ?)""",
-                            (cutoff, cutoff, cutoff, cutoff, _DELETE_CHUNK_ROWS),
-                        ).rowcount
+                    # Same-boot rows are aged by the witness. Rows from another boot (or
+                    # written before the witness existed) can only be proven aged once
+                    # this boot has itself lasted a full TTL.
+                    removed = db.execute(
+                        """DELETE FROM access_audit WHERE created_at < ? AND retention_at < ?
+                        AND ((boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ?)
+                             OR ((boot_epoch <> ? OR booted_at <= 0) AND ? >= ?))
+                        AND seq IN (
+                            SELECT seq FROM access_audit WHERE created_at < ? AND retention_at < ?
+                            AND ((boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ?)
+                                 OR ((boot_epoch <> ? OR booted_at <= 0) AND ? >= ?))
+                            ORDER BY seq LIMIT ?)""",
+                        (cutoff, cutoff, self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch,
+                         boot_now, self.ttl_seconds,
+                         cutoff, cutoff, self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch,
+                         boot_now, self.ttl_seconds, _DELETE_CHUNK_ROWS),
+                    ).rowcount
+                    self.pinned_by_wall_clock = db.execute(
+                        """SELECT COUNT(*) FROM access_audit
+                        WHERE boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ? AND created_at >= ?""",
+                        (self._boot_epoch, boot_now, self.ttl_seconds, cutoff),
+                    ).fetchone()[0]
                     if removed:
                         db.execute(
                             "UPDATE maintenance_state SET scrub_pending=1 WHERE id=1"
