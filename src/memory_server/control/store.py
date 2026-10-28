@@ -245,7 +245,7 @@ class ControlStore:
             cursor = connection.execute(
                 "UPDATE profiles SET enabled=?,desired_state=?,display_name=?,description=?,generation=?"
                 " WHERE id=? AND generation=?",
-                (int(flag), desired, name, desc, generation, profile_id, before.generation),
+                (int(flag), desired, name, desc, generation, profile_id, expected_generation),
             )
             if cursor.rowcount != 1:
                 raise ControlError("E_VERSION_CONFLICT")
