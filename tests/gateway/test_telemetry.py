@@ -809,6 +809,46 @@ def test_n3_new_losses_observed_even_after_success(tmp_path, ctx, clock):
         second.close()
 
 
+def test_m1_failed_primary_health_update_uses_independent_connection(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now)
+    store._denials._db.close()
+    assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
+    store.close()
+
+    store = AccessAuditStore(root, clock=clock.now)
+    try:
+        assert store.dropped_denials == 1
+        assert store.saturation()["denials"] is True
+    finally:
+        store.close()
+
+
+def test_m1_marker_survives_when_both_database_writes_fail(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now)
+    denial_db = root / "denials" / "access.sqlite"
+    blocker = sqlite3.connect(denial_db, isolation_level=None)
+    store._denials._db.execute("PRAGMA busy_timeout=0")
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
+        marker = root / "denials" / "denial.failure"
+        assert marker.is_file()
+        assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    finally:
+        blocker.rollback()
+        blocker.close()
+        store.close()
+
+    store = AccessAuditStore(root, clock=clock.now)
+    try:
+        assert store.dropped_denials == 1
+        assert store.saturation()["denials"] is True
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("damage", ["table", "row"])
 def test_m2_missing_denial_health_refuses_parent_reopen(tmp_path, clock, damage):
     root = tmp_path / "audit"

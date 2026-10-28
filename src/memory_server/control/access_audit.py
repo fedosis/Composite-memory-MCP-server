@@ -20,6 +20,9 @@ saturation() is the S06 gate input: exact keys "authenticated" and "denials".
 "denials" is true on failure, capacity exhaustion, or durable losses since the
 last observation; retain() cannot clear write failure. Only a successful denial
 write clears the durable failing flag. No new C9 metric family is introduced.
+If both denial-health database writes fail, a private, fsynced marker beside the
+denial database preserves the loss across restart. If both that database and its
+directory are unwritable, only the process-local fail-closed signal can remain.
 S06 owns route integration, S12 owns the atomic canonical outcome journal.
 """
 
@@ -124,7 +127,7 @@ class AccessAuditStore:
             self._fd = _private_directory(Path(root))
             stale_journal = False
             for name in ("access.sqlite", "access.sqlite-journal", "access.sqlite-wal", "access.sqlite-shm",
-                         "retention.watermark", "retention.next"):
+                         "retention.watermark", "retention.next", "denial.failure", "denial.failure.next"):
                 try:
                     info = os.stat(name, dir_fd=self._fd, follow_symlinks=False)
                 except FileNotFoundError:
@@ -321,9 +324,81 @@ class AccessAuditStore:
             row = self._db.execute("SELECT dropped,failing FROM denial_health WHERE id=1").fetchone()
             if row is None:
                 raise AuditError()
-            return row[0], row[1]
+            marker_dropped, marker_failing = self._denial_failure_marker()
+            return row[0] + marker_dropped, max(row[1], marker_failing)
         except sqlite3.Error:
             raise AuditError() from None
+
+    def _denial_failure_marker(self) -> tuple[int, int]:
+        """Read the supplemental loss marker; absence is the only healthy case."""
+        try:
+            try:
+                fd = os.open("denial.failure", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=self._fd)
+            except FileNotFoundError:
+                return 0, 0
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                    raise AuditError()
+                raw = os.read(fd, 128)
+                match = re.fullmatch(rb"([1-9][0-9]*) ([01])\n", raw)
+                if match is None:
+                    raise AuditError()
+                return int(match[1]), int(match[2])
+            finally:
+                os.close(fd)
+        except OSError:
+            raise AuditError() from None
+
+    def _write_denial_failure_marker(self, dropped: int, failing: int) -> None:
+        """Atomically replace and fsync the private supplemental health record."""
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+            fd = os.open("denial.failure.next", flags, 0o600, dir_fd=self._fd)
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                    raise AuditError()
+                data = f"{dropped} {failing}\n".encode("ascii")
+                if os.write(fd, data) != len(data):
+                    raise AuditError()
+                os.ftruncate(fd, len(data))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace("denial.failure.next", "denial.failure",
+                       src_dir_fd=self._fd, dst_dir_fd=self._fd)
+            os.fsync(self._fd)
+        except OSError:
+            raise AuditError() from None
+
+    def _record_denial_failure_fallback(self) -> None:
+        """Persist one loss independently, then fall back to the side marker."""
+        try:
+            fallback = sqlite3.connect(
+                f"/proc/self/fd/{self._fd}/access.sqlite", isolation_level=None,
+                timeout=0, check_same_thread=False,
+            )
+            try:
+                fallback.execute("PRAGMA synchronous=FULL")
+                fallback.execute("BEGIN IMMEDIATE")
+                changed = fallback.execute(
+                    "UPDATE denial_health SET dropped=dropped+1,failing=1 WHERE id=1"
+                ).rowcount
+                if changed != 1:
+                    raise sqlite3.IntegrityError
+                fallback.execute("COMMIT")
+                return
+            finally:
+                fallback.close()
+        except sqlite3.Error:
+            pass
+        with self._lock:
+            dropped, _ = self._denial_failure_marker()
+            self._write_denial_failure_marker(dropped + 1, 1)
 
     @property
     def dropped_denials(self) -> int:
@@ -341,6 +416,9 @@ class AccessAuditStore:
             ).rowcount
             if changed != 1:
                 raise AuditError()
+        marker_dropped, _ = self._denial_failure_marker()
+        if marker_dropped and not dropped:
+            self._write_denial_failure_marker(marker_dropped, 0)
 
     async def record_unauthenticated(self, request_id: str, reason: ErrorCode) -> AuditTicket | None:
         """Best effort off-protocol seam; None means dropped, never request denial."""
@@ -359,7 +437,10 @@ class AccessAuditStore:
                 try:
                     self._denials._record_denial_health(dropped=True)
                 except AuditError:
-                    pass  # metadata unavailable: keep the gate fail-safe, never claim health
+                    try:
+                        self._denials._record_denial_failure_fallback()
+                    except AuditError:
+                        pass  # DB and marker unavailable: process-local gate stays fail-closed
             return None
         try:
             self._denials._record_denial_health(dropped=False)
