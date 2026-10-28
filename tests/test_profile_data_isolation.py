@@ -125,7 +125,7 @@ def test_real_provider_keeps_all_store_paths_inside_each_profile(tmp_path: Path,
 
 
 def test_native_provider_legacy_in_memory_config_initializes_like_baseline(
-    synthetic_storage_env,
+    synthetic_storage_env, monkeypatch,
 ) -> None:
     """SPEC-5 regression: legacy standalone in-memory config must still work.
 
@@ -134,11 +134,22 @@ def test_native_provider_legacy_in_memory_config_initializes_like_baseline(
     profile root was claimed and the polling outbox worker was skipped
     (``_supports_background_outbox`` refuses in-memory URLs). The profile-layout
     rewrite must not reject that configuration, and the CWD-relative standalone
-    root must land in the synthetic temporary directory.
+    root must land in the synthetic temporary directory. C03 ordered startup
+    and the C2 bridge now construct the vector provider before READY, but its
+    connection remains lazy (runtime_factory.py:122-151; lancedb_provider.py:374-391).
     """
+    import lancedb
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
     env = synthetic_storage_env
     env.assert_injection()
 
+    def forbidden_connect(*args, **kwargs):
+        raise AssertionError("in-memory initialization must not open a LanceDB store")
+
+    monkeypatch.setattr(lancedb, "connect", forbidden_connect)
+    vector_path = env.root / "data/lancedb"
+    assert not vector_path.exists()
     provider = HermesProvider()
     try:
         provider.initialize(
@@ -148,21 +159,26 @@ def test_native_provider_legacy_in_memory_config_initializes_like_baseline(
         assert provider._initialized is True
         assert provider._provider is not None
         assert provider._provider._url == "sqlite+aiosqlite://"
-        # In-memory URL: no background outbox worker, no projection store yet.
+        # In-memory SQLite disables the worker, not the vector recipe.
         assert provider._outbox_task is None
         assert provider._outbox_worker is None
-        assert provider._lancedb is None
-        # No file-backed store exists at all, so there is no path to guard
-        # beyond the in-memory URL asserted above.
-        env.assert_provider_synthetic(provider, require_paths=False)
-        layout = getattr(provider, "_storage_layout", None)
-        if layout is not None:
-            assert layout.mode == "standalone"
-            assert env.root == Path(layout.data_root)
-            assert layout.sqlite.local_path is None
+        assert isinstance(provider._lancedb, LanceDBProvider)
+        assert provider._bridge is not None and provider._bridge.runtime is not None
+        assert provider._lancedb is provider._bridge.runtime.dependencies.vector
+        assert provider._lancedb._db is None
+        assert Path(provider._lancedb._db_path) == vector_path
+        assert not vector_path.exists()
+        env.assert_provider_synthetic(provider, profile_home=env.root)
+        layout = provider._storage_layout
+        assert layout is not None
+        assert layout.mode == "standalone"
+        assert env.root == Path(layout.data_root)
+        assert layout.sqlite.local_path is None
     finally:
         provider.shutdown()
 
+    assert not vector_path.exists()
+    assert provider._lancedb is None
     assert provider._initialized is False
     assert provider._provider is None
     assert provider._writer is None
