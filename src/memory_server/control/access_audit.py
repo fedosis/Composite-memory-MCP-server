@@ -170,6 +170,10 @@ class AccessAuditStore:
                 if "retention_at" not in {r[1] for r in self._db.execute("PRAGMA table_info(access_audit)")}:
                     self._db.execute("ALTER TABLE access_audit ADD COLUMN retention_at REAL NOT NULL DEFAULT 0")
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
+                self._db.execute("""CREATE TABLE IF NOT EXISTS maintenance_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    scrub_pending INTEGER NOT NULL CHECK(scrub_pending IN (0,1)))""")
+                self._db.execute("INSERT OR IGNORE INTO maintenance_state VALUES (1,0)")
                 self._watermark()
                 if _denial_only:
                     if new_database:
@@ -186,9 +190,18 @@ class AccessAuditStore:
                         ).fetchone()
                         if table is None or health is None:
                             raise _DenialHealthTamper()
-            if stale_journal:
-                # SQLite recovers hot journals first; scrub before serving.
+            scrub_pending = bool(self._db.execute(
+                "SELECT scrub_pending FROM maintenance_state WHERE id=1"
+            ).fetchone()[0])
+            if stale_journal or scrub_pending:
+                # SQLite recovers hot journals first; pending work is retried
+                # after restart before this store can serve.
                 self._scrub()
+                if scrub_pending:
+                    with self._transaction():
+                        self._db.execute(
+                            "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
+                        )
             os.fsync(self._fd)
             if not _denial_only:
                 try:
@@ -593,6 +606,16 @@ class AccessAuditStore:
         """
         now = self._now().timestamp()
         try:
+            with self._lock:
+                pending = self._db.execute(
+                    "SELECT scrub_pending FROM maintenance_state WHERE id=1"
+                ).fetchone()[0]
+                if pending:
+                    self._scrub()
+                    with self._transaction():
+                        self._db.execute(
+                            "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
+                        )
             with self._lock, self._transaction():
                 watermark = self._watermark()
                 if now < watermark:
@@ -606,9 +629,17 @@ class AccessAuditStore:
                 removed = self._db.execute(
                     "DELETE FROM access_audit WHERE created_at < ? AND retention_at < ?", (cutoff, cutoff),
                 ).rowcount
+                if removed:
+                    self._db.execute(
+                        "UPDATE maintenance_state SET scrub_pending=1 WHERE id=1"
+                    )
             if removed:
                 with self._lock:
                     self._scrub()
+                    with self._transaction():
+                        self._db.execute(
+                            "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
+                        )
             if self._denials is not None:
                 try:
                     removed += self._denials.retain()

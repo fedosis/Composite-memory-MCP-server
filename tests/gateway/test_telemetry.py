@@ -911,6 +911,41 @@ def test_n4_startup_scrubs_stale_journal(tmp_path, ctx, clock):
         store.close()
 
 
+def test_m3_failed_scrub_is_durable_and_retried_after_restart(tmp_path, ctx, clock, monkeypatch):
+    root = tmp_path / "audit"
+    original_scrub = AccessAuditStore._scrub
+    calls = []
+
+    def fail_once(self):
+        calls.append(self)
+        if len(calls) == 1:
+            raise AuditError()
+        return original_scrub(self)
+
+    monkeypatch.setattr(AccessAuditStore, "_scrub", fail_once)
+    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    begin(store, ctx)
+    clock.wall += timedelta(seconds=11)
+    with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
+        store.retain()
+    assert rows(store) == []  # DELETE committed; its scrub obligation did too.
+    assert store._db.execute(
+        "SELECT scrub_pending FROM maintenance_state WHERE id=1"
+    ).fetchone()[0] == 1
+    store.close()
+
+    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    try:
+        assert len(calls) == 2  # startup retried with no later deletion to trigger it
+        assert store._db.execute(
+            "SELECT scrub_pending FROM maintenance_state WHERE id=1"
+        ).fetchone()[0] == 0
+        assert store.retain() == 0
+        assert len(calls) == 2
+    finally:
+        store.close()
+
+
 def test_n5_capacity_and_cache_budgets_are_explicit(store):
     assert store.segment_rows == 10000
     assert store.max_segments == 27  # ceil(30d / 10s / 10000) + spare
