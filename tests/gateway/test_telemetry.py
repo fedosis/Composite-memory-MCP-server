@@ -4,10 +4,12 @@ import asyncio
 import inspect
 import sqlite3
 import stat
+import statistics
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from threading import Barrier
+from threading import Barrier, Event
 from typing import get_args
 from uuid import uuid4
 
@@ -69,6 +71,24 @@ def begin(store, ctx):
 
 def rows(store):
     return store._db.execute("SELECT * FROM access_audit ORDER BY seq").fetchall()
+
+
+def insert_retention_fixture(store, root, clock, count, *, payload_size=0):
+    sql = """INSERT INTO access_audit
+        (id,timestamp,request_id,token_id,client_id,profile_id,operation,memory_id,
+         result,latency_ms,remote_address,state,created_at,segment,started,clock_id,retention_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+    timestamp = clock.wall.isoformat()
+    created = clock.wall.timestamp()
+    payload = "X" * payload_size or None
+    with sqlite3.connect(root / "access.sqlite") as writer:
+        writer.execute("PRAGMA secure_delete=OFF")
+        writer.executemany(sql, (
+            (f"aud_retention_{i}", timestamp, f"req_{uuid4()}", "a" * 32,
+             "fixture", "alpha", "search", payload, "success", 0.0, None,
+             "terminal", created, 0, 0.0, "fixture", created)
+            for i in range(count)
+        ))
 
 
 def retain_elapsed(store, clock, *, days):
@@ -153,6 +173,7 @@ def test_intent_before_real_sqlite_effect_and_insert_failure(store, ctx, tmp_pat
 def test_dml_shapes_cas_and_terminal_immutability(store, ctx, clock):
     statements = []
     store._db.set_trace_callback(statements.append)
+    store._maintenance_db.set_trace_callback(statements.append)
     ticket = begin(store, ctx)
     run(store.finish(ticket, SUCCESS))
     before = tuple(rows(store)[0])
@@ -165,8 +186,19 @@ def test_dml_shapes_cas_and_terminal_immutability(store, ctx, clock):
     assert retain_elapsed(store, clock, days=31) == 1
     dml = [s for s in statements if s.split()[0].upper() in {"INSERT", "UPDATE", "DELETE"}]
     assert {s.split()[0] for s in dml} == {"INSERT", "UPDATE", "DELETE"}
-    assert all("WHERE id=" in s and "AND state='intent'" in s for s in dml if s.startswith("UPDATE"))
-    assert all("DELETE FROM access_audit WHERE created_at < " in s for s in dml if s.startswith("DELETE"))
+    updates = [s for s in dml if s.startswith("UPDATE")]
+    audit_updates = [s for s in updates if s.startswith("UPDATE access_audit")]
+    assert audit_updates
+    assert all("WHERE id=" in s and "AND state='intent'" in s for s in audit_updates)
+    assert all(
+        s.startswith("UPDATE access_audit") or s.startswith("UPDATE maintenance_state")
+        for s in updates
+    )
+    assert all(
+        "DELETE FROM access_audit WHERE seq IN" in s
+        and "created_at < " in s and "retention_at < " in s and "LIMIT 500" in s
+        for s in dml if s.startswith("DELETE")
+    )
 
 
 def test_public_projection_and_search_canaries(store, ctx, tmp_path, caplog):
@@ -916,11 +948,11 @@ def test_m3_failed_scrub_is_durable_and_retried_after_restart(tmp_path, ctx, clo
     original_scrub = AccessAuditStore._scrub
     calls = []
 
-    def fail_once(self):
+    def fail_once(self, *, force=False):
         calls.append(self)
         if len(calls) == 1:
             raise AuditError()
-        return original_scrub(self)
+        return original_scrub(self, force=force)
 
     monkeypatch.setattr(AccessAuditStore, "_scrub", fail_once)
     store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
@@ -942,6 +974,81 @@ def test_m3_failed_scrub_is_durable_and_retried_after_restart(tmp_path, ctx, clo
         ).fetchone()[0] == 0
         assert store.retain() == 0
         assert len(calls) == 2
+    finally:
+        store.close()
+
+
+def test_m1_bounded_chunks_and_auth_lock_independence(tmp_path, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    insert_retention_fixture(store, root, clock, 501)
+    clock.wall += timedelta(seconds=11)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with store._lock:
+                assert pool.submit(store.retain).result(timeout=0.2) == 500
+        assert len(rows(store)) == 1
+        assert store.retain() == 1
+        assert rows(store) == []
+    finally:
+        store.close()
+
+
+def test_m1_incremental_vacuum_creation_and_explicit_legacy_migration(tmp_path, clock):
+    fresh = AccessAuditStore(tmp_path / "fresh", clock=clock.now)
+    try:
+        assert fresh._db.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+    finally:
+        fresh.close()
+
+    root = tmp_path / "legacy"
+    root.mkdir(mode=0o700)
+    with sqlite3.connect(root / "access.sqlite") as legacy:
+        legacy.execute("CREATE TABLE legacy_fixture (id INTEGER PRIMARY KEY)")
+        assert legacy.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+    (root / "access.sqlite").chmod(0o600)
+    store = AccessAuditStore(root, clock=clock.now)
+    statements = []
+    store._maintenance_db.set_trace_callback(statements.append)
+    try:
+        assert store._db.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+        store.migrate_incremental_vacuum()
+        assert store._maintenance_db.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+        assert sum(sql == "VACUUM" for sql in statements) == 1
+    finally:
+        store.close()
+
+
+def test_m1_deleting_retain_auth_p95_bounded(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(
+        root, clock=clock.now, ttl_seconds=10,
+        segment_rows=1_000_000_000, max_segments=2,
+    )
+    insert_retention_fixture(store, root, clock, 4000, payload_size=4096)
+    assert (root / "access.sqlite").stat().st_size > 16 * 1024 * 1024
+    clock.wall += timedelta(seconds=11)
+    timings = []
+    removed = []
+    try:
+        for _ in range(8):
+            delete_started = Event()
+            store._maintenance_db.set_trace_callback(
+                lambda sql: delete_started.set()
+                if sql.startswith("DELETE FROM access_audit") else None
+            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                retaining = pool.submit(store.retain)
+                assert delete_started.wait(2)
+                started = time.perf_counter()
+                run(store.finish(begin(store, ctx), SUCCESS))
+                timings.append((time.perf_counter() - started) * 1000)
+                removed.append(retaining.result(timeout=2))
+        p95 = statistics.quantiles(timings, n=100, method="inclusive")[94]
+        print(f"M1 auth begin+finish ms={timings}; p95={p95:.3f}; bound=75.000")
+        assert removed == [500] * 8
+        assert p95 < 75
+        assert len(rows(store)) == 8
     finally:
         store.close()
 

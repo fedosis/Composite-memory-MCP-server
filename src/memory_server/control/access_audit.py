@@ -12,7 +12,12 @@ SQLite max_page_count caps the authenticated file at 256 MiB, with 4 MiB for
 denials (260 MiB total database budget). These are disk, not RAM guarantees;
 large metadata may hit the byte cap first and fail closed. Each connection has
 an explicit 2048 KiB page-cache target (4096 KiB for the pair, not a process RSS
-limit); lists materialize at most 200 rows. VACUUM needs temporary disk space.
+    limit); lists materialize at most 200 rows. Retention deletes at most 500 rows
+    per stream and call on a separate maintenance connection/lock. New databases
+    use incremental auto-vacuum; once per 60 seconds, at most 16 freelist/btree
+    pages are scrubbed and 16 free pages reclaimed when the freelist exceeds one
+    page. Existing NONE-mode databases must
+    use the explicit migrate_incremental_vacuum() administrative full rewrite.
 Pre-auth denials use a separate file/sequence/page budget (2000 rows, 4 MiB),
 never authenticated slots. Saturation drops denial recording, not requests.
 Exhaustion of authenticated storage is E_AUDIT_UNAVAILABLE.
@@ -55,6 +60,10 @@ _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _CODES = frozenset(get_args(ErrorCode))
 _OPERATIONS = frozenset(get_args(Operation))
 _CLOCK_ID = uuid4().hex  # comparable monotonic clocks only within this process
+_DELETE_CHUNK_ROWS = 500
+_VACUUM_PAGES = 16
+_VACUUM_MIN_FREE_PAGES = 1
+_VACUUM_INTERVAL_SECONDS = 60.0
 
 
 class AuditError(Exception):
@@ -117,12 +126,15 @@ class AccessAuditStore:
         self.segment_rows = segment_rows
         self.max_segments = max_segments if max_segments is not None else math.ceil(ttl_seconds / 10 / segment_rows) + 1
         self._lock = RLock()
+        self._maintenance_lock = RLock()
         self._denials = None
         self._observed_denial_drops = 0
         self._denial_failed = False
         self.rollback_refusals = 0
         self._fd = None
         self._db = None
+        self._maintenance_db = None
+        self._last_vacuum_at = -math.inf
         try:
             self._fd = _private_directory(Path(root))
             stale_journal = False
@@ -155,6 +167,8 @@ class AccessAuditStore:
             self._db.execute("PRAGMA journal_mode=DELETE")
             self._db.execute("PRAGMA secure_delete=ON")  # scrub expired identities from freed SQLite cells
             self._db.execute("PRAGMA cache_size=-2048")  # KiB target, not a process RSS limit
+            if new_database:
+                self._db.execute("PRAGMA auto_vacuum=INCREMENTAL")
             page_size = self._db.execute("PRAGMA page_size").fetchone()[0]
             self._db.execute(f"PRAGMA max_page_count={max_bytes // page_size}")
             with self._transaction():
@@ -172,8 +186,25 @@ class AccessAuditStore:
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
                 self._db.execute("""CREATE TABLE IF NOT EXISTS maintenance_state (
                     id INTEGER PRIMARY KEY CHECK(id=1),
-                    scrub_pending INTEGER NOT NULL CHECK(scrub_pending IN (0,1)))""")
-                self._db.execute("INSERT OR IGNORE INTO maintenance_state VALUES (1,0)")
+                    scrub_pending INTEGER NOT NULL CHECK(scrub_pending IN (0,1)),
+                    last_vacuum REAL NOT NULL DEFAULT 0,
+                    scrub_cursor INTEGER NOT NULL DEFAULT 1)""")
+                if "last_vacuum" not in {
+                    r[1] for r in self._db.execute("PRAGMA table_info(maintenance_state)")
+                }:
+                    self._db.execute(
+                        "ALTER TABLE maintenance_state ADD COLUMN last_vacuum REAL NOT NULL DEFAULT 0"
+                    )
+                if "scrub_cursor" not in {
+                    r[1] for r in self._db.execute("PRAGMA table_info(maintenance_state)")
+                }:
+                    self._db.execute(
+                        "ALTER TABLE maintenance_state ADD COLUMN scrub_cursor INTEGER NOT NULL DEFAULT 1"
+                    )
+                self._db.execute(
+                    """INSERT OR IGNORE INTO maintenance_state
+                        (id,scrub_pending,last_vacuum,scrub_cursor) VALUES (1,0,0,1)"""
+                )
                 self._watermark()
                 if _denial_only:
                     if new_database:
@@ -190,16 +221,26 @@ class AccessAuditStore:
                         ).fetchone()
                         if table is None or health is None:
                             raise _DenialHealthTamper()
+            self._maintenance_db = sqlite3.connect(
+                f"/proc/self/fd/{self._fd}/access.sqlite", isolation_level=None,
+                timeout=5, check_same_thread=False,
+            )
+            self._maintenance_db.row_factory = sqlite3.Row
+            self._maintenance_db.execute("PRAGMA synchronous=FULL")
+            self._maintenance_db.execute("PRAGMA journal_mode=DELETE")
+            self._maintenance_db.execute("PRAGMA secure_delete=ON")
+            self._maintenance_db.execute("PRAGMA cache_size=-2048")
+            self._maintenance_db.execute(f"PRAGMA max_page_count={max_bytes // page_size}")
             scrub_pending = bool(self._db.execute(
                 "SELECT scrub_pending FROM maintenance_state WHERE id=1"
             ).fetchone()[0])
             if stale_journal or scrub_pending:
                 # SQLite recovers hot journals first; pending work is retried
                 # after restart before this store can serve.
-                self._scrub()
+                self._scrub(force=True)
                 if scrub_pending:
-                    with self._transaction():
-                        self._db.execute(
+                    with self._transaction(db=self._maintenance_db):
+                        self._maintenance_db.execute(
                             "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
                         )
             os.fsync(self._fd)
@@ -227,6 +268,10 @@ class AccessAuditStore:
         if self._denials is not None:
             self._denials.close()
             self._denials = None
+        with self._maintenance_lock:
+            if self._maintenance_db is not None:
+                self._maintenance_db.close()
+                self._maintenance_db = None
         with self._lock:
             if self._db is not None:
                 self._db.close()
@@ -236,16 +281,18 @@ class AccessAuditStore:
                 self._fd = None
 
     @contextmanager
-    def _transaction(self, *, exclusive: bool = False) -> Iterator[None]:
-        if self._db is None:
+    def _transaction(self, *, db: sqlite3.Connection | None = None,
+                     exclusive: bool = False) -> Iterator[None]:
+        target = self._db if db is None else db
+        if target is None:
             raise AuditError()
         try:
-            self._db.execute("BEGIN EXCLUSIVE" if exclusive else "BEGIN IMMEDIATE")
+            target.execute("BEGIN EXCLUSIVE" if exclusive else "BEGIN IMMEDIATE")
             try:
                 yield
-                self._db.execute("COMMIT")
+                target.execute("COMMIT")
             except BaseException:
-                self._db.execute("ROLLBACK")
+                target.execute("ROLLBACK")
                 raise
         except sqlite3.Error:
             raise AuditError() from None
@@ -521,13 +568,14 @@ class AccessAuditStore:
                 # Includes Pydantic ValidationError; never expose corrupted row content.
                 raise AuditError() from None
 
-    def _watermark(self) -> float:
+    def _watermark(self, db: sqlite3.Connection | None = None) -> float:
         """Called only under the SQLite write lock; invalid metadata fails closed."""
+        target = self._db if db is None else db
         try:
             try:
                 fd = os.open("retention.watermark", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self._fd)
             except FileNotFoundError:
-                if self._db.execute("SELECT 1 FROM access_audit LIMIT 1").fetchone() is not None:
+                if target.execute("SELECT 1 FROM access_audit LIMIT 1").fetchone() is not None:
                     raise AuditError()
                 value = self._now().timestamp()
                 self._write_watermark(value)
@@ -565,16 +613,158 @@ class AccessAuditStore:
         except OSError:
             raise AuditError() from None
 
-    def _scrub(self) -> None:
-        """Own connection, under own lock, with no active transaction.
-
-        VACUUM removes bytes freed by unflagged external connections as well.
-        An exclusive SQLite lock prevents unlinking another writer's journal.
-        Startup recovery/scrubbing completes before this store is served.
-        """
+    def _scrub_freelist_pages(self, db: sqlite3.Connection, limit: int) -> int:
+        """Zero bounded free-page payloads while an EXCLUSIVE lock is held."""
+        fd = None
         try:
-            self._db.execute("VACUUM")
-            with self._transaction(exclusive=True):
+            fd = os.open("access.sqlite", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=self._fd)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                raise AuditError()
+            header = os.pread(fd, 100, 0)
+            if len(header) != 100 or header[:16] != b"SQLite format 3\0":
+                raise AuditError()
+            encoded_page_size = int.from_bytes(header[16:18], "big")
+            page_size = 65536 if encoded_page_size == 1 else encoded_page_size
+            if page_size != db.execute("PRAGMA page_size").fetchone()[0]:
+                raise AuditError()
+            page_count = int.from_bytes(header[28:32], "big")
+            trunk = int.from_bytes(header[32:36], "big")
+            scrubbed = 0
+            seen = set()
+            while trunk and scrubbed < limit:
+                if trunk in seen or not 1 <= trunk <= page_count:
+                    raise AuditError()
+                seen.add(trunk)
+                offset = (trunk - 1) * page_size
+                page = os.pread(fd, page_size, offset)
+                if len(page) != page_size:
+                    raise AuditError()
+                next_trunk = int.from_bytes(page[:4], "big")
+                leaves = int.from_bytes(page[4:8], "big")
+                if leaves > (page_size - 8) // 4:
+                    raise AuditError()
+                metadata_end = 8 + leaves * 4
+                if os.pwrite(fd, b"\0" * (page_size - metadata_end),
+                             offset + metadata_end) != page_size - metadata_end:
+                    raise AuditError()
+                scrubbed += 1
+                for index in range(leaves):
+                    if scrubbed >= limit:
+                        break
+                    start = 8 + index * 4
+                    leaf = int.from_bytes(page[start:start + 4], "big")
+                    if not 1 <= leaf <= page_count or leaf in seen:
+                        raise AuditError()
+                    seen.add(leaf)
+                    if os.pwrite(fd, b"\0" * page_size,
+                                 (leaf - 1) * page_size) != page_size:
+                        raise AuditError()
+                    scrubbed += 1
+                trunk = next_trunk
+            os.fsync(fd)
+            return scrubbed
+        except OSError:
+            raise AuditError() from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _scrub_btree_slack(self, db: sqlite3.Connection, start: int, limit: int) -> int:
+        """Zero safe freeblocks/unallocated regions in a bounded page window."""
+        fd = None
+        try:
+            fd = os.open("access.sqlite", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=self._fd)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                raise AuditError()
+            page_size = db.execute("PRAGMA page_size").fetchone()[0]
+            page_count = db.execute("PRAGMA page_count").fetchone()[0]
+            if page_count < 1:
+                raise AuditError()
+            page_number = min(max(start, 1), page_count)
+            for _ in range(min(limit, page_count)):
+                offset = (page_number - 1) * page_size
+                page = os.pread(fd, page_size, offset)
+                if len(page) != page_size:
+                    raise AuditError()
+                header_offset = 100 if page_number == 1 else 0
+                page_type = page[header_offset]
+                if page_type in (0x02, 0x05, 0x0A, 0x0D):
+                    header_size = 12 if page_type in (0x02, 0x05) else 8
+                    cell_count = int.from_bytes(
+                        page[header_offset + 3:header_offset + 5], "big"
+                    )
+                    cell_start = int.from_bytes(
+                        page[header_offset + 5:header_offset + 7], "big"
+                    ) or 65536
+                    pointer_end = header_offset + header_size + cell_count * 2
+                    if not pointer_end <= cell_start <= page_size:
+                        raise AuditError()
+                    if cell_start > pointer_end:
+                        if os.pwrite(fd, b"\0" * (cell_start - pointer_end),
+                                     offset + pointer_end) != cell_start - pointer_end:
+                            raise AuditError()
+                    freeblock = int.from_bytes(
+                        page[header_offset + 1:header_offset + 3], "big"
+                    )
+                    seen = set()
+                    while freeblock:
+                        if freeblock in seen or freeblock + 4 > page_size:
+                            raise AuditError()
+                        seen.add(freeblock)
+                        next_free = int.from_bytes(page[freeblock:freeblock + 2], "big")
+                        size = int.from_bytes(page[freeblock + 2:freeblock + 4], "big")
+                        if size < 4 or freeblock + size > page_size:
+                            raise AuditError()
+                        if os.pwrite(fd, b"\0" * (size - 4),
+                                     offset + freeblock + 4) != size - 4:
+                            raise AuditError()
+                        freeblock = next_free
+                page_number = 1 if page_number == page_count else page_number + 1
+            os.fsync(fd)
+            return page_number
+        except OSError:
+            raise AuditError() from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _scrub(self, *, force: bool = False) -> None:
+        """Bounded incremental cleanup on the maintenance connection.
+
+        Freelist and btree-slack cleanup covers bytes freed by unflagged external connections;
+        an exclusive SQLite lock prevents unlinking another writer's journal.
+        Startup and durable retry work bypass only the 60-second rate limit, not
+        the 16-page bound or freelist threshold.
+        """
+        db = self._maintenance_db
+        if db is None:
+            raise AuditError()
+        try:
+            free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
+            now = time.monotonic()
+            due = force or now - self._last_vacuum_at >= _VACUUM_INTERVAL_SECONDS
+            if free_pages > _VACUUM_MIN_FREE_PAGES and due:
+                cursor = db.execute(
+                    "SELECT scrub_cursor FROM maintenance_state WHERE id=1"
+                ).fetchone()[0]
+                with self._transaction(db=db, exclusive=True):
+                    self._scrub_freelist_pages(db, _VACUUM_PAGES // 2)
+                    next_cursor = self._scrub_btree_slack(db, cursor, _VACUUM_PAGES // 2)
+                db.execute(f"PRAGMA incremental_vacuum({_VACUUM_PAGES})")
+                self._last_vacuum_at = now
+                with self._transaction(db=db):
+                    db.execute(
+                        """UPDATE maintenance_state
+                            SET last_vacuum=?,scrub_cursor=? WHERE id=1""",
+                        (now, next_cursor),
+                    )
+            with self._transaction(db=db, exclusive=True):
                 try:
                     fd = os.open("access.sqlite-journal", os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                                  dir_fd=self._fd)
@@ -594,6 +784,20 @@ class AccessAuditStore:
         except (sqlite3.Error, OSError):
             raise AuditError() from None
 
+    def migrate_incremental_vacuum(self) -> None:
+        """Explicit administrator-only full rewrite for legacy NONE-mode stores."""
+        with self._maintenance_lock:
+            db = self._maintenance_db
+            if db is None:
+                raise AuditError()
+            try:
+                if db.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
+                    return
+                db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                db.execute("VACUUM")
+            except sqlite3.Error:
+                raise AuditError() from None
+
     def retain(self) -> int:
         """Apply min(now, watermark + max_clock_step); default cap is one hour.
 
@@ -603,41 +807,50 @@ class AccessAuditStore:
         created_at is exact wall time; internal retention_at guards rollback
         inserts until TTL after the previous watermark, including after restart.
         The SQLite write lock serializes sidecar access; fsync precedes DELETE.
+        Each stream deletes at most 500 rows per call. The maintenance connection
+        and lock are disjoint from authenticated Python locking; legacy NONE-mode
+        stores refuse retention until explicit administrative migration.
         """
         now = self._now().timestamp()
         try:
-            with self._lock:
-                pending = self._db.execute(
+            with self._maintenance_lock:
+                db = self._maintenance_db
+                if db is None or db.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
+                    raise AuditError()
+                pending = db.execute(
                     "SELECT scrub_pending FROM maintenance_state WHERE id=1"
                 ).fetchone()[0]
                 if pending:
-                    self._scrub()
-                    with self._transaction():
-                        self._db.execute(
+                    self._scrub(force=True)
+                    with self._transaction(db=db):
+                        db.execute(
                             "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
                         )
-            with self._lock, self._transaction():
-                watermark = self._watermark()
-                if now < watermark:
-                    self.rollback_refusals += 1
-                    raise AuditError("E_VALIDATION")
-                effective_now = min(now, watermark + self.max_clock_step)
-                if now > effective_now:
-                    self.clock_step_refusals += 1
-                self._write_watermark(effective_now)
-                cutoff = effective_now - self.ttl_seconds
-                removed = self._db.execute(
-                    "DELETE FROM access_audit WHERE created_at < ? AND retention_at < ?", (cutoff, cutoff),
-                ).rowcount
+                with self._transaction(db=db):
+                    watermark = self._watermark(db)
+                    if now < watermark:
+                        self.rollback_refusals += 1
+                        raise AuditError("E_VALIDATION")
+                    effective_now = min(now, watermark + self.max_clock_step)
+                    if now > effective_now:
+                        self.clock_step_refusals += 1
+                    self._write_watermark(effective_now)
+                    cutoff = effective_now - self.ttl_seconds
+                    removed = db.execute(
+                        """DELETE FROM access_audit WHERE seq IN (
+                            SELECT seq FROM access_audit
+                            WHERE created_at < ? AND retention_at < ?
+                            ORDER BY seq LIMIT ?)""",
+                        (cutoff, cutoff, _DELETE_CHUNK_ROWS),
+                    ).rowcount
+                    if removed:
+                        db.execute(
+                            "UPDATE maintenance_state SET scrub_pending=1 WHERE id=1"
+                        )
                 if removed:
-                    self._db.execute(
-                        "UPDATE maintenance_state SET scrub_pending=1 WHERE id=1"
-                    )
-            if removed:
-                with self._lock:
                     self._scrub()
-                    with self._transaction():
-                        self._db.execute(
+                    with self._transaction(db=db):
+                        db.execute(
                             "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
                         )
             if self._denials is not None:
