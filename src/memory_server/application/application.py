@@ -51,6 +51,7 @@ class MemoryApplication:
         belief_provider: Any | None = None,
         belief_policy: BeliefPolicy | None = None,
         get_graph: Callable[[], Awaitable[Any]] | None = None,
+        lifecycle_get_graph: Callable[[], Awaitable[Any | None]] | None = None,
         reflection_provider: Any | None = None,
         reflection_policy: ReflectionPolicy | None = None,
         relation_provider: Any | None = None,
@@ -105,7 +106,7 @@ class MemoryApplication:
 
             self._lifecycle = LifecycleService(
                 lifecycle_provider,
-                get_graph=get_graph,
+                get_graph=lifecycle_get_graph if lifecycle_get_graph is not None else get_graph,
             )
         self._audit = None
         if audit_validator is not None and audit_confidence_engine is not None and audit_state is not None:

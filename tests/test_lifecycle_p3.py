@@ -327,7 +327,7 @@ class TestLifecycleServiceP3:
                 reason="invalid type",
             )
 
-    async def test_invalidate_demotes_dependent_confidence(self, seam02_composition):
+    async def test_invalidate_demotes_dependent_confidence(self, seam02_composition, monkeypatch):
         async with seam02_composition() as composition:
             provider = composition.runtime.dependencies.sqlite
             assert provider._url == composition.layout.sqlite.effective_url
@@ -367,6 +367,16 @@ class TestLifecycleServiceP3:
                 target_id=parent.id,
                 relation="derived_from",
             )
+            # Observe the real graph lookup, not a mocked propagation result.
+            searches = []
+            search_by_relation = graph.search_by_relation
+
+            def tracked_search(relation):
+                searches.append(relation)
+                return search_by_relation(relation)
+
+            monkeypatch.setattr(graph, "search_by_relation", tracked_search)
+            assert await composition.get_optional_graph() is graph
 
             payload = json.loads(
                 await server_module.invalidate_tool(
@@ -376,6 +386,7 @@ class TestLifecycleServiceP3:
                 )
             )
 
+            assert searches == ["derived_from"]
             assert payload["memory"]["lifecycle_state"] == "discarded"
             assert payload["memory"]["version"] == 2
             assert payload["propagated"]
@@ -492,6 +503,16 @@ class TestLifecycleServiceP3:
             assert composition.runtime.dependencies.graph is None
             assert composition.routers["graph_router"] is None
             assert composition.runtime.dependencies.outbox_worker is None
+            # Both public graph tools must remain fail-closed in degraded mode.
+            for response in (
+                await server_module.graph_search_tool(entity_id="missing"),
+                await server_module.add_relation_tool(
+                    source_id="child", target_id="parent", relation_type="derived_from"
+                ),
+            ):
+                error = json.loads(response)
+                assert error["error"] == "E_PROJECTION_UNAVAILABLE"
+                assert error["message"].startswith("E_PROJECTION_UNAVAILABLE: graph")
             parent = Fact(
                 id="fact-parent-sql",
                 subject="Source",
@@ -534,6 +555,12 @@ class TestLifecycleServiceP3:
             assert updated_child is not None
             assert updated_child.confidence == pytest.approx(0.4)
             assert updated_child.version == 2
+            assert await composition.get_optional_graph() is None
+
+        from memory_server.runtime.errors import RuntimeNotReadyError
+
+        with pytest.raises(RuntimeNotReadyError, match="E_RUNTIME_NOT_READY"):
+            await composition.get_optional_graph()
 
 
 @pytest.mark.asyncio

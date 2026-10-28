@@ -221,6 +221,7 @@ class MCPComposition:
             belief_provider=sqlite,
             belief_policy=BeliefPolicy.capture(self.settings),
             get_graph=self.get_graph,
+            lifecycle_get_graph=self.get_optional_graph,
             reflection_provider=sqlite,
             reflection_policy=ReflectionPolicy.capture(self.settings),
             relation_provider=sqlite,
@@ -291,6 +292,12 @@ class MCPComposition:
 
     async def get_graph(self) -> Any:
         return self._dependency("graph")
+
+    async def get_optional_graph(self) -> Any | None:
+        """Allow SQL-only lifecycle propagation only while the runtime is READY."""
+        if self.runtime.state != "READY":
+            raise RuntimeNotReadyError()
+        return self.runtime.dependencies.graph
 
 
 _active_composition: MCPComposition | None = None
