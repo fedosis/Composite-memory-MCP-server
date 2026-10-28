@@ -58,3 +58,65 @@ def test_f3_record_producer_redacts_raw_database_row(configured):
     assert record.canonical_root is None
     assert store._get("alpha").canonical_root is None
     assert (record.id, record.enabled, record.generation) == ("alpha", True, 1)
+
+
+@pytest.mark.parametrize("overrides", [{}, {"max_header_bytes": 10**9}])
+def test_f4_exact_type_rejects_even_valid_bypass_subclasses(tmp_path, overrides):
+    from memory_server.gateway_contracts.ports import HttpConfig, validate_http_config
+
+    class Bypass(HttpConfig):
+        def __post_init__(self):
+            pass
+
+    config = Bypass(control_path=tmp_path, **overrides)
+    with pytest.raises(ValueError, match="^E_VALIDATION:"):
+        validate_http_config(config)
+
+
+def test_f4_inherited_validation_rejects_subclass_construction(tmp_path):
+    from memory_server.gateway_contracts.ports import HttpConfig
+
+    class Extension(HttpConfig):
+        pass
+
+    with pytest.raises(ValueError, match="^E_VALIDATION:"):
+        Extension(control_path=tmp_path)
+
+
+@pytest.mark.parametrize("value", [None, object()])
+def test_f4_non_config_is_validation_error(value):
+    from memory_server.gateway_contracts.ports import validate_http_config
+
+    with pytest.raises(ValueError, match="^E_VALIDATION:"):
+        validate_http_config(value)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("max_header_bytes", 10**9),
+    ("max_connections", 10**9),
+    ("header_timeout_seconds", 10**6),
+    ("request_timeout_seconds", 0),
+])
+def test_f4_config_fields_cannot_be_mutated_or_deleted(tmp_path, field, value):
+    from memory_server.gateway_contracts.ports import HttpConfig, validate_http_config
+
+    config = HttpConfig(control_path=tmp_path)
+    before = getattr(config, field)
+    with pytest.raises(FrozenInstanceError):
+        setattr(config, field, value)
+    with pytest.raises(FrozenInstanceError):
+        delattr(config, field)
+    assert getattr(config, field) == before
+    validate_http_config(config)
+
+
+@pytest.mark.parametrize("header,total,valid", [(5, 5, True), (4, 5, True), (6, 5, False)])
+def test_f4_deadline_ordering_at_construction_and_validation(tmp_path, header, total, valid):
+    from memory_server.gateway_contracts.ports import HttpConfig, validate_http_config
+
+    if valid:
+        config = HttpConfig(control_path=tmp_path, header_timeout_seconds=header, request_timeout_seconds=total)
+        validate_http_config(config)
+    else:
+        with pytest.raises(ValueError, match="^E_VALIDATION:"):
+            HttpConfig(control_path=tmp_path, header_timeout_seconds=header, request_timeout_seconds=total)

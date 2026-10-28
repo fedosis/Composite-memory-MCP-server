@@ -381,12 +381,15 @@ class HttpConfig:
 
 
 def validate_http_config(config: HttpConfig) -> None:
-    """Validate HTTP resource ceilings at construction and point of use.
+    """Validate exact HttpConfig values and HTTP resource ceilings.
 
     Raises ``ValueError`` with an ``E_VALIDATION:`` prefix for every invalid
-    configuration, including configurations created through a subclass that
-    bypasses ``HttpConfig.__post_init__``.
+    configuration. Subclasses are not supported, even with valid field values.
+    S06 limits.py must call this helper on its received config; that consumer
+    and its wiring regression test are not implemented in this amendment.
     """
+    if type(config) is not HttpConfig:
+        raise ValueError("E_VALIDATION: expected exact HttpConfig")
     if type(config.max_header_bytes) is not int or not 1 <= config.max_header_bytes <= 1048576:
         raise ValueError("E_VALIDATION: invalid max_header_bytes")
     if type(config.max_connections) is not int or not 1 <= config.max_connections <= 65536:
