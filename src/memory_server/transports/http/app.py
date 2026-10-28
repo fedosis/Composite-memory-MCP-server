@@ -183,7 +183,10 @@ class HttpApp:
                         profile_budget = None
                         raise HttpError('E_RATE_LIMIT')
                     self.guard.profiles[profile_budget] = self.guard.profiles.get(profile_budget, 0) + 1
-                self.guard.pre_auth.take('process')
+                # The independent admission/connection ceilings bound the process;
+                # unauthenticated traffic only spends its source's rate budget.
+                source = scope.get('client')
+                self.guard.pre_auth.take(source[0] if source else 'unknown-peer')
                 async with asyncio.timeout_at(deadline):
                     body = await read_body(scope, receive, self.config)
                     scope['s06'] = dict(spec=spec, body=body, request_id=request_id, deadline=deadline)
