@@ -916,18 +916,27 @@ def test_n2_unknown_provenance_is_quarantined_not_auto_deleted(tmp_path, ctx, cl
 def test_quarantined_rows_never_block_recording(tmp_path, ctx, clock):
     root = tmp_path / "audit"
     store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10,
-                             segment_rows=5, max_segments=10)
+                             segment_rows=2, max_segments=4)
     try:
-        for _ in range(9):
+        for _ in range(8):
             run(store.finish(begin(store, ctx), SUCCESS))
+        # Quarantine exactly one terminal row, then age and expire the rest.
+        with sqlite3.connect(root / "access.sqlite") as writer:
+            writer.execute(
+                "UPDATE access_audit SET boot_epoch='', booted_at=0.0 WHERE seq=1"
+            )
+            assert writer.execute(
+                "SELECT COUNT(*) FROM access_audit WHERE boot_epoch=''"
+            ).fetchone()[0] == 1
         clock.wall += timedelta(seconds=11)
         clock.boot += 11
-        assert store.retain() == 9  # everything ageable is gone
-        with sqlite3.connect(root / "access.sqlite") as writer:
-            writer.execute("UPDATE access_audit SET boot_epoch='', booted_at=0.0")
-        # a quarantined row must not pin capacity for the recorder
+        assert store.retain() == 7  # only the witnessed rows are ageable
+        assert len(rows(store)) == 1  # the quarantined row survives
+        assert store.saturation()["unknown_provenance_rows"] == 1
+        # ...and it must not pin capacity: recording still works.
         assert store.saturation()["authenticated"] is False
-        assert store.begin(ctx, "search")
+        ticket = run(store.begin(ctx, "search"))
+        assert ticket.id
     finally:
         store.close()
 

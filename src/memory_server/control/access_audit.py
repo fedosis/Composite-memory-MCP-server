@@ -388,7 +388,7 @@ class AccessAuditStore:
             seq_row = self._db.execute("SELECT seq FROM sqlite_sequence WHERE name='access_audit'").fetchone()
             seq = (seq_row[0] if seq_row else 0) + 1
             segment = (seq - 1) // self.segment_rows
-            first = self._db.execute("SELECT MIN(segment) FROM access_audit").fetchone()[0]
+            first = self._first_ageable_segment()
             if first is not None and segment - first >= self.max_segments:
                 raise AuditError()
             watermark = self._watermark()
@@ -423,6 +423,16 @@ class AccessAuditStore:
         return self._insert(ctx.request_id, ctx.principal.token_id, ctx.principal.client_id,
                             ctx.profile_id, operation, "intent")
 
+    def _first_ageable_segment(self) -> int | None:
+        """Oldest segment retention can still free.
+
+        Quarantined (unwitnessed) rows are excluded: they must never block the
+        recording path, and saturation() reports them separately.
+        """
+        return self._db.execute(
+            "SELECT MIN(segment) FROM access_audit WHERE boot_epoch <> '' AND booted_at > 0"
+        ).fetchone()[0]
+
     def _segment_full(self) -> bool:
         """Capacity counts only rows retention can actually age.
 
@@ -431,9 +441,7 @@ class AccessAuditStore:
         """
         seq_row = self._db.execute("SELECT seq FROM sqlite_sequence WHERE name='access_audit'").fetchone()
         segment = (seq_row[0] if seq_row else 0) // self.segment_rows
-        first = self._db.execute(
-            "SELECT MIN(segment) FROM access_audit WHERE boot_epoch <> '' AND booted_at > 0"
-        ).fetchone()[0]
+        first = self._first_ageable_segment()
         return first is not None and segment - first >= self.max_segments
 
     def retire_unknown_provenance(self, *, older_than_seconds: float | None = None) -> int:
