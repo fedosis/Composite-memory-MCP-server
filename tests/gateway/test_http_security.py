@@ -5,6 +5,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from http import HTTPStatus
 from time import monotonic
 
 import pytest
@@ -196,7 +197,7 @@ async def test_t13_fragmented_headers_reach_pinned_parser(shell):
         data = await asyncio.wait_for(reader.read(), 2)
         writer.close()
         await writer.wait_closed()
-        assert b'200 OK' in data and b'{"status":"ok"}' in data
+        assert data.startswith(b'HTTP/1.1 200 ') and b'{"status":"ok"}' in data
 
 
 @asynccontextmanager
@@ -264,7 +265,7 @@ async def test_t13_wire_cl_te_pipeline_and_connection_cap(shell):
         writer.write(b'GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n' * 2)
         await writer.drain()
         response = await asyncio.wait_for(reader.read(), 1)
-        assert response.count(b'HTTP/1.1 200') == 1
+        assert response.count(b'HTTP/1.1 200 ') == 1
         writer.close()
         await writer.wait_closed()
         connections = [await asyncio.open_connection('127.0.0.1', port) for _ in range(3)]
@@ -294,7 +295,7 @@ async def test_t14_wire_default_slow_body_deadline(shell):
         try:
             response = await asyncio.wait_for(reader.read(), 31)
             elapsed = monotonic() - started
-            assert b'504 Gateway Timeout' in response and b'E_TIMEOUT' in response
+            assert response.startswith(b'HTTP/1.1 504 ') and b'E_TIMEOUT' in response
             assert 29 <= elapsed <= 31
             print('BODY_DEADLINE_SECONDS', elapsed)
         finally:
@@ -454,7 +455,7 @@ async def rss_probe(tmp_path):
             writer.write(b'POST /api/v1/profiles/alpha/disable HTTP/1.1\r\nHost: localhost\r\n'
                          b'Transfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n')
             await writer.drain()
-            assert b'401 Unauthorized' in await reader.read()
+            assert (await reader.read()).startswith(b'HTTP/1.1 401 ')
             writer.close()
             await writer.wait_closed()
             assert rows(state) == []  # denial stream is separate from authenticated audit
@@ -496,7 +497,8 @@ async def rss_probe(tmp_path):
                 pass
             sample()
             response = b''.join(pieces)
-            assert b'413 Request Entity Too Large' in response, response
+            assert response.startswith(b'HTTP/1.1 413 '), response
+            assert response.split(b'\r\n', 1)[0] == f'HTTP/1.1 413 {HTTPStatus(413).phrase}'.encode(), response
             return dict(planned_bytes=64*1024*1024, chunks_sent=chunks_sent, status=413,
                         incremental_peak_kib=peak, samples=samples,
                         audit_rows=len(rows(state)))
@@ -570,7 +572,7 @@ async def test_raw_chunked_8k_overflow_receives_413(shell):
             await writer.drain()
             response = await asyncio.wait_for(reader.read(), 2)
             head, body = response.split(b"\r\n\r\n", 1)
-            assert b" 413 " in head, response
+            assert head.startswith(b"HTTP/1.1 413 "), response
             error = json.loads(body)["error"]
             assert error["code"] == "E_REQUEST_TOO_LARGE"
             assert set(error) == {"code", "message", "details", "request_id"}

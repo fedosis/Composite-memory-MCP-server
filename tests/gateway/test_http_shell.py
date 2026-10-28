@@ -444,7 +444,7 @@ async def test_t11_real_cli_subprocess_bind_and_sigterm(shell, tmp_path):
         response = await asyncio.wait_for(reader.read(), 5)
         writer.close()
         await writer.wait_closed()
-        assert b'200 OK' in response and b'"id":"alpha"' in response
+        assert response.startswith(b'HTTP/1.1 200 ') and b'"id":"alpha"' in response
         proc.terminate()
         stdout, stderr = await asyncio.to_thread(proc.communicate, timeout=15)
         assert proc.returncode == 0, stderr
@@ -544,7 +544,7 @@ async def test_t11_cli_composition_real_server_and_drain(tmp_path):
             assert self.config.app.dependencies.leases.snapshot() == {}
 
     assert await run_daemon(config, path, factory=create_http_app, server_factory=ExerciseServer) == 0
-    assert b'200 OK' in observed[0] and b'{"status":"ok"}' in observed[0]
+    assert observed[0].startswith(b'HTTP/1.1 200 ') and b'{"status":"ok"}' in observed[0]
     assert not (tmp_path / 'alpha').exists()
     # No default socket/listener remained; wire used and closed an ephemeral bind.
     with socket.socket() as probe:
