@@ -774,7 +774,9 @@ async def test_f3_page_and_record_roots_are_frozen_null(configured):
     assert store._get("alpha").canonical_root is not None
 
 
-@pytest.mark.parametrize("kind", ["fabricated", "terminal", "foreign", "wrong_request", "wrong_profile", "wrong_operation"])
+@pytest.mark.parametrize("kind", [
+    "fabricated", "terminal", "foreign", "wrong_request", "wrong_profile", "wrong_operation",
+])
 async def test_f5_q9_control_requires_owned_persisted_intent(configured, tmp_path, kind):
     from memory_server.control.access_audit import AccessAuditStore
     from memory_server.gateway_contracts.ports import AuditOutcome

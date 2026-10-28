@@ -22,6 +22,7 @@ from . import dto as d
 
 # S06 amendment Q9 (2026-10-28): eligibility declaration, not HTTP orchestration.
 # Only E_AUTH_REQUIRED uses the existing identity-free S05a denial callback.
+# Q6 integration must add the scrape key here and in the frozen exhaustive test.
 AUDIT_ELIGIBILITY: Mapping[str, Literal["none", "denial", "intent_outcome"]] = MappingProxyType({
     "pre_auth_reject": "none",
     "authentication_failure": "denial",

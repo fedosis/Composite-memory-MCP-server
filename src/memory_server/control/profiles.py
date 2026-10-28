@@ -59,9 +59,17 @@ def _overlap(left: Path, right: Path) -> bool:
 
 @dataclass(frozen=True)
 class RegistryConfiguration:
-    """Frozen local composition input, never derived from HTTP request data."""
+    """Frozen local composition input, never derived from HTTP request data.
+
+    S06 binds the owning S05a audit store and S03 token service here. Missing
+    audit custody rejects new control with E_AUDIT_UNAVAILABLE; missing token
+    verifier rejects replay with E_AUTH_REQUIRED. Neither dependency opens a
+    profile runtime; the registry constructor ABI stays configuration-only.
+    """
 
     bindings: tuple[ProfileBinding, ...]
+    audit_store: AccessAuditStore | None = None
+    tokens: TokenService | None = None
 
     def __post_init__(self) -> None:
         if type(self.bindings) is not tuple or len(self.bindings) > 100:
@@ -77,13 +85,10 @@ class ProfileRegistry:
     profile.manage respectively. No wildcard grants or root-setting methods.
     """
 
-    def __init__(
-        self, store: ControlStore, configuration: RegistryConfiguration, *,
-        audit_store: AccessAuditStore | None = None, tokens: TokenService | None = None
-    ) -> None:
+    def __init__(self, store: ControlStore, configuration: RegistryConfiguration) -> None:
         self._store = store
-        self._audit_store = audit_store
-        self._tokens = tokens
+        self._audit_store = configuration.audit_store
+        self._tokens = configuration.tokens
         self._configuration = configuration
         self._reconcile_after = 0
         bindings: dict[str, ProfileBinding] = {}
