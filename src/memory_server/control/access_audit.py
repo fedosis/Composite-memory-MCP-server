@@ -87,8 +87,8 @@ def _default_boottime() -> float:
         return time.clock_gettime(time.CLOCK_BOOTTIME)  # type: ignore[attr-defined]
     except (AttributeError, OSError):
         return time.monotonic()
-_DELETE_CHUNK_ROWS = 500
-_VACUUM_PAGES = 16
+_DELETE_CHUNK_ROWS = 200
+_VACUUM_PAGES = 8
 _VACUUM_MIN_FREE_PAGES = 1
 _VACUUM_INTERVAL_SECONDS = 60.0
 
@@ -166,6 +166,7 @@ class AccessAuditStore:
         self._denial_snapshot = (True, 0, time.monotonic(), True)
         self.rollback_refusals = 0
         self.pinned_by_wall_clock = 0  # rows old by the witness, not yet by the wall clock
+        self.unknown_provenance_rows = 0  # rows with no usable witness; admin retire only
         self._fd = None
         self._db = None
         self._maintenance_db = None
@@ -424,6 +425,38 @@ class AccessAuditStore:
         first = self._db.execute("SELECT MIN(segment) FROM access_audit").fetchone()[0]
         return first is not None and segment - first >= self.max_segments
 
+    def retire_unknown_provenance(self, *, older_than_seconds: float | None = None) -> int:
+        """Administrative retirement of rows that carry no usable witness.
+
+        Rows written before the witness existed, or while boottime was broken,
+        can never be aged automatically. They are quarantined (reported by
+        saturation()["unknown_provenance_rows"]) and deleted here on an explicit
+        operator call, still honouring a wall-clock age floor.
+        """
+        age = self.ttl_seconds if older_than_seconds is None else float(older_than_seconds)
+        if not math.isfinite(age) or age <= 0:
+            raise AuditError("E_VALIDATION")
+        cutoff = self._now().timestamp() - age
+        try:
+            with self._maintenance_lock:
+                db = self._maintenance_db
+                if db is None:
+                    raise AuditError()
+                removed = db.execute(
+                    "DELETE FROM access_audit WHERE (boot_epoch = '' OR booted_at <= 0) AND created_at < ?",
+                    (cutoff,),
+                ).rowcount
+                if removed:
+                    db.execute("UPDATE maintenance_state SET scrub_pending=1 WHERE id=1")
+                self.unknown_provenance_rows = db.execute(
+                    "SELECT COUNT(*) FROM access_audit WHERE boot_epoch = '' OR booted_at <= 0"
+                ).fetchone()[0]
+            if removed:
+                self._scrub()
+            return removed
+        except (OSError, sqlite3.Error):
+            raise AuditError() from None
+
     def saturation(self) -> dict[str, bool | float]:
         """S06 admission probe, not a reservation; unavailable storage is saturated.
 
@@ -452,6 +485,7 @@ class AccessAuditStore:
             "clock_lag_seconds": clock_lag,
             "clock_suspect": clock_suspect,
             "pinned_by_wall_clock": self.pinned_by_wall_clock,
+            "unknown_provenance_rows": self.unknown_provenance_rows,
         }
 
     def _refresh_denial_snapshot(self) -> None:
@@ -1083,20 +1117,28 @@ class AccessAuditStore:
                     # Same-boot rows are aged by the witness. Rows from another boot (or
                     # written before the witness existed) can only be proven aged once
                     # this boot has itself lasted a full TTL.
+                    # Unknown provenance (no boot_epoch, or booted_at<=0) is never
+                    # deleted automatically: it is surfaced and retired only by an
+                    # explicit administrative call.
+                    where_aged = (
+                        "((boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ?)"
+                        " OR (boot_epoch <> '' AND boot_epoch <> ? AND ? >= ?))"
+                    )
                     removed = db.execute(
-                        """DELETE FROM access_audit WHERE created_at < ? AND retention_at < ?
-                        AND ((boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ?)
-                             OR ((boot_epoch <> ? OR booted_at <= 0) AND ? >= ?))
-                        AND seq IN (
-                            SELECT seq FROM access_audit WHERE created_at < ? AND retention_at < ?
-                            AND ((boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ?)
-                                 OR ((boot_epoch <> ? OR booted_at <= 0) AND ? >= ?))
-                            ORDER BY seq LIMIT ?)""",
-                        (cutoff, cutoff, self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch,
-                         boot_now, self.ttl_seconds,
-                         cutoff, cutoff, self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch,
-                         boot_now, self.ttl_seconds, _DELETE_CHUNK_ROWS),
+                        "DELETE FROM access_audit WHERE created_at < ? AND retention_at < ? AND "
+                        + where_aged
+                        + " AND seq IN (SELECT seq FROM access_audit WHERE created_at < ? AND retention_at < ? AND "
+                        + where_aged
+                        + " ORDER BY seq LIMIT ?)",
+                        (cutoff, cutoff,
+                         self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch, boot_now, self.ttl_seconds,
+                         cutoff, cutoff,
+                         self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch, boot_now, self.ttl_seconds,
+                         _DELETE_CHUNK_ROWS),
                     ).rowcount
+                    self.unknown_provenance_rows = db.execute(
+                        "SELECT COUNT(*) FROM access_audit WHERE boot_epoch = '' OR booted_at <= 0"
+                    ).fetchone()[0]
                     self.pinned_by_wall_clock = db.execute(
                         """SELECT COUNT(*) FROM access_audit
                         WHERE boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ? AND created_at >= ?""",
