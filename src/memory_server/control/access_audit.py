@@ -266,7 +266,8 @@ class AccessAuditStore:
             self._maintenance_db.execute("PRAGMA cache_size=-2048")
             self._maintenance_db.execute(f"PRAGMA max_page_count={max_bytes // page_size}")
             scrub_pending = bool(self._db.execute(
-                "SELECT scrub_pending FROM maintenance_state WHERE id=1"
+                """SELECT scrub_pending OR EXISTS(SELECT 1 FROM maintenance_scrub_frontier)
+                    FROM maintenance_state WHERE id=1"""
             ).fetchone()[0])
             if stale_journal or scrub_pending:
                 # SQLite recovers hot journals first; pending work is retried
@@ -937,7 +938,8 @@ class AccessAuditStore:
                 )
                 self._compact(db)
                 db.execute(
-                    "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
+                    """UPDATE maintenance_state SET scrub_pending=
+                        EXISTS(SELECT 1 FROM maintenance_scrub_frontier) WHERE id=1"""
                 )
             # The commit bumps the change counter, invalidating clean page caches
             # after safe slack writes, and SQLite removes its own journal.

@@ -1288,6 +1288,32 @@ def test_m1_eight_page_scrub_has_bounded_sql_vm_work(tmp_path, clock):
     assert measurements[1] <= 5000
 
 
+def test_m3_partial_scrub_remains_pending_until_frontier_drains(tmp_path, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now)
+    insert_retention_fixture(store, root, clock, 1000)
+    with sqlite3.connect(root / "access.sqlite") as writer:
+        writer.execute("UPDATE maintenance_state SET scrub_pending=1 WHERE id=1")
+    assert store.retain() == 0  # Fresh rows; maintenance alone must make progress.
+    assert store._db.execute("SELECT COUNT(*) FROM maintenance_scrub_frontier").fetchone()[0] > 0
+    assert store._db.execute("SELECT scrub_pending FROM maintenance_state WHERE id=1").fetchone()[0] == 1
+    store.close()
+
+    store = AccessAuditStore(root, clock=clock.now)
+    try:
+        calls = 0
+        while store._db.execute("SELECT scrub_pending FROM maintenance_state WHERE id=1").fetchone()[0]:
+            assert calls < 1000
+            assert store.retain() == 0
+            calls += 1
+        assert store._db.execute("SELECT COUNT(*) FROM maintenance_scrub_frontier").fetchone()[0] == 0
+        assert len(rows(store)) == 1000
+        assert store._db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        print(f"m3 partial scrub: restart + {calls} zero-delete calls; retained=1000")
+    finally:
+        store.close()
+
+
 def test_n5_capacity_and_cache_budgets_are_explicit(store):
     assert store.segment_rows == 10000
     assert store.max_segments == 27  # ceil(30d / 10s / 10000) + spare
