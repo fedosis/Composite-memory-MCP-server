@@ -40,6 +40,7 @@ from .store import ControlError, ControlStore
 
 if TYPE_CHECKING:
     from .access_audit import AccessAuditStore
+    from .tokens import TokenService
 
 # Process-local exclusion only (workers=1), not a cross-process lock.
 _ACTIVE_CONTROLS: set[tuple[str, int]] = set()
@@ -77,10 +78,12 @@ class ProfileRegistry:
     """
 
     def __init__(
-        self, store: ControlStore, configuration: RegistryConfiguration, *, audit_store: AccessAuditStore | None = None
+        self, store: ControlStore, configuration: RegistryConfiguration, *,
+        audit_store: AccessAuditStore | None = None, tokens: TokenService | None = None
     ) -> None:
         self._store = store
         self._audit_store = audit_store
+        self._tokens = tokens
         self._configuration = configuration
         self._reconcile_after = 0
         bindings: dict[str, ProfileBinding] = {}
@@ -349,6 +352,19 @@ class ProfileRegistry:
             raise ControlError("E_VALIDATION")
         if ctx.deadline <= asyncio.get_running_loop().time():
             raise ControlError("E_TIMEOUT")
+        # Revalidate cached authority before any port access or replay hydration.
+        if self._store._connection is None:
+            raise ControlError("E_STORAGE")
+        prior = self._store._request(ctx.principal.subject, profile_id, command.operation, str(ctx.idempotency_key))
+        if prior is not None:
+            from .policy import TokenError
+
+            if self._tokens is None:
+                raise ControlError("E_AUTH_REQUIRED")
+            try:
+                self._tokens.verify_principal(ctx.principal, now=now)
+            except TokenError as exc:
+                raise ControlError(exc.code) from None
         enabled = isinstance(command, d.ProfilesEnableCommand)
         observation = leases.snapshot().get(profile_id)
         eligible = (

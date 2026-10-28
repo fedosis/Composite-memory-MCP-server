@@ -17,6 +17,7 @@ import pytest
 from memory_server.control.access_audit import AccessAuditStore
 from memory_server.control.profiles import ProfileRegistry, RegistryConfiguration
 from memory_server.control.store import ControlError, ControlStore
+from memory_server.control.tokens import TokenService
 from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.ports import AuditTicket, ProfileRecord, RequestContext
 from tests.gateway.test_registry import binding, principal
@@ -154,6 +155,18 @@ async def publish_ok(ticket, outcome):
 
 async def run_control(registry, args, leases, *, publish=publish_ok, now=None):
     ctx, command, ticket = args
+    if getattr(registry, "_tokens", None) is None:
+        registry._tokens = TokenService(registry._store)
+    # Existing lower-level control proofs use synthetic Principals; persist their
+    # credential metadata so replay crosses the real S03 generation check too.
+    db = registry._store._connection
+    db.execute("INSERT OR IGNORE INTO tokens "
+               "(id,digest,subject,profiles,permissions,created_at,expires_at,last_used_at,revoked_at,generation) "
+               "VALUES (?,?,?,?,?,?,?,NULL,NULL,?)",
+               (ctx.principal.token_id, bytes(32), ctx.principal.subject,
+                json.dumps(sorted(ctx.principal.profiles)), json.dumps(sorted(ctx.principal.permissions)),
+                datetime.now(timezone.utc).isoformat(), ctx.principal.expires_at.isoformat(),
+                ctx.principal.credential_generation))
     existing = registry._store._request(ctx.principal.subject, command.profile_id, command.operation,
                                         str(ctx.idempotency_key))
     audit = registry._audit_store
@@ -799,3 +812,42 @@ async def test_f5_q9_control_requires_owned_persisted_intent(configured, tmp_pat
     finally:
         with_audit.close()
         foreign.close()
+
+
+@pytest.mark.parametrize("change", ["revoked", "narrowed"])
+async def test_f6_replay_revalidates_principal_before_touching_port(configured, monkeypatch, change):
+    from datetime import timedelta
+
+    from memory_server.control.tokens import TokenService
+
+    registry, store, _ = configured
+    tokens = TokenService(store)
+    registry._tokens = tokens
+    now = datetime.now(timezone.utc)
+    created = tokens._bootstrap_create(d.TokenCreate(subject="replay-actor", profiles=["alpha"],
+        permissions=["profile.read", "profile.manage", "token.manage"], expires_at=now + timedelta(hours=1)), now=now)
+    actor = await tokens.authenticate(f"cmms_{created.token.id}.{created.secret}", now=now)
+    args = control_input()
+    args[0] = replace(args[0], principal=actor)
+    leases = ObservedLeases()
+    assert (await run_control(registry, args, leases, now=now)).status == 200
+    if change == "revoked":
+        admin_ctx = replace(args[0], profile_id=None, idempotency_key=uuid4(), request_id="req_" + str(uuid4()))
+        await tokens.revoke(admin_ctx, actor.token_id,
+            d.ControlMutation(reason="revoke replay", confirmation=True, expected_generation=1), now=now)
+    else:
+        store._connection.execute("UPDATE tokens SET profiles='[]',permissions='[]',generation=generation+1 WHERE id=?",
+                                  (actor.token_id,))
+    before = store._connection.total_changes
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("revoked replay touched the lease port")
+
+    monkeypatch.setattr(leases, "snapshot", forbidden)
+    monkeypatch.setattr(leases, "stop_profile", forbidden)
+    with pytest.raises(ControlError) as exc:
+        await registry.control(args[0], args[1], ticket=args[2], leases=leases,
+            publish=publish_ok, now=now, ttl_seconds=60)
+    assert exc.value.code in {"E_AUTH_REQUIRED", "E_PERMISSION_DENIED"}
+    assert store._connection.total_changes == before
+    assert len(store.journal(profile_ids=["alpha"])) == 1
