@@ -80,6 +80,7 @@ packages = [
     "memory_server.router",
     "memory_server.runtime",
     "memory_server.transports",
+    "memory_server.transports.http",
     "memory_server.services",
     "storage",
     "storage.adapters",
