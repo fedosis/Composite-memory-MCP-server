@@ -47,6 +47,8 @@ _DEFAULT_STATUS: dict[str, int] = {
 }
 
 _MESSAGES: dict[str, str] = {
+    "E_VERSION_CONFLICT": "Version conflict",
+    "E_INTERNAL": "Internal server error",
     "E_AUTH_REQUIRED": "Authentication required",
     "E_PERMISSION_DENIED": "Permission denied",
     "E_PROFILE_NOT_FOUND": "Profile not found",
@@ -136,7 +138,7 @@ def error_response(code: str | HttpError, request_id: str, status: int | None = 
     body: dict[str, Any] = {
         "error": {
             "code": safe_code,
-            "message": _MESSAGES.get(safe_code, "Internal server error"),
+            "message": _MESSAGES.get(safe_code, "Request failed"),
             "request_id": request_id,
             "details": details,
         }
