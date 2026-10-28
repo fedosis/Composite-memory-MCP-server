@@ -99,7 +99,7 @@ def revoke(
             request = d.ControlMutation(
                 reason="Local CLI revocation", confirmation=True, expected_generation=row["generation"]
             )
-            service._revoke(service._local_context(now), token_id, request, now, local=True)
+            service._unchecked_revoke(service._local_context(now), token_id, request, now, local=True)
             with service._atomic():
                 result = service._info(service._db.execute("SELECT * FROM tokens WHERE id=?", (token_id,)).fetchone())
                 if result.revoked_at is None:

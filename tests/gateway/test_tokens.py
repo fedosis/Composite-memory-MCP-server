@@ -256,6 +256,48 @@ def test_revoke_immediate_generation_and_replay(custody):
     assert row["generation"] == 2 and row["revoked_at"] is not None
 
 
+def test_revoke_of_out_of_scope_token_looks_absent(custody):
+    # C2.4: an id outside the caller's profile scope must be indistinguishable from absent.
+    _, _, _, service = custody
+    foreign = run(service.create(context(), payload(subject="other", profiles=["B"]), now=NOW))
+    narrow = context(owner=principal(profiles=frozenset({"A"})))
+    expect("E_NOT_FOUND", lambda: run(service.revoke(narrow, foreign.token.id, mutation(), now=NOW)))
+    expect("E_NOT_FOUND", lambda: run(service.revoke(narrow, uuid4().hex, mutation(), now=NOW)))
+
+
+def test_verify_principal_rejects_stale_cached_principal(custody):
+    # T9/C2.1: a Principal cached before revoke must not keep authority.
+    _, _, _, service = custody
+    result = run(service.create(context(), payload(), now=NOW))
+    cached = run(service.authenticate(bearer(result), now=NOW))
+    service.verify_principal(cached, now=NOW)
+    run(service.revoke(context(), result.token.id, mutation(), now=NOW))
+    expect("E_AUTH_REQUIRED", lambda: service.verify_principal(cached, now=NOW))
+
+
+def test_create_expiry_and_scope_are_bounded_by_the_issuer(custody):
+    # F3: a token may not outlive the credential that minted it.
+    t, _, _, service = custody
+    issuer = principal(expires_at=NOW + timedelta(hours=2))
+    ctx = context(owner=issuer)
+    too_long = payload(expires_at=NOW + timedelta(days=30))
+    expect("E_VALIDATION", lambda: run(service.create(ctx, too_long, now=NOW)))
+    ok = run(service.create(ctx, payload(expires_at=NOW + timedelta(hours=1)), now=NOW))
+    assert ok.token.expires_at == NOW + timedelta(hours=1)
+    boot = service._bootstrap_create(payload(expires_at=NOW + timedelta(days=30)), now=NOW)
+    assert boot.token.expires_at == NOW + timedelta(days=30)
+
+
+def test_journal_records_issuer_and_target_subject_separately(custody):
+    # F4: delegated issuance keeps an explicit issuer on the journal row; the target
+    # subject lives in the immutable snapshot, so attribution cannot be confused.
+    _, _, store, service = custody
+    run(service.create(context(owner=principal(subject="issuer")), payload(subject="agent"), now=NOW))
+    row = store._connection.execute("SELECT subject, snapshot FROM token_journal").fetchone()
+    assert row["subject"] == "issuer"
+    assert '"subject":"agent"' in row["snapshot"]
+
+
 @pytest.mark.parametrize("operation", ["create", "revoke"])
 @pytest.mark.parametrize("phase", ["after_row", "after_journal", "after_commit"])
 def test_crash_atomicity_reopen(tmp_path, operation, phase):
@@ -505,7 +547,7 @@ with ControlStore(Path(root)) as store:
         service._bootstrap_create(d.TokenCreate(subject='crash', profiles=['A'],
             permissions=['memory.read'], expires_at=now+timedelta(hours=1)), now=now)
     else:
-        service._revoke(service._local_context(now), token_id,
+        service._unchecked_revoke(service._local_context(now), token_id,
             d.ControlMutation(reason='crash', confirmation=True, expected_generation=1), now, local=True)
 """
     proc = subprocess.run(

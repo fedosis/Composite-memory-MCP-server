@@ -177,8 +177,24 @@ class TokenService:
             principal = principal_from_token(token)
         return principal
 
-    @staticmethod
-    def _authority(ctx: RequestContext, now: datetime) -> None:
+    def verify_principal(self, principal: Principal, *, now: datetime) -> None:
+        """Revalidate a cached Principal against the store.
+
+        The transport boundary (S06) MUST call this for every request that reuses a
+        cached Principal: revocation bumps the credential generation, and C2.1 allows
+        caching only with generation invalidation. S03 exposes the check; the caching
+        layer lives in S06.
+        """
+        utc_now(now)
+        if now >= principal.expires_at:
+            raise TokenError("E_AUTH_REQUIRED")
+        row = self._db.execute(
+            "SELECT generation, revoked_at FROM tokens WHERE id=?", (principal.token_id,)
+        ).fetchone()
+        if row is None or row["revoked_at"] is not None or row["generation"] != principal.credential_generation:
+            raise TokenError("E_AUTH_REQUIRED")
+
+    def _authority(self, ctx: RequestContext, now: datetime) -> None:
         utc_now(now)
         if now >= ctx.principal.expires_at:
             raise TokenError("E_AUTH_REQUIRED")
@@ -247,9 +263,11 @@ class TokenService:
             or not set(request.permissions) <= ctx.principal.permissions
         ):
             raise TokenError("E_PERMISSION_DENIED")
-        return self._create(ctx, request, now)
+        if request.expires_at > ctx.principal.expires_at:
+            raise TokenError("E_VALIDATION")
+        return self._unchecked_create(ctx, request, now)
 
-    def _create(self, ctx: RequestContext, request: d.TokenCreate, now: datetime) -> d.TokenCreated:
+    def _unchecked_create(self, ctx: RequestContext, request: d.TokenCreate, now: datetime) -> d.TokenCreated:
         utc_now(now)
         if any(_PROFILE.fullmatch(profile) is None for profile in request.profiles):
             raise TokenError("E_VALIDATION")
@@ -297,9 +315,9 @@ class TokenService:
         self, ctx: RequestContext, token_id: str, payload: d.ControlMutation, *, now: datetime
     ) -> d.TokenInfo:
         self._authority(ctx, now)
-        return self._revoke(ctx, token_id, payload, now, local=False)
+        return self._unchecked_revoke(ctx, token_id, payload, now, local=False)
 
-    def _revoke(self, ctx, token_id, payload, now, *, local):
+    def _unchecked_revoke(self, ctx, token_id, payload, now, *, local):
         utc_now(now)
         if not isinstance(token_id, str) or re.fullmatch("[0-9a-f]{32}", token_id, re.ASCII) is None:
             raise TokenError("E_VALIDATION")
@@ -311,7 +329,8 @@ class TokenService:
                 raise TokenError("E_NOT_FOUND")
             before = self._info(row)
             if not local and not set(before.profiles) <= ctx.principal.profiles:
-                raise TokenError("E_PERMISSION_DENIED")
+                # C2.4: scoped ids outside the caller's profiles are indistinguishable from absent.
+                raise TokenError("E_NOT_FOUND")
             replay = self._replay(ctx, "tokens.revoke", fingerprint, now)
             if replay is not None:
                 return replay
@@ -423,7 +442,7 @@ class TokenService:
         return RequestContext("req_" + str(uuid4()), principal, None, uuid4(), float("inf"))
 
     def _bootstrap_create(self, payload: d.TokenCreate, *, now: datetime) -> d.TokenCreated:
-        return self._create(self._local_context(now), _validate(d.TokenCreate, payload), now)
+        return self._unchecked_create(self._local_context(now), _validate(d.TokenCreate, payload), now)
 
     async def execute(self, ctx: RequestContext, command: d.GatewayCommand) -> d.GatewayResult:
         now = datetime.now(UTC)
