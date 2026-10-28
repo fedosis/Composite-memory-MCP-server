@@ -854,3 +854,14 @@ def test_n4_startup_scrubs_stale_journal(tmp_path, ctx, clock):
         assert CANARY_SECRET.encode() not in (root / "access.sqlite").read_bytes()
     finally:
         store.close()
+
+
+def test_n5_capacity_and_cache_budgets_are_explicit(store):
+    assert store.segment_rows == 10000
+    assert store.max_segments == 27  # ceil(30d / 10s / 10000) + spare
+    assert store.segment_rows * (store.max_segments - 1) >= store.ttl_seconds / 10
+    assert store._db.execute("PRAGMA cache_size").fetchone()[0] == -2048
+    assert store._denials._db.execute("PRAGMA cache_size").fetchone()[0] == -2048
+    page_size = store._db.execute("PRAGMA page_size").fetchone()[0]
+    assert store._db.execute("PRAGMA max_page_count").fetchone()[0] * page_size == 256 * 1024 * 1024
+    assert store._denials._db.execute("PRAGMA max_page_count").fetchone()[0] * page_size == 4 * 1024 * 1024

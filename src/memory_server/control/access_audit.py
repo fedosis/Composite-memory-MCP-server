@@ -5,7 +5,14 @@ evicted. The authenticated default budgets one row / 10 s across the TTL:
 30 * 86400 / 10 = 259200 rows; ceil(259200 / 10000) + 1 = 27 segments.
 The spare segment covers partial-segment retention; retain must run at least
 once per segment interval. Higher audited rates need explicit capacity planning.
-SQLite max_page_count additionally bounds physical growth (default 256 MiB).
+The 27-segment default is retained intentionally: 8 segments hold only 80000
+rows, below the 259200-row TTL target. At an illustrative 512 B/row including
+indexes, 270000 slots need 138240000 B (~132 MiB), exceeding the old 64 MiB.
+SQLite max_page_count caps the authenticated file at 256 MiB, with 4 MiB for
+denials (260 MiB total database budget). These are disk, not RAM guarantees;
+large metadata may hit the byte cap first and fail closed. Each connection has
+an explicit 2048 KiB page-cache target (4096 KiB for the pair, not a process RSS
+limit); lists materialize at most 200 rows. VACUUM needs temporary disk space.
 Pre-auth denials use a separate file/sequence/page budget (2000 rows, 4 MiB),
 never authenticated slots. Saturation drops denial recording, not requests.
 Exhaustion of authenticated storage is E_AUDIT_UNAVAILABLE.
@@ -139,6 +146,7 @@ class AccessAuditStore:
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.execute("PRAGMA journal_mode=DELETE")
             self._db.execute("PRAGMA secure_delete=ON")  # scrub expired identities from freed SQLite cells
+            self._db.execute("PRAGMA cache_size=-2048")  # KiB target, not a process RSS limit
             page_size = self._db.execute("PRAGMA page_size").fetchone()[0]
             self._db.execute(f"PRAGMA max_page_count={max_bytes // page_size}")
             with self._transaction():
@@ -279,7 +287,8 @@ class AccessAuditStore:
             with target._lock:
                 try:
                     dropped, failing = target._health()
-                    denials = denials or bool(failing) or dropped > self._observed_denial_drops or target._segment_full()
+                    denials = (denials or bool(failing) or dropped > self._observed_denial_drops
+                               or target._segment_full())
                     self._observed_denial_drops = dropped
                 except (AuditError, sqlite3.Error):
                     denials = True
