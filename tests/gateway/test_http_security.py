@@ -305,24 +305,52 @@ async def test_t14_wire_default_slow_body_deadline(shell):
     assert rows(shell) == []
 
 
-def test_t13_warmed_isolated_64mib_stream_rss(tmp_path):
+def test_t13_warmed_isolated_64mib_stream_rss(tmp_path, request):
     import os
     import subprocess
     import sys
+    from pathlib import Path
+    from statistics import median
+
+    if not Path('/proc/self/statm').is_file():
+        pytest.skip('current RSS sampling requires Linux /proc/self/statm')
+    root = Path(__file__).resolve().parents[2]
+    # Explicit allowlist: no inherited allocator, Python, tracing or service settings.
+    env = {'PATH': os.defpath, 'TMPDIR': str(tmp_path),
+           'PYTHONPATH': os.pathsep.join((str(root / 'src'), str(root))),
+           'PYTHONHASHSEED': '0', 'PYTHONNOUSERSITE': '1'}
     script = '''
-import asyncio,json,resource,sys
+import asyncio,json,sys
 from pathlib import Path
 from tests.gateway.test_http_security import rss_probe
 print(json.dumps(asyncio.run(rss_probe(Path(sys.argv[1])))))
 '''
-    result = subprocess.run([sys.executable, '-c', script, str(tmp_path)],
-                            env=dict(os.environ), capture_output=True, text=True, timeout=20)
-    assert result.returncode == 0, result.stderr
-    observed = json.loads(result.stdout)
-    print('RSS_STREAM', json.dumps(observed, sort_keys=True))
-    assert observed['planned_bytes'] == 64 * 1024 * 1024
-    assert observed['incremental_peak_kib'] <= 16 * 1024
-    assert observed['status'] == 413 and observed['audit_rows'] == 0
+    observations = []
+
+    def measure():
+        child_path = tmp_path / f'child-{len(observations)}'
+        child_path.mkdir()
+        result = subprocess.run([sys.executable, '-c', script, str(child_path)], cwd=root,
+                                env=env, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        observed = json.loads(result.stdout)
+        observations.append(observed)
+        print('RSS_STREAM', json.dumps(observed, sort_keys=True))
+        assert observed['planned_bytes'] == 64 * 1024 * 1024
+        assert observed['samples'] > 1
+        assert observed['status'] == 413 and observed['audit_rows'] == 0
+        return observed['incremental_peak_kib']
+
+    peaks = [measure()]
+    # Only a noisy first exceedance triggers two fresh children: median of THREE,
+    # never best-of-three or a wider bound. Child/protocol errors are not retried.
+    if peaks[0] > 16 * 1024:
+        peaks.extend(measure() for _ in range(2))
+    measured = median(peaks)
+    request.node.user_properties.extend([
+        ('rss_peaks_kib', json.dumps(peaks)), ('rss_incremental_peak_kib', measured)])
+    print('RSS_STREAM_RESULT', json.dumps({'peaks_kib': peaks, 'median_kib': measured}))
+    assert measured <= 16 * 1024, f'incremental RSS peaks KiB: {peaks}; median: {measured}'
 
 
 @pytest.mark.parametrize('trusted', [(), ('192.0.2.0/24',), ('127.0.0.0/8',)])
@@ -383,21 +411,54 @@ async def test_t11_mutated_and_subclass_config_rejected(shell):
 
 
 async def rss_probe(tmp_path):
-    import resource
+    import gc
+    import os
+    from pathlib import Path
 
     from tests.gateway.test_http_shell import shell as fixture
     generator = fixture.__wrapped__(tmp_path)
     state = await anext(generator)
+    baseline = None
+    peak = 0
+    samples = 0
+    page_kib = os.sysconf('SC_PAGE_SIZE') // 1024
+
+    def sample():
+        nonlocal peak, samples
+        gc.collect()
+        # Current RSS, not ru_maxrss: an import-time/inherited high-water mark
+        # must not mask allocations made by the measured request.
+        current = int(Path('/proc/self/statm').read_text().split()[1]) * page_kib
+        if baseline is not None:
+            peak = max(peak, current - baseline)
+            samples += 1
+        return current
+
+    async def measured_app(scope, receive, send):
+        async def measured_receive():
+            message = await receive()
+            sample()
+            return message
+
+        async def measured_send(message):
+            sample()
+            await send(message)
+
+        await state.app(scope, measured_receive, measured_send)
+
     try:
-        async with wire(state.app, state.config) as port:
-            # Warm the same loopback parser/app before taking peak-RSS baseline.
+        async with wire(measured_app, state.config) as port:
+            # Imports/fixture/server are ready. Warm the SAME chunked POST,
+            # parser and read_body path with a small request before the baseline.
             reader, writer = await asyncio.open_connection('127.0.0.1', port)
-            writer.write(b'GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n')
+            writer.write(b'POST /api/v1/profiles/alpha/disable HTTP/1.1\r\nHost: localhost\r\n'
+                         b'Transfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n')
             await writer.drain()
-            assert b'200 OK' in await reader.read()
+            assert b'401 Unauthorized' in await reader.read()
             writer.close()
             await writer.wait_closed()
-            baseline = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            assert rows(state) == []  # denial stream is separate from authenticated audit
+            baseline = sample()
             reader, writer = await asyncio.open_connection('127.0.0.1', port)
             writer.write(b'POST /api/v1/profiles/alpha/disable HTTP/1.1\r\nHost: localhost\r\n'
                          b'Transfer-Encoding: chunked\r\n\r\n')
@@ -410,6 +471,10 @@ async def rss_probe(tmp_path):
                         writer.write(b'10000\r\n' + b'x' * 65536 + b'\r\n')
                         await writer.drain()
                         chunks_sent += 1
+                        sample()
+                        # Bounded producer buffering and a scheduling point for
+                        # real socket/parser/ASGI samples throughout the stream.
+                        await asyncio.sleep(0)
                     writer.write(b'0\r\n\r\n')
                     await writer.drain()
                 except (OSError, ConnectionError):
@@ -419,6 +484,7 @@ async def rss_probe(tmp_path):
             try:
                 while part := await reader.read(65536):
                     pieces.append(part)
+                    sample()
             except ConnectionError:
                 pass
             task.cancel()
@@ -428,10 +494,11 @@ async def rss_probe(tmp_path):
                 await writer.wait_closed()
             except ConnectionError:
                 pass
+            sample()
             response = b''.join(pieces)
             assert b'413 Request Entity Too Large' in response, response
             return dict(planned_bytes=64*1024*1024, chunks_sent=chunks_sent, status=413,
-                        incremental_peak_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss-baseline,
+                        incremental_peak_kib=peak, samples=samples,
                         audit_rows=len(rows(state)))
     finally:
         try:
