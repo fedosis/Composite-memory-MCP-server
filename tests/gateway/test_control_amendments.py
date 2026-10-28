@@ -727,3 +727,13 @@ def test_f4_header_timeout_cannot_exceed_request_timeout(tmp_path):
 
     with pytest.raises(ValueError, match="^E_VALIDATION:"):
         HttpConfig(control_path=tmp_path, header_timeout_seconds=300, request_timeout_seconds=30)
+
+
+async def test_f3_page_and_record_roots_are_frozen_null(configured):
+    registry, store, _ = configured
+    actor = principal("alpha")
+    page, _ = await registry.page(actor, limit=1, after=None, upper=None)
+    for permission in ("profile.read", "profile.manage"):
+        record = await registry.record(actor, "alpha", permission=permission)
+        assert record.canonical_root is page[0].storage_root is None
+    assert store._get("alpha").canonical_root is not None

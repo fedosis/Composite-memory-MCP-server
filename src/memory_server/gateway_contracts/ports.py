@@ -61,7 +61,7 @@ class RequestContext:
 @dataclass(frozen=True)
 class ProfileRecord:
     id: str
-    canonical_root: Path
+    canonical_root: Path | None  # Q7 deferred: record() always redacts this field.
     enabled: bool
     display_name: str
     description: str | None
