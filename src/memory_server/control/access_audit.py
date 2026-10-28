@@ -9,6 +9,10 @@ SQLite max_page_count additionally bounds physical growth (default 256 MiB).
 Pre-auth denials use a separate file/sequence/page budget (2000 rows, 4 MiB),
 never authenticated slots. Saturation drops denial recording, not requests.
 Exhaustion of authenticated storage is E_AUDIT_UNAVAILABLE.
+saturation() is the S06 gate input: exact keys "authenticated" and "denials".
+"denials" is true on failure, capacity exhaustion, or durable losses since the
+last observation; retain() cannot clear write failure. Only a successful denial
+write clears the durable failing flag. No new C9 metric family is introduced.
 S06 owns route integration, S12 owns the atomic canonical outcome journal.
 """
 
@@ -100,7 +104,7 @@ class AccessAuditStore:
         self.max_segments = max_segments if max_segments is not None else math.ceil(ttl_seconds / 10 / segment_rows) + 1
         self._lock = RLock()
         self._denials = None
-        self.dropped_denials = 0  # local diagnostic counter; not a new C9 family
+        self._observed_denial_drops = 0
         self._denial_failed = False
         self.rollback_refusals = 0
         self._fd = None
@@ -149,6 +153,11 @@ class AccessAuditStore:
                     self._db.execute("ALTER TABLE access_audit ADD COLUMN retention_at REAL NOT NULL DEFAULT 0")
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
                 self._watermark()
+                if _denial_only:
+                    self._db.execute("""CREATE TABLE IF NOT EXISTS denial_health (
+                        id INTEGER PRIMARY KEY CHECK(id=1), dropped INTEGER NOT NULL,
+                        failing INTEGER NOT NULL CHECK(failing IN (0,1)))""")
+                    self._db.execute("INSERT OR IGNORE INTO denial_health VALUES (1,0,0)")
             os.fsync(self._fd)
             if not _denial_only:
                 try:
@@ -249,8 +258,9 @@ class AccessAuditStore:
     def saturation(self) -> dict[str, bool]:
         """S06 admission probe, not a reservation; unavailable storage is saturated.
 
-        dropped_denials is a process-local monotonic diagnostic counter. No new
-        metric family is exported: C9's wire vocabulary remains unchanged.
+        Exact S06 keys: authenticated, denials. Durable losses are observed once
+        per store instance, including after restart; ongoing failure stays true.
+        Retention cannot acknowledge losses or prove recovery of denial writes.
         """
         with self._lock:
             try:
@@ -260,8 +270,44 @@ class AccessAuditStore:
         # A slow denial probe must not hold the authenticated lock either.
         denials = self._denial_failed or self._denials is None
         if self._denials is not None:
-            denials = denials or self._denials.saturation()["authenticated"]
+            target = self._denials
+            with target._lock:
+                try:
+                    dropped, failing = target._health()
+                    denials = denials or bool(failing) or dropped > self._observed_denial_drops or target._segment_full()
+                    self._observed_denial_drops = dropped
+                except (AuditError, sqlite3.Error):
+                    denials = True
         return {"authenticated": authenticated, "denials": denials}
+
+    def _health(self) -> tuple[int, int]:
+        """Denial store only, under its own lock; no authenticated I/O."""
+        if self._db is None:
+            raise AuditError()
+        try:
+            row = self._db.execute("SELECT dropped,failing FROM denial_health WHERE id=1").fetchone()
+            if row is None:
+                raise AuditError()
+            return row[0], row[1]
+        except sqlite3.Error:
+            raise AuditError() from None
+
+    @property
+    def dropped_denials(self) -> int:
+        """Durable denial-store loss count; unavailable metadata fails closed."""
+        if self._denials is None:
+            raise AuditError()
+        with self._denials._lock:
+            return self._denials._health()[0]
+
+    def _record_denial_health(self, *, dropped: bool) -> None:
+        with self._lock, self._transaction():
+            changed = self._db.execute(
+                "UPDATE denial_health SET dropped=dropped+?,failing=? WHERE id=1",
+                (int(dropped), int(dropped)),
+            ).rowcount
+            if changed != 1:
+                raise AuditError()
 
     async def record_unauthenticated(self, request_id: str, reason: ErrorCode) -> AuditTicket | None:
         """Best effort off-protocol seam; None means dropped, never request denial."""
@@ -274,11 +320,20 @@ class AccessAuditStore:
                 raise AuditError()
             ticket = self._denials._insert(request_id, None, None, None, "authentication", "intent")
             await self._denials.finish(ticket, AuditOutcome(401, reason, (), 0.0))
-            return ticket
         except AuditError:
-            self.dropped_denials += 1
             self._denial_failed = True
+            if self._denials is not None:
+                try:
+                    self._denials._record_denial_health(dropped=True)
+                except AuditError:
+                    pass  # metadata unavailable: keep the gate fail-safe, never claim health
             return None
+        try:
+            self._denials._record_denial_health(dropped=False)
+            self._denial_failed = False
+        except AuditError:
+            self._denial_failed = True
+        return ticket
 
     async def finish(self, ticket: AuditTicket, outcome: AuditOutcome) -> None:
         if (type(outcome.status) is not int or not 100 <= outcome.status <= 599
@@ -411,7 +466,6 @@ class AccessAuditStore:
             if self._denials is not None:
                 try:
                     removed += self._denials.retain()
-                    self._denial_failed = False
                 except AuditError:
                     self._denial_failed = True
             return removed

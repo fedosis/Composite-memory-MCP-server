@@ -99,6 +99,8 @@ def test_f1_denial_flood_isolated_and_dropped(tmp_path, ctx, clock):
             begin(store, ctx)
         assert store._denials._db.execute("SELECT COUNT(*) FROM access_audit").fetchone()[0] == 2
         assert retain_elapsed(store, clock, days=31) == 6
+        assert store.saturation() == {"authenticated": False, "denials": True}
+        assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is not None
         assert store.saturation() == {"authenticated": False, "denials": False}
     finally:
         store.close()
@@ -751,3 +753,57 @@ def test_n2_backward_clock_refuses_without_deleting_fresh(store, ctx, clock):
         store.retain()
     assert store.rollback_refusals == 1
     assert rows(store)[0]["id"] == fresh.id
+
+
+def break_denial_inserts(store):
+    store._denials._db.execute("""CREATE TRIGGER broken_denials BEFORE INSERT ON access_audit
+        BEGIN SELECT RAISE(FAIL, 'synthetic insert failure'); END""")
+
+
+def test_n3_drop_count_and_failure_survive_restart(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now)
+    break_denial_inserts(store)
+    for _ in range(3):
+        assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
+    assert store.dropped_denials == 3
+    store.close()
+    store = AccessAuditStore(root, clock=clock.now)
+    try:
+        assert store.dropped_denials == 3
+        assert store.saturation()["denials"] is True
+        store.retain()
+        assert store.saturation()["denials"] is True
+        assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
+        assert store.dropped_denials == 4
+    finally:
+        store.close()
+
+
+def test_n3_total_drop_never_healthy_across_retention(store, ctx):
+    break_denial_inserts(store)
+    for _ in range(5):
+        assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
+        assert store.saturation() == {"authenticated": False, "denials": True}
+        store.retain()
+        assert store.saturation() == {"authenticated": False, "denials": True}
+    assert store.dropped_denials == 5
+    assert rows(store._denials) == []
+
+
+def test_n3_new_losses_observed_even_after_success(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    first = AccessAuditStore(root, clock=clock.now)
+    second = AccessAuditStore(root, clock=clock.now)
+    try:
+        assert first.saturation()["denials"] is False
+        break_denial_inserts(second)
+        assert run(second.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
+        second._denials._db.execute("DROP TRIGGER broken_denials")
+        assert run(second.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is not None
+        assert first.dropped_denials == 1
+        assert first.saturation()["denials"] is True  # loss since last observation
+        assert first.saturation()["denials"] is False  # successful write recovered
+    finally:
+        first.close()
+        second.close()
