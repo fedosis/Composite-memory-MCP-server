@@ -41,10 +41,12 @@ class GraphRouter:
 
     def __init__(
         self,
-        graph: SimpleGraph | None = None,
+        graph: SimpleGraph,
         max_path_depth: int = 4,
     ) -> None:
-        self._graph = graph or SimpleGraph()
+        if graph is None:
+            raise ValueError("E_CAPABILITY_UNAVAILABLE")
+        self._graph = graph
         self._max_path_depth = max_path_depth
 
     # --- Entity extraction ---
@@ -220,7 +222,7 @@ class GraphRouter:
 
         for triple in triples:
             if not _valid_triple(triple):
-                logger.warning("sync_facts_batch rejected invalid triple: %r", triple)
+                logger.warning("sync_facts_batch rejected invalid triple")
                 raise ValueError(f"invalid triple in sync_facts_batch: {triple!r}")
 
         # Collect unique node ids/names up front.

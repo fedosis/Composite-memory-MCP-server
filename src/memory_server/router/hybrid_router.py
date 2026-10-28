@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any
 
 from memory_server.providers.embedding_provider import (
     EmbeddingProvider,
-    MockEmbeddingProvider,
 )
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.router.graph_router import GraphRouter
@@ -65,16 +64,20 @@ class HybridRouter:
         rules: RoutingRuleSet | None = None,
         graph: SimpleGraph | None = None,
         collection: str = DEFAULT_COLLECTION,
+        *,
+        fts_provider: Any = None,
     ) -> None:
+        if vector_provider is None or embedder is None or graph is None:
+            raise ValueError("E_CAPABILITY_UNAVAILABLE")
         self._vector_provider = vector_provider
-        self._embedder = embedder or MockEmbeddingProvider()
+        self._embedder = embedder
         self._rules = rules or RoutingRuleSet.default()
-        self._graph = graph or SimpleGraph()
+        self._graph = graph
         self._graph_router = GraphRouter(graph=self._graph)
         self._collection = collection
         self._merger = RankMerger()
-        # FTS provider reference; set externally for FTS search integration
-        self._fts_provider = None
+        # Legacy compositions omit FTS; daemon composition supplies it explicitly.
+        self._fts_provider = fts_provider
 
     @property
     def fts_provider(self):
@@ -118,8 +121,7 @@ class HybridRouter:
         rule_result = self._rules.evaluate(query)
         if rule_result is not None:
             logger.info(
-                "Stage 1: Query '%s' matched rule '%s' -> route '%s'",
-                query, rule_result.rule_name, rule_result.route,
+                "routing rule matched",
             )
             # Even with a rule match, run all searches and merge
             all_ranked = await self._search_all(query, top_k, score_threshold)
@@ -140,7 +142,7 @@ class HybridRouter:
         all_ranked = await self._search_all(query, top_k, score_threshold)
 
         if not all_ranked:
-            logger.info("All sources returned no results for '%s'", query)
+            logger.info("routing no results")
             return self._llm_fallback(query)
 
         # Determine winning source from top result
@@ -193,9 +195,9 @@ class HybridRouter:
             try:
                 facts = await self._fts_provider.search_facts(text=query, limit=top_k)
                 fts_results = RankMerger.fts_from_facts(facts, query)
-                logger.debug("FTS returned %d results for '%s'", len(fts_results), query)
-            except Exception as e:
-                logger.warning("FTS search failed: %s", e)
+                logger.debug("FTS returned %d results", len(fts_results))
+            except Exception:
+                logger.warning("FTS search failed")
 
         # Semantic search (embedding-based)
         try:
@@ -208,16 +210,16 @@ class HybridRouter:
             )
             semantic_results = RankMerger.semantic_from_vector(qdrant_results)
             logger.debug("Semantic search returned %d results", len(semantic_results))
-        except Exception as e:
-            logger.warning("Semantic search failed: %s", e)
+        except Exception:
+            logger.warning("Semantic search failed")
 
         # Graph search (entity relation)
         try:
             graph_result = self._graph_router.query(query)
             graph_results = RankMerger.graph_from_router(graph_result)
             logger.debug("Graph search returned %d results", len(graph_results))
-        except Exception as e:
-            logger.warning("Graph search failed: %s", e)
+        except Exception:
+            logger.warning("Graph search failed")
 
         # Merge all results
         return self._merger.merge(fts_results, semantic_results, graph_results)
