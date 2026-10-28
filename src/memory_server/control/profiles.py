@@ -37,6 +37,7 @@ from memory_server.paths import (
 
 from .store import ControlError, ControlStore
 
+# Process-local exclusion only (workers=1), not a cross-process lock.
 _ACTIVE_CONTROLS: set[tuple[str, int]] = set()
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", re.ASCII)
@@ -74,6 +75,7 @@ class ProfileRegistry:
     def __init__(self, store: ControlStore, configuration: RegistryConfiguration) -> None:
         self._store = store
         self._configuration = configuration
+        self._reconcile_after = 0
         bindings: dict[str, ProfileBinding] = {}
         records = []
         identities = []
@@ -380,8 +382,10 @@ class ProfileRegistry:
     async def reconcile_control(
         self, *, leases: ProfileLeases, publish: Callable[[AuditTicket, AuditOutcome], Awaitable[bool]], limit: int
     ) -> bool:
-        rows = self._store.control_requests(limit=limit)
+        """Bounded round-robin recovery; active exclusion is process-local, workers=1."""
+        rows = self._store.control_requests(limit=limit, after_generation=self._reconcile_after)
         for row in rows:
+            self._reconcile_after = row["generation"]
             marker = (str(self._store.root), row["generation"])
             if marker in _ACTIVE_CONTROLS:
                 continue

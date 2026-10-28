@@ -380,7 +380,8 @@ class ControlStore:
             if (
                 not eligible
                 or self._connection.execute(
-                    "SELECT 1 FROM control_journal WHERE pending_publication=1 LIMIT 1"
+                    "SELECT 1 FROM control_journal WHERE pending_publication=1 AND profile_id=? LIMIT 1",
+                    (profile_id,),
                 ).fetchone()
             ):
                 raise ControlError("E_PROFILE_BUSY")
@@ -452,7 +453,7 @@ class ControlStore:
                 ),
             )
 
-    def control_requests(self, *, limit: int) -> tuple[MappingProxyType, ...]:
+    def control_requests(self, *, limit: int, after_generation: int = 0) -> tuple[MappingProxyType, ...]:
         if self._connection is None:
             raise ControlError("E_STORAGE")
         if type(limit) is not int or not 1 <= limit <= 1000:
@@ -461,7 +462,8 @@ class ControlStore:
             return tuple(
                 self._request_record(row)
                 for row in self._connection.execute(
-                    "SELECT * FROM control_journal WHERE pending_publication=1 ORDER BY generation LIMIT ?", (limit,)
+                    "SELECT * FROM control_journal WHERE pending_publication=1 "
+                    "ORDER BY generation<=?,generation LIMIT ?", (after_generation, limit)
                 ).fetchall()
             )
         except sqlite3.Error:

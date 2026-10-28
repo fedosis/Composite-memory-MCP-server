@@ -243,9 +243,7 @@ async def test_q4_live_two_connections_pending_and_bounded_recovery(configured):
             before_calls = leases.calls
             assert not await other.reconcile_control(leases=leases, publish=publish_ok, limit=1)
             assert leases.calls == before_calls
-            with pytest.raises(ControlError) as exc:
-                await run_control(other, control_input("beta", enable=True), leases)
-            assert exc.value.code == "E_PROFILE_BUSY"
+            assert (await run_control(other, control_input("beta", enable=True), leases)).status == 200
             # Probe/read paths are not gated by pending control work.
             assert (await other.page(principal("alpha"), limit=1, after=None, upper=None))[0][0].id == "alpha"
     finally:
@@ -611,3 +609,53 @@ async def test_q9_existing_denial_binding_no_submitted_identity(tmp_path):
         assert audit._denials._db.execute("SELECT COUNT(*) FROM access_audit").fetchone()[0] == 1
     finally:
         audit.close()
+
+
+async def test_f1_pending_is_profile_scoped_and_recovers_without_restart(configured):
+    registry, store, _ = configured
+    leases = ObservedLeases()
+
+    async def failed_publication(ticket, outcome):
+        raise OSError("publication unavailable")
+
+    a = control_input()
+    await run_control(registry, a, leases, publish=failed_publication)
+    assert store.control_requests(limit=1)[0]["pending_publication"] == 1
+    b = await run_control(registry, control_input("beta", enable=True), leases)
+    assert b.status == 200
+    b_before = tuple(store._connection.execute("SELECT * FROM profiles WHERE id='beta'").fetchone())
+    b_journal = store.journal(profile_ids=["beta"])
+    seen = []
+
+    async def recover(ticket, outcome):
+        seen.append(ticket)
+        return True
+
+    assert await registry.reconcile_control(leases=leases, publish=recover, limit=1)
+    assert seen == [a[2]] and leases.calls == 1
+    assert tuple(store._connection.execute("SELECT * FROM profiles WHERE id='beta'").fetchone()) == b_before
+    assert store.journal(profile_ids=["beta"]) == b_journal
+    assert store.control_requests(limit=1) == ()
+
+
+async def test_f1_bounded_recovery_rotates_past_failed_profile(configured):
+    registry, store, _ = configured
+    leases = ObservedLeases()
+
+    async def unavailable(ticket, outcome):
+        return False
+
+    a = control_input()
+    b = control_input("beta", enable=True)
+    await run_control(registry, a, leases, publish=unavailable)
+    await run_control(registry, b, leases, publish=unavailable)
+    seen = []
+
+    async def recover_b(ticket, outcome):
+        seen.append(ticket.id)
+        return ticket.id == b[2].id
+
+    assert not await registry.reconcile_control(leases=leases, publish=recover_b, limit=1)
+    assert not await registry.reconcile_control(leases=leases, publish=recover_b, limit=1)
+    assert seen == [a[2].id, b[2].id]
+    assert [row["profile_id"] for row in store.control_requests(limit=10)] == ["alpha"]
