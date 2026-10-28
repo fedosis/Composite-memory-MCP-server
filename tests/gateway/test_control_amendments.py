@@ -393,3 +393,160 @@ def test_q4_existing_deafea8_store_migration_rehearsal(tmp_path):
         assert [tuple(row)[:7] for row in migrated._connection.execute("SELECT * FROM control_journal")] == old_journal
         assert migrated.control_requests(limit=1) == ()
         assert migrated._get("alpha").generation == 2
+
+
+def test_q5_availability_is_bounded_read_only_and_fail_closed(configured, monkeypatch):
+    from memory_server.control.tokens import TokenService
+
+    registry, store, _ = configured
+    tokens = TokenService(store)
+    now = datetime.now(timezone.utc)
+    from datetime import timedelta
+
+    tokens._bootstrap_create(
+        d.TokenCreate(
+            subject="readiness", profiles=["alpha"], permissions=["profile.read"],
+            expires_at=now + timedelta(hours=1),
+        ), now=now,
+    )
+    before = [tuple(row) for row in store._connection.execute("SELECT * FROM tokens")]
+    changes = store._connection.total_changes
+    statements = []
+    store._connection.set_trace_callback(statements.append)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("readiness must not authenticate or open anything")
+
+    monkeypatch.setattr(tokens, "authenticate", forbidden)
+    monkeypatch.setattr(sqlite3, "connect", forbidden)
+    assert registry.available() and tokens.available()
+    assert len(statements) == 2 and all(query.startswith("SELECT") and "LIMIT 1" in query for query in statements)
+    assert store._connection.total_changes == changes
+    assert [tuple(row) for row in store._connection.execute("SELECT * FROM tokens")] == before
+    store._connection.execute("DROP TABLE token_journal")
+    store._connection.execute("DROP TABLE tokens")
+    assert not tokens.available() and registry.available()
+    store.close()
+    assert not tokens.available() and not registry.available()
+
+
+def test_q5_dependencies_readiness_defaults_unavailable():
+    from dataclasses import FrozenInstanceError
+
+    from memory_server.gateway_contracts.ports import GatewayDependencies
+
+    dependencies = GatewayDependencies(registry=None, tokens=None, access=None, metrics=None, ports={})
+    assert dependencies.readiness is None
+    with pytest.raises(FrozenInstanceError):
+        dependencies.readiness = publish_ok
+
+
+@pytest.fixture
+async def observed_daemon(tmp_path):
+    from memory_server.application.profile_bundle import BundlePolicies
+    from memory_server.runtime.daemon import Daemon
+    from memory_server.runtime.runtime_manager import RuntimeManager
+    from memory_server.settings import Settings
+    from tests.gateway.test_daemon import factory, make_binding
+
+    settings = Settings(_env_file=None, outbox_poll_interval_seconds=0.01)
+    bindings = tuple(make_binding(tmp_path / name, name, settings) for name in ("alpha", "beta"))
+    with ControlStore(tmp_path / "control") as store:
+        registry = ProfileRegistry(store, RegistryConfiguration(bindings))
+        daemon = Daemon(registry, policies=BundlePolicies.capture(settings),
+                        manager=RuntimeManager(factory_builder=factory))
+        try:
+            yield daemon, registry, store
+        finally:
+            await daemon.close_all()
+
+
+async def test_q5_snapshot_real_runtime_and_stop_without_lazy_open(observed_daemon, monkeypatch):
+    from dataclasses import FrozenInstanceError
+
+    daemon, _, _ = observed_daemon
+    assert callable(getattr(daemon, "snapshot", None))
+    assert dict(daemon.snapshot()) == {}
+    assert await daemon.stop_profile("beta") is None
+    assert not daemon.manager._entries
+    ctx, _, _ = control_input()
+    async with daemon.acquire(ctx) as session:
+        snapshot = daemon.snapshot()
+        observed = snapshot["alpha"]
+        assert observed.state == "ready" and observed.owned and observed.admissions == 1
+        assert not observed.stopping and not observed.retained and "beta" not in snapshot
+        with pytest.raises(FrozenInstanceError):
+            observed.owned = False
+        with pytest.raises(TypeError):
+            snapshot["beta"] = observed
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("snapshot must not call manager.get/acquire")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(daemon.manager, "get", forbidden)
+            patch.setattr(daemon, "acquire", forbidden)
+            assert daemon.snapshot()["alpha"] == observed
+        assert await daemon.stop_profile("alpha") is None
+        stopped = daemon.snapshot()["alpha"]
+        assert stopped.state == "closing" and stopped.stopping and stopped.owned
+        assert session.runtime.lock is not None
+    assert dict(daemon.snapshot()) == {}
+    assert session.runtime.lock is None
+    assert observed.admissions == 1  # detached, not a live view
+
+
+async def test_q5_stop_closes_admission_before_lock_await(observed_daemon):
+    daemon, _, _ = observed_daemon
+    ctx, _, _ = control_input()
+    async with daemon.acquire(ctx):
+        async with daemon._lock:
+            task = asyncio.create_task(daemon.stop_profile("alpha"))
+            try:
+                await asyncio.sleep(0)
+                assert daemon._entries["alpha"].stopping
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
+async def test_q5_failed_close_snapshot_retains_real_owner(observed_daemon, monkeypatch):
+    daemon, _, _ = observed_daemon
+    assert callable(getattr(daemon, "snapshot", None))
+    ctx, _, _ = control_input()
+    async with daemon.acquire(ctx) as session:
+        pass
+    close = session.runtime.dependencies.sqlite.close
+
+    async def fail_close():
+        raise RuntimeError("synthetic close failure")
+
+    monkeypatch.setattr(session.runtime.dependencies.sqlite, "close", fail_close)
+    try:
+        report = await daemon.stop_profile("alpha")
+        observation = daemon.snapshot()["alpha"]
+        assert report.lock_retained and session.runtime.lock is not None
+        assert observation.state == "failed" and observation.owned
+        assert observation.stopping and observation.retained and observation.admissions == 0
+    finally:
+        monkeypatch.setattr(session.runtime.dependencies.sqlite, "close", close)
+        await daemon.manager.stop_profile("alpha")
+
+
+async def test_q5_control_real_daemon_retains_pending_until_drain(observed_daemon):
+    daemon, registry, store = observed_daemon
+    assert callable(getattr(daemon, "snapshot", None))
+    args = control_input()
+    async with daemon.acquire(args[0]):
+        with pytest.raises(ControlError) as exc:
+            await run_control(registry, args, daemon)
+        assert exc.value.code == "E_PROFILE_BUSY"
+        assert not store._get("alpha").enabled
+        assert daemon.snapshot()["alpha"].stopping
+        assert not await registry.reconcile_control(leases=daemon, publish=publish_ok, limit=1)
+    assert await registry.reconcile_control(leases=daemon, publish=publish_ok, limit=1)
+    assert (await run_control(registry, args, daemon)).replayed
+    assert len(store.journal(profile_ids=["alpha"])) == 1

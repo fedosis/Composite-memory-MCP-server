@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -213,6 +214,17 @@ class ProfileRegistry:
             raise ControlError("E_VALIDATION")
         self._authorise(principal, profile_id, permission)
         return self._store._get(profile_id)
+
+    def available(self) -> bool:
+        """S06 Q5: probe the loaded control store, never resolve/open profiles."""
+        connection = self._store._connection
+        if connection is None:
+            return False
+        try:
+            connection.execute("SELECT id,generation FROM profiles LIMIT 1").fetchone()
+        except sqlite3.Error:
+            return False
+        return True
 
     @staticmethod
     def _safe_observation(observation) -> bool:

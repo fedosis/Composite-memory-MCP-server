@@ -8,12 +8,20 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from memory_server.application.profile_bundle import BundlePolicies, ProfileBundle
 from memory_server.gateway_contracts import dto as d
-from memory_server.gateway_contracts.ports import ProfileBinding, ProfileRegistry, ProfileSession, RequestContext
+from memory_server.gateway_contracts.ports import (
+    ProfileBinding,
+    ProfileRegistry,
+    ProfileSession,
+    RequestContext,
+    RuntimeObservation,
+)
 from memory_server.paths import StorageLayoutError
 from memory_server.runtime.errors import StorageOwnershipError
 from memory_server.runtime.runtime import CMMSRuntime, ShutdownReport
@@ -200,18 +208,51 @@ class Daemon:
 
         entry.close_task = asyncio.create_task(close())
 
+    def snapshot(self) -> Mapping[str, RuntimeObservation]:
+        """Detached non-opening observations on this daemon's single loop.
+
+        Startup has no published runtime yet: mark that uncertainty retained,
+        never mistake an opening entry for a verified absent/unowned profile.
+        """
+        if asyncio.get_running_loop() is not self._loop:
+            raise LeaseError("E_RUNTIME_NOT_READY")
+        observations = {}
+        for profile_id, entry in self._entries.items():
+            runtime = entry.runtime
+            owned = runtime is not None and runtime.lock is not None
+            starting = entry.task is not None and not entry.task.done()
+            failed = entry.failed or (runtime is not None and runtime.state == "FAILED")
+            if entry.task is not None and entry.task.done():
+                failed = failed or entry.task.cancelled() or entry.task.exception() is not None
+            stopping = self._closing or entry.stopping
+            report = entry.report
+            retained = (starting and runtime is None) or bool(
+                report is not None and (report.lock_retained or report.retained_resources or report.unsettled)
+            ) or (failed and owned)
+            state = "not_started"
+            if failed:
+                state = "failed"
+            elif stopping or (runtime is not None and runtime.state == "CLOSING"):
+                state = "closing"
+            elif entry.bundle is not None and runtime is not None and runtime.state == "READY":
+                state = "ready"
+            observations[profile_id] = RuntimeObservation(state, owned, entry.admissions, stopping, retained)
+        return MappingProxyType(observations)
+
     async def stop_profile(self, profile_id: str) -> ShutdownReport | None:
         """Close admission before awaiting; retain owner while callers hold it."""
-        async with self._lock:
-            entry = self._entries.get(profile_id)
-            if entry is None:
-                return None
-            entry.stopping = True
-            if entry.admissions:
-                return None
-            self._begin_stop(entry)
-            task = entry.close_task
-        return await asyncio.shield(task)
+        if asyncio.get_running_loop() is not self._loop:
+            raise LeaseError("E_RUNTIME_NOT_READY")
+        # Single-loop synchronous table access: even a contended publication
+        # lock must not postpone closing admission past the first await.
+        entry = self._entries.get(profile_id)
+        if entry is None:
+            return None
+        entry.stopping = True
+        if entry.admissions:
+            return None
+        self._begin_stop(entry)
+        return await asyncio.shield(entry.close_task)
 
     async def close_all(self) -> CloseAllReport:
         if asyncio.get_running_loop() is not self._loop:

@@ -1205,6 +1205,7 @@ EXPECTED_PORT_SIGNATURES = {
     "GatewayPort": {"execute": ("self, ctx: RequestContext, command: GatewayCommand", "GatewayResult", True)},
     "ContractCatalog": {"validate": ("self, operation: Operation, payload: JSONValue", "GatewayCommand", False)},
     "ProfileRegistry": {
+        "available": ("self", "bool", False),
         "resolve": ("self, principal: Principal, profile_id: str", "ProfileBinding", True),
         "page": (
             "self, principal: Principal, *, limit: int, after: str | None, upper: str | None",
@@ -1224,10 +1225,15 @@ EXPECTED_PORT_SIGNATURES = {
         ),
     },
     "TokenService": {
+        "available": ("self", "bool", False),
         "authenticate": ("self, bearer: str, *, now: datetime", "Principal", True),
         "verify_principal": ("self, principal: Principal, *, now: datetime", "None", False),
     },
-    "ProfileLeases": {"acquire": ("self, ctx: RequestContext", "AsyncContextManager[ProfileSession]", False)},
+    "ProfileLeases": {
+        "acquire": ("self, ctx: RequestContext", "AsyncContextManager[ProfileSession]", False),
+        "stop_profile": ("self, profile_id: str", "ShutdownReport | None", True),
+        "snapshot": ("self", "Mapping[str, RuntimeObservation]", False),
+    },
     "AccessSink": {
         "begin": ("self, ctx: RequestContext, operation: Operation", "AuditTicket", True),
         "finish": ("self, ticket: AuditTicket, outcome: AuditOutcome", "None", True),

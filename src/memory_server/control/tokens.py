@@ -148,6 +148,14 @@ class TokenService:
         except (ValueError, TypeError, KeyError):
             raise TokenError("E_STORAGE") from None
 
+    def available(self) -> bool:
+        """S06 Q5: bounded, read-only availability; no authentication/last_used."""
+        try:
+            self._db.execute("SELECT generation,last_used_at FROM tokens LIMIT 1").fetchone()
+        except (TokenError, sqlite3.Error):
+            return False
+        return True
+
     async def authenticate(self, bearer: str, *, now: datetime) -> Principal:
         utc_now(now)
         match = _BEARER.fullmatch(bearer) if isinstance(bearer, str) else None

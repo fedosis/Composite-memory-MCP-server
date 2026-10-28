@@ -84,6 +84,15 @@ class AuditOutcome:
 
 
 @dataclass(frozen=True)
+class RuntimeObservation:
+    state: Literal["not_started", "ready", "closing", "failed"]
+    owned: bool
+    admissions: int
+    stopping: bool
+    retained: bool
+
+
+@dataclass(frozen=True)
 class ControlReply:
     status: int
     body: d.Profile | Mapping[str, d.JSONValue]
@@ -131,6 +140,8 @@ class ContractCatalog(Protocol):
 
 
 class ProfileRegistry(Protocol):
+    def available(self) -> bool: ...
+
     async def resolve(self, principal: Principal, profile_id: str) -> ProfileBinding: ...
     async def page(
         self, principal: Principal, *, limit: int, after: str | None, upper: str | None
@@ -159,6 +170,8 @@ class ProfileRegistry(Protocol):
 
 
 class TokenService(Protocol):
+    def available(self) -> bool: ...
+
     async def authenticate(self, bearer: str, *, now: datetime) -> Principal: ...
 
     def verify_principal(self, principal: Principal, *, now: datetime) -> None: ...
@@ -166,6 +179,8 @@ class TokenService(Protocol):
 
 class ProfileLeases(Protocol):
     def acquire(self, ctx: RequestContext) -> AsyncContextManager[ProfileSession]: ...
+    async def stop_profile(self, profile_id: str) -> ShutdownReport | None: ...
+    def snapshot(self) -> Mapping[str, RuntimeObservation]: ...
 
 
 class AccessSink(Protocol):
@@ -312,6 +327,7 @@ class GatewayDependencies:
     events: EventSource | None = None
     sessions: SessionService | None = None
     traces: TracePort | None = None
+    readiness: Callable[[], Awaitable[bool]] | None = None
 
     def __post_init__(self) -> None:
         if not set(self.ports) <= d.COMMAND_TYPES.keys():
