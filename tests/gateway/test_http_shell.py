@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -16,10 +19,12 @@ from memory_server.control.profiles import ProfileRegistry, RegistryConfiguratio
 from memory_server.control.store import ControlStore
 from memory_server.control.tokens import TokenService
 from memory_server.gateway_contracts import dto as d
+from memory_server.gateway_contracts.catalog import CATALOG
 from memory_server.gateway_contracts.ports import GatewayDependencies, HttpConfig
 from memory_server.runtime.daemon import Daemon
 from memory_server.settings import Settings
 from memory_server.transports.http.app import create_http_app, with_profile_ports
+from memory_server.transports.http.errors import _DEFAULT_STATUS, error_response
 from memory_server.transports.http.routes.profiles import bind_control_pending
 from memory_server.transports.http.telemetry import BoundedMetricsSink
 from tests.gateway.test_registry import binding
@@ -544,3 +549,116 @@ async def test_t11_cli_composition_real_server_and_drain(tmp_path):
     # No default socket/listener remained; wire used and closed an ephemeral bind.
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
+
+
+@pytest.mark.parametrize("optimized", [False, True])
+@pytest.mark.parametrize("field,value", [
+    ("permission", "profile.read"), ("method", "GET"),
+    ("path", "/tampered"), ("operation", "unknown.operation"),
+])
+def test_catalog_mismatch_rejected_at_build(tmp_path, optimized, field, value):
+    script = '''
+import sys
+from dataclasses import replace
+from types import SimpleNamespace
+from memory_server.gateway_contracts.ports import HttpConfig
+from memory_server.transports.http import app
+specs = list(app.S06_ROUTE_SPECS)
+specs[4] = replace(specs[4], **{sys.argv[2]: sys.argv[3]})
+app.S06_ROUTE_SPECS = tuple(specs)
+access = SimpleNamespace(record_unauthenticated=lambda: None,
+                         publish_committed=lambda: None, saturation=lambda: None)
+deps = SimpleNamespace(access=access)
+try:
+    app.create_http_app(HttpConfig(control_path=sys.argv[1]), deps)
+except ValueError:
+    print("CATALOG_MISMATCH_REJECTED")
+else:
+    sys.exit("tampered spec accepted")
+'''
+    result = subprocess.run(
+        [sys.executable, *(["-O"] if optimized else []), "-c", script, str(tmp_path), field, value],
+        capture_output=True, text=True, env=os.environ.copy(), check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "CATALOG_MISMATCH_REJECTED"
+
+
+@pytest.mark.parametrize("operation", ["enable", "disable"])
+async def test_read_only_token_cannot_reach_control_port(shell, monkeypatch, operation):
+    bearer, _ = shell.mint(permissions=("profile.read",))
+    calls = []
+    original = shell.app.profile_port.execute
+
+    async def inspect(ctx, command):
+        if command.operation in {"profiles.enable", "profiles.disable"}:
+            calls.append(command.operation)
+        return await original(ctx, command)
+
+    monkeypatch.setattr(shell.app.profile_port, "execute", inspect)
+    # Prove least privilege with the SAME principal, not the fixture's manager.
+    for path in ("/api/v1/profiles", "/api/v1/profiles/alpha"):
+        response = await request(shell.app, path, bearer=bearer)
+        assert response.status == 200, response.body
+    response = await request(
+        shell.app, f"/api/v1/profiles/alpha/{operation}", method="POST", bearer=bearer,
+        body=dict(reason="read-only", confirmation=True, expected_generation=1),
+        headers=[("Idempotency-Key", str(uuid4()))],
+    )
+    code(response, "E_PERMISSION_DENIED", 403)
+    assert calls == []
+    assert not shell.store.journal(profile_ids=["alpha"])
+    assert not shell.store.control_requests(limit=10)
+    assert len(rows(shell)) == 2  # Only the successful reads were admitted.
+    route = next(route for route in shell.app.routes if route.name == f"profiles.{operation}")
+    assert route.spec is CATALOG.by_operation[f"profiles.{operation}"]
+
+
+@pytest.mark.parametrize("path,boundary", [
+    ("/api/v1/profiles", "page"), ("/api/v1/profiles/alpha", "resolve"),
+])
+async def test_read_audit_ticket_before_registry(shell, monkeypatch, path, boundary):
+    calls = []
+    original = getattr(shell.registry, boundary)
+
+    async def inspect(*args, **kwargs):
+        calls.append(boundary)
+        assert rows(shell)[-1]["state"] == "intent"
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(shell.registry, boundary, inspect)
+    response = await request(shell.app, path, bearer=shell.bearer)
+    assert response.status == 200, response.body
+    assert calls and rows(shell)[-1]["state"] == "terminal"
+    calls.clear()
+
+    async def missing_ticket(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(shell.access, "begin", missing_ticket)
+    code(await request(shell.app, path, bearer=shell.bearer), "E_AUDIT_UNAVAILABLE", 503)
+    assert calls == []
+    assert len(rows(shell)) == 1
+
+
+async def test_conflict_permission_validation_messages_are_consistent(shell):
+    bearer, _ = shell.mint(permissions=("profile.read",))
+    payload = dict(reason="test", confirmation=True, expected_generation=2)
+    cases = [
+        (shell.bearer, payload, "E_VERSION_CONFLICT", 409, "Version conflict"),
+        (bearer, payload, "E_PERMISSION_DENIED", 403, "Permission denied"),
+        (shell.bearer, {**payload, "confirmation": False}, "E_VALIDATION", 422, "Invalid request"),
+    ]
+    for token, body, expected, status, message in cases:
+        response = await request(
+            shell.app, "/api/v1/profiles/alpha/disable", method="POST", bearer=token, body=body,
+            headers=[("Idempotency-Key", str(uuid4()))],
+        )
+        code(response, expected, status)
+        assert response.json["error"]["message"] == message
+    for name, status in _DEFAULT_STATUS.items():
+        error = json.loads(error_response(name, "req_test").body)["error"]
+        assert error["message"]
+        if status != 500:
+            assert "internal server error" not in error["message"].lower()
+    assert json.loads(error_response("unknown", "req_test").body)["error"]["message"] == "Internal server error"
