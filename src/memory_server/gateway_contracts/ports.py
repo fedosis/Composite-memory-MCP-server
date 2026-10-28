@@ -345,6 +345,9 @@ class HttpConfig:
     trusted_proxy_cidrs: tuple[str, ...] = ()
     allowed_origins: tuple[str, ...] = ()
     max_body_bytes: int = 1048576
+    max_header_bytes: int = 16384
+    header_timeout_seconds: float = 5.0
+    max_connections: int = 128
     max_learn_chars: int = 32768
     max_query_chars: int = 4096
     max_batch: int = 100
@@ -356,3 +359,12 @@ class HttpConfig:
     graph_max_depth: int = 4
     cursor_ttl_seconds: int = 900
     idempotency_ttl_seconds: int = 86400
+
+    def __post_init__(self) -> None:
+        # S06 amendment Q8: configuration only; wire enforcement is S06 limits.py.
+        if type(self.max_header_bytes) is not int or not 1 <= self.max_header_bytes <= 1048576:
+            raise ValueError("invalid max_header_bytes")
+        if type(self.max_connections) is not int or not 1 <= self.max_connections <= 65536:
+            raise ValueError("invalid max_connections")
+        if type(self.header_timeout_seconds) not in (int, float) or not 0 < self.header_timeout_seconds <= 300:
+            raise ValueError("invalid header_timeout_seconds")

@@ -550,3 +550,24 @@ async def test_q5_control_real_daemon_retains_pending_until_drain(observed_daemo
     assert await registry.reconcile_control(leases=daemon, publish=publish_ok, limit=1)
     assert (await run_control(registry, args, daemon)).replayed
     assert len(store.journal(profile_ids=["alpha"])) == 1
+
+
+def test_q8_wire_ceiling_defaults_and_bounds(tmp_path):
+    from memory_server.gateway_contracts.ports import HttpConfig
+
+    config = HttpConfig(control_path=tmp_path)
+    assert (config.max_header_bytes, config.header_timeout_seconds, config.max_connections) == (16384, 5.0, 128)
+    bounded = HttpConfig(control_path=tmp_path, max_header_bytes=1048576,
+                         header_timeout_seconds=300.0, max_connections=65536)
+    assert bounded.max_header_bytes == 1048576 and bounded.max_connections == 65536
+    for name, values in {
+        "max_header_bytes": (0, -1, 1048577, True, 1.0, "16384", None),
+        "header_timeout_seconds": (0, -1, 300.001, True, float("nan"), float("inf"), "5", None),
+        "max_connections": (0, -1, 65537, True, 1.0, "128", None),
+    }.items():
+        for value in values:
+            with pytest.raises(ValueError):
+                HttpConfig(control_path=tmp_path, **{name: value})
+    smallest = HttpConfig(control_path=tmp_path, max_header_bytes=1,
+                          header_timeout_seconds=0.001, max_connections=1)
+    assert smallest.header_timeout_seconds == 0.001
