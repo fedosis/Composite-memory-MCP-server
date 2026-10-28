@@ -51,6 +51,10 @@ def _get_run_server():
 
 app = typer.Typer()
 
+from memory_server.control.token_cli import app as token_app  # noqa: E402
+
+app.add_typer(token_app, name="token")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
