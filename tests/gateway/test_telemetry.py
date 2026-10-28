@@ -71,6 +71,15 @@ def rows(store):
     return store._db.execute("SELECT * FROM access_audit ORDER BY seq").fetchall()
 
 
+def retain_elapsed(store, clock, *, days):
+    # Normal periodic retention, not an unbounded forward-clock step.
+    removed = 0
+    for _ in range(days * 24):
+        clock.wall += timedelta(hours=1)
+        removed += store.retain()
+    return removed
+
+
 def test_f1_denial_flood_isolated_and_dropped(tmp_path, ctx, clock):
     store = AccessAuditStore(tmp_path / "audit", clock=clock.now, segment_rows=2, max_segments=2,
                              denial_segment_rows=2, denial_max_segments=1)
@@ -89,8 +98,7 @@ def test_f1_denial_flood_isolated_and_dropped(tmp_path, ctx, clock):
         with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
             begin(store, ctx)
         assert store._denials._db.execute("SELECT COUNT(*) FROM access_audit").fetchone()[0] == 2
-        clock.wall += timedelta(days=31)
-        assert store.retain() == 6
+        assert retain_elapsed(store, clock, days=31) == 6
         assert store.saturation() == {"authenticated": False, "denials": False}
     finally:
         store.close()
@@ -152,8 +160,7 @@ def test_dml_shapes_cas_and_terminal_immutability(store, ctx, clock):
     assert store._db.total_changes == changes  # second UPDATE changed zero rows
     assert tuple(rows(store)[0]) == before
     store.list(ctx.principal, "alpha")
-    clock.wall += timedelta(days=31)
-    assert store.retain() == 1
+    assert retain_elapsed(store, clock, days=31) == 1
     dml = [s for s in statements if s.split()[0].upper() in {"INSERT", "UPDATE", "DELETE"}]
     assert {s.split()[0] for s in dml} == {"INSERT", "UPDATE", "DELETE"}
     assert all("WHERE id=" in s and "AND state='intent'" in s for s in dml if s.startswith("UPDATE"))
@@ -425,8 +432,7 @@ def test_f4_retention_scrubs_file_bytes(store, ctx, clock, tmp_path, stream):
         canaries.append(ctx.principal.token_id.encode())
     raw = (root / "access.sqlite").read_bytes()
     assert all(canary in raw for canary in canaries)
-    clock.wall += timedelta(days=31)
-    assert store.retain() == 1
+    assert retain_elapsed(store, clock, days=31) == 1
     assert rows(target) == []
     assert all(canary not in (root / "access.sqlite").read_bytes() for canary in canaries)
     assert not (root / "access.sqlite-journal").exists()
@@ -436,10 +442,14 @@ def test_f2_rollback_before_first_retain(store, ctx, clock):
     watermark = clock.wall
     clock.wall -= timedelta(days=40)
     ticket = begin(store, ctx)
+    assert rows(store)[0]["created_at"] == clock.wall.timestamp()
+    with pytest.raises(AuditError, match="^E_VALIDATION$"):
+        store.retain()
+    assert store.rollback_refusals == 1
+    assert rows(store)[0]["id"] == ticket.id
     clock.wall = watermark
     assert store.retain() == 0
     assert rows(store)[0]["id"] == ticket.id
-    assert rows(store)[0]["created_at"] == watermark.timestamp()
 
 
 @pytest.mark.parametrize("operation", ["begin", "finish", "list", "reopen"])
@@ -473,7 +483,10 @@ def test_f2_first_insert_seeds_empty_store_and_advances(store, ctx, clock, tmp_p
     assert float(sidecar.read_text()) == expected
     clock.wall += timedelta(days=2)
     begin(store, ctx)
-    assert float(sidecar.read_text()) == clock.wall.timestamp()
+    assert rows(store)[-1]["created_at"] == clock.wall.timestamp()
+    assert float(sidecar.read_text()) == expected
+    assert store.retain() == 0
+    assert float(sidecar.read_text()) == expected + 3600
 
 
 def test_rollback_watermark_survives_restart(tmp_path, ctx, clock):
@@ -683,3 +696,58 @@ def test_n1_concurrent_denial_and_authenticated_writes(store, ctx):
         list(pool.map(write, (True, False, True, False)))
     assert len(rows(store)) == len(rows(store._denials)) == 50
     assert all(r["state"] == "terminal" for target in (store, store._denials) for r in rows(target))
+
+
+def test_n2_forward_step_bounded_and_converges(store, ctx, clock, tmp_path):
+    original = clock.wall
+    first = begin(store, ctx)
+    clock.wall += timedelta(days=40)
+    assert store.retain() == 0
+    assert rows(store)[0]["id"] == first.id
+    assert store.clock_step_refusals == 1
+    watermark = tmp_path / "audit" / "retention.watermark"
+    assert float(watermark.read_text()) == original.timestamp() + 3600
+    # A permanently skewed clock still accepts exact wall-clock inserts.
+    for _ in range(3):
+        run(store.finish(begin(store, ctx), SUCCESS))
+    assert all(r["created_at"] == clock.wall.timestamp() for r in rows(store)[1:])
+    removed = 0
+    for step in range(1, 960):
+        removed += store.retain()
+        assert float(watermark.read_text()) == original.timestamp() + (step + 1) * 3600
+    assert removed == 1
+    assert len(rows(store)) == 3
+    assert store.clock_step_refusals == 959
+    assert store.retain() == 0
+    clock.wall += timedelta(seconds=1)
+    assert store.retain() == 0
+    print("N2 +40d: first deleted=0; cap=3600s; catchup=960 calls; refusals=959; skewed inserts=3")
+
+
+@pytest.mark.parametrize("value", [0, 0.5, -1, float("nan"), float("inf"), True, "3600", None])
+def test_n2_invalid_max_clock_step(tmp_path, value):
+    with pytest.raises(AuditError, match="^E_VALIDATION$"):
+        AccessAuditStore(tmp_path / "audit", max_clock_step=value)
+
+
+def test_n2_configured_step_and_normal_expiry(tmp_path, ctx, clock):
+    store = AccessAuditStore(tmp_path / "audit", clock=clock.now, ttl_seconds=10, max_clock_step=1)
+    try:
+        begin(store, ctx)
+        clock.wall += timedelta(seconds=11)
+        assert [store.retain() for _ in range(11)] == [0] * 10 + [1]
+        assert store.clock_step_refusals == 10
+        assert rows(store) == []
+    finally:
+        store.close()
+
+
+def test_n2_backward_clock_refuses_without_deleting_fresh(store, ctx, clock):
+    store.retain()
+    clock.wall -= timedelta(days=40)
+    fresh = begin(store, ctx)
+    assert rows(store)[0]["created_at"] == clock.wall.timestamp()
+    with pytest.raises(AuditError, match="^E_VALIDATION$"):
+        store.retain()
+    assert store.rollback_refusals == 1
+    assert rows(store)[0]["id"] == fresh.id

@@ -73,6 +73,7 @@ class AccessAuditStore:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic: Callable[[], float] = time.monotonic,
         ttl_seconds: float = 30 * 86400,
+        max_clock_step: float = 3600,
         segment_rows: int = 10000,
         max_segments: int | None = None,
         max_bytes: int = 256 * 1024 * 1024,
@@ -82,6 +83,8 @@ class AccessAuditStore:
     ) -> None:
         if (
             not math.isfinite(ttl_seconds) or ttl_seconds <= 0
+            or type(max_clock_step) not in (int, float)
+            or not math.isfinite(max_clock_step) or max_clock_step < 1
             or type(segment_rows) is not int or segment_rows < 1
             or (max_segments is not None and (type(max_segments) is not int or max_segments < 1))
             or type(denial_segment_rows) is not int or denial_segment_rows < 1
@@ -91,6 +94,8 @@ class AccessAuditStore:
             raise AuditError("E_VALIDATION")
         self.clock, self.monotonic = clock, monotonic
         self.ttl_seconds = ttl_seconds
+        self.max_clock_step = max_clock_step
+        self.clock_step_refusals = 0
         self.segment_rows = segment_rows
         self.max_segments = max_segments if max_segments is not None else math.ceil(ttl_seconds / 10 / segment_rows) + 1
         self._lock = RLock()
@@ -140,6 +145,8 @@ class AccessAuditStore:
                     state TEXT NOT NULL CHECK(state IN ('intent','terminal')),
                     created_at REAL NOT NULL, segment INTEGER NOT NULL,
                     started REAL NOT NULL, clock_id TEXT NOT NULL)""")
+                if "retention_at" not in {r[1] for r in self._db.execute("PRAGMA table_info(access_audit)")}:
+                    self._db.execute("ALTER TABLE access_audit ADD COLUMN retention_at REAL NOT NULL DEFAULT 0")
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
                 self._watermark()
             os.fsync(self._fd)
@@ -148,7 +155,7 @@ class AccessAuditStore:
                     self._denials = AccessAuditStore(
                         Path(root) / "denials", clock=clock, monotonic=monotonic, ttl_seconds=ttl_seconds,
                         segment_rows=denial_segment_rows, max_segments=denial_max_segments,
-                        max_bytes=4 * 1024 * 1024, _denial_only=True,
+                        max_bytes=4 * 1024 * 1024, max_clock_step=max_clock_step, _denial_only=True,
                     )
                 except AuditError:
                     self._denial_failed = True
@@ -208,14 +215,15 @@ class AccessAuditStore:
             if first is not None and segment - first >= self.max_segments:
                 raise AuditError()
             watermark = self._watermark()
-            created_at = max(now.timestamp(), watermark)
-            if created_at > watermark:
-                self._write_watermark(created_at)
+            created_at = now.timestamp()
+            # Internal rollback guard, not the wall-clock timestamp or watermark.
+            # It preserves fresh rollback inserts when the wall clock recovers.
+            retention_at = max(created_at, watermark)
             self._db.execute(
-                f"INSERT INTO access_audit ({_COLUMNS},state,created_at,segment,started,clock_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO access_audit ({_COLUMNS},state,created_at,segment,started,clock_id,retention_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ticket.id, now.isoformat(), request_id, token_id, client_id, profile_id,
-                 operation, None, result, 0.0, None, "intent", created_at, segment, started, _CLOCK_ID),
+                 operation, None, result, 0.0, None, "intent", created_at, segment, started, _CLOCK_ID, retention_at),
             )
         return ticket
 
@@ -354,7 +362,7 @@ class AccessAuditStore:
             raise AuditError() from None
 
     def _write_watermark(self, value: float) -> None:
-        """Persist before INSERT/DELETE; metadata loss with rows is E_AUDIT_UNAVAILABLE."""
+        """Seed once, then persist only before retention; missing metadata fails closed."""
         try:
             flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
             fd = os.open("retention.next", flags, 0o600, dir_fd=self._fd)
@@ -376,21 +384,29 @@ class AccessAuditStore:
             raise AuditError() from None
 
     def retain(self) -> int:
-        """Refuse backward wall clocks using a durable atomic watermark.
+        """Apply min(now, watermark + max_clock_step); default cap is one hour.
 
-        The SQLite write lock serializes sidecar access. fsync + replace before
-        DELETE is conservative on crash. Inserts clamp created_at to this
-        watermark, protecting fresh intents created during a wall-clock rollback.
+        Backward clocks refuse E_VALIDATION and count rollback_refusals. Forward
+        steps above the cap count clock_step_refusals but apply the bounded step;
+        repeated calls converge. Inserts never advance this retention watermark.
+        created_at is exact wall time; internal retention_at guards rollback
+        inserts until TTL after the previous watermark, including after restart.
+        The SQLite write lock serializes sidecar access; fsync precedes DELETE.
         """
         now = self._now().timestamp()
         try:
             with self._lock, self._transaction():
-                if now < self._watermark():
+                watermark = self._watermark()
+                if now < watermark:
                     self.rollback_refusals += 1
                     raise AuditError("E_VALIDATION")
-                self._write_watermark(now)
+                effective_now = min(now, watermark + self.max_clock_step)
+                if now > effective_now:
+                    self.clock_step_refusals += 1
+                self._write_watermark(effective_now)
+                cutoff = effective_now - self.ttl_seconds
                 removed = self._db.execute(
-                    "DELETE FROM access_audit WHERE created_at < ?", (now - self.ttl_seconds,),
+                    "DELETE FROM access_audit WHERE created_at < ? AND retention_at < ?", (cutoff, cutoff),
                 ).rowcount
             if self._denials is not None:
                 try:
