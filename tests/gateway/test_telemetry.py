@@ -1024,17 +1024,19 @@ def test_capacity_ignores_a_live_intent_that_cannot_be_aged(tmp_path, ctx, clock
     store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10,
                              segment_rows=2, max_segments=2)
     try:
-        for _ in range(4):
+        # The intent occupies the oldest segment; nothing else stays behind there.
+        live = begin(store, ctx)
+        for _ in range(3):
             run(store.finish(begin(store, ctx), SUCCESS))
-        with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
-            begin(store, ctx)
-        # An intent is not ageable, so the capacity view must not count it.
-        assert store._first_ageable_segment() == 0
         clock.wall += timedelta(seconds=11)
         clock.boot += 11
-        assert store.retain() == 4
-        live = begin(store, ctx)
-        assert live.id
+        assert store.retain() == 3  # the live intent is never expired
+        assert [r["id"] for r in rows(store)] == [live.id]
+        # The only remaining row is an intent, which retention cannot free, so the
+        # capacity view must ignore it (otherwise one abandoned intent pins the store).
+        assert store._first_ageable_segment() is None
+        assert store.segment_rows == 2 and store.max_segments == 2
+        assert run(store.begin(ctx, "search")).id
     finally:
         store.close()
 
