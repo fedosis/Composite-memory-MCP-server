@@ -901,16 +901,20 @@ def test_m1_successful_denial_with_failed_health_update_survives_restart(tmp_pat
         store.close()
 
 
-@pytest.mark.parametrize("damage", ["table", "row"])
+@pytest.mark.parametrize("damage", ["table", "row", "truncate"])
 def test_m2_missing_denial_health_refuses_parent_reopen(tmp_path, clock, damage):
     root = tmp_path / "audit"
     store = AccessAuditStore(root, clock=clock.now)
     store.close()
-    with sqlite3.connect(root / "denials" / "access.sqlite") as writer:
-        if damage == "table":
-            writer.execute("DROP TABLE denial_health")
-        else:
-            writer.execute("DELETE FROM denial_health")
+    denial_db = root / "denials" / "access.sqlite"
+    if damage == "truncate":
+        denial_db.write_bytes(b"")
+    else:
+        with sqlite3.connect(denial_db) as writer:
+            if damage == "table":
+                writer.execute("DROP TABLE denial_health")
+            else:
+                writer.execute("DELETE FROM denial_health")
 
     with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
         AccessAuditStore(root, clock=clock.now)

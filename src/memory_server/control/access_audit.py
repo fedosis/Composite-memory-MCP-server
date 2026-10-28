@@ -74,7 +74,7 @@ class AuditError(Exception):
         super().__init__(code)
 
 
-class _DenialHealthTamper(AuditError):
+class _DenialHealthTamperError(AuditError):
     """Existing denial evidence is missing; the parent must refuse service."""
 
 
@@ -148,11 +148,20 @@ class AccessAuditStore:
                         or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
                     raise AuditError()
                 stale_journal |= name == "access.sqlite-journal"
-            flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
-            pin = os.open("access.sqlite", flags, 0o600, dir_fd=self._fd)
+            flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                pin = os.open(
+                    "access.sqlite", flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self._fd
+                )
+                new_database = True
+            except FileExistsError:
+                pin = os.open("access.sqlite", flags, dir_fd=self._fd)
+                new_database = False
             try:
                 before = os.fstat(pin)
-                new_database = before.st_size == 0
+                if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                        or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) != 0o600):
+                    raise AuditError()
                 self._db = sqlite3.connect(
                     f"/proc/self/fd/{self._fd}/access.sqlite", isolation_level=None,
                     timeout=5, check_same_thread=False,
@@ -220,7 +229,7 @@ class AccessAuditStore:
                             "SELECT dropped,failing FROM denial_health WHERE id=1"
                         ).fetchone()
                         if table is None or health is None:
-                            raise _DenialHealthTamper()
+                            raise _DenialHealthTamperError()
             self._maintenance_db = sqlite3.connect(
                 f"/proc/self/fd/{self._fd}/access.sqlite", isolation_level=None,
                 timeout=5, check_same_thread=False,
@@ -251,7 +260,7 @@ class AccessAuditStore:
                         segment_rows=denial_segment_rows, max_segments=denial_max_segments,
                         max_bytes=4 * 1024 * 1024, max_clock_step=max_clock_step, _denial_only=True,
                     )
-                except _DenialHealthTamper:
+                except _DenialHealthTamperError:
                     # Missing durable loss evidence is tamper, not an optional
                     # denial-recorder outage: never serve through the parent.
                     raise AuditError() from None
