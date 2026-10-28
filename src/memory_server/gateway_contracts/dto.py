@@ -441,8 +441,8 @@ class ContextResult(DTO):
     package: ContextPackage
     memories: list[Memory]
     trace_id: str | None
-    estimated_tokens: int | None = Field(default=None)
-    tokenizer: str | None = Field(default=None)
+    estimated_tokens: int | None
+    tokenizer: str | None
     token_count_is_estimate: bool
 
 

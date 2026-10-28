@@ -1045,6 +1045,18 @@ def test_token_creation_replay_nullable_secret():
         dto.TokenCreated.model_validate_json(json.dumps({"token": data["token"]}))
 
 
+def test_context_result_requires_nullable_wire_fields():
+    # C4:425 — estimated_tokens/tokenizer are required-nullable, not optional.
+    dto, _, _ = modules()
+    data = {**example(dto.ContextResult), "estimated_tokens": None, "tokenizer": None}
+    parsed = dto.ContextResult.model_validate_json(json.dumps(data))
+    assert parsed.estimated_tokens is None and parsed.tokenizer is None
+    for missing in ("estimated_tokens", "tokenizer"):
+        payload = {k: v for k, v in data.items() if k != missing}
+        with pytest.raises(ValidationError):
+            dto.ContextResult.model_validate_json(json.dumps(payload))
+
+
 def test_result_discriminator_requires_operation_for_wire_decode():
     dto, _, catalog = modules()
     # C1 result union has no C4 wire tag; ambiguous Page JSON is not guessed.
