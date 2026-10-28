@@ -369,11 +369,14 @@ def test_restart_retention_strict_boundary_and_sequence(tmp_path, ctx, clock):
     run(store.finish(first, SUCCESS))
     store.close()
     clock.wall += timedelta(seconds=10)
-    for _ in range(2):
-        store = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic, ttl_seconds=10)
-        assert store.list(ctx.principal, "alpha")[0].id == first.id
-        assert store.retain() == 0  # strict <, equality retained
-        store.close()
+    store = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic, ttl_seconds=10)
+    assert store.list(ctx.principal, "alpha")[0].id == first.id
+    assert [store.retain() for _ in range(8)] == [0] * 8
+    store.close()
+    store = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic, ttl_seconds=10)
+    assert store.list(ctx.principal, "alpha")[0].id == first.id
+    assert store.retain() == 0  # exact TTL equality is still retained after convergence
+    store.close()
     store = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic, ttl_seconds=10)
     second = begin(store, ctx)
     clock.wall += timedelta(seconds=1)
@@ -381,7 +384,7 @@ def test_restart_retention_strict_boundary_and_sequence(tmp_path, ctx, clock):
     assert [r["id"] for r in rows(store)] == [second.id]
     old_sequence = rows(store)[0]["seq"]
     clock.wall += timedelta(seconds=11)
-    assert store.retain() == 1
+    assert [store.retain() for _ in range(9)] == [0] * 7 + [1, 0]
     third = begin(store, ctx)
     assert rows(store)[0]["seq"] > old_sequence
     assert rows(store)[0]["id"] == third.id
@@ -423,7 +426,7 @@ def test_rotation_full_fail_closed_and_reclaim(tmp_path, ctx, clock):
         begin(store, ctx)
     assert len(rows(store)) == 4
     clock.wall += timedelta(seconds=11)
-    assert store.retain() == 4
+    assert [store.retain() for _ in range(9)] == [0] * 8 + [4]
     begin(store, ctx)
     assert rows(store)[0]["segment"] == 2
     assert (tmp_path / "audit" / "access.sqlite").stat().st_size <= 64 * 1024 * 1024
@@ -524,7 +527,7 @@ def test_f2_first_insert_seeds_empty_store_and_advances(store, ctx, clock, tmp_p
     assert rows(store)[-1]["created_at"] == clock.wall.timestamp()
     assert float(sidecar.read_text()) == expected
     assert store.retain() == 0
-    assert float(sidecar.read_text()) == expected + 3600
+    assert float(sidecar.read_text()) == expected + (2 * 86400) / 8
 
 
 def test_rollback_watermark_survives_restart(tmp_path, ctx, clock):
@@ -774,22 +777,24 @@ def test_n2_forward_step_bounded_and_converges(store, ctx, clock, tmp_path):
     assert rows(store)[0]["id"] == first.id
     assert store.clock_step_refusals == 1
     watermark = tmp_path / "audit" / "retention.watermark"
-    assert float(watermark.read_text()) == original.timestamp() + 3600
+    assert float(watermark.read_text()) == original.timestamp() + store.ttl_seconds / 8
     # A permanently skewed clock still accepts exact wall-clock inserts.
     for _ in range(3):
         run(store.finish(begin(store, ctx), SUCCESS))
     assert all(r["created_at"] == clock.wall.timestamp() for r in rows(store)[1:])
-    removed = 0
-    for step in range(1, 960):
-        removed += store.retain()
-        assert float(watermark.read_text()) == original.timestamp() + (step + 1) * 3600
-    assert removed == 1
+    removals = [0]
+    for _ in range(44):
+        clock.wall += timedelta(minutes=1)
+        removals.append(store.retain())
+    assert removals[:10] == [0] * 10 and removals[10] == 1
+    assert sum(removals) == 1
+    assert float(watermark.read_text()) == clock.wall.timestamp()
     assert len(rows(store)) == 3
-    assert store.clock_step_refusals == 959
+    assert store.clock_step_refusals == 44
     assert store.retain() == 0
     clock.wall += timedelta(seconds=1)
     assert store.retain() == 0
-    print("N2 +40d: first deleted=0; cap=3600s; catchup=960 calls; refusals=959; skewed inserts=3")
+    print("M3 +40d: first deleted=0; first expiry=call11; catchup=45 calls; skewed inserts=3")
 
 
 @pytest.mark.parametrize("value", [0, 0.5, -1, float("nan"), float("inf"), True, "3600", None])
@@ -803,7 +808,7 @@ def test_n2_configured_step_and_normal_expiry(tmp_path, ctx, clock):
     try:
         begin(store, ctx)
         clock.wall += timedelta(seconds=11)
-        assert [store.retain() for _ in range(11)] == [0] * 10 + [1]
+        assert [store.retain() for _ in range(11)] == [0] * 9 + [1, 0]
         assert store.clock_step_refusals == 10
         assert rows(store) == []
     finally:
@@ -819,6 +824,59 @@ def test_n2_backward_clock_refuses_without_deleting_fresh(store, ctx, clock):
         store.retain()
     assert store.rollback_refusals == 1
     assert rows(store)[0]["id"] == fresh.id
+
+
+def test_m3_default_minute_scheduler_converges_without_expiring_fresh(
+    store, ctx, clock, tmp_path,
+):
+    old = begin(store, ctx)
+    clock.wall += timedelta(days=40)
+    fresh = begin(store, replace(ctx, request_id="req_" + str(uuid4())))
+    removals = []
+    for call in range(1, 46):
+        if call > 1:
+            clock.wall += timedelta(minutes=1)
+        removals.append(store.retain())
+    watermark = float((tmp_path / "audit" / "retention.watermark").read_text())
+    assert watermark == clock.wall.timestamp()
+    assert removals[:10] == [0] * 10
+    assert removals[10] == 1
+    assert sum(removals) == 1
+    assert [row["id"] for row in rows(store)] == [fresh.id]
+    assert old.id != fresh.id
+
+
+def test_m3_clock_suspect_capacity_recovers_on_minute_cadence(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(
+        root, clock=clock.now, ttl_seconds=8 * 3600,
+        segment_rows=5, max_segments=2,
+    )
+    try:
+        for _ in range(10):
+            begin(store, replace(ctx, request_id="req_" + str(uuid4())))
+        clock.wall += timedelta(hours=16)
+        with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
+            begin(store, ctx)
+        state = store.saturation()
+        assert state["authenticated"] is True
+        assert state["clock_suspect"] is True
+        assert state["clock_lag_seconds"] == 16 * 3600
+
+        removals = []
+        for _ in range(17):
+            removals.append(store.retain())
+            clock.wall += timedelta(minutes=1)
+        assert removals[:8] == [0] * 8
+        assert removals[8] == 10
+        assert sum(removals) == 10
+        assert begin(store, ctx).id
+        state = store.saturation()
+        assert state["authenticated"] is False
+        assert state["clock_suspect"] is False
+        assert state["clock_lag_seconds"] == 60
+    finally:
+        store.close()
 
 
 def break_denial_inserts(store):
@@ -980,7 +1038,7 @@ def test_n4_retention_vacuums_external_freed_bytes(tmp_path, ctx, clock, stream)
             external.execute("DELETE FROM access_audit WHERE id=?", (first.id,))
         assert canary in (target_root / "access.sqlite").read_bytes()
         clock.wall += timedelta(seconds=11)
-        assert store.retain() == 1
+        assert [store.retain() for _ in range(9)] == [0] * 8 + [1]
         assert rows(target) == []
         assert canary not in (target_root / "access.sqlite").read_bytes()
         assert not (target_root / "access.sqlite-journal").exists()
@@ -1020,6 +1078,7 @@ def test_m3_failed_scrub_is_durable_and_retried_after_restart(tmp_path, ctx, clo
     store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
     begin(store, ctx)
     clock.wall += timedelta(seconds=11)
+    assert [store.retain() for _ in range(8)] == [0] * 8
     with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
         store.retain()
     assert rows(store) == []  # DELETE committed; its scrub obligation did too.
@@ -1046,6 +1105,7 @@ def test_m1_bounded_chunks_and_auth_lock_independence(tmp_path, clock):
     insert_retention_fixture(store, root, clock, 501)
     clock.wall += timedelta(seconds=11)
     try:
+        assert [store.retain() for _ in range(8)] == [0] * 8
         with ThreadPoolExecutor(max_workers=1) as pool:
             with store._lock:
                 assert pool.submit(store.retain).result(timeout=0.2) == 500
@@ -1090,6 +1150,7 @@ def test_m1_deleting_retain_auth_p95_bounded(tmp_path, ctx, clock):
     insert_retention_fixture(store, root, clock, 4000, payload_size=4096)
     assert (root / "access.sqlite").stat().st_size > 16 * 1024 * 1024
     clock.wall += timedelta(seconds=11)
+    assert [store.retain() for _ in range(8)] == [0] * 8
     timings = []
     removed = []
     try:
@@ -1131,6 +1192,7 @@ def test_m1_pending_retry_does_not_bypass_compaction_interval(tmp_path, ctx, clo
     store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
     insert_retention_fixture(store, root, clock, 3, payload_size=4096)
     clock.wall += timedelta(seconds=11)
+    assert [store.retain() for _ in range(8)] == [0] * 8
     assert store.retain() == 3
     canary = b"CANARY_PENDING_SCRUB_RETRY_8f31"
     with sqlite3.connect(root / "access.sqlite") as writer:
@@ -1165,6 +1227,7 @@ def test_m1_bounded_scrub_large_ptrmap_database_survives_concurrent_writes(
     insert_retention_fixture(store, root, clock, 1500, payload_size=4096)
     assert store._db.execute("PRAGMA page_count").fetchone()[0] > 1025
     clock.wall += timedelta(seconds=11)
+    assert [store.retain() for _ in range(8)] == [0] * 8
     delete_started = Event()
     store._maintenance_db.set_trace_callback(
         lambda sql: delete_started.set()

@@ -12,18 +12,25 @@ SQLite max_page_count caps the authenticated file at 256 MiB, with 4 MiB for
 denials (260 MiB total database budget). These are disk, not RAM guarantees;
 large metadata may hit the byte cap first and fail closed. Each connection has
 an explicit 2048 KiB page-cache target (4096 KiB for the pair, not a process RSS
-    limit); lists materialize at most 200 rows. Retention deletes at most 500 rows
-    per stream and call on a separate maintenance connection/lock. New databases
-    use incremental auto-vacuum. Every scrub obligation cleans a bounded window
-    of 8 freelist and 8 authoritative dbstat btree pages. Separately, at most 16
-    free pages are compacted once per durable wall-clock 60 seconds when the
-    freelist exceeds one page. Existing NONE-mode databases must
-    use the explicit migrate_incremental_vacuum() administrative full rewrite.
+limit); lists materialize at most 200 rows. Retention deletes at most 500 rows
+per stream and call on a separate maintenance connection/lock. New databases
+use incremental auto-vacuum. Every scrub obligation cleans a bounded window of
+8 freelist and 8 authoritative dbstat btree pages. Separately, at most 16 free
+pages are compacted once per durable wall-clock 60 seconds when the freelist
+exceeds one page. Existing NONE-mode databases require the explicit
+migrate_incremental_vacuum() administrative full rewrite.
+Retention runs once per minute while clock_suspect is true (and at least once
+per segment interval normally). The step is
+min(ttl/8, max(max_clock_step, lag/8)); with defaults a +40-day jump catches up
+in 45 calls/44 elapsed minutes. One parent call deletes at most 500 authenticated
+plus 500 denial rows; repeated calls drain the backlog.
 Pre-auth denials use a separate file/sequence/page budget (2000 rows, 4 MiB),
 never authenticated slots. Saturation drops denial recording, not requests.
 Exhaustion of authenticated storage is E_AUDIT_UNAVAILABLE.
-saturation() is the S06 gate input: keys "authenticated", "denials", "stale"
-and "age_seconds" (plus clock keys documented below). "denials" is true on
+saturation() is the S06 gate input: keys "authenticated", "denials", "stale",
+"age_seconds", "clock_lag_seconds" and "clock_suspect". Clock lag is
+max(0, now-watermark); suspect means raw lag > ttl and remains an admission
+signal while capacity cannot yet be reclaimed safely. "denials" is true on
 failure, capacity exhaustion, a busy writer, or durable losses since the last
 observation. Denial state is an immutable lock-free snapshot; an opportunistic
 read-only timeout-zero connection refreshes it, while stale/age_seconds expose
@@ -382,8 +389,13 @@ class AccessAuditStore:
         with self._lock:
             try:
                 authenticated = self._db is None or self._segment_full()
-            except sqlite3.Error:
+                raw_lag = self._now().timestamp() - self._read_watermark()
+                clock_lag = max(0.0, raw_lag)
+                clock_suspect = raw_lag > self.ttl_seconds
+            except (AuditError, sqlite3.Error):
                 authenticated = True
+                clock_lag = math.inf
+                clock_suspect = True
         self._refresh_denial_snapshot()
         denial_state, _, observed_at, stale = self._denial_snapshot
         inflight = self._denial_write_inflight
@@ -392,6 +404,8 @@ class AccessAuditStore:
             "denials": bool(denial_state or inflight or self._denial_failed),
             "stale": bool(stale or inflight),
             "age_seconds": max(0.0, time.monotonic() - observed_at),
+            "clock_lag_seconds": clock_lag,
+            "clock_suspect": clock_suspect,
         }
 
     def _refresh_denial_snapshot(self) -> None:
@@ -668,6 +682,27 @@ class AccessAuditStore:
         except (OSError, ValueError):
             raise AuditError() from None
 
+    def _read_watermark(self) -> float:
+        """Read an existing sidecar without creating it; failures stay closed."""
+        try:
+            fd = os.open(
+                "retention.watermark", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=self._fd,
+            )
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                    raise AuditError()
+                value = float(os.read(fd, 128))
+                if not math.isfinite(value):
+                    raise AuditError()
+                return value
+            finally:
+                os.close(fd)
+        except (OSError, ValueError):
+            raise AuditError() from None
+
     def _write_watermark(self, value: float) -> None:
         """Seed once, then persist only before retention; missing metadata fails closed."""
         try:
@@ -905,7 +940,7 @@ class AccessAuditStore:
                 raise AuditError() from None
 
     def retain(self) -> int:
-        """Apply min(now, watermark + max_clock_step); default cap is one hour.
+        """Apply min(now, watermark + min(ttl/8,max(max_clock_step,lag/8))).
 
         Backward clocks refuse E_VALIDATION and count rollback_refusals. Forward
         steps above the cap count clock_step_refusals but apply the bounded step;
@@ -937,7 +972,12 @@ class AccessAuditStore:
                     if now < watermark:
                         self.rollback_refusals += 1
                         raise AuditError("E_VALIDATION")
-                    effective_now = min(now, watermark + self.max_clock_step)
+                    lag = now - watermark
+                    step = min(
+                        self.ttl_seconds / 8,
+                        max(self.max_clock_step, lag / 8),
+                    )
+                    effective_now = min(now, watermark + step)
                     if now > effective_now:
                         self.clock_step_refusals += 1
                     self._write_watermark(effective_now)
