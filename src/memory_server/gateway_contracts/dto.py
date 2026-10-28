@@ -219,13 +219,19 @@ class Page(DTO, Generic[T]):
 
 
 class Profile(DTO):
+    # C1: ProfileBinding carries this DTO across registry/auth/runtime boundaries, so it
+    # must be deeply immutable (S02 threat T4): frozen model + tuple collection.
+    model_config = ConfigDict(
+        strict=True, extra="forbid", frozen=True, allow_inf_nan=False, populate_by_name=True
+    )
+
     id: str
     display_name: str
     description: str | None
     enabled: bool
     generation: int
     runtime_state: Literal["not_started", "ready", "closing", "failed"]
-    capabilities: list[str]
+    capabilities: tuple[str, ...]
     storage_root: str | None
 
 

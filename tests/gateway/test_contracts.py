@@ -1057,6 +1057,24 @@ def test_context_result_requires_nullable_wire_fields():
             dto.ContextResult.model_validate_json(json.dumps(payload))
 
 
+def test_profile_binding_nested_dto_is_deeply_immutable():
+    # S02 threat T4: a resolved binding must not be mutable through its nested Profile.
+
+    dto, ports, _ = modules()
+    profile = dto.Profile.model_validate_json(json.dumps(example(dto.Profile)))
+    assert isinstance(profile.capabilities, tuple)
+    with pytest.raises(ValidationError):
+        profile.enabled = False
+    with pytest.raises(AttributeError):
+        profile.capabilities.append("admin")  # type: ignore[attr-defined]
+
+    assert ports.ProfileBinding.__dataclass_params__.frozen is True
+    annotations = ports.ProfileBinding.__annotations__
+    assert annotations["profile"] == "d.Profile"
+    # Foreign composition types stay symbolic (no concrete neighbour import).
+    assert {"StorageLayout", "RuntimeConfig", "RuntimeDescriptor"} <= set(annotations.values())
+
+
 def test_result_discriminator_requires_operation_for_wire_decode():
     dto, _, catalog = modules()
     # C1 result union has no C4 wire tag; ambiguous Page JSON is not guessed.
