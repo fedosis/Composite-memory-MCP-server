@@ -807,3 +807,50 @@ def test_n3_new_losses_observed_even_after_success(tmp_path, ctx, clock):
     finally:
         first.close()
         second.close()
+
+
+@pytest.mark.parametrize("stream", ["authenticated", "denials"])
+def test_n4_retention_vacuums_external_freed_bytes(tmp_path, ctx, clock, stream):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    try:
+        target = store if stream == "authenticated" else store._denials
+        target_root = root if stream == "authenticated" else root / "denials"
+        if stream == "authenticated":
+            first = begin(store, ctx)
+            begin(store, replace(ctx, request_id="req_" + str(uuid4())))
+        else:
+            first = run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED"))
+            run(store.record_unauthenticated("req_" + str(uuid4()), "E_AUTH_REQUIRED"))
+        canary = first.id.encode()
+        with sqlite3.connect(target_root / "access.sqlite") as external:
+            external.execute("PRAGMA secure_delete=OFF")
+            # Force overflow pages: the store's later DELETE cannot scrub pages
+            # freed by another connection merely by clearing its own row cells.
+            external.execute("UPDATE access_audit SET memory_id=? WHERE id=?", (first.id * 1000, first.id))
+            external.execute("DELETE FROM access_audit WHERE id=?", (first.id,))
+        assert canary in (target_root / "access.sqlite").read_bytes()
+        clock.wall += timedelta(seconds=11)
+        assert store.retain() == 1
+        assert rows(target) == []
+        assert canary not in (target_root / "access.sqlite").read_bytes()
+        assert not (target_root / "access.sqlite-journal").exists()
+    finally:
+        store.close()
+
+
+def test_n4_startup_scrubs_stale_journal(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now)
+    ticket = begin(store, ctx)
+    store.close()
+    journal = root / "access.sqlite-journal"
+    journal.write_bytes(b"\0" * 512 + CANARY_SECRET.encode())
+    journal.chmod(0o600)
+    store = AccessAuditStore(root, clock=clock.now)
+    try:
+        assert not journal.exists()
+        assert rows(store)[0]["id"] == ticket.id
+        assert CANARY_SECRET.encode() not in (root / "access.sqlite").read_bytes()
+    finally:
+        store.close()

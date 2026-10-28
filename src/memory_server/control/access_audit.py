@@ -111,6 +111,7 @@ class AccessAuditStore:
         self._db = None
         try:
             self._fd = _private_directory(Path(root))
+            stale_journal = False
             for name in ("access.sqlite", "access.sqlite-journal", "access.sqlite-wal", "access.sqlite-shm",
                          "retention.watermark", "retention.next"):
                 try:
@@ -120,6 +121,7 @@ class AccessAuditStore:
                 if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                         or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
                     raise AuditError()
+                stale_journal |= name == "access.sqlite-journal"
             flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
             pin = os.open("access.sqlite", flags, 0o600, dir_fd=self._fd)
             try:
@@ -158,6 +160,9 @@ class AccessAuditStore:
                         id INTEGER PRIMARY KEY CHECK(id=1), dropped INTEGER NOT NULL,
                         failing INTEGER NOT NULL CHECK(failing IN (0,1)))""")
                     self._db.execute("INSERT OR IGNORE INTO denial_health VALUES (1,0,0)")
+            if stale_journal:
+                # SQLite recovers hot journals first; scrub before serving.
+                self._scrub()
             os.fsync(self._fd)
             if not _denial_only:
                 try:
@@ -188,11 +193,11 @@ class AccessAuditStore:
                 self._fd = None
 
     @contextmanager
-    def _transaction(self) -> Iterator[None]:
+    def _transaction(self, *, exclusive: bool = False) -> Iterator[None]:
         if self._db is None:
             raise AuditError()
         try:
-            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute("BEGIN EXCLUSIVE" if exclusive else "BEGIN IMMEDIATE")
             try:
                 yield
                 self._db.execute("COMMIT")
@@ -438,6 +443,35 @@ class AccessAuditStore:
         except OSError:
             raise AuditError() from None
 
+    def _scrub(self) -> None:
+        """Own connection, under own lock, with no active transaction.
+
+        VACUUM removes bytes freed by unflagged external connections as well.
+        An exclusive SQLite lock prevents unlinking another writer's journal.
+        Startup recovery/scrubbing completes before this store is served.
+        """
+        try:
+            self._db.execute("VACUUM")
+            with self._transaction(exclusive=True):
+                try:
+                    fd = os.open("access.sqlite-journal", os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                 dir_fd=self._fd)
+                except FileNotFoundError:
+                    return
+                try:
+                    info = os.fstat(fd)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                            or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                        raise AuditError()
+                    os.ftruncate(fd, 0)
+                    os.fsync(fd)
+                    os.unlink("access.sqlite-journal", dir_fd=self._fd)
+                    os.fsync(self._fd)
+                finally:
+                    os.close(fd)
+        except (sqlite3.Error, OSError):
+            raise AuditError() from None
+
     def retain(self) -> int:
         """Apply min(now, watermark + max_clock_step); default cap is one hour.
 
@@ -463,6 +497,9 @@ class AccessAuditStore:
                 removed = self._db.execute(
                     "DELETE FROM access_audit WHERE created_at < ? AND retention_at < ?", (cutoff, cutoff),
                 ).rowcount
+            if removed:
+                with self._lock:
+                    self._scrub()
             if self._denials is not None:
                 try:
                     removed += self._denials.retain()
