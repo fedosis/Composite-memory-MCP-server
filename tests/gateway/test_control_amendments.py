@@ -571,3 +571,43 @@ def test_q8_wire_ceiling_defaults_and_bounds(tmp_path):
     smallest = HttpConfig(control_path=tmp_path, max_header_bytes=1,
                           header_timeout_seconds=0.001, max_connections=1)
     assert smallest.header_timeout_seconds == 0.001
+
+
+def test_q9_audit_eligibility_policy_is_closed_and_immutable():
+    from memory_server.gateway_contracts import ports
+
+    assert dict(ports.AUDIT_ELIGIBILITY) == {
+        "pre_auth_reject": "none",
+        "authentication_failure": "denial",
+        "authentication_storage_failure": "none",
+        "authenticated_authz_reject": "none",
+        "authenticated_validation_reject": "none",
+        "authenticated_rate_reject": "none",
+        "eligible_execution": "intent_outcome",
+        "public_probe": "none",
+    }
+    with pytest.raises(TypeError):
+        ports.AUDIT_ELIGIBILITY["pre_auth_reject"] = "intent_outcome"
+
+
+async def test_q9_existing_denial_binding_no_submitted_identity(tmp_path):
+    from memory_server.control.access_audit import AccessAuditStore, AuditError
+    from memory_server.gateway_contracts import ports
+
+    assert ports.AUDIT_ELIGIBILITY["authentication_failure"] == "denial"
+    audit = AccessAuditStore(tmp_path / "audit")
+    try:
+        request_id = "req_" + str(uuid4())
+        ticket = await audit.record_unauthenticated(request_id, "E_AUTH_REQUIRED")
+        assert ticket is not None and ticket.request_id == request_id
+        assert audit._db.execute("SELECT COUNT(*) FROM access_audit").fetchone()[0] == 0
+        rows = audit._denials._db.execute("SELECT * FROM access_audit").fetchall()
+        assert len(rows) == 1 and rows[0]["state"] == "terminal"
+        assert rows[0]["token_id"] is None and rows[0]["profile_id"] is None and rows[0]["client_id"] is None
+        assert rows[0]["operation"] == "authentication" and rows[0]["result"] == "E_AUTH_REQUIRED"
+        with pytest.raises(AuditError) as exc:
+            await audit.record_unauthenticated("req_" + str(uuid4()), "E_PERMISSION_DENIED")
+        assert exc.value.code == "E_VALIDATION"
+        assert audit._denials._db.execute("SELECT COUNT(*) FROM access_audit").fetchone()[0] == 1
+    finally:
+        audit.close()

@@ -13,10 +13,24 @@ from contextlib import AbstractAsyncContextManager as AsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Protocol
 from uuid import UUID
 
 from . import dto as d
+
+# S06 amendment Q9 (2026-10-28): eligibility declaration, not HTTP orchestration.
+# Only E_AUTH_REQUIRED uses the existing identity-free S05a denial callback.
+AUDIT_ELIGIBILITY: Mapping[str, Literal["none", "denial", "intent_outcome"]] = MappingProxyType({
+    "pre_auth_reject": "none",
+    "authentication_failure": "denial",
+    "authentication_storage_failure": "none",
+    "authenticated_authz_reject": "none",
+    "authenticated_validation_reject": "none",
+    "authenticated_rate_reject": "none",
+    "eligible_execution": "intent_outcome",
+    "public_probe": "none",
+})
 
 ASGIApp = Callable[
     [Mapping[str, object], Callable[[], Awaitable[dict]], Callable[[dict], Awaitable[None]]], Awaitable[None]
