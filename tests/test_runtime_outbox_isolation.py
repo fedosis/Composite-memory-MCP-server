@@ -3,7 +3,6 @@
 import asyncio
 import logging
 
-import storage.outbox_worker as worker_module
 from storage.outbox import OutboxEntryORM, OutboxRepository
 
 from tests.test_runtime_profile_isolation import _drain, _profiles, _read, _remember
@@ -35,20 +34,27 @@ async def test_compaction_descendant_is_test_owned_and_awaited_without_run_loop(
         await _drain(runtime)
         worker = runtime.dependencies.outbox_worker
         worker._compact_interval_seconds = 0
-        tasks = []
-        original = worker_module.asyncio.create_task
-        def capture(coro, *args, **kwargs):
-            task = original(coro, *args, **kwargs)
-            tasks.append(task)
-            return task
-        worker_module.asyncio.create_task = capture
-        try:
-            caplog.set_level(logging.INFO, logger="storage.outbox_worker")
-            await worker._maybe_compact()
-            done, pending = await asyncio.wait(tasks, timeout=10)
-        finally:
-            worker_module.asyncio.create_task = original
-        assert done and not pending and "compaction done" in caplog.text
+        caplog.set_level(logging.INFO, logger="storage.outbox_worker")
+        await worker._maybe_compact()
+        assert worker._compact_task is not None
+        task = worker._compact_task
+        _, records, _ = runtime.owned_snapshot()
+        owned = [record for record in records if record.task is task]
+        assert len(owned) == 1
+        record = owned[0]
+        assert record.kind == "outbox-compact" and record.state == "ATTACHED"
+        await asyncio.wait_for(task, timeout=10)
+        assert task.done() and not task.cancelled() and task.exception() is None
+        assert "compaction done" in caplog.text
+        # Completion schedules the runtime reaper through two loop callbacks.
+        for _ in range(10):
+            if record not in runtime.owned_snapshot()[1]:
+                break
+            await asyncio.sleep(0)
+        assert record.state == "TERMINATED" and record.terminal_type is None
+        assert record not in runtime.owned_snapshot()[1]
+    assert runtime.state == "CLOSED"
+    assert runtime.owned_snapshot()[1:] == ((), ())
 
 
 async def test_receipt_audit_and_vector_graph_provenance_remain_profile_local(tmp_path):
