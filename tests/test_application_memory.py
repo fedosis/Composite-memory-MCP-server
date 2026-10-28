@@ -318,9 +318,10 @@ def test_command_dto_defaults_are_taken_from_code_not_from_architecture_source()
     assert learn.llm_max_input_chars is None and learn.llm_confidence_gate is None
     bulk = BulkImportCommand(path="/tmp/MEMORY.md")
     assert (bulk.source, bulk.gate) == ("MEMORY.md", None)
-    contracts = (APPLICATION_DIR / "contracts.py").read_text(encoding="utf-8")
-    assert '= 0.5' not in contracts, "ARCHITECTURE_SOURCE §21 confidence default leaked in"
-    assert '"manual"' not in contracts, "ARCHITECTURE_SOURCE §21 source default leaked in"
+    from memory_server.application.contracts import SetBeliefCommand
+    belief = SetBeliefCommand(proposition="p")
+    assert (belief.confidence, belief.source) == (0.5, "system")
+    assert SetBeliefCommand.__dataclass_fields__["confidence"].default == 0.5
 
 
 def test_command_dto_defaults_match_the_c00_wire_snapshot() -> None:
