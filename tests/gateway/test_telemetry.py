@@ -809,6 +809,21 @@ def test_n3_new_losses_observed_even_after_success(tmp_path, ctx, clock):
         second.close()
 
 
+@pytest.mark.parametrize("damage", ["table", "row"])
+def test_m2_missing_denial_health_refuses_parent_reopen(tmp_path, clock, damage):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now)
+    store.close()
+    with sqlite3.connect(root / "denials" / "access.sqlite") as writer:
+        if damage == "table":
+            writer.execute("DROP TABLE denial_health")
+        else:
+            writer.execute("DELETE FROM denial_health")
+
+    with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
+        AccessAuditStore(root, clock=clock.now)
+
+
 @pytest.mark.parametrize("stream", ["authenticated", "denials"])
 def test_n4_retention_vacuums_external_freed_bytes(tmp_path, ctx, clock, stream):
     root = tmp_path / "audit"

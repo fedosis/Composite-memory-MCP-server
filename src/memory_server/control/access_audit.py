@@ -62,6 +62,10 @@ class AuditError(Exception):
         super().__init__(code)
 
 
+class _DenialHealthTamper(AuditError):
+    """Existing denial evidence is missing; the parent must refuse service."""
+
+
 def _check(value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise AuditError("E_VALIDATION")
@@ -133,6 +137,7 @@ class AccessAuditStore:
             pin = os.open("access.sqlite", flags, 0o600, dir_fd=self._fd)
             try:
                 before = os.fstat(pin)
+                new_database = before.st_size == 0
                 self._db = sqlite3.connect(
                     f"/proc/self/fd/{self._fd}/access.sqlite", isolation_level=None,
                     timeout=5, check_same_thread=False,
@@ -164,10 +169,20 @@ class AccessAuditStore:
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
                 self._watermark()
                 if _denial_only:
-                    self._db.execute("""CREATE TABLE IF NOT EXISTS denial_health (
-                        id INTEGER PRIMARY KEY CHECK(id=1), dropped INTEGER NOT NULL,
-                        failing INTEGER NOT NULL CHECK(failing IN (0,1)))""")
-                    self._db.execute("INSERT OR IGNORE INTO denial_health VALUES (1,0,0)")
+                    if new_database:
+                        self._db.execute("""CREATE TABLE denial_health (
+                            id INTEGER PRIMARY KEY CHECK(id=1), dropped INTEGER NOT NULL,
+                            failing INTEGER NOT NULL CHECK(failing IN (0,1)))""")
+                        self._db.execute("INSERT INTO denial_health VALUES (1,0,0)")
+                    else:
+                        table = self._db.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='denial_health'"
+                        ).fetchone()
+                        health = None if table is None else self._db.execute(
+                            "SELECT dropped,failing FROM denial_health WHERE id=1"
+                        ).fetchone()
+                        if table is None or health is None:
+                            raise _DenialHealthTamper()
             if stale_journal:
                 # SQLite recovers hot journals first; scrub before serving.
                 self._scrub()
@@ -179,6 +194,10 @@ class AccessAuditStore:
                         segment_rows=denial_segment_rows, max_segments=denial_max_segments,
                         max_bytes=4 * 1024 * 1024, max_clock_step=max_clock_step, _denial_only=True,
                     )
+                except _DenialHealthTamper:
+                    # Missing durable loss evidence is tamper, not an optional
+                    # denial-recorder outage: never serve through the parent.
+                    raise AuditError() from None
                 except AuditError:
                     self._denial_failed = True
         except (OSError, sqlite3.Error, ControlError):
