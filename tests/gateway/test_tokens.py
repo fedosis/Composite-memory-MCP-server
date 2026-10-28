@@ -391,7 +391,7 @@ def test_entropy_64(custody):
 
 
 def test_last_used_bounded_monotonic_failure_no_write(custody):
-    _, _, store, service = custody
+    t, _, store, service = custody
     result = run(service.create(context(), payload(), now=NOW))
     before = store._connection.total_changes
     for _ in range(20):
@@ -405,7 +405,10 @@ def test_last_used_bounded_monotonic_failure_no_write(custody):
     # reach the digest comparison and still write nothing: the earlier probe was rejected
     # by the regex before the UPDATE, so it could not have caught a write on failure.
     wrong = base64.urlsafe_b64encode(b"\x00" * 32).decode().rstrip("=")
-    expect("E_AUTH_REQUIRED", lambda: run(service.authenticate(bearer(result)[:-44] + wrong, now=NOW)))
+    tampered = bearer(result)[: -len(wrong)] + wrong
+    assert t._BEARER.fullmatch(tampered), "probe must pass the bearer regex to reach the digest comparison"
+    assert len(base64.urlsafe_b64decode(wrong + "=")) == 32
+    expect("E_AUTH_REQUIRED", lambda: run(service.authenticate(tampered, now=NOW)))
     expect("E_AUTH_REQUIRED", lambda: run(service.authenticate(bearer(result) + "x", now=NOW)))
     assert store._connection.total_changes == before
     assert store._connection.execute("SELECT last_used_at FROM tokens").fetchone()[0] == last
