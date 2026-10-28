@@ -1252,6 +1252,33 @@ def test_m1_bounded_scrub_large_ptrmap_database_survives_concurrent_writes(
         store.close()
 
 
+def test_m1_eight_page_scrub_has_bounded_sql_vm_work(tmp_path, clock):
+    measurements = []
+    for count in (100, 5000):
+        root = tmp_path / str(count)
+        store = AccessAuditStore(root, clock=clock.now)
+        try:
+            insert_retention_fixture(store, root, clock, count, payload_size=4096)
+            db = store._maintenance_db
+            steps = [0]
+
+            def progress():
+                steps[0] += 1
+                return 0
+
+            with store._maintenance_lock, store._transaction(db=db, exclusive=True):
+                db.set_progress_handler(progress, 1)
+                try:
+                    store._scrub_btree_slack(db, 1, 8)
+                finally:
+                    db.set_progress_handler(None, 0)
+            measurements.append(steps[0])
+        finally:
+            store.close()
+    print(f"M1 bounded scrub VM steps small/large={measurements}")
+    assert measurements[1] <= 5000
+
+
 def test_n5_capacity_and_cache_budgets_are_explicit(store):
     assert store.segment_rows == 10000
     assert store.max_segments == 27  # ceil(30d / 10s / 10000) + spare

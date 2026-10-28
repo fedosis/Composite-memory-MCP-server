@@ -15,7 +15,7 @@ an explicit 2048 KiB page-cache target (4096 KiB for the pair, not a process RSS
 limit); lists materialize at most 200 rows. Retention deletes at most 500 rows
 per stream and call on a separate maintenance connection/lock. New databases
 use incremental auto-vacuum. Every scrub obligation cleans a bounded window of
-8 freelist and 8 authoritative dbstat btree pages. Separately, at most 16 free
+8 freelist and 8 btree pages reached from authoritative schema roots. Separately, at most 16 free
 pages are compacted once per durable wall-clock 60 seconds when the freelist
 exceeds one page. Existing NONE-mode databases require the explicit
 migrate_incremental_vacuum() administrative full rewrite.
@@ -233,6 +233,12 @@ class AccessAuditStore:
                     """INSERT OR IGNORE INTO maintenance_state
                         (id,scrub_pending,last_vacuum,scrub_cursor) VALUES (1,0,0,1)"""
                 )
+                self._db.execute("""CREATE TABLE IF NOT EXISTS maintenance_scrub_frontier (
+                    id INTEGER PRIMARY KEY,
+                    root_name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    next_child INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(root_name,path))""")
                 self._watermark()
                 if _denial_only:
                     if new_database:
@@ -785,7 +791,7 @@ class AccessAuditStore:
                 os.close(fd)
 
     def _scrub_btree_slack(self, db: sqlite3.Connection, start: int, limit: int) -> int:
-        """Zero slack only on btrees identified authoritatively by dbstat."""
+        """Walk a persisted bounded frontier rooted at authoritative rootpages."""
         fd = None
         try:
             fd = os.open("access.sqlite", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -798,25 +804,20 @@ class AccessAuditStore:
             page_count = db.execute("PRAGMA page_count").fetchone()[0]
             if page_count < 1:
                 raise AuditError()
-            cursor = min(max(start, 1), page_count)
-            query = """SELECT pageno FROM dbstat
+
+            roots = dict(db.execute("""SELECT name,rootpage FROM sqlite_schema
                 WHERE name IN ('access_audit','audit_scope','audit_segment','audit_retention',
-                               'sqlite_autoindex_access_audit_1')
-                  AND pagetype IN ('leaf','internal') AND pageno>=?
-                ORDER BY pageno LIMIT ?"""
-            pages = [row[0] for row in db.execute(query, (cursor, limit))]
-            if len(pages) < limit and cursor > 1:
-                wrap_query = """SELECT pageno FROM dbstat
-                    WHERE name IN ('access_audit','audit_scope','audit_segment','audit_retention',
-                                   'sqlite_autoindex_access_audit_1')
-                      AND pagetype IN ('leaf','internal') AND pageno<?
-                    ORDER BY pageno LIMIT ?"""
-                pages.extend(
-                    row[0] for row in db.execute(
-                        wrap_query, (cursor, limit - len(pages))
-                    )
+                               'sqlite_autoindex_access_audit_1') AND rootpage>0"""))
+            if db.execute("SELECT 1 FROM maintenance_scrub_frontier LIMIT 1").fetchone() is None:
+                db.executemany(
+                    """INSERT OR IGNORE INTO maintenance_scrub_frontier
+                        (root_name,path,next_child) VALUES (?,'',0)""",
+                    ((name,) for name in roots),
                 )
-            for page_number in pages:
+
+            def read_btree(page_number: int):
+                if not 1 <= page_number <= page_count:
+                    raise AuditError()
                 offset = (page_number - 1) * page_size
                 page = os.pread(fd, page_size, offset)
                 if len(page) != page_size:
@@ -835,6 +836,50 @@ class AccessAuditStore:
                 pointer_end = header_offset + header_size + cell_count * 2
                 if not pointer_end <= cell_start <= page_size:
                     raise AuditError()
+                children = []
+                if page_type in (0x02, 0x05):
+                    for index in range(cell_count):
+                        pointer_at = header_offset + header_size + index * 2
+                        cell = int.from_bytes(page[pointer_at:pointer_at + 2], "big")
+                        if not cell_start <= cell <= page_size - 4:
+                            raise AuditError()
+                        child = int.from_bytes(page[cell:cell + 4], "big")
+                        if not 1 <= child <= page_count:
+                            raise AuditError()
+                        children.append(child)
+                    rightmost = int.from_bytes(
+                        page[header_offset + 8:header_offset + 12], "big"
+                    )
+                    if not 1 <= rightmost <= page_count:
+                        raise AuditError()
+                    children.append(rightmost)
+                return page, offset, header_offset, pointer_end, cell_start, children
+
+            last_page = max(start, 1)
+            for _ in range(limit):
+                frontier = db.execute("""SELECT id,root_name,path,next_child
+                    FROM maintenance_scrub_frontier ORDER BY id LIMIT 1""").fetchone()
+                if frontier is None:
+                    break
+                db.execute(
+                    "DELETE FROM maintenance_scrub_frontier WHERE id=?", (frontier[0],)
+                )
+                page_number = roots.get(frontier[1])
+                if page_number is None:
+                    continue
+                path = [] if not frontier[2] else [int(part) for part in frontier[2].split("/")]
+                stale_path = False
+                for child_index in path:
+                    _, _, _, _, _, children = read_btree(page_number)
+                    if not 0 <= child_index < len(children):
+                        stale_path = True
+                        break
+                    page_number = children[child_index]
+                if stale_path:
+                    continue
+                page, offset, header_offset, pointer_end, cell_start, children = read_btree(
+                    page_number
+                )
                 if cell_start > pointer_end:
                     if os.pwrite(fd, b"\0" * (cell_start - pointer_end),
                                  offset + pointer_end) != cell_start - pointer_end:
@@ -855,11 +900,20 @@ class AccessAuditStore:
                                  offset + freeblock + 4) != size - 4:
                         raise AuditError()
                     freeblock = next_free
+                child_index = frontier[3]
+                if child_index < len(children):
+                    child_path = f"{frontier[2]}/{child_index}" if frontier[2] else str(child_index)
+                    db.execute("""INSERT OR IGNORE INTO maintenance_scrub_frontier
+                        (root_name,path,next_child) VALUES (?,?,0)""",
+                               (frontier[1], child_path))
+                    if child_index + 1 < len(children):
+                        db.execute("""INSERT OR IGNORE INTO maintenance_scrub_frontier
+                            (root_name,path,next_child) VALUES (?,?,?)""",
+                                   (frontier[1], frontier[2], child_index + 1))
+                last_page = page_number
             os.fsync(fd)
-            if not pages or pages[-1] >= page_count:
-                return 1
-            return pages[-1] + 1
-        except OSError:
+            return 1 if last_page >= page_count else last_page + 1
+        except (OSError, ValueError):
             raise AuditError() from None
         finally:
             if fd is not None:
@@ -874,7 +928,7 @@ class AccessAuditStore:
             cursor = db.execute(
                 "SELECT scrub_cursor FROM maintenance_state WHERE id=1"
             ).fetchone()[0]
-            # dbstat supplies the authoritative btree page set; pointer-map,
+            # The persisted frontier starts at sqlite_schema rootpages; pointer-map,
             # overflow and freelist pages can never enter the btree parser.
             with self._transaction(db=db, exclusive=True):
                 self._scrub_freelist_pages(db, _VACUUM_PAGES // 2)
