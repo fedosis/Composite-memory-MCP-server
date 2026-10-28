@@ -256,6 +256,15 @@ def test_revoke_immediate_generation_and_replay(custody):
     assert row["generation"] == 2 and row["revoked_at"] is not None
 
 
+def test_ports_token_service_exposes_verify_principal():
+    # C2.1 cache invalidation must be reachable through the port S06 depends on,
+    # not only through the concrete class.
+    from memory_server.gateway_contracts.ports import TokenService
+
+    assert "verify_principal" in TokenService.__dict__
+    assert "authenticate" in TokenService.__dict__
+
+
 def test_revoke_of_out_of_scope_token_looks_absent(custody):
     # C2.4: an id outside the caller's profile scope must be indistinguishable from absent.
     _, _, _, service = custody

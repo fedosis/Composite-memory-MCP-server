@@ -1205,7 +1205,10 @@ EXPECTED_PORT_SIGNATURES = {
     "GatewayPort": {"execute": ("self, ctx: RequestContext, command: GatewayCommand", "GatewayResult", True)},
     "ContractCatalog": {"validate": ("self, operation: Operation, payload: JSONValue", "GatewayCommand", False)},
     "ProfileRegistry": {"resolve": ("self, principal: Principal, profile_id: str", "ProfileBinding", True)},
-    "TokenService": {"authenticate": ("self, bearer: str, *, now: datetime", "Principal", True)},
+    "TokenService": {
+        "authenticate": ("self, bearer: str, *, now: datetime", "Principal", True),
+        "verify_principal": ("self, principal: Principal, *, now: datetime", "None", False),
+    },
     "ProfileLeases": {"acquire": ("self, ctx: RequestContext", "AsyncContextManager[ProfileSession]", False)},
     "AccessSink": {
         "begin": ("self, ctx: RequestContext, operation: Operation", "AuditTicket", True),
