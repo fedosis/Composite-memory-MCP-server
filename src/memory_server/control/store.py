@@ -360,6 +360,7 @@ class ControlStore:
         now: datetime,
         capabilities: tuple[str, ...],
         eligible: bool = True,
+        require_intent: Callable[[], None],
     ) -> MappingProxyType:
         """Replay lookup, reservation metadata, CAS and one generation row: one commit."""
         with self._transaction():
@@ -377,6 +378,7 @@ class ControlStore:
                     if row["phase"] != "final":
                         raise ControlError("E_REQUEST_IN_PROGRESS")
                     return self._request_record(row)
+            require_intent()
             if (
                 not eligible
                 or self._connection.execute(

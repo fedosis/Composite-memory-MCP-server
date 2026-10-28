@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import pytest
 
+from memory_server.control.access_audit import AccessAuditStore
 from memory_server.control.profiles import ProfileRegistry, RegistryConfiguration
 from memory_server.control.store import ControlError, ControlStore
 from memory_server.gateway_contracts import dto as d
@@ -25,8 +26,13 @@ from tests.gateway.test_registry import binding, principal
 def configured(tmp_path):
     bindings = tuple(binding(tmp_path / name, name, enabled=name != "beta") for name in ("alpha", "beta", "gamma"))
     with ControlStore(tmp_path / "control") as store:
-        registry = ProfileRegistry(store, RegistryConfiguration(bindings))
-        yield registry, store, bindings
+        audit = AccessAuditStore(tmp_path / "audit-fixture")
+        try:
+            registry = ProfileRegistry(store, RegistryConfiguration(bindings))
+            registry._audit_store = audit
+            yield registry, store, bindings
+        finally:
+            audit.close()
 
 
 async def test_q3_page_scoped_keyset_and_disabled_record(configured):
@@ -139,7 +145,7 @@ def control_input(profile="alpha", *, key=None, generation=1, enable=False, reas
             expected_generation=generation,
         ),
     )
-    return ctx, command, AuditTicket(str(uuid4()), ctx.request_id)
+    return [ctx, command, AuditTicket(str(uuid4()), ctx.request_id)]
 
 
 async def publish_ok(ticket, outcome):
@@ -148,6 +154,13 @@ async def publish_ok(ticket, outcome):
 
 async def run_control(registry, args, leases, *, publish=publish_ok, now=None):
     ctx, command, ticket = args
+    existing = registry._store._request(ctx.principal.subject, command.profile_id, command.operation,
+                                        str(ctx.idempotency_key))
+    audit = registry._audit_store
+    if existing is None and audit._db.execute("SELECT 1 FROM access_audit WHERE id=?", (ticket.id,)).fetchone() is None:
+        ticket = await audit.begin(ctx, command.operation)
+        if isinstance(args, list):
+            args[2] = ticket
     return await registry.control(
         ctx,
         command,
@@ -166,6 +179,7 @@ async def test_q4_atomic_replay_scope_digest_and_real_audit(configured, tmp_path
     leases = ObservedLeases()
     args = control_input()
     audit = AccessAuditStore(tmp_path / "audit")
+    registry._audit_store = audit
     statements = []
     audit._db.set_trace_callback(statements.append)
     try:
@@ -187,13 +201,14 @@ async def test_q4_atomic_replay_scope_digest_and_real_audit(configured, tmp_path
             await run_control(registry, (denied, args[1], AuditTicket("x", denied.request_id)), leases)
         assert exc.value.code == "E_PERMISSION_DENIED"
         # Scope key includes profile, so the same key is independent on beta.
-        await run_control(registry, control_input("beta", key=args[0].idempotency_key, enable=True), leases)
+        await run_control(registry, control_input("beta", key=args[0].idempotency_key, enable=True), leases,
+                          publish=audit.publish_committed)
         assert len(store.journal(profile_ids=["alpha", "beta"])) == 2
         rows = audit.list(replace(args[0].principal, permissions=frozenset({"audit.read"})), "alpha")
         assert len(rows) == 1
-        assert audit._db.execute("SELECT COUNT(*) FROM access_audit").fetchone()[0] == 1
-        assert sum(query.startswith("INSERT INTO access_audit") for query in statements) == 1
-        assert sum(query.startswith("UPDATE access_audit") for query in statements) == 1
+        assert audit._db.execute("SELECT COUNT(*) FROM access_audit").fetchone()[0] == 2
+        assert sum(query.startswith("INSERT INTO access_audit") for query in statements) == 2
+        assert sum(query.startswith("UPDATE access_audit") for query in statements) == 2
         assert store.control_requests(limit=1) == ()
     finally:
         audit.close()
@@ -209,6 +224,7 @@ async def test_q4_ten_replays_and_concurrent_cas(configured):
     assert len(store.journal(profile_ids=["alpha"])) == 1 and leases.calls == 1
     with ControlStore(store.root) as second:
         other = ProfileRegistry(second, RegistryConfiguration(bindings))
+        other._audit_store = registry._audit_store
         results = await asyncio.gather(
             run_control(registry, control_input("beta", enable=True), leases),
             run_control(other, control_input("beta", enable=True), leases),
@@ -233,6 +249,7 @@ async def test_q4_live_two_connections_pending_and_bounded_recovery(configured):
         assert json.loads(rows[0]["response_snapshot"])["storage_root"] is None
         with ControlStore(store.root) as second:
             other = ProfileRegistry(second, RegistryConfiguration(bindings))
+            other._audit_store = registry._audit_store
             with pytest.raises(ControlError) as exc:
                 await run_control(other, args, leases)
             assert exc.value.code == "E_REQUEST_IN_PROGRESS"
@@ -276,6 +293,7 @@ async def test_q4_publish_failure_preserves_snapshot_original_ticket_and_reopen(
 
     with ControlStore(root) as reopened:
         again = ProfileRegistry(reopened, RegistryConfiguration(bindings))
+        again._audit_store = registry._audit_store
         sql = []
         reopened._connection.set_trace_callback(sql.append)
         assert await again.reconcile_control(leases=leases, publish=published, limit=1)
@@ -359,6 +377,7 @@ async def test_q4_crash_checkpoints_reopen(configured, phase):
     store.close()
     with ControlStore(root) as reopened:
         again = ProfileRegistry(reopened, RegistryConfiguration(bindings))
+        again._audit_store = registry._audit_store
         committed = phase == "after_control_commit"
         assert reopened._get("alpha").generation == (2 if committed else 1)
         assert len(reopened.journal(profile_ids=["alpha"])) == int(committed)
@@ -450,13 +469,16 @@ async def observed_daemon(tmp_path):
     settings = Settings(_env_file=None, outbox_poll_interval_seconds=0.01)
     bindings = tuple(make_binding(tmp_path / name, name, settings) for name in ("alpha", "beta"))
     with ControlStore(tmp_path / "control") as store:
+        audit = AccessAuditStore(tmp_path / "daemon-audit")
         registry = ProfileRegistry(store, RegistryConfiguration(bindings))
+        registry._audit_store = audit
         daemon = Daemon(registry, policies=BundlePolicies.capture(settings),
                         manager=RuntimeManager(factory_builder=factory))
         try:
             yield daemon, registry, store
         finally:
             await daemon.close_all()
+            audit.close()
 
 
 async def test_q5_snapshot_real_runtime_and_stop_without_lazy_open(observed_daemon, monkeypatch):
@@ -737,3 +759,43 @@ async def test_f3_page_and_record_roots_are_frozen_null(configured):
         record = await registry.record(actor, "alpha", permission=permission)
         assert record.canonical_root is page[0].storage_root is None
     assert store._get("alpha").canonical_root is not None
+
+
+@pytest.mark.parametrize("kind", ["fabricated", "terminal", "foreign", "wrong_request", "wrong_profile", "wrong_operation"])
+async def test_f5_q9_control_requires_owned_persisted_intent(configured, tmp_path, kind):
+    from memory_server.control.access_audit import AccessAuditStore
+    from memory_server.gateway_contracts.ports import AuditOutcome
+
+    registry, store, _ = configured
+    args = control_input()
+    leases = ObservedLeases()
+    with_audit = AccessAuditStore(tmp_path / "proof-audit")
+    foreign = AccessAuditStore(tmp_path / "foreign-audit")
+    registry._audit_store = with_audit
+    try:
+        ctx, command, ticket = args
+        intent_ctx = ctx
+        operation = command.operation
+        if kind == "wrong_request":
+            intent_ctx = replace(ctx, request_id="req_" + str(uuid4()))
+        if kind == "wrong_profile":
+            intent_ctx = replace(ctx, profile_id="beta")
+        if kind == "wrong_operation":
+            operation = "profiles.enable"
+        if kind != "fabricated":
+            owner = foreign if kind == "foreign" else with_audit
+            persisted = await owner.begin(intent_ctx, operation)
+            ticket = AuditTicket(persisted.id, ctx.request_id)
+            if kind == "terminal":
+                await owner.finish(persisted, AuditOutcome(200, None, (), 0))
+        before = store._connection.total_changes
+        with pytest.raises(ControlError) as exc:
+            await registry.control(ctx, command, ticket=ticket, leases=leases,
+                publish=publish_ok, now=datetime.now(timezone.utc), ttl_seconds=60)
+        assert exc.value.code == "E_AUDIT_UNAVAILABLE"
+        assert store._get("alpha").generation == 1
+        assert store._connection.total_changes == before
+        assert leases.calls == 0 and store.journal(profile_ids=["alpha"]) == ()
+    finally:
+        with_audit.close()
+        foreign.close()

@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.ports import (
@@ -36,6 +37,9 @@ from memory_server.paths import (
 )
 
 from .store import ControlError, ControlStore
+
+if TYPE_CHECKING:
+    from .access_audit import AccessAuditStore
 
 # Process-local exclusion only (workers=1), not a cross-process lock.
 _ACTIVE_CONTROLS: set[tuple[str, int]] = set()
@@ -72,8 +76,11 @@ class ProfileRegistry:
     profile.manage respectively. No wildcard grants or root-setting methods.
     """
 
-    def __init__(self, store: ControlStore, configuration: RegistryConfiguration) -> None:
+    def __init__(
+        self, store: ControlStore, configuration: RegistryConfiguration, *, audit_store: AccessAuditStore | None = None
+    ) -> None:
         self._store = store
+        self._audit_store = audit_store
         self._configuration = configuration
         self._reconcile_after = 0
         bindings: dict[str, ProfileBinding] = {}
@@ -288,6 +295,26 @@ class ProfileRegistry:
             # Cancellation still propagates, leaving the durable marker.
             pass
 
+    def _require_intent(self, ctx: RequestContext, operation: str, ticket: AuditTicket) -> None:
+        """Fail E_AUDIT_UNAVAILABLE unless our bound S05a store owns this intent.
+
+        This concrete composition check adds no AccessSink method. Replay uses
+        its original durable ticket and does not admit a new audited execution.
+        """
+        audit = self._audit_store
+        if audit is None or audit._db is None:
+            raise ControlError("E_AUDIT_UNAVAILABLE")
+        try:
+            row = audit._db.execute(
+                "SELECT 1 FROM access_audit WHERE id=? AND request_id=? AND state='intent' "
+                "AND token_id=? AND profile_id=? AND operation=? AND client_id IS ? LIMIT 1",
+                (ticket.id, ctx.request_id, ctx.principal.token_id, ctx.profile_id, operation, ctx.principal.client_id),
+            ).fetchone()
+        except sqlite3.Error:
+            raise ControlError("E_AUDIT_UNAVAILABLE") from None
+        if row is None:
+            raise ControlError("E_AUDIT_UNAVAILABLE")
+
     async def control(
         self,
         ctx: RequestContext,
@@ -356,6 +383,7 @@ class ProfileRegistry:
             now=now,
             capabilities=tuple(self._bindings[profile_id].profile.capabilities),
             eligible=eligible,
+            require_intent=lambda: self._require_intent(ctx, command.operation, ticket),
         )
         marker = (str(self._store.root), row["generation"])
         if row["phase"] == "final":
