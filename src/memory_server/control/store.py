@@ -262,6 +262,8 @@ class ControlStore:
         connection = self._connection
         if connection is None:
             raise ControlError("E_STORAGE")
+        if upper is not None and upper not in scope:
+            raise ControlError("E_VALIDATION")
         placeholders = ",".join("?" for _ in scope) or "NULL"
         try:
             # Deferred/read transaction: upper and rows use the same snapshot.

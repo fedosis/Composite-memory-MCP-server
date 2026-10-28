@@ -851,3 +851,15 @@ async def test_f6_replay_revalidates_principal_before_touching_port(configured, 
     assert exc.value.code in {"E_AUTH_REQUIRED", "E_PERMISSION_DENIED"}
     assert store._connection.total_changes == before
     assert len(store.journal(profile_ids=["alpha"])) == 1
+
+
+@pytest.mark.parametrize("scope", [("alpha",), ()])
+async def test_f7_page_never_echoes_foreign_upper(configured, scope):
+    registry, _, _ = configured
+    try:
+        page, upper = await registry.page(principal(*scope), limit=1, after="beta", upper="gamma")
+    except ControlError as exc:
+        assert exc.code == "E_VALIDATION"
+    else:
+        assert page == ()
+        assert upper == ("alpha" if scope else None)
