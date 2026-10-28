@@ -28,7 +28,8 @@ backlog.
 Pre-auth denials use a separate file/sequence/page budget (2000 rows, 4 MiB),
 never authenticated slots. Saturation drops denial recording, not requests.
 Exhaustion of authenticated storage is E_AUDIT_UNAVAILABLE.
-saturation() is the S06 gate input: keys "authenticated", "denials", "stale",
+saturation() is the S06 gate input: keys "authenticated" (segments or bytes),
+"bytes_saturated", "unknown_provenance_rows", "pinned_by_wall_clock", "denials", "stale",
 "age_seconds", "clock_lag_seconds" and "clock_suspect". Clock lag is
 max(0, now-watermark); suspect means raw lag > ttl and remains an admission
 signal while capacity cannot yet be reclaimed safely. "denials" is true on
@@ -307,6 +308,7 @@ class AccessAuditStore:
                 # SQLite recovers hot journals first; pending work is retried
                 # after restart before this store can serve.
                 self._scrub()
+            self._reconcile_abandoned_intents()
             os.fsync(self._fd)
             if not _denial_only:
                 try:
@@ -424,6 +426,19 @@ class AccessAuditStore:
         return self._insert(ctx.request_id, ctx.principal.token_id, ctx.principal.client_id,
                             ctx.profile_id, operation, "intent")
 
+    def _reconcile_abandoned_intents(self) -> None:
+        """Close intents left open by a previous process.
+
+        A crash between begin() and finish() leaves an intent this process can never
+        complete. It is closed as E_JOB_INTERRUPTED so retention can age it; finishing
+        it afterwards reports E_VERSION_CONFLICT, which is the truth.
+        """
+        self._db.execute(
+            "UPDATE access_audit SET state='terminal', result='E_JOB_INTERRUPTED'"
+            " WHERE state='intent' AND clock_id <> ?",
+            (_CLOCK_ID,),
+        )
+
     def _first_ageable_segment(self, db: sqlite3.Connection | None = None) -> int | None:
         """Oldest segment retention can still free.
 
@@ -433,7 +448,8 @@ class AccessAuditStore:
         """
         handle = self._db if db is None else db
         return handle.execute(
-            "SELECT MIN(segment) FROM access_audit WHERE boot_epoch <> '' AND booted_at > 0"
+            "SELECT MIN(segment) FROM access_audit"
+            " WHERE boot_epoch <> '' AND booted_at > 0 AND state = 'terminal'"
         ).fetchone()[0]
 
     def _bytes_full(self) -> bool:

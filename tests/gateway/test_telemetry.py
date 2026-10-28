@@ -992,6 +992,53 @@ def test_byte_capacity_is_visible_to_saturation(tmp_path, ctx, clock):
         store.close()
 
 
+def test_abandoned_intent_is_reconciled_and_never_pins_capacity(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10,
+                             segment_rows=2, max_segments=2)
+    ticket = begin(store, ctx)  # crash before finish: a different process wrote it
+    with sqlite3.connect(root / "access.sqlite") as writer:
+        writer.execute("UPDATE access_audit SET clock_id='previous-process' WHERE state='intent'")
+    store.close()
+
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10,
+                             segment_rows=2, max_segments=2)
+    try:
+        reconciled = rows(store)[0]
+        assert reconciled["state"] == "terminal"
+        assert reconciled["result"] == "E_JOB_INTERRUPTED"
+        # The stale ticket cannot be completed any more, and says so.
+        with pytest.raises(AuditError, match="E_VERSION_CONFLICT"):
+            run(store.finish(ticket, SUCCESS))
+        # Recording continues and the reconciled row is ageable evidence.
+        clock.wall += timedelta(seconds=11)
+        clock.boot += 11
+        assert store.retain() == 1
+        assert run(store.begin(ctx, "search")).id
+    finally:
+        store.close()
+
+
+def test_capacity_ignores_a_live_intent_that_cannot_be_aged(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10,
+                             segment_rows=2, max_segments=2)
+    try:
+        for _ in range(4):
+            run(store.finish(begin(store, ctx), SUCCESS))
+        with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
+            begin(store, ctx)
+        # An intent is not ageable, so the capacity view must not count it.
+        assert store._first_ageable_segment() == 0
+        clock.wall += timedelta(seconds=11)
+        clock.boot += 11
+        assert store.retain() == 4
+        live = begin(store, ctx)
+        assert live.id
+    finally:
+        store.close()
+
+
 def test_m3_wall_jump_never_expires_and_real_time_does(store, ctx, clock):
     old = begin(store, ctx)
     run(store.finish(old, SUCCESS))
