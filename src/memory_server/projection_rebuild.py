@@ -346,16 +346,13 @@ def _held_verification_handle(label: str):
         _OPEN_VERIFICATION_HANDLES.remove(label)
 
 
-_SHARED_NODE_ID_ROUTER = GraphRouter()
-
-
 def _normalized_node_id(value: object) -> str:
     """The pinned A.3.2 node-id normalization (``GraphRouter._to_node_id``)."""
-    return _SHARED_NODE_ID_ROUTER._to_node_id(str(value))
+    return GraphRouter._to_node_id(str(value))
 
 
 def _prefixed_node_id(prefix: str, value: object) -> str:
-    return _SHARED_NODE_ID_ROUTER._to_node_id(f"{prefix}{value}")
+    return GraphRouter._to_node_id(f"{prefix}{value}")
 
 
 def expected_projection(records: Sequence[CanonicalProjectionRecord]) -> ExpectedProjection:

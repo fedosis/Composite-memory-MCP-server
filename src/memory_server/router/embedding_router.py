@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 from memory_server.providers.embedding_provider import (
     EmbeddingProvider,
-    MockEmbeddingProvider,
 )
 from memory_server.providers.exceptions import ProviderSearchError
 from memory_server.router.rules import RoutingRuleSet
@@ -52,8 +51,10 @@ class EmbeddingRouter:
         rules: RoutingRuleSet | None = None,
         collection: str = DEFAULT_COLLECTION,
     ) -> None:
+        if vector_provider is None or embedder is None:
+            raise ValueError("E_CAPABILITY_UNAVAILABLE")
         self._vector_provider = vector_provider
-        self._embedder = embedder or MockEmbeddingProvider()
+        self._embedder = embedder
         self._rules = rules or RoutingRuleSet.default()
         self._collection = collection
 
@@ -87,10 +88,7 @@ class EmbeddingRouter:
         rule_result = self._rules.evaluate(query)
         if rule_result is not None:
             logger.info(
-                "Query '%s' matched rule '%s' -> route '%s'",
-                query,
-                rule_result.rule_name,
-                rule_result.route,
+                "routing rule matched",
             )
             return {
                 "rule_match": {
@@ -101,7 +99,7 @@ class EmbeddingRouter:
             }
 
         # Step 2: Semantic search
-        logger.info("No rule match for '%s' — falling through to semantic search", query)
+        logger.info("routing semantic search")
         results = await self.search(query, top_k=top_k, score_threshold=score_threshold)
         return {
             "semantic_results": results,
@@ -129,7 +127,7 @@ class EmbeddingRouter:
 
         # Embed the query
         vector = self._embedder.embed(query)
-        logger.debug("Embedded query '%s' to %d-dim vector", query[:50], len(vector))
+        logger.debug("embedding dimensions=%d", len(vector))
 
         # Search vector store — a search failure degrades to a logged []
         # instead of escaping to server/hermes. Embed failures above stay
@@ -143,18 +141,18 @@ class EmbeddingRouter:
             )
         except ProviderSearchError as exc:
             logger.warning(
-                "embedding search failed (%s): %s", type(exc).__name__, exc
+                "embedding search failed (%s)", type(exc).__name__
             )
             return []
         except Exception as exc:
             logger.warning(
-                "embedding search failed (unexpected %s): %s",
-                type(exc).__name__, exc,
+                "embedding search failed (unexpected %s)",
+                type(exc).__name__,
             )
             return []
         logger.debug(
-            "semantic_search: query=%r top_k=%d found=%d provider=%s",
-            query, top_k, len(results),
+            "semantic_search: top_k=%d found=%d provider=%s",
+            top_k, len(results),
             type(self._vector_provider).__name__,
         )
         return results
