@@ -198,11 +198,20 @@ def test_dml_shapes_cas_and_terminal_immutability(store, ctx, clock):
         s.startswith("UPDATE access_audit") or s.startswith("UPDATE maintenance_state")
         for s in updates
     )
+    deletes = [s for s in dml if s.startswith("DELETE")]
+    audit_deletes = [s for s in deletes if s.startswith("DELETE FROM access_audit")]
+    frontier_deletes = [
+        s for s in deletes if s.startswith("DELETE FROM maintenance_scrub_frontier")
+    ]
+    assert audit_deletes
+    assert frontier_deletes
+    assert len(deletes) == len(audit_deletes) + len(frontier_deletes)
     assert all(
         "DELETE FROM access_audit WHERE created_at < " in s
         and "retention_at < " in s and "AND seq IN" in s and "LIMIT 500" in s
-        for s in dml if s.startswith("DELETE")
+        for s in audit_deletes
     )
+    assert all(" WHERE id=" in s for s in frontier_deletes)
 
 
 def test_public_projection_and_search_canaries(store, ctx, tmp_path, caplog):
