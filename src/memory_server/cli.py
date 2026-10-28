@@ -55,6 +55,10 @@ from memory_server.control.token_cli import app as token_app  # noqa: E402
 
 app.add_typer(token_app, name="token")
 
+from memory_server.runtime.daemon_cli import daemon as daemon_command  # noqa: E402
+
+app.command(name="daemon")(daemon_command)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
