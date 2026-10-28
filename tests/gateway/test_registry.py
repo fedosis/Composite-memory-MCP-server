@@ -169,6 +169,36 @@ async def test_disabled_cas_metadata_journal_reopen(setup):
             assert len(reopened.journal(profile_ids=["alpha"])) == 2
 
 
+class _Token(int):
+    """int subclass so identity, not equality, can be asserted on the bound parameter."""
+
+
+def test_cas_predicate_binds_client_expectation(setup, monkeypatch):
+    # If the UPDATE bound the row's own generation instead of the client's expectation,
+    # the last parameter would be a plain int and this identity check would fail.
+    registry, store, error, _ = setup
+
+    class Recording:
+        def __init__(self, inner):
+            self.inner = inner
+            self.calls = []
+
+        def execute(self, sql, params=()):
+            self.calls.append((sql, params))
+            return self.inner.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    recorder = Recording(store._connection)
+    monkeypatch.setattr(store, "_connection", recorder)
+    token = _Token(1)
+    store._mutate("alpha", expected_generation=token, operation="enabled", enabled=False)
+    updates = [params for sql, params in recorder.calls if sql.lstrip().startswith("UPDATE profiles")]
+    assert updates, "no UPDATE profiles statement was issued"
+    assert updates[-1][-1] is token
+
+
 def test_concurrent_cas_real_connections(setup):
     registry, store, error, bindings = setup
     registry_cls, configuration, _, store_cls = api()
