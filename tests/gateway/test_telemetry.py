@@ -71,6 +71,54 @@ def rows(store):
     return store._db.execute("SELECT * FROM access_audit ORDER BY seq").fetchall()
 
 
+def test_f1_denial_flood_isolated_and_dropped(tmp_path, ctx, clock):
+    store = AccessAuditStore(tmp_path / "audit", clock=clock.now, segment_rows=2, max_segments=2,
+                             denial_segment_rows=2, denial_max_segments=1)
+    try:
+        for _ in range(2):
+            assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is not None
+        assert store.saturation()["denials"] is True
+        for _ in range(100):
+            assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
+        assert store.dropped_denials == 100
+        assert store.saturation()["authenticated"] is False
+        for _ in range(4):
+            run(store.finish(begin(store, ctx), SUCCESS))
+        assert [r["segment"] for r in rows(store)] == [0, 0, 1, 1]
+        assert store.saturation()["authenticated"] is True
+        with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
+            begin(store, ctx)
+        assert store._denials._db.execute("SELECT COUNT(*) FROM access_audit").fetchone()[0] == 2
+        clock.wall += timedelta(days=31)
+        assert store.retain() == 6
+        assert store.saturation() == {"authenticated": False, "denials": False}
+    finally:
+        store.close()
+
+
+def test_f1_denials_do_not_consume_authenticated_segments(tmp_path, ctx):
+    store = AccessAuditStore(tmp_path / "audit", segment_rows=2, max_segments=2)
+    try:
+        for _ in range(20):
+            run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED"))
+        assert begin(store, ctx).id
+        assert len(rows(store)) == 1
+    finally:
+        store.close()
+
+
+def test_f1_defaults_follow_retention(tmp_path, clock):
+    stores = [AccessAuditStore(tmp_path / str(days), clock=clock.now, ttl_seconds=days * 86400)
+              for days in (30, 60)]
+    try:
+        assert stores[0].max_segments == 27
+        assert stores[1].max_segments == 53
+        assert stores[0].segment_rows * (stores[0].max_segments - 1) >= 30 * 86400 / 10
+    finally:
+        for store in stores:
+            store.close()
+
+
 def test_intent_before_real_sqlite_effect_and_insert_failure(store, ctx, tmp_path):
     domain = sqlite3.connect(tmp_path / "domain.sqlite")
     domain.execute("CREATE TABLE effects (id INTEGER PRIMARY KEY)")
@@ -138,7 +186,7 @@ def test_public_projection_and_search_canaries(store, ctx, tmp_path, caplog):
 def test_unauthenticated_has_no_identity(store, ctx, caplog, tmp_path):
     assert set(inspect.signature(store.record_unauthenticated).parameters) == {"request_id", "reason"}
     ticket = run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED"))
-    row = rows(store)[0]
+    row = rows(store._denials)[0]
     assert row["id"] == ticket.id
     assert row["request_id"] == ctx.request_id
     assert row["result"] == "E_AUTH_REQUIRED"

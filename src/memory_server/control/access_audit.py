@@ -1,9 +1,14 @@
 """Private append-only access log; no payloads, credentials or exception text.
 
-Logical segments contain at most segment_rows rows. At most max_segments live
-segments are admitted; unexpired history is never evicted to admit a request.
-SQLite max_page_count additionally bounds physical growth (default 64 MiB).
-Exhaustion is E_AUDIT_UNAVAILABLE. Only retention can reclaim expired rows.
+Logical segments contain at most segment_rows rows; unexpired history is never
+evicted. The authenticated default budgets one row / 10 s across the TTL:
+30 * 86400 / 10 = 259200 rows; ceil(259200 / 10000) + 1 = 27 segments.
+The spare segment covers partial-segment retention; retain must run at least
+once per segment interval. Higher audited rates need explicit capacity planning.
+SQLite max_page_count additionally bounds physical growth (default 256 MiB).
+Pre-auth denials use a separate file/sequence/page budget (2000 rows, 4 MiB),
+never authenticated slots. Saturation drops denial recording, not requests.
+Exhaustion of authenticated storage is E_AUDIT_UNAVAILABLE.
 S06 owns route integration, S12 owns the atomic canonical outcome journal.
 """
 
@@ -69,20 +74,29 @@ class AccessAuditStore:
         monotonic: Callable[[], float] = time.monotonic,
         ttl_seconds: float = 30 * 86400,
         segment_rows: int = 10000,
-        max_segments: int = 8,
-        max_bytes: int = 64 * 1024 * 1024,
+        max_segments: int | None = None,
+        max_bytes: int = 256 * 1024 * 1024,
+        denial_segment_rows: int = 1000,
+        denial_max_segments: int = 2,
+        _denial_only: bool = False,
     ) -> None:
         if (
             not math.isfinite(ttl_seconds) or ttl_seconds <= 0
             or type(segment_rows) is not int or segment_rows < 1
-            or type(max_segments) is not int or max_segments < 1
+            or (max_segments is not None and (type(max_segments) is not int or max_segments < 1))
+            or type(denial_segment_rows) is not int or denial_segment_rows < 1
+            or type(denial_max_segments) is not int or denial_max_segments < 1
             or type(max_bytes) is not int or max_bytes < 65536
         ):
             raise AuditError("E_VALIDATION")
         self.clock, self.monotonic = clock, monotonic
         self.ttl_seconds = ttl_seconds
-        self.segment_rows, self.max_segments = segment_rows, max_segments
+        self.segment_rows = segment_rows
+        self.max_segments = max_segments if max_segments is not None else math.ceil(ttl_seconds / 10 / segment_rows) + 1
         self._lock = RLock()
+        self._denials = None
+        self.dropped_denials = 0  # local diagnostic counter; not a new C9 family
+        self._denial_failed = False
         self.rollback_refusals = 0
         self._fd = None
         self._db = None
@@ -127,6 +141,15 @@ class AccessAuditStore:
                     started REAL NOT NULL, clock_id TEXT NOT NULL)""")
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
             os.fsync(self._fd)
+            if not _denial_only:
+                try:
+                    self._denials = AccessAuditStore(
+                        Path(root) / "denials", clock=clock, monotonic=monotonic, ttl_seconds=ttl_seconds,
+                        segment_rows=denial_segment_rows, max_segments=denial_max_segments,
+                        max_bytes=4 * 1024 * 1024, _denial_only=True,
+                    )
+                except AuditError:
+                    self._denial_failed = True
         except (OSError, sqlite3.Error, ControlError):
             self.close()
             raise AuditError() from None
@@ -136,6 +159,9 @@ class AccessAuditStore:
 
     def close(self) -> None:
         with self._lock:
+            if self._denials is not None:
+                self._denials.close()
+                self._denials = None
             if self._db is not None:
                 self._db.close()
                 self._db = None
@@ -201,13 +227,44 @@ class AccessAuditStore:
         return self._insert(ctx.request_id, ctx.principal.token_id, ctx.principal.client_id,
                             ctx.profile_id, operation, "intent")
 
-    async def record_unauthenticated(self, request_id: str, reason: ErrorCode) -> AuditTicket:
-        """No Principal or submitted identity is accepted on this off-protocol seam."""
+    def _segment_full(self) -> bool:
+        seq_row = self._db.execute("SELECT seq FROM sqlite_sequence WHERE name='access_audit'").fetchone()
+        segment = (seq_row[0] if seq_row else 0) // self.segment_rows
+        first = self._db.execute("SELECT MIN(segment) FROM access_audit").fetchone()[0]
+        return first is not None and segment - first >= self.max_segments
+
+    def saturation(self) -> dict[str, bool]:
+        """S06 admission probe, not a reservation; unavailable storage is saturated.
+
+        dropped_denials is a process-local monotonic diagnostic counter. No new
+        metric family is exported: C9's wire vocabulary remains unchanged.
+        """
+        with self._lock:
+            try:
+                authenticated = self._db is None or self._segment_full()
+            except sqlite3.Error:
+                authenticated = True
+            denials = self._denial_failed or self._denials is None
+            if self._denials is not None:
+                denials = denials or self._denials.saturation()["authenticated"]
+            return {"authenticated": authenticated, "denials": denials}
+
+    async def record_unauthenticated(self, request_id: str, reason: ErrorCode) -> AuditTicket | None:
+        """Best effort off-protocol seam; None means dropped, never request denial."""
         if reason != "E_AUTH_REQUIRED":
             raise AuditError("E_VALIDATION")
-        ticket = self._insert(request_id, None, None, None, "authentication", "intent")
-        await self.finish(ticket, AuditOutcome(401, reason, (), 0.0))
-        return ticket
+        _check(request_id, _REQUEST)
+        with self._lock:
+            try:
+                if self._denials is None:
+                    raise AuditError()
+                ticket = self._denials._insert(request_id, None, None, None, "authentication", "intent")
+                await self._denials.finish(ticket, AuditOutcome(401, reason, (), 0.0))
+                return ticket
+            except AuditError:
+                self.dropped_denials += 1
+                self._denial_failed = True
+                return None
 
     async def finish(self, ticket: AuditTicket, outcome: AuditOutcome) -> None:
         if (type(outcome.status) is not int or not 100 <= outcome.status <= 599
@@ -311,8 +368,15 @@ class AccessAuditStore:
                     os.close(fd)
                 os.replace("retention.next", "retention.watermark", src_dir_fd=self._fd, dst_dir_fd=self._fd)
                 os.fsync(self._fd)
-                return self._db.execute(
+                removed = self._db.execute(
                     "DELETE FROM access_audit WHERE created_at < ?", (now - self.ttl_seconds,),
                 ).rowcount
+            if self._denials is not None:
+                try:
+                    removed += self._denials.retain()
+                    self._denial_failed = False
+                except AuditError:
+                    self._denial_failed = True
+            return removed
         except OSError:
             raise AuditError() from None
