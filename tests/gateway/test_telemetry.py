@@ -119,9 +119,13 @@ def test_f1_denial_flood_isolated_and_dropped(tmp_path, ctx, clock):
             begin(store, ctx)
         assert store._denials._db.execute("SELECT COUNT(*) FROM access_audit").fetchone()[0] == 2
         assert retain_elapsed(store, clock, days=31) == 6
-        assert store.saturation() == {"authenticated": False, "denials": True}
+        state = store.saturation()
+        assert state["authenticated"] is False and state["denials"] is True
+        assert state["stale"] is False and state["age_seconds"] >= 0
         assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is not None
-        assert store.saturation() == {"authenticated": False, "denials": False}
+        state = store.saturation()
+        assert state["authenticated"] is False and state["denials"] is False
+        assert state["stale"] is False and state["age_seconds"] >= 0
     finally:
         store.close()
 
@@ -732,6 +736,36 @@ def test_n1_concurrent_denial_and_authenticated_writes(store, ctx):
     assert all(r["state"] == "terminal" for target in (store, store._denials) for r in rows(target))
 
 
+def test_m2_saturation_snapshot_never_waits_for_denial_writer(store, ctx, tmp_path):
+    entered = Event()
+    blocker = sqlite3.connect(tmp_path / "audit" / "denials" / "access.sqlite")
+    blocker.execute("BEGIN IMMEDIATE")
+    store._denials._db.set_trace_callback(
+        lambda sql: entered.set() if sql == "BEGIN IMMEDIATE" else None
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            denial = pool.submit(
+                run, store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")
+            )
+            assert entered.wait(2)
+            started = time.perf_counter()
+            probe = pool.submit(store.saturation)
+            try:
+                state = probe.result(timeout=0.05)
+                elapsed = time.perf_counter() - started
+            finally:
+                blocker.rollback()
+            assert denial.result(timeout=2) is not None
+        print(f"M2 blocked-writer saturation={elapsed:.6f}s bound=0.050s state={state}")
+        assert elapsed < 0.05
+        assert state["denials"] is True
+        assert state["stale"] is True
+        assert state["age_seconds"] >= 0
+    finally:
+        blocker.close()
+
+
 def test_n2_forward_step_bounded_and_converges(store, ctx, clock, tmp_path):
     original = clock.wall
     first = begin(store, ctx)
@@ -816,9 +850,13 @@ def test_n3_total_drop_never_healthy_across_retention(store, ctx):
     break_denial_inserts(store)
     for _ in range(5):
         assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
-        assert store.saturation() == {"authenticated": False, "denials": True}
+        state = store.saturation()
+        assert state["authenticated"] is False and state["denials"] is True
+        assert state["stale"] is False and state["age_seconds"] >= 0
         store.retain()
-        assert store.saturation() == {"authenticated": False, "denials": True}
+        state = store.saturation()
+        assert state["authenticated"] is False and state["denials"] is True
+        assert state["stale"] is False and state["age_seconds"] >= 0
     assert store.dropped_denials == 5
     assert rows(store._denials) == []
 

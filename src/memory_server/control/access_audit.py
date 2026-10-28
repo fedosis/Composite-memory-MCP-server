@@ -22,10 +22,13 @@ an explicit 2048 KiB page-cache target (4096 KiB for the pair, not a process RSS
 Pre-auth denials use a separate file/sequence/page budget (2000 rows, 4 MiB),
 never authenticated slots. Saturation drops denial recording, not requests.
 Exhaustion of authenticated storage is E_AUDIT_UNAVAILABLE.
-saturation() is the S06 gate input: exact keys "authenticated" and "denials".
-"denials" is true on failure, capacity exhaustion, or durable losses since the
-last observation; retain() cannot clear write failure. Only a successful denial
-write clears the durable failing flag. No new C9 metric family is introduced.
+saturation() is the S06 gate input: keys "authenticated", "denials", "stale"
+and "age_seconds" (plus clock keys documented below). "denials" is true on
+failure, capacity exhaustion, a busy writer, or durable losses since the last
+observation. Denial state is an immutable lock-free snapshot; an opportunistic
+read-only timeout-zero connection refreshes it, while stale/age_seconds expose
+the last successful refresh. retain() cannot clear write failure. Only a
+successful denial write clears the durable failing flag. No new C9 family exists.
 If both denial-health database writes fail, a private, fsynced marker beside the
 denial database preserves the loss across restart. If both that database and its
 directory are unwritable, only the process-local fail-closed signal can remain.
@@ -131,6 +134,8 @@ class AccessAuditStore:
         self._denials = None
         self._observed_denial_drops = 0
         self._denial_failed = False
+        self._denial_write_inflight = False
+        self._denial_snapshot = (True, 0, time.monotonic(), True)
         self.rollback_refusals = 0
         self._fd = None
         self._db = None
@@ -267,6 +272,7 @@ class AccessAuditStore:
                         segment_rows=denial_segment_rows, max_segments=denial_max_segments,
                         max_bytes=4 * 1024 * 1024, max_clock_step=max_clock_step, _denial_only=True,
                     )
+                    self._refresh_denial_snapshot()
                 except _DenialHealthTamperError:
                     # Missing durable loss evidence is tamper, not an optional
                     # denial-recorder outage: never serve through the parent.
@@ -366,31 +372,74 @@ class AccessAuditStore:
         first = self._db.execute("SELECT MIN(segment) FROM access_audit").fetchone()[0]
         return first is not None and segment - first >= self.max_segments
 
-    def saturation(self) -> dict[str, bool]:
+    def saturation(self) -> dict[str, bool | float]:
         """S06 admission probe, not a reservation; unavailable storage is saturated.
 
-        Exact S06 keys: authenticated, denials. Durable losses are observed once
-        per store instance, including after restart; ongoing failure stays true.
-        Retention cannot acknowledge losses or prove recovery of denial writes.
+        Denial snapshot keys include denials, stale and age_seconds. Durable
+        losses are observed once per store instance, including after restart;
+        ongoing or busy writes stay true. Retention cannot acknowledge losses.
         """
         with self._lock:
             try:
                 authenticated = self._db is None or self._segment_full()
             except sqlite3.Error:
                 authenticated = True
-        # A slow denial probe must not hold the authenticated lock either.
-        denials = self._denial_failed or self._denials is None
-        if self._denials is not None:
-            target = self._denials
-            with target._lock:
-                try:
-                    dropped, failing = target._health()
-                    denials = (denials or bool(failing) or dropped > self._observed_denial_drops
-                               or target._segment_full())
-                    self._observed_denial_drops = dropped
-                except (AuditError, sqlite3.Error):
-                    denials = True
-        return {"authenticated": authenticated, "denials": denials}
+        self._refresh_denial_snapshot()
+        denial_state, _, observed_at, stale = self._denial_snapshot
+        inflight = self._denial_write_inflight
+        return {
+            "authenticated": authenticated,
+            "denials": bool(denial_state or inflight or self._denial_failed),
+            "stale": bool(stale or inflight),
+            "age_seconds": max(0.0, time.monotonic() - observed_at),
+        }
+
+    def _refresh_denial_snapshot(self) -> None:
+        """Opportunistic timeout-zero read; publish failure conservatively."""
+        target = self._denials
+        previous = self._denial_snapshot
+        if target is None or target._fd is None:
+            self._denial_snapshot = (True, previous[1], previous[2], True)
+            return
+        reader = None
+        try:
+            reader = sqlite3.connect(
+                f"file:/proc/self/fd/{target._fd}/access.sqlite?mode=ro",
+                uri=True, isolation_level=None, timeout=0, check_same_thread=False,
+            )
+            reader.execute("PRAGMA busy_timeout=0")
+            health = reader.execute(
+                "SELECT dropped,failing FROM denial_health WHERE id=1"
+            ).fetchone()
+            if health is None:
+                raise AuditError()
+            marker_dropped, marker_failing = target._denial_failure_marker()
+            dropped = health[0] + marker_dropped
+            seq_row = reader.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='access_audit'"
+            ).fetchone()
+            segment = ((seq_row[0] if seq_row else 0) // target.segment_rows)
+            first = reader.execute("SELECT MIN(segment) FROM access_audit").fetchone()[0]
+            full = first is not None and segment - first >= target.max_segments
+            new_loss = dropped > self._observed_denial_drops
+            if new_loss:
+                self._observed_denial_drops = dropped
+            self._denial_snapshot = (
+                bool(health[1] or marker_failing or full or new_loss),
+                dropped,
+                time.monotonic(),
+                False,
+            )
+        except (AuditError, OSError, sqlite3.Error):
+            self._denial_snapshot = (True, previous[1], previous[2], True)
+        finally:
+            if reader is not None:
+                reader.close()
+
+    def _mark_denial_write_inflight(self) -> None:
+        denial_state, dropped, observed_at, _ = self._denial_snapshot
+        self._denial_write_inflight = True
+        self._denial_snapshot = (bool(denial_state), dropped, observed_at, True)
 
     def _health(self) -> tuple[int, int]:
         """Denial store only, under its own lock; no authenticated I/O."""
@@ -503,32 +552,39 @@ class AccessAuditStore:
             raise AuditError("E_VALIDATION")
         _check(request_id, _REQUEST)
         # Never enter the authenticated lock/connection/sidecar on this path.
+        self._mark_denial_write_inflight()
         try:
-            if self._denials is None:
-                raise AuditError()
-            ticket = self._denials._insert(request_id, None, None, None, "authentication", "intent")
-            await self._denials.finish(ticket, AuditOutcome(401, reason, (), 0.0))
-        except AuditError:
-            self._denial_failed = True
-            if self._denials is not None:
-                try:
-                    self._denials._record_denial_health(dropped=True)
-                except AuditError:
-                    try:
-                        self._denials._record_denial_failure_fallback(dropped=True)
-                    except AuditError:
-                        pass  # DB and marker unavailable: process-local gate stays fail-closed
-            return None
-        try:
-            self._denials._record_denial_health(dropped=False)
-            self._denial_failed = False
-        except AuditError:
-            self._denial_failed = True
             try:
-                self._denials._record_denial_failure_fallback(dropped=False)
+                if self._denials is None:
+                    raise AuditError()
+                ticket = self._denials._insert(
+                    request_id, None, None, None, "authentication", "intent"
+                )
+                await self._denials.finish(ticket, AuditOutcome(401, reason, (), 0.0))
             except AuditError:
-                pass  # DB and marker unavailable: process-local gate stays fail-closed
-        return ticket
+                self._denial_failed = True
+                if self._denials is not None:
+                    try:
+                        self._denials._record_denial_health(dropped=True)
+                    except AuditError:
+                        try:
+                            self._denials._record_denial_failure_fallback(dropped=True)
+                        except AuditError:
+                            pass  # process-local gate stays fail-closed
+                return None
+            try:
+                self._denials._record_denial_health(dropped=False)
+                self._denial_failed = False
+            except AuditError:
+                self._denial_failed = True
+                try:
+                    self._denials._record_denial_failure_fallback(dropped=False)
+                except AuditError:
+                    pass  # process-local gate stays fail-closed
+            return ticket
+        finally:
+            self._refresh_denial_snapshot()
+            self._denial_write_inflight = False
 
     async def finish(self, ticket: AuditTicket, outcome: AuditOutcome) -> None:
         if (type(outcome.status) is not int or not 100 <= outcome.status <= 599
