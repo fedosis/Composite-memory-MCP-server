@@ -272,11 +272,6 @@ class AccessAuditStore:
                 # SQLite recovers hot journals first; pending work is retried
                 # after restart before this store can serve.
                 self._scrub()
-                if scrub_pending:
-                    with self._transaction(db=self._maintenance_db):
-                        self._maintenance_db.execute(
-                            "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
-                        )
             os.fsync(self._fd)
             if not _denial_only:
                 try:
@@ -920,64 +915,73 @@ class AccessAuditStore:
                 os.close(fd)
 
     def _scrub(self) -> None:
-        """Complete mandatory bounded scrubbing, then optional compaction."""
+        """Scrub, compact if due, and clear pending in one maintenance commit."""
         db = self._maintenance_db
         if db is None:
             raise AuditError()
         try:
-            cursor = db.execute(
-                "SELECT scrub_cursor FROM maintenance_state WHERE id=1"
-            ).fetchone()[0]
+            self._remove_stale_journal(db)
             # The persisted frontier starts at sqlite_schema rootpages; pointer-map,
             # overflow and freelist pages can never enter the btree parser.
             with self._transaction(db=db, exclusive=True):
+                cursor = db.execute(
+                    "SELECT scrub_cursor FROM maintenance_state WHERE id=1"
+                ).fetchone()[0]
                 self._scrub_freelist_pages(db, _VACUUM_PAGES // 2)
                 next_cursor = self._scrub_btree_slack(
                     db, cursor, _VACUUM_PAGES // 2
                 )
-            # This SQLite commit bumps the change counter so other connections
-            # invalidate clean cached pages after the safe direct slack writes.
-            with self._transaction(db=db):
                 db.execute(
                     "UPDATE maintenance_state SET scrub_cursor=? WHERE id=1",
                     (next_cursor,),
                 )
-            self._compact(db)
-            with self._transaction(db=db, exclusive=True):
-                try:
-                    fd = os.open("access.sqlite-journal", os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                 dir_fd=self._fd)
-                except FileNotFoundError:
-                    return
-                try:
-                    info = os.fstat(fd)
-                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                            or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
-                        raise AuditError()
-                    os.ftruncate(fd, 0)
-                    os.fsync(fd)
-                    os.unlink("access.sqlite-journal", dir_fd=self._fd)
-                    os.fsync(self._fd)
-                finally:
-                    os.close(fd)
+                self._compact(db)
+                db.execute(
+                    "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
+                )
+            # The commit bumps the change counter, invalidating clean page caches
+            # after safe slack writes, and SQLite removes its own journal.
         except (sqlite3.Error, OSError):
             raise AuditError() from None
 
-    def _compact(self, db: sqlite3.Connection) -> None:
-        """Rate-limit incremental vacuum durably, including across restart."""
-        now = time.time()
-        with self._transaction(db=db):
-            free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
-            last_vacuum = db.execute(
-                "SELECT last_vacuum FROM maintenance_state WHERE id=1"
-            ).fetchone()[0]
-            if (free_pages <= _VACUUM_MIN_FREE_PAGES
-                    or now < last_vacuum + _VACUUM_INTERVAL_SECONDS):
+    def _remove_stale_journal(self, db: sqlite3.Connection) -> None:
+        """Remove only a journal that predates the maintenance transaction."""
+        try:
+            os.stat("access.sqlite-journal", dir_fd=self._fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        with self._transaction(db=db, exclusive=True):
+            try:
+                fd = os.open("access.sqlite-journal", os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=self._fd)
+            except FileNotFoundError:
                 return
-            db.execute(f"PRAGMA incremental_vacuum({_VACUUM_PAGES})")
-            db.execute(
-                "UPDATE maintenance_state SET last_vacuum=? WHERE id=1", (now,)
-            )
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                    raise AuditError()
+                os.ftruncate(fd, 0)
+                os.fsync(fd)
+                os.unlink("access.sqlite-journal", dir_fd=self._fd)
+                os.fsync(self._fd)
+            finally:
+                os.close(fd)
+
+    def _compact(self, db: sqlite3.Connection) -> None:
+        """Rate-limit incremental vacuum inside the caller's transaction."""
+        now = time.time()
+        free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
+        last_vacuum = db.execute(
+            "SELECT last_vacuum FROM maintenance_state WHERE id=1"
+        ).fetchone()[0]
+        if (free_pages <= _VACUUM_MIN_FREE_PAGES
+                or now < last_vacuum + _VACUUM_INTERVAL_SECONDS):
+            return
+        db.execute(f"PRAGMA incremental_vacuum({_VACUUM_PAGES})")
+        db.execute(
+            "UPDATE maintenance_state SET last_vacuum=? WHERE id=1", (now,)
+        )
 
     def migrate_incremental_vacuum(self) -> None:
         """Explicit administrator-only full rewrite for legacy NONE-mode stores."""
@@ -1017,10 +1021,6 @@ class AccessAuditStore:
                 ).fetchone()[0]
                 if pending:
                     self._scrub()
-                    with self._transaction(db=db):
-                        db.execute(
-                            "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
-                        )
                 with self._transaction(db=db):
                     watermark = self._watermark(db)
                     if now < watermark:
@@ -1049,10 +1049,6 @@ class AccessAuditStore:
                         )
                 if removed:
                     self._scrub()
-                    with self._transaction(db=db):
-                        db.execute(
-                            "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
-                        )
             if self._denials is not None:
                 try:
                     removed += self._denials.retain()

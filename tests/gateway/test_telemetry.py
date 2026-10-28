@@ -1147,14 +1147,14 @@ def test_m1_deleting_retain_auth_p95_bounded(tmp_path, ctx, clock):
         root, clock=clock.now, ttl_seconds=10,
         segment_rows=1_000_000_000, max_segments=2,
     )
-    insert_retention_fixture(store, root, clock, 4000, payload_size=4096)
+    insert_retention_fixture(store, root, clock, 10000, payload_size=4096)
     assert (root / "access.sqlite").stat().st_size > 16 * 1024 * 1024
     clock.wall += timedelta(seconds=11)
     assert [store.retain() for _ in range(8)] == [0] * 8
     timings = []
     removed = []
     try:
-        for _ in range(8):
+        for _ in range(20):
             delete_started = Event()
             store._maintenance_db.set_trace_callback(
                 lambda sql: delete_started.set()
@@ -1169,9 +1169,9 @@ def test_m1_deleting_retain_auth_p95_bounded(tmp_path, ctx, clock):
                 removed.append(retaining.result(timeout=2))
         p95 = statistics.quantiles(timings, n=100, method="inclusive")[94]
         print(f"M1 auth begin+finish ms={timings}; p95={p95:.3f}; bound=50.000")
-        assert removed == [500] * 8
+        assert removed == [500] * 20
         assert p95 < 50
-        assert len(rows(store)) == 8
+        assert len(rows(store)) == 20
     finally:
         store.close()
 
