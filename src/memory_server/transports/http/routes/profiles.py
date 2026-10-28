@@ -287,6 +287,9 @@ class ProfilePort(GatewayPort):
         control_reply.set(None)
         operation = command.operation
         try:
+            ticket = audit_ticket.get()
+            if operation in {"profiles.list", "profiles.get", "profiles.enable", "profiles.disable"} and ticket is None:
+                _fail("E_AUDIT_UNAVAILABLE")
             if operation == "profiles.list":
                 return await self._list(ctx, command)
             if operation == "profiles.get":
@@ -297,9 +300,6 @@ class ProfilePort(GatewayPort):
             if operation in {"profiles.enable", "profiles.disable"}:
                 if self.dependencies.leases is None or self.pending_control is None:
                     _fail("E_CAPABILITY_UNAVAILABLE")
-                ticket = audit_ticket.get()
-                if ticket is None:
-                    _fail("E_AUDIT_UNAVAILABLE")
                 # Recovery gates new effects inside registry.control; it must not
                 # prevent replay of a final, still-pending publication snapshot.
                 await self.dependencies.registry.reconcile_control(
