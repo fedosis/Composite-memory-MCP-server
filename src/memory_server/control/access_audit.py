@@ -12,18 +12,19 @@ SQLite max_page_count caps the authenticated file at 256 MiB, with 4 MiB for
 denials (260 MiB total database budget). These are disk, not RAM guarantees;
 large metadata may hit the byte cap first and fail closed. Each connection has
 an explicit 2048 KiB page-cache target (4096 KiB for the pair, not a process RSS
-limit); lists materialize at most 200 rows. Retention deletes at most 500 rows
+limit); lists materialize at most 200 rows. Retention deletes at most 200 rows
 per stream and call on a separate maintenance connection/lock. New databases
 use incremental auto-vacuum. Every scrub obligation cleans a bounded window of
-8 freelist and 8 btree pages reached from authoritative schema roots. Separately, at most 16 free
+8 freelist and 8 btree pages reached from authoritative schema roots. Separately, at most 8 free
 pages are compacted once per durable wall-clock 60 seconds when the freelist
 exceeds one page. Existing NONE-mode databases require the explicit
 migrate_incremental_vacuum() administrative full rewrite.
-Retention runs once per minute while clock_suspect is true (and at least once
-per segment interval normally). The step is
-min(ttl/8, max(max_clock_step, lag/8)); with defaults a +40-day jump catches up
-in 45 calls/44 elapsed minutes. One parent call deletes at most 500 authenticated
-plus 500 denial rows; repeated calls drain the backlog.
+Age is decided by the boot witness, not by wall-clock arithmetic: a row is
+deleted only when its wall age and its boot-relative age both pass the TTL
+(rows from a previous boot only after this boot has itself lasted a TTL;
+unwitnessed rows are quarantined and never aged automatically). One parent call
+deletes at most 200 authenticated plus 200 denial rows; repeated calls drain the
+backlog.
 Pre-auth denials use a separate file/sequence/page budget (2000 rows, 4 MiB),
 never authenticated slots. Saturation drops denial recording, not requests.
 Exhaustion of authenticated storage is E_AUDIT_UNAVAILABLE.
@@ -235,6 +236,9 @@ class AccessAuditStore:
                     self._db.execute("ALTER TABLE access_audit ADD COLUMN boot_epoch TEXT NOT NULL DEFAULT ''")
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
                 self._db.execute(
+                    "CREATE INDEX IF NOT EXISTS audit_provenance ON access_audit(boot_epoch,booted_at,state)"
+                )
+                self._db.execute(
                     "CREATE INDEX IF NOT EXISTS audit_segment ON access_audit(segment)"
                 )
                 self._db.execute(
@@ -365,11 +369,6 @@ class AccessAuditStore:
             raise AuditError("E_VALIDATION")
         return value
 
-    def _require_witness(self) -> None:
-        """A silent wall-clock fallback would disable the ageing guarantee."""
-        if not self._boot_epoch:
-            raise AuditError()
-
     def _boottime_value(self) -> float:
         """Boot-relative seconds, or 0.0 when the witness is unavailable."""
         try:
@@ -397,12 +396,17 @@ class AccessAuditStore:
             # Internal rollback guard, not the wall-clock timestamp or watermark.
             # It preserves fresh rollback inserts when the wall clock recovers.
             retention_at = max(created_at, watermark)
+            booted_at = self._boottime_value()
+            if booted_at <= 0:
+                # Fail closed: an unwitnessed row could never be aged and would
+                # silently hold capacity (quarantine), so the write is refused.
+                raise AuditError()
             self._db.execute(
                 f"INSERT INTO access_audit ({_COLUMNS},state,created_at,segment,started,clock_id,retention_at,"
                 "booted_at,boot_epoch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ticket.id, now.isoformat(), request_id, token_id, client_id, profile_id,
                  operation, None, result, 0.0, None, "intent", created_at, segment, started, _CLOCK_ID,
-                 retention_at, self._boottime_value(), self._boot_epoch),
+                 retention_at, booted_at, self._boot_epoch),
             )
         return ticket
 
@@ -420,9 +424,16 @@ class AccessAuditStore:
                             ctx.profile_id, operation, "intent")
 
     def _segment_full(self) -> bool:
+        """Capacity counts only rows retention can actually age.
+
+        Quarantined (unwitnessed) rows are excluded: they must never block the
+        recording path, and they are reported separately by saturation().
+        """
         seq_row = self._db.execute("SELECT seq FROM sqlite_sequence WHERE name='access_audit'").fetchone()
         segment = (seq_row[0] if seq_row else 0) // self.segment_rows
-        first = self._db.execute("SELECT MIN(segment) FROM access_audit").fetchone()[0]
+        first = self._db.execute(
+            "SELECT MIN(segment) FROM access_audit WHERE boot_epoch <> '' AND booted_at > 0"
+        ).fetchone()[0]
         return first is not None and segment - first >= self.max_segments
 
     def retire_unknown_provenance(self, *, older_than_seconds: float | None = None) -> int:
@@ -443,7 +454,8 @@ class AccessAuditStore:
                 if db is None:
                     raise AuditError()
                 removed = db.execute(
-                    "DELETE FROM access_audit WHERE (boot_epoch = '' OR booted_at <= 0) AND created_at < ?",
+                    "DELETE FROM access_audit WHERE (boot_epoch = '' OR booted_at <= 0)"
+                    " AND state = 'terminal' AND created_at < ?",
                     (cutoff,),
                 ).rowcount
                 if removed:
@@ -470,6 +482,9 @@ class AccessAuditStore:
                 raw_lag = self._now().timestamp() - self._read_watermark()
                 clock_lag = max(0.0, raw_lag)
                 clock_suspect = raw_lag > self.ttl_seconds
+                self.unknown_provenance_rows = self._db.execute(
+                    "SELECT COUNT(*) FROM access_audit WHERE boot_epoch = '' OR booted_at <= 0"
+                ).fetchone()[0]
             except (AuditError, sqlite3.Error):
                 authenticated = True
                 clock_lag = math.inf
