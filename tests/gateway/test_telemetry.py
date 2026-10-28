@@ -405,6 +405,7 @@ def test_restart_retention_strict_boundary_and_sequence(tmp_path, ctx, clock):
     store.close()
     store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, monotonic=clock.monotonic, ttl_seconds=10)
     second = begin(store, ctx)
+    run(store.finish(second, SUCCESS))  # retention never expires a live intent
     clock.wall += timedelta(seconds=1)
     assert store.retain() == 1
     assert [r["id"] for r in rows(store)] == [second.id]
@@ -794,6 +795,7 @@ def test_m2_saturation_snapshot_never_waits_for_denial_writer(store, ctx, tmp_pa
 
 def test_n2_forward_wall_jump_never_expires_fresh_rows(store, ctx, clock, tmp_path):
     first = begin(store, ctx)
+    run(store.finish(first, SUCCESS))
     clock.boot_frozen = True  # a wall-clock jump alone must not age a row
     clock.wall += timedelta(days=40)
     assert store.retain() == 0
@@ -826,7 +828,7 @@ def test_n2_configured_step_and_normal_expiry(tmp_path, ctx, clock):
         tmp_path / "audit", clock=clock.now, boottime=clock.boottime, ttl_seconds=10, max_clock_step=1,
     )
     try:
-        begin(store, ctx)
+        run(store.finish(begin(store, ctx), SUCCESS))
         clock.wall += timedelta(seconds=11)
         assert store.retain() == 1  # both clocks passed the TTL: immediate expiry
         assert store.clock_step_refusals == 1
@@ -866,7 +868,7 @@ def test_n2_foreign_boot_rows_expire_only_after_a_full_ttl_of_uptime(tmp_path, c
 
 def test_n2_corrected_clock_keeps_running_and_reports_pinned_rows(store, ctx, clock):
     clock.boot_frozen = True  # the witness only moves when real time passes
-    begin(store, ctx)
+    run(store.finish(begin(store, ctx), SUCCESS))
     clock.wall += timedelta(days=40)
     store.retain()
     clock.wall -= timedelta(days=40)  # NTP corrects the clock back
@@ -948,11 +950,55 @@ def test_insert_fails_closed_when_the_witness_disappears(store, ctx, monkeypatch
     assert rows(store) == []  # nothing half-written, no quarantine row
 
 
+def test_retention_never_expires_a_live_intent(store, ctx, clock):
+    ticket = begin(store, ctx)  # intent, never finished
+    clock.wall += timedelta(days=40)
+    clock.boot += 40 * 86400
+    assert store.retain() == 0  # an unfinished intent is not ageable evidence
+    assert rows(store)[0]["state"] == "intent"
+    run(store.finish(ticket, SUCCESS))  # and it can still be completed
+    assert rows(store)[0]["result"] == "success"
+
+
+def test_denial_capacity_ignores_unwitnessed_rows(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10,
+                             denial_segment_rows=2, denial_max_segments=2)
+    try:
+        for _ in range(6):
+            run(store.record_unauthenticated("req_" + str(uuid4()), "E_AUTH_REQUIRED"))
+        with sqlite3.connect(root / "denials" / "access.sqlite") as writer:
+            writer.execute("UPDATE access_audit SET boot_epoch='', booted_at=0.0")
+        # Legacy, unwitnessed denial rows must not be reported as capacity pressure
+        # while the recorder keeps accepting writes.
+        assert run(store.record_unauthenticated("req_" + str(uuid4()), "E_AUTH_REQUIRED")) is not None
+        assert store.saturation()["denials"] is False
+    finally:
+        store.close()
+
+
+def test_byte_capacity_is_visible_to_saturation(tmp_path, ctx, clock):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10,
+                             max_bytes=128 * 1024)
+    try:
+        with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
+            for _ in range(10_000):
+                run(store.finish(begin(store, ctx), SUCCESS))
+        state = store.saturation()
+        assert state["authenticated"] is True
+        assert state["bytes_saturated"] is True
+    finally:
+        store.close()
+
+
 def test_m3_wall_jump_never_expires_and_real_time_does(store, ctx, clock):
     old = begin(store, ctx)
+    run(store.finish(old, SUCCESS))
     clock.boot_frozen = True
     clock.wall += timedelta(days=40)
     fresh = begin(store, replace(ctx, request_id="req_" + str(uuid4())))
+    run(store.finish(fresh, SUCCESS))
     removals = [store.retain() for _ in range(45)]
     assert removals == [0] * 45  # no wall-clock jump can expire a row
     assert {row["id"] for row in rows(store)} == {old.id, fresh.id}
@@ -969,7 +1015,7 @@ def test_m3_clock_suspect_capacity_recovers_when_real_time_passes(tmp_path, ctx,
     )
     try:
         for _ in range(10):
-            begin(store, replace(ctx, request_id="req_" + str(uuid4())))
+            run(store.finish(begin(store, replace(ctx, request_id="req_" + str(uuid4()))), SUCCESS))
         clock.boot_frozen = True
         clock.wall += timedelta(hours=16)
         with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
@@ -1136,7 +1182,10 @@ def test_n4_retention_vacuums_external_freed_bytes(tmp_path, ctx, clock, stream)
         target_root = root if stream == "authenticated" else root / "denials"
         if stream == "authenticated":
             first = begin(store, ctx)
-            begin(store, replace(ctx, request_id="req_" + str(uuid4())))
+            run(store.finish(first, SUCCESS))
+            # A second terminal row stays behind: retention must delete it, which is
+            # what triggers the compaction that scrubs the externally freed pages.
+            run(store.finish(begin(store, replace(ctx, request_id="req_" + str(uuid4()))), SUCCESS))
         else:
             first = run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED"))
             run(store.record_unauthenticated("req_" + str(uuid4()), "E_AUTH_REQUIRED"))
@@ -1187,7 +1236,7 @@ def test_m3_failed_scrub_is_durable_and_retried_after_restart(tmp_path, ctx, clo
 
     monkeypatch.setattr(AccessAuditStore, "_scrub", fail_once)
     store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
-    begin(store, ctx)
+    run(store.finish(begin(store, ctx), SUCCESS))
     clock.wall += timedelta(seconds=11)
     with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
         store.retain()  # DELETE commits, the scrub fails, the obligation survives

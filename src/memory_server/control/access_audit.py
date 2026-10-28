@@ -156,6 +156,7 @@ class AccessAuditStore:
         self.ttl_seconds = ttl_seconds
         self.max_clock_step = max_clock_step
         self.clock_step_refusals = 0
+        self.max_bytes = max_bytes
         self.segment_rows = segment_rows
         self.max_segments = max_segments if max_segments is not None else math.ceil(ttl_seconds / 10 / segment_rows) + 1
         self._lock = RLock()
@@ -423,15 +424,23 @@ class AccessAuditStore:
         return self._insert(ctx.request_id, ctx.principal.token_id, ctx.principal.client_id,
                             ctx.profile_id, operation, "intent")
 
-    def _first_ageable_segment(self) -> int | None:
+    def _first_ageable_segment(self, db: sqlite3.Connection | None = None) -> int | None:
         """Oldest segment retention can still free.
 
         Quarantined (unwitnessed) rows are excluded: they must never block the
-        recording path, and saturation() reports them separately.
+        recording path, and saturation() reports them separately. The caller may
+        pass any connection so every capacity view uses this one predicate.
         """
-        return self._db.execute(
+        handle = self._db if db is None else db
+        return handle.execute(
             "SELECT MIN(segment) FROM access_audit WHERE boot_epoch <> '' AND booted_at > 0"
         ).fetchone()[0]
+
+    def _bytes_full(self) -> bool:
+        """True when the SQLite page cap leaves no room for another write."""
+        page_count = self._db.execute("PRAGMA page_count").fetchone()[0]
+        page_size = self._db.execute("PRAGMA page_size").fetchone()[0]
+        return (page_count + 1) * page_size > self.max_bytes
 
     def _segment_full(self) -> bool:
         """Capacity counts only rows retention can actually age.
@@ -486,17 +495,19 @@ class AccessAuditStore:
         """
         with self._lock:
             try:
-                authenticated = self._db is None or self._segment_full()
+                authenticated = self._db is None or self._segment_full() or self._bytes_full()
                 raw_lag = self._now().timestamp() - self._read_watermark()
                 clock_lag = max(0.0, raw_lag)
                 clock_suspect = raw_lag > self.ttl_seconds
                 self.unknown_provenance_rows = self._db.execute(
                     "SELECT COUNT(*) FROM access_audit WHERE boot_epoch = '' OR booted_at <= 0"
                 ).fetchone()[0]
+                bytes_saturated = self._bytes_full()
             except (AuditError, sqlite3.Error):
                 authenticated = True
                 clock_lag = math.inf
                 clock_suspect = True
+                bytes_saturated = True
         self._refresh_denial_snapshot()
         denial_state, _, observed_at, stale = self._denial_snapshot
         inflight = self._denial_write_inflight
@@ -509,6 +520,7 @@ class AccessAuditStore:
             "clock_suspect": clock_suspect,
             "pinned_by_wall_clock": self.pinned_by_wall_clock,
             "unknown_provenance_rows": self.unknown_provenance_rows,
+            "bytes_saturated": bytes_saturated,
         }
 
     def _refresh_denial_snapshot(self) -> None:
@@ -536,7 +548,7 @@ class AccessAuditStore:
                 "SELECT seq FROM sqlite_sequence WHERE name='access_audit'"
             ).fetchone()
             segment = ((seq_row[0] if seq_row else 0) // target.segment_rows)
-            first = reader.execute("SELECT MIN(segment) FROM access_audit").fetchone()[0]
+            first = target._first_ageable_segment(reader)
             full = first is not None and segment - first >= target.max_segments
             new_loss = dropped > self._observed_denial_drops
             if new_loss:
@@ -1148,9 +1160,11 @@ class AccessAuditStore:
                         " OR (boot_epoch <> '' AND boot_epoch <> ? AND ? >= ?))"
                     )
                     removed = db.execute(
-                        "DELETE FROM access_audit WHERE created_at < ? AND retention_at < ? AND "
+                        "DELETE FROM access_audit WHERE created_at < ? AND retention_at < ?"
+                        " AND state = 'terminal' AND "
                         + where_aged
-                        + " AND seq IN (SELECT seq FROM access_audit WHERE created_at < ? AND retention_at < ? AND "
+                        + " AND seq IN (SELECT seq FROM access_audit WHERE created_at < ? AND retention_at < ?"
+                        " AND state = 'terminal' AND "
                         + where_aged
                         + " ORDER BY seq LIMIT ?)",
                         (cutoff, cutoff,
