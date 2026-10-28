@@ -401,6 +401,11 @@ def test_last_used_bounded_monotonic_failure_no_write(custody):
     last = store._connection.execute("SELECT last_used_at FROM tokens").fetchone()[0]
     before = store._connection.total_changes
     run(service.authenticate(bearer(result), now=NOW + timedelta(seconds=1)))
+    # A well-formed bearer with the right id and a wrong (but valid) 32-byte secret must
+    # reach the digest comparison and still write nothing: the earlier probe was rejected
+    # by the regex before the UPDATE, so it could not have caught a write on failure.
+    wrong = base64.urlsafe_b64encode(b"\x00" * 32).decode().rstrip("=")
+    expect("E_AUTH_REQUIRED", lambda: run(service.authenticate(bearer(result)[:-44] + wrong, now=NOW)))
     expect("E_AUTH_REQUIRED", lambda: run(service.authenticate(bearer(result) + "x", now=NOW)))
     assert store._connection.total_changes == before
     assert store._connection.execute("SELECT last_used_at FROM tokens").fetchone()[0] == last
