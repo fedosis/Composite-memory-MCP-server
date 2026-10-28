@@ -230,7 +230,7 @@ class ProfileRegistry:
         if permission not in {"profile.read", "profile.manage"}:
             raise ControlError("E_VALIDATION")
         self._authorise(principal, profile_id, permission)
-        return replace(self._store._get(profile_id), canonical_root=None)
+        return self._store._get(profile_id)
 
     def available(self) -> bool:
         """S06 Q5: probe the loaded control store, never resolve/open profiles."""

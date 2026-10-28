@@ -235,9 +235,11 @@ class ControlStore:
 
     @staticmethod
     def _record(row: sqlite3.Row) -> ProfileRecord:
+        # Q7 deferred: redact at the producer, never by caller discipline.
+        # Persisted roots remain private; resolve() uses the admitted binding.
         return ProfileRecord(
             row["id"],
-            Path(row["canonical_root"]),
+            None,
             bool(row["enabled"]),
             row["display_name"],
             row["description"],

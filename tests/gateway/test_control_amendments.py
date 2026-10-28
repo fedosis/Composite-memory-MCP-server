@@ -771,7 +771,9 @@ async def test_f3_page_and_record_roots_are_frozen_null(configured):
     for permission in ("profile.read", "profile.manage"):
         record = await registry.record(actor, "alpha", permission=permission)
         assert record.canonical_root is page[0].storage_root is None
-    assert store._get("alpha").canonical_root is not None
+    assert store._get("alpha").canonical_root is None
+    row = store._connection.execute("SELECT canonical_root FROM profiles WHERE id='alpha'").fetchone()
+    assert row["canonical_root"] == str(registry._bindings["alpha"].layout.data_root)
 
 
 @pytest.mark.parametrize("kind", [
