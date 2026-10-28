@@ -71,6 +71,22 @@ _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _CODES = frozenset(get_args(ErrorCode))
 _OPERATIONS = frozenset(get_args(Operation))
 _CLOCK_ID = uuid4().hex  # comparable monotonic clocks only within this process
+
+
+def _read_boot_epoch() -> str:
+    """Kernel boot id; boottime values are only comparable within one boot."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except OSError:
+        return ""
+
+
+def _default_boottime() -> float:
+    """Suspend-inclusive monotonic clock; falls back to monotonic when unavailable."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return time.monotonic()
 _DELETE_CHUNK_ROWS = 500
 _VACUUM_PAGES = 16
 _VACUUM_MIN_FREE_PAGES = 1
@@ -110,6 +126,7 @@ class AccessAuditStore:
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic: Callable[[], float] = time.monotonic,
+        boottime: Callable[[], float] = _default_boottime,
         ttl_seconds: float = 30 * 86400,
         max_clock_step: float = 3600,
         segment_rows: int = 10000,
@@ -130,7 +147,8 @@ class AccessAuditStore:
             or type(max_bytes) is not int or max_bytes < 65536
         ):
             raise AuditError("E_VALIDATION")
-        self.clock, self.monotonic = clock, monotonic
+        self.clock, self.monotonic, self.boottime = clock, monotonic, boottime
+        self._boot_epoch = _read_boot_epoch()
         self.ttl_seconds = ttl_seconds
         self.max_clock_step = max_clock_step
         self.clock_step_refusals = 0
@@ -201,9 +219,15 @@ class AccessAuditStore:
                     latency_ms REAL NOT NULL, remote_address TEXT,
                     state TEXT NOT NULL CHECK(state IN ('intent','terminal')),
                     created_at REAL NOT NULL, segment INTEGER NOT NULL,
-                    started REAL NOT NULL, clock_id TEXT NOT NULL)""")
-                if "retention_at" not in {r[1] for r in self._db.execute("PRAGMA table_info(access_audit)")}:
+                    started REAL NOT NULL, clock_id TEXT NOT NULL,
+                    booted_at REAL NOT NULL DEFAULT 0, boot_epoch TEXT NOT NULL DEFAULT '')""")
+                columns = {r[1] for r in self._db.execute("PRAGMA table_info(access_audit)")}
+                if "retention_at" not in columns:
                     self._db.execute("ALTER TABLE access_audit ADD COLUMN retention_at REAL NOT NULL DEFAULT 0")
+                if "booted_at" not in columns:
+                    self._db.execute("ALTER TABLE access_audit ADD COLUMN booted_at REAL NOT NULL DEFAULT 0")
+                if "boot_epoch" not in columns:
+                    self._db.execute("ALTER TABLE access_audit ADD COLUMN boot_epoch TEXT NOT NULL DEFAULT ''")
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
                 self._db.execute(
                     "CREATE INDEX IF NOT EXISTS audit_segment ON access_audit(segment)"
@@ -277,7 +301,8 @@ class AccessAuditStore:
             if not _denial_only:
                 try:
                     self._denials = AccessAuditStore(
-                        Path(root) / "denials", clock=clock, monotonic=monotonic, ttl_seconds=ttl_seconds,
+                        Path(root) / "denials", clock=clock, monotonic=monotonic, boottime=boottime,
+                        ttl_seconds=ttl_seconds,
                         segment_rows=denial_segment_rows, max_segments=denial_max_segments,
                         max_bytes=4 * 1024 * 1024, max_clock_step=max_clock_step, _denial_only=True,
                     )
@@ -335,6 +360,14 @@ class AccessAuditStore:
             raise AuditError("E_VALIDATION")
         return value
 
+    def _boottime_value(self) -> float:
+        """Boot-relative seconds, or 0.0 when the witness is unavailable."""
+        try:
+            value = float(self.boottime())
+        except Exception:
+            return 0.0
+        return value if math.isfinite(value) and value >= 0 else 0.0
+
     def _insert(self, request_id, token_id, client_id, profile_id, operation, result) -> AuditTicket:
         _check(request_id, _REQUEST)
         now = self._now()
@@ -355,10 +388,11 @@ class AccessAuditStore:
             # It preserves fresh rollback inserts when the wall clock recovers.
             retention_at = max(created_at, watermark)
             self._db.execute(
-                f"INSERT INTO access_audit ({_COLUMNS},state,created_at,segment,started,clock_id,retention_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO access_audit ({_COLUMNS},state,created_at,segment,started,clock_id,retention_at,"
+                "booted_at,boot_epoch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ticket.id, now.isoformat(), request_id, token_id, client_id, profile_id,
-                 operation, None, result, 0.0, None, "intent", created_at, segment, started, _CLOCK_ID, retention_at),
+                 operation, None, result, 0.0, None, "intent", created_at, segment, started, _CLOCK_ID,
+                 retention_at, self._boottime_value(), self._boot_epoch),
             )
         return ticket
 
@@ -1029,22 +1063,34 @@ class AccessAuditStore:
                         self.rollback_refusals += 1
                         raise AuditError("E_VALIDATION")
                     lag = now - watermark
-                    step = min(
-                        self.ttl_seconds / 8,
-                        max(self.max_clock_step, lag / 8),
-                    )
-                    effective_now = min(now, watermark + step)
-                    if now > effective_now:
+                    if lag > self.max_clock_step:
                         self.clock_step_refusals += 1
-                    self._write_watermark(effective_now)
-                    cutoff = effective_now - self.ttl_seconds
-                    removed = db.execute(
-                        """DELETE FROM access_audit WHERE created_at < ? AND retention_at < ? AND seq IN (
-                            SELECT seq FROM access_audit
-                            WHERE created_at < ? AND retention_at < ?
-                            ORDER BY seq LIMIT ?)""",
-                        (cutoff, cutoff, cutoff, cutoff, _DELETE_CHUNK_ROWS),
-                    ).rowcount
+                    # The boot-relative witness, not the wall step, decides whether a
+                    # row is old enough: wall-clock jump forward cannot age a fresh row.
+                    boot_now = self._boottime_value()
+                    witnessed = bool(self._boot_epoch) and boot_now > 0 and self._boot_epoch == self._boot_epoch
+                    self._write_watermark(now)
+                    cutoff = now - self.ttl_seconds
+                    if witnessed:
+                        removed = db.execute(
+                            """DELETE FROM access_audit WHERE created_at < ? AND retention_at < ?
+                            AND ((boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ?) OR boot_epoch <> ?)
+                            AND seq IN (
+                                SELECT seq FROM access_audit WHERE created_at < ? AND retention_at < ?
+                                AND ((boot_epoch = ? AND booted_at > 0 AND ? - booted_at >= ?) OR boot_epoch <> ?)
+                                ORDER BY seq LIMIT ?)""",
+                            (cutoff, cutoff, self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch,
+                             cutoff, cutoff, self._boot_epoch, boot_now, self.ttl_seconds, self._boot_epoch,
+                             _DELETE_CHUNK_ROWS),
+                        ).rowcount
+                    else:
+                        removed = db.execute(
+                            """DELETE FROM access_audit WHERE created_at < ? AND retention_at < ? AND seq IN (
+                                SELECT seq FROM access_audit
+                                WHERE created_at < ? AND retention_at < ?
+                                ORDER BY seq LIMIT ?)""",
+                            (cutoff, cutoff, cutoff, cutoff, _DELETE_CHUNK_ROWS),
+                        ).rowcount
                     if removed:
                         db.execute(
                             "UPDATE maintenance_state SET scrub_pending=1 WHERE id=1"

@@ -38,12 +38,21 @@ class Clock:
     def __init__(self):
         self.wall = datetime(2026, 10, 28, tzinfo=UTC)
         self.mono = 10.0
+        self.boot = 1000.0
+        self.boot_frozen = False
+        self._origin = self.wall
 
     def now(self):
         return self.wall
 
     def monotonic(self):
         return self.mono
+
+    def boottime(self):
+        """Boot-relative witness: real time by default, freezable for wall-jump tests."""
+        if self.boot_frozen:
+            return self.boot
+        return self.boot + max(0.0, (self.wall - self._origin).total_seconds())
 
 
 @pytest.fixture
@@ -60,7 +69,7 @@ def ctx():
 
 @pytest.fixture
 def store(tmp_path, clock):
-    value = AccessAuditStore(tmp_path / "audit", clock=clock.now, monotonic=clock.monotonic)
+    value = AccessAuditStore(tmp_path / "audit", clock=clock.now, boottime=clock.boottime, monotonic=clock.monotonic)
     yield value
     value.close()
 
@@ -101,8 +110,10 @@ def retain_elapsed(store, clock, *, days):
 
 
 def test_f1_denial_flood_isolated_and_dropped(tmp_path, ctx, clock):
-    store = AccessAuditStore(tmp_path / "audit", clock=clock.now, segment_rows=2, max_segments=2,
-                             denial_segment_rows=2, denial_max_segments=1)
+    store = AccessAuditStore(
+        tmp_path / "audit", clock=clock.now, boottime=clock.boottime, segment_rows=2,
+        max_segments=2, denial_segment_rows=2, denial_max_segments=1,
+    )
     try:
         for _ in range(2):
             assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is not None
@@ -142,7 +153,7 @@ def test_f1_denials_do_not_consume_authenticated_segments(tmp_path, ctx):
 
 
 def test_f1_defaults_follow_retention(tmp_path, clock):
-    stores = [AccessAuditStore(tmp_path / str(days), clock=clock.now, ttl_seconds=days * 86400)
+    stores = [AccessAuditStore(tmp_path / str(days), clock=clock.now, boottime=clock.boottime, ttl_seconds=days * 86400)
               for days in (30, 60)]
     try:
         assert stores[0].max_segments == 27
@@ -373,27 +384,27 @@ def test_metrics_permission_and_text(ctx):
 
 def test_restart_retention_strict_boundary_and_sequence(tmp_path, ctx, clock):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, monotonic=clock.monotonic, ttl_seconds=10)
     first = begin(store, ctx)
     run(store.finish(first, SUCCESS))
     store.close()
     clock.wall += timedelta(seconds=10)
-    store = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, monotonic=clock.monotonic, ttl_seconds=10)
     assert store.list(ctx.principal, "alpha")[0].id == first.id
     assert [store.retain() for _ in range(8)] == [0] * 8
     store.close()
-    store = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, monotonic=clock.monotonic, ttl_seconds=10)
     assert store.list(ctx.principal, "alpha")[0].id == first.id
     assert store.retain() == 0  # exact TTL equality is still retained after convergence
     store.close()
-    store = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, monotonic=clock.monotonic, ttl_seconds=10)
     second = begin(store, ctx)
     clock.wall += timedelta(seconds=1)
     assert store.retain() == 1
     assert [r["id"] for r in rows(store)] == [second.id]
     old_sequence = rows(store)[0]["seq"]
     clock.wall += timedelta(seconds=11)
-    assert [store.retain() for _ in range(9)] == [0] * 7 + [1, 0]
+    assert [store.retain() for _ in range(9)] == [1] + [0] * 8
     third = begin(store, ctx)
     assert rows(store)[0]["seq"] > old_sequence
     assert rows(store)[0]["id"] == third.id
@@ -427,7 +438,10 @@ def test_monotonic_measurement_ignores_caller_and_wall_clock(store, ctx, clock):
 
 
 def test_rotation_full_fail_closed_and_reclaim(tmp_path, ctx, clock):
-    store = AccessAuditStore(tmp_path / "audit", clock=clock.now, segment_rows=2, max_segments=2, ttl_seconds=10)
+    store = AccessAuditStore(
+        tmp_path / "audit", clock=clock.now, boottime=clock.boottime, segment_rows=2,
+        max_segments=2, ttl_seconds=10,
+    )
     for _ in range(4):
         run(store.finish(begin(store, ctx), SUCCESS))
     assert [r["segment"] for r in rows(store)] == [0, 0, 1, 1]
@@ -435,7 +449,7 @@ def test_rotation_full_fail_closed_and_reclaim(tmp_path, ctx, clock):
         begin(store, ctx)
     assert len(rows(store)) == 4
     clock.wall += timedelta(seconds=11)
-    assert [store.retain() for _ in range(9)] == [0] * 8 + [4]
+    assert [store.retain() for _ in range(9)] == [4] + [0] * 8
     begin(store, ctx)
     assert rows(store)[0]["segment"] == 2
     assert (tmp_path / "audit" / "access.sqlite").stat().st_size <= 64 * 1024 * 1024
@@ -505,14 +519,14 @@ def test_f2_rollback_before_first_retain(store, ctx, clock):
 @pytest.mark.parametrize("operation", ["begin", "finish", "list", "reopen"])
 def test_f2_missing_watermark_with_rows_fails_closed(tmp_path, ctx, clock, operation):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     try:
         ticket = begin(store, ctx)
         (root / "retention.watermark").unlink(missing_ok=True)
         with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$") as caught:
             if operation == "reopen":
                 store.close()
-                AccessAuditStore(root, clock=clock.now)
+                AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
             elif operation == "begin":
                 begin(store, ctx)
             elif operation == "finish":
@@ -524,29 +538,25 @@ def test_f2_missing_watermark_with_rows_fails_closed(tmp_path, ctx, clock, opera
         store.close()
 
 
-def test_f2_first_insert_seeds_empty_store_and_advances(store, ctx, clock, tmp_path):
+def test_f2_inserts_never_advance_retention_watermark(store, ctx, clock, tmp_path):
     sidecar = tmp_path / "audit" / "retention.watermark"
-    sidecar.unlink(missing_ok=True)
-    clock.wall += timedelta(days=2)
-    begin(store, ctx)
-    expected = clock.wall.timestamp()
-    assert float(sidecar.read_text()) == expected
+    before = float(sidecar.read_text()) if sidecar.exists() else clock.wall.timestamp()
     clock.wall += timedelta(days=2)
     begin(store, ctx)
     assert rows(store)[-1]["created_at"] == clock.wall.timestamp()
-    assert float(sidecar.read_text()) == expected
+    assert (float(sidecar.read_text()) if sidecar.exists() else before) == before
     assert store.retain() == 0
-    assert float(sidecar.read_text()) == expected + (2 * 86400) / 8
+    assert float(sidecar.read_text()) == clock.wall.timestamp()
 
 
 def test_rollback_watermark_survives_restart(tmp_path, ctx, clock):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     ticket = begin(store, ctx)
     assert store.retain() == 0
     store.close()
     clock.wall -= timedelta(seconds=1)
-    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     with pytest.raises(AuditError, match="E_VALIDATION"):
         store.retain()
     assert store.rollback_refusals == 1
@@ -555,7 +565,7 @@ def test_rollback_watermark_survives_restart(tmp_path, ctx, clock):
 
 
 def test_fresh_intent_during_clock_rollback_is_not_expired(tmp_path, ctx, clock):
-    store = AccessAuditStore(tmp_path / "audit", clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(tmp_path / "audit", clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     assert store.retain() == 0
     watermark = clock.wall
     clock.wall -= timedelta(seconds=100)
@@ -568,8 +578,8 @@ def test_fresh_intent_during_clock_rollback_is_not_expired(tmp_path, ctx, clock)
 
 def test_monotonic_across_connections(tmp_path, ctx, clock):
     root = tmp_path / "audit"
-    first = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic)
-    second = AccessAuditStore(root, clock=clock.now, monotonic=clock.monotonic)
+    first = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, monotonic=clock.monotonic)
+    second = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, monotonic=clock.monotonic)
     ticket = begin(first, ctx)
     clock.mono += 0.25
     run(second.finish(ticket, SUCCESS))
@@ -778,32 +788,27 @@ def test_m2_saturation_snapshot_never_waits_for_denial_writer(store, ctx, tmp_pa
         blocker.close()
 
 
-def test_n2_forward_step_bounded_and_converges(store, ctx, clock, tmp_path):
-    original = clock.wall
+def test_n2_forward_wall_jump_never_expires_fresh_rows(store, ctx, clock, tmp_path):
     first = begin(store, ctx)
+    clock.boot_frozen = True  # a wall-clock jump alone must not age a row
     clock.wall += timedelta(days=40)
     assert store.retain() == 0
     assert rows(store)[0]["id"] == first.id
     assert store.clock_step_refusals == 1
-    watermark = tmp_path / "audit" / "retention.watermark"
-    assert float(watermark.read_text()) == original.timestamp() + store.ttl_seconds / 8
-    # A permanently skewed clock still accepts exact wall-clock inserts.
+    # A permanently skewed wall clock still accepts exact wall-clock inserts.
     for _ in range(3):
         run(store.finish(begin(store, ctx), SUCCESS))
     assert all(r["created_at"] == clock.wall.timestamp() for r in rows(store)[1:])
-    removals = [0]
-    for _ in range(44):
+    for _ in range(60):
         clock.wall += timedelta(minutes=1)
-        removals.append(store.retain())
-    assert removals[:10] == [0] * 10 and removals[10] == 1
-    assert sum(removals) == 1
-    assert float(watermark.read_text()) == clock.wall.timestamp()
+        assert store.retain() == 0  # the witness says no time passed
+    assert len(rows(store)) == 4
+    # Real elapsed time (boot witness) past the TTL expires the pre-jump row in one
+    # call; the three rows written after the jump are newer by wall clock as well.
+    clock.boot += store.ttl_seconds + 1
+    assert store.retain() == 1
     assert len(rows(store)) == 3
-    assert store.clock_step_refusals == 44
-    assert store.retain() == 0
-    clock.wall += timedelta(seconds=1)
-    assert store.retain() == 0
-    print("M3 +40d: first deleted=0; first expiry=call11; catchup=45 calls; skewed inserts=3")
+    print("N2 +40d wall jump: 0 expired over 61 calls; pre-jump row expired once real TTL passed")
 
 
 @pytest.mark.parametrize("value", [0, 0.5, -1, float("nan"), float("inf"), True, "3600", None])
@@ -813,12 +818,14 @@ def test_n2_invalid_max_clock_step(tmp_path, value):
 
 
 def test_n2_configured_step_and_normal_expiry(tmp_path, ctx, clock):
-    store = AccessAuditStore(tmp_path / "audit", clock=clock.now, ttl_seconds=10, max_clock_step=1)
+    store = AccessAuditStore(
+        tmp_path / "audit", clock=clock.now, boottime=clock.boottime, ttl_seconds=10, max_clock_step=1,
+    )
     try:
         begin(store, ctx)
         clock.wall += timedelta(seconds=11)
-        assert [store.retain() for _ in range(11)] == [0] * 9 + [1, 0]
-        assert store.clock_step_refusals == 10
+        assert store.retain() == 1  # both clocks passed the TTL: immediate expiry
+        assert store.clock_step_refusals == 1
         assert rows(store) == []
     finally:
         store.close()
@@ -835,35 +842,29 @@ def test_n2_backward_clock_refuses_without_deleting_fresh(store, ctx, clock):
     assert rows(store)[0]["id"] == fresh.id
 
 
-def test_m3_default_minute_scheduler_converges_without_expiring_fresh(
-    store, ctx, clock, tmp_path,
-):
+def test_m3_wall_jump_never_expires_and_real_time_does(store, ctx, clock):
     old = begin(store, ctx)
+    clock.boot_frozen = True
     clock.wall += timedelta(days=40)
     fresh = begin(store, replace(ctx, request_id="req_" + str(uuid4())))
-    removals = []
-    for call in range(1, 46):
-        if call > 1:
-            clock.wall += timedelta(minutes=1)
-        removals.append(store.retain())
-    watermark = float((tmp_path / "audit" / "retention.watermark").read_text())
-    assert watermark == clock.wall.timestamp()
-    assert removals[:10] == [0] * 10
-    assert removals[10] == 1
-    assert sum(removals) == 1
+    removals = [store.retain() for _ in range(45)]
+    assert removals == [0] * 45  # no wall-clock jump can expire a row
+    assert {row["id"] for row in rows(store)} == {old.id, fresh.id}
+    clock.boot += store.ttl_seconds + 1
+    assert store.retain() == 1  # only the pre-jump row is old enough by wall clock too
     assert [row["id"] for row in rows(store)] == [fresh.id]
-    assert old.id != fresh.id
 
 
-def test_m3_clock_suspect_capacity_recovers_on_minute_cadence(tmp_path, ctx, clock):
+def test_m3_clock_suspect_capacity_recovers_when_real_time_passes(tmp_path, ctx, clock):
     root = tmp_path / "audit"
     store = AccessAuditStore(
-        root, clock=clock.now, ttl_seconds=8 * 3600,
+        root, clock=clock.now, boottime=clock.boottime, ttl_seconds=8 * 3600,
         segment_rows=5, max_segments=2,
     )
     try:
         for _ in range(10):
             begin(store, replace(ctx, request_id="req_" + str(uuid4())))
+        clock.boot_frozen = True
         clock.wall += timedelta(hours=16)
         with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
             begin(store, ctx)
@@ -871,19 +872,14 @@ def test_m3_clock_suspect_capacity_recovers_on_minute_cadence(tmp_path, ctx, clo
         assert state["authenticated"] is True
         assert state["clock_suspect"] is True
         assert state["clock_lag_seconds"] == 16 * 3600
+        assert [store.retain() for _ in range(10)] == [0] * 10  # nothing really aged
 
-        removals = []
-        for _ in range(17):
-            removals.append(store.retain())
-            clock.wall += timedelta(minutes=1)
-        assert removals[:8] == [0] * 8
-        assert removals[8] == 10
-        assert sum(removals) == 10
+        clock.boot += 8 * 3600 + 1  # real time passes the TTL
+        assert store.retain() == 10
         assert begin(store, ctx).id
         state = store.saturation()
         assert state["authenticated"] is False
         assert state["clock_suspect"] is False
-        assert state["clock_lag_seconds"] == 60
     finally:
         store.close()
 
@@ -895,13 +891,13 @@ def break_denial_inserts(store):
 
 def test_n3_drop_count_and_failure_survive_restart(tmp_path, ctx, clock):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     break_denial_inserts(store)
     for _ in range(3):
         assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
     assert store.dropped_denials == 3
     store.close()
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     try:
         assert store.dropped_denials == 3
         assert store.saturation()["denials"] is True
@@ -930,8 +926,8 @@ def test_n3_total_drop_never_healthy_across_retention(store, ctx):
 
 def test_n3_new_losses_observed_even_after_success(tmp_path, ctx, clock):
     root = tmp_path / "audit"
-    first = AccessAuditStore(root, clock=clock.now)
-    second = AccessAuditStore(root, clock=clock.now)
+    first = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
+    second = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     try:
         assert first.saturation()["denials"] is False
         break_denial_inserts(second)
@@ -948,12 +944,12 @@ def test_n3_new_losses_observed_even_after_success(tmp_path, ctx, clock):
 
 def test_m1_failed_primary_health_update_uses_independent_connection(tmp_path, ctx, clock):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     store._denials._db.close()
     assert run(store.record_unauthenticated(ctx.request_id, "E_AUTH_REQUIRED")) is None
     store.close()
 
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     try:
         assert store.dropped_denials == 1
         assert store.saturation()["denials"] is True
@@ -963,7 +959,7 @@ def test_m1_failed_primary_health_update_uses_independent_connection(tmp_path, c
 
 def test_m1_marker_survives_when_both_database_writes_fail(tmp_path, ctx, clock):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     denial_db = root / "denials" / "access.sqlite"
     blocker = sqlite3.connect(denial_db, isolation_level=None)
     store._denials._db.execute("PRAGMA busy_timeout=0")
@@ -978,7 +974,7 @@ def test_m1_marker_survives_when_both_database_writes_fail(tmp_path, ctx, clock)
         blocker.close()
         store.close()
 
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     try:
         assert store.dropped_denials == 1
         assert store.saturation()["denials"] is True
@@ -988,7 +984,7 @@ def test_m1_marker_survives_when_both_database_writes_fail(tmp_path, ctx, clock)
 
 def test_m1_successful_denial_with_failed_health_update_survives_restart(tmp_path, ctx, clock):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     store._denials._db.set_authorizer(
         lambda action, table, *args: sqlite3.SQLITE_DENY
         if action == sqlite3.SQLITE_UPDATE and table == "denial_health"
@@ -999,7 +995,7 @@ def test_m1_successful_denial_with_failed_health_update_survives_restart(tmp_pat
     assert store.saturation()["denials"] is True
     store.close()
 
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     try:
         assert store.saturation()["denials"] is True
     finally:
@@ -1009,7 +1005,7 @@ def test_m1_successful_denial_with_failed_health_update_survives_restart(tmp_pat
 @pytest.mark.parametrize("damage", ["table", "row", "truncate"])
 def test_m2_missing_denial_health_refuses_parent_reopen(tmp_path, clock, damage):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     store.close()
     denial_db = root / "denials" / "access.sqlite"
     if damage == "truncate":
@@ -1022,13 +1018,13 @@ def test_m2_missing_denial_health_refuses_parent_reopen(tmp_path, clock, damage)
                 writer.execute("DELETE FROM denial_health")
 
     with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
-        AccessAuditStore(root, clock=clock.now)
+        AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
 
 
 @pytest.mark.parametrize("stream", ["authenticated", "denials"])
 def test_n4_retention_vacuums_external_freed_bytes(tmp_path, ctx, clock, stream):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     try:
         target = store if stream == "authenticated" else store._denials
         target_root = root if stream == "authenticated" else root / "denials"
@@ -1047,7 +1043,7 @@ def test_n4_retention_vacuums_external_freed_bytes(tmp_path, ctx, clock, stream)
             external.execute("DELETE FROM access_audit WHERE id=?", (first.id,))
         assert canary in (target_root / "access.sqlite").read_bytes()
         clock.wall += timedelta(seconds=11)
-        assert [store.retain() for _ in range(9)] == [0] * 8 + [1]
+        assert [store.retain() for _ in range(9)] == [1] + [0] * 8
         assert rows(target) == []
         assert canary not in (target_root / "access.sqlite").read_bytes()
         assert not (target_root / "access.sqlite-journal").exists()
@@ -1057,13 +1053,13 @@ def test_n4_retention_vacuums_external_freed_bytes(tmp_path, ctx, clock, stream)
 
 def test_n4_startup_scrubs_stale_journal(tmp_path, ctx, clock):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     ticket = begin(store, ctx)
     store.close()
     journal = root / "access.sqlite-journal"
     journal.write_bytes(b"\0" * 512 + CANARY_SECRET.encode())
     journal.chmod(0o600)
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     try:
         assert not journal.exists()
         assert rows(store)[0]["id"] == ticket.id
@@ -1084,19 +1080,18 @@ def test_m3_failed_scrub_is_durable_and_retried_after_restart(tmp_path, ctx, clo
         return original_scrub(self)
 
     monkeypatch.setattr(AccessAuditStore, "_scrub", fail_once)
-    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     begin(store, ctx)
     clock.wall += timedelta(seconds=11)
-    assert [store.retain() for _ in range(8)] == [0] * 8
     with pytest.raises(AuditError, match="^E_AUDIT_UNAVAILABLE$"):
-        store.retain()
+        store.retain()  # DELETE commits, the scrub fails, the obligation survives
     assert rows(store) == []  # DELETE committed; its scrub obligation did too.
     assert store._db.execute(
         "SELECT scrub_pending FROM maintenance_state WHERE id=1"
     ).fetchone()[0] == 1
     store.close()
 
-    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     try:
         assert len(calls) == 2  # startup retried with no later deletion to trigger it
         assert store._db.execute(
@@ -1110,11 +1105,10 @@ def test_m3_failed_scrub_is_durable_and_retried_after_restart(tmp_path, ctx, clo
 
 def test_m1_bounded_chunks_and_auth_lock_independence(tmp_path, clock):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     insert_retention_fixture(store, root, clock, 501)
     clock.wall += timedelta(seconds=11)
     try:
-        assert [store.retain() for _ in range(8)] == [0] * 8
         with ThreadPoolExecutor(max_workers=1) as pool:
             with store._lock:
                 assert pool.submit(store.retain).result(timeout=0.2) == 500
@@ -1126,7 +1120,7 @@ def test_m1_bounded_chunks_and_auth_lock_independence(tmp_path, clock):
 
 
 def test_m1_incremental_vacuum_creation_and_explicit_legacy_migration(tmp_path, clock):
-    fresh = AccessAuditStore(tmp_path / "fresh", clock=clock.now)
+    fresh = AccessAuditStore(tmp_path / "fresh", clock=clock.now, boottime=clock.boottime)
     try:
         assert fresh._db.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
     finally:
@@ -1138,7 +1132,7 @@ def test_m1_incremental_vacuum_creation_and_explicit_legacy_migration(tmp_path, 
         legacy.execute("CREATE TABLE legacy_fixture (id INTEGER PRIMARY KEY)")
         assert legacy.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
     (root / "access.sqlite").chmod(0o600)
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     statements = []
     store._maintenance_db.set_trace_callback(statements.append)
     try:
@@ -1153,13 +1147,12 @@ def test_m1_incremental_vacuum_creation_and_explicit_legacy_migration(tmp_path, 
 def test_m1_deleting_retain_auth_p95_bounded(tmp_path, ctx, clock):
     root = tmp_path / "audit"
     store = AccessAuditStore(
-        root, clock=clock.now, ttl_seconds=10,
+        root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10,
         segment_rows=1_000_000_000, max_segments=2,
     )
     insert_retention_fixture(store, root, clock, 10000, payload_size=4096)
     assert (root / "access.sqlite").stat().st_size > 16 * 1024 * 1024
     clock.wall += timedelta(seconds=11)
-    assert [store.retain() for _ in range(8)] == [0] * 8
     timings = []
     removed = []
     try:
@@ -1198,10 +1191,9 @@ def test_m1_pending_retry_does_not_bypass_compaction_interval(tmp_path, ctx, clo
         return original_scrub(self, *args, **kwargs)
 
     monkeypatch.setattr(AccessAuditStore, "_scrub", traced_scrub)
-    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     insert_retention_fixture(store, root, clock, 3, payload_size=4096)
     clock.wall += timedelta(seconds=11)
-    assert [store.retain() for _ in range(8)] == [0] * 8
     assert store.retain() == 3
     canary = b"CANARY_PENDING_SCRUB_RETRY_8f31"
     with sqlite3.connect(root / "access.sqlite") as writer:
@@ -1216,7 +1208,7 @@ def test_m1_pending_retry_does_not_bypass_compaction_interval(tmp_path, ctx, clo
     assert canary in (root / "access.sqlite").read_bytes()
     store.close()
 
-    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     try:
         assert len(incremental) == 1
         assert canary not in (root / "access.sqlite").read_bytes()
@@ -1230,13 +1222,12 @@ def test_m1_bounded_scrub_large_ptrmap_database_survives_concurrent_writes(
 ):
     root = tmp_path / "audit"
     store = AccessAuditStore(
-        root, clock=clock.now, ttl_seconds=10,
+        root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10,
         segment_rows=1_000_000_000, max_segments=2,
     )
     insert_retention_fixture(store, root, clock, 1500, payload_size=4096)
     assert store._db.execute("PRAGMA page_count").fetchone()[0] > 1025
     clock.wall += timedelta(seconds=11)
-    assert [store.retain() for _ in range(8)] == [0] * 8
     delete_started = Event()
     store._maintenance_db.set_trace_callback(
         lambda sql: delete_started.set()
@@ -1252,7 +1243,7 @@ def test_m1_bounded_scrub_large_ptrmap_database_survives_concurrent_writes(
     assert len(rows(store)) == 1020
     store.close()
 
-    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime, ttl_seconds=10)
     try:
         assert store._db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert len(rows(store)) == 1020
@@ -1265,7 +1256,7 @@ def test_m1_eight_page_scrub_has_bounded_sql_vm_work(tmp_path, clock):
     measurements = []
     for count in (100, 5000):
         root = tmp_path / str(count)
-        store = AccessAuditStore(root, clock=clock.now)
+        store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
         try:
             insert_retention_fixture(store, root, clock, count, payload_size=4096)
             db = store._maintenance_db
@@ -1290,7 +1281,7 @@ def test_m1_eight_page_scrub_has_bounded_sql_vm_work(tmp_path, clock):
 
 def test_m3_partial_scrub_remains_pending_until_frontier_drains(tmp_path, clock):
     root = tmp_path / "audit"
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     insert_retention_fixture(store, root, clock, 1000)
     with sqlite3.connect(root / "access.sqlite") as writer:
         writer.execute("UPDATE maintenance_state SET scrub_pending=1 WHERE id=1")
@@ -1299,7 +1290,7 @@ def test_m3_partial_scrub_remains_pending_until_frontier_drains(tmp_path, clock)
     assert store._db.execute("SELECT scrub_pending FROM maintenance_state WHERE id=1").fetchone()[0] == 1
     store.close()
 
-    store = AccessAuditStore(root, clock=clock.now)
+    store = AccessAuditStore(root, clock=clock.now, boottime=clock.boottime)
     try:
         calls = 0
         while store._db.execute("SELECT scrub_pending FROM maintenance_state WHERE id=1").fetchone()[0]:
