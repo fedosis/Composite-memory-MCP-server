@@ -14,9 +14,10 @@ large metadata may hit the byte cap first and fail closed. Each connection has
 an explicit 2048 KiB page-cache target (4096 KiB for the pair, not a process RSS
     limit); lists materialize at most 200 rows. Retention deletes at most 500 rows
     per stream and call on a separate maintenance connection/lock. New databases
-    use incremental auto-vacuum; once per 60 seconds, at most 16 freelist/btree
-    pages are scrubbed and 16 free pages reclaimed when the freelist exceeds one
-    page. Existing NONE-mode databases must
+    use incremental auto-vacuum. Every scrub obligation cleans a bounded window
+    of 8 freelist and 8 authoritative dbstat btree pages. Separately, at most 16
+    free pages are compacted once per durable wall-clock 60 seconds when the
+    freelist exceeds one page. Existing NONE-mode databases must
     use the explicit migrate_incremental_vacuum() administrative full rewrite.
 Pre-auth denials use a separate file/sequence/page budget (2000 rows, 4 MiB),
 never authenticated slots. Saturation drops denial recording, not requests.
@@ -134,7 +135,6 @@ class AccessAuditStore:
         self._fd = None
         self._db = None
         self._maintenance_db = None
-        self._last_vacuum_at = -math.inf
         try:
             self._fd = _private_directory(Path(root))
             stale_journal = False
@@ -193,6 +193,13 @@ class AccessAuditStore:
                 if "retention_at" not in {r[1] for r in self._db.execute("PRAGMA table_info(access_audit)")}:
                     self._db.execute("ALTER TABLE access_audit ADD COLUMN retention_at REAL NOT NULL DEFAULT 0")
                 self._db.execute("CREATE INDEX IF NOT EXISTS audit_scope ON access_audit(profile_id,seq)")
+                self._db.execute(
+                    "CREATE INDEX IF NOT EXISTS audit_segment ON access_audit(segment)"
+                )
+                self._db.execute(
+                    """CREATE INDEX IF NOT EXISTS audit_retention
+                        ON access_audit(created_at,retention_at,seq)"""
+                )
                 self._db.execute("""CREATE TABLE IF NOT EXISTS maintenance_state (
                     id INTEGER PRIMARY KEY CHECK(id=1),
                     scrub_pending INTEGER NOT NULL CHECK(scrub_pending IN (0,1)),
@@ -246,7 +253,7 @@ class AccessAuditStore:
             if stale_journal or scrub_pending:
                 # SQLite recovers hot journals first; pending work is retried
                 # after restart before this store can serve.
-                self._scrub(force=True)
+                self._scrub()
                 if scrub_pending:
                     with self._transaction(db=self._maintenance_db):
                         self._maintenance_db.execute(
@@ -687,7 +694,7 @@ class AccessAuditStore:
                 os.close(fd)
 
     def _scrub_btree_slack(self, db: sqlite3.Connection, start: int, limit: int) -> int:
-        """Zero safe freeblocks/unallocated regions in a bounded page window."""
+        """Zero slack only on btrees identified authoritatively by dbstat."""
         fd = None
         try:
             fd = os.open("access.sqlite", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -700,84 +707,97 @@ class AccessAuditStore:
             page_count = db.execute("PRAGMA page_count").fetchone()[0]
             if page_count < 1:
                 raise AuditError()
-            page_number = min(max(start, 1), page_count)
-            for _ in range(min(limit, page_count)):
+            cursor = min(max(start, 1), page_count)
+            query = """SELECT pageno FROM dbstat
+                WHERE name IN ('access_audit','audit_scope','audit_segment','audit_retention',
+                               'sqlite_autoindex_access_audit_1')
+                  AND pagetype IN ('leaf','internal') AND pageno>=?
+                ORDER BY pageno LIMIT ?"""
+            pages = [row[0] for row in db.execute(query, (cursor, limit))]
+            if len(pages) < limit and cursor > 1:
+                wrap_query = """SELECT pageno FROM dbstat
+                    WHERE name IN ('access_audit','audit_scope','audit_segment','audit_retention',
+                                   'sqlite_autoindex_access_audit_1')
+                      AND pagetype IN ('leaf','internal') AND pageno<?
+                    ORDER BY pageno LIMIT ?"""
+                pages.extend(
+                    row[0] for row in db.execute(
+                        wrap_query, (cursor, limit - len(pages))
+                    )
+                )
+            for page_number in pages:
                 offset = (page_number - 1) * page_size
                 page = os.pread(fd, page_size, offset)
                 if len(page) != page_size:
                     raise AuditError()
                 header_offset = 100 if page_number == 1 else 0
                 page_type = page[header_offset]
-                if page_type in (0x02, 0x05, 0x0A, 0x0D):
-                    header_size = 12 if page_type in (0x02, 0x05) else 8
-                    cell_count = int.from_bytes(
-                        page[header_offset + 3:header_offset + 5], "big"
-                    )
-                    cell_start = int.from_bytes(
-                        page[header_offset + 5:header_offset + 7], "big"
-                    ) or 65536
-                    pointer_end = header_offset + header_size + cell_count * 2
-                    if not pointer_end <= cell_start <= page_size:
+                if page_type not in (0x02, 0x05, 0x0A, 0x0D):
+                    raise AuditError()
+                header_size = 12 if page_type in (0x02, 0x05) else 8
+                cell_count = int.from_bytes(
+                    page[header_offset + 3:header_offset + 5], "big"
+                )
+                cell_start = int.from_bytes(
+                    page[header_offset + 5:header_offset + 7], "big"
+                ) or 65536
+                pointer_end = header_offset + header_size + cell_count * 2
+                if not pointer_end <= cell_start <= page_size:
+                    raise AuditError()
+                if cell_start > pointer_end:
+                    if os.pwrite(fd, b"\0" * (cell_start - pointer_end),
+                                 offset + pointer_end) != cell_start - pointer_end:
                         raise AuditError()
-                    if cell_start > pointer_end:
-                        if os.pwrite(fd, b"\0" * (cell_start - pointer_end),
-                                     offset + pointer_end) != cell_start - pointer_end:
-                            raise AuditError()
-                    freeblock = int.from_bytes(
-                        page[header_offset + 1:header_offset + 3], "big"
-                    )
-                    seen = set()
-                    while freeblock:
-                        if freeblock in seen or freeblock + 4 > page_size:
-                            raise AuditError()
-                        seen.add(freeblock)
-                        next_free = int.from_bytes(page[freeblock:freeblock + 2], "big")
-                        size = int.from_bytes(page[freeblock + 2:freeblock + 4], "big")
-                        if size < 4 or freeblock + size > page_size:
-                            raise AuditError()
-                        if os.pwrite(fd, b"\0" * (size - 4),
-                                     offset + freeblock + 4) != size - 4:
-                            raise AuditError()
-                        freeblock = next_free
-                page_number = 1 if page_number == page_count else page_number + 1
+                freeblock = int.from_bytes(
+                    page[header_offset + 1:header_offset + 3], "big"
+                )
+                seen = set()
+                while freeblock:
+                    if freeblock in seen or freeblock + 4 > page_size:
+                        raise AuditError()
+                    seen.add(freeblock)
+                    next_free = int.from_bytes(page[freeblock:freeblock + 2], "big")
+                    size = int.from_bytes(page[freeblock + 2:freeblock + 4], "big")
+                    if size < 4 or freeblock + size > page_size:
+                        raise AuditError()
+                    if os.pwrite(fd, b"\0" * (size - 4),
+                                 offset + freeblock + 4) != size - 4:
+                        raise AuditError()
+                    freeblock = next_free
             os.fsync(fd)
-            return page_number
+            if not pages or pages[-1] >= page_count:
+                return 1
+            return pages[-1] + 1
         except OSError:
             raise AuditError() from None
         finally:
             if fd is not None:
                 os.close(fd)
 
-    def _scrub(self, *, force: bool = False) -> None:
-        """Bounded incremental cleanup on the maintenance connection.
-
-        Freelist and btree-slack cleanup covers bytes freed by unflagged external connections;
-        an exclusive SQLite lock prevents unlinking another writer's journal.
-        Startup and durable retry work bypass only the 60-second rate limit, not
-        the 16-page bound or freelist threshold.
-        """
+    def _scrub(self) -> None:
+        """Complete mandatory bounded scrubbing, then optional compaction."""
         db = self._maintenance_db
         if db is None:
             raise AuditError()
         try:
-            free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
-            now = time.monotonic()
-            due = force or now - self._last_vacuum_at >= _VACUUM_INTERVAL_SECONDS
-            if free_pages > _VACUUM_MIN_FREE_PAGES and due:
-                cursor = db.execute(
-                    "SELECT scrub_cursor FROM maintenance_state WHERE id=1"
-                ).fetchone()[0]
-                with self._transaction(db=db, exclusive=True):
-                    self._scrub_freelist_pages(db, _VACUUM_PAGES // 2)
-                    next_cursor = self._scrub_btree_slack(db, cursor, _VACUUM_PAGES // 2)
-                db.execute(f"PRAGMA incremental_vacuum({_VACUUM_PAGES})")
-                self._last_vacuum_at = now
-                with self._transaction(db=db):
-                    db.execute(
-                        """UPDATE maintenance_state
-                            SET last_vacuum=?,scrub_cursor=? WHERE id=1""",
-                        (now, next_cursor),
-                    )
+            cursor = db.execute(
+                "SELECT scrub_cursor FROM maintenance_state WHERE id=1"
+            ).fetchone()[0]
+            # dbstat supplies the authoritative btree page set; pointer-map,
+            # overflow and freelist pages can never enter the btree parser.
+            with self._transaction(db=db, exclusive=True):
+                self._scrub_freelist_pages(db, _VACUUM_PAGES // 2)
+                next_cursor = self._scrub_btree_slack(
+                    db, cursor, _VACUUM_PAGES // 2
+                )
+            # This SQLite commit bumps the change counter so other connections
+            # invalidate clean cached pages after the safe direct slack writes.
+            with self._transaction(db=db):
+                db.execute(
+                    "UPDATE maintenance_state SET scrub_cursor=? WHERE id=1",
+                    (next_cursor,),
+                )
+            self._compact(db)
             with self._transaction(db=db, exclusive=True):
                 try:
                     fd = os.open("access.sqlite-journal", os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -797,6 +817,22 @@ class AccessAuditStore:
                     os.close(fd)
         except (sqlite3.Error, OSError):
             raise AuditError() from None
+
+    def _compact(self, db: sqlite3.Connection) -> None:
+        """Rate-limit incremental vacuum durably, including across restart."""
+        now = time.time()
+        with self._transaction(db=db):
+            free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
+            last_vacuum = db.execute(
+                "SELECT last_vacuum FROM maintenance_state WHERE id=1"
+            ).fetchone()[0]
+            if (free_pages <= _VACUUM_MIN_FREE_PAGES
+                    or now < last_vacuum + _VACUUM_INTERVAL_SECONDS):
+                return
+            db.execute(f"PRAGMA incremental_vacuum({_VACUUM_PAGES})")
+            db.execute(
+                "UPDATE maintenance_state SET last_vacuum=? WHERE id=1", (now,)
+            )
 
     def migrate_incremental_vacuum(self) -> None:
         """Explicit administrator-only full rewrite for legacy NONE-mode stores."""
@@ -835,7 +871,7 @@ class AccessAuditStore:
                     "SELECT scrub_pending FROM maintenance_state WHERE id=1"
                 ).fetchone()[0]
                 if pending:
-                    self._scrub(force=True)
+                    self._scrub()
                     with self._transaction(db=db):
                         db.execute(
                             "UPDATE maintenance_state SET scrub_pending=0 WHERE id=1"
@@ -851,11 +887,11 @@ class AccessAuditStore:
                     self._write_watermark(effective_now)
                     cutoff = effective_now - self.ttl_seconds
                     removed = db.execute(
-                        """DELETE FROM access_audit WHERE seq IN (
+                        """DELETE FROM access_audit WHERE created_at < ? AND retention_at < ? AND seq IN (
                             SELECT seq FROM access_audit
                             WHERE created_at < ? AND retention_at < ?
                             ORDER BY seq LIMIT ?)""",
-                        (cutoff, cutoff, _DELETE_CHUNK_ROWS),
+                        (cutoff, cutoff, cutoff, cutoff, _DELETE_CHUNK_ROWS),
                     ).rowcount
                     if removed:
                         db.execute(

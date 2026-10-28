@@ -195,8 +195,8 @@ def test_dml_shapes_cas_and_terminal_immutability(store, ctx, clock):
         for s in updates
     )
     assert all(
-        "DELETE FROM access_audit WHERE seq IN" in s
-        and "created_at < " in s and "retention_at < " in s and "LIMIT 500" in s
+        "DELETE FROM access_audit WHERE created_at < " in s
+        and "retention_at < " in s and "AND seq IN" in s and "LIMIT 500" in s
         for s in dml if s.startswith("DELETE")
     )
 
@@ -972,11 +972,11 @@ def test_m3_failed_scrub_is_durable_and_retried_after_restart(tmp_path, ctx, clo
     original_scrub = AccessAuditStore._scrub
     calls = []
 
-    def fail_once(self, *, force=False):
+    def fail_once(self):
         calls.append(self)
         if len(calls) == 1:
             raise AuditError()
-        return original_scrub(self, force=force)
+        return original_scrub(self)
 
     monkeypatch.setattr(AccessAuditStore, "_scrub", fail_once)
     store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
@@ -1069,10 +1069,84 @@ def test_m1_deleting_retain_auth_p95_bounded(tmp_path, ctx, clock):
                 timings.append((time.perf_counter() - started) * 1000)
                 removed.append(retaining.result(timeout=2))
         p95 = statistics.quantiles(timings, n=100, method="inclusive")[94]
-        print(f"M1 auth begin+finish ms={timings}; p95={p95:.3f}; bound=75.000")
+        print(f"M1 auth begin+finish ms={timings}; p95={p95:.3f}; bound=50.000")
         assert removed == [500] * 8
-        assert p95 < 75
+        assert p95 < 50
         assert len(rows(store)) == 8
+    finally:
+        store.close()
+
+
+def test_m1_pending_retry_does_not_bypass_compaction_interval(tmp_path, ctx, clock, monkeypatch):
+    root = tmp_path / "audit"
+    incremental = []
+    original_scrub = AccessAuditStore._scrub
+
+    def traced_scrub(self, *args, **kwargs):
+        self._maintenance_db.set_trace_callback(
+            lambda sql: incremental.append(sql)
+            if sql.startswith("PRAGMA incremental_vacuum(") else None
+        )
+        return original_scrub(self, *args, **kwargs)
+
+    monkeypatch.setattr(AccessAuditStore, "_scrub", traced_scrub)
+    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    insert_retention_fixture(store, root, clock, 3, payload_size=4096)
+    clock.wall += timedelta(seconds=11)
+    assert store.retain() == 3
+    canary = b"CANARY_PENDING_SCRUB_RETRY_8f31"
+    with sqlite3.connect(root / "access.sqlite") as writer:
+        writer.execute("PRAGMA secure_delete=OFF")
+        writer.execute("CREATE TABLE discarded_pages (payload BLOB)")
+        writer.executemany(
+            "INSERT INTO discarded_pages VALUES (?)",
+            ((canary + b"X" * 4000,) for _ in range(3)),
+        )
+        writer.execute("DROP TABLE discarded_pages")
+        writer.execute("UPDATE maintenance_state SET scrub_pending=1 WHERE id=1")
+    assert canary in (root / "access.sqlite").read_bytes()
+    store.close()
+
+    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    try:
+        assert len(incremental) == 1
+        assert canary not in (root / "access.sqlite").read_bytes()
+        assert store._db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        store.close()
+
+
+def test_m1_bounded_scrub_large_ptrmap_database_survives_concurrent_writes(
+    tmp_path, ctx, clock,
+):
+    root = tmp_path / "audit"
+    store = AccessAuditStore(
+        root, clock=clock.now, ttl_seconds=10,
+        segment_rows=1_000_000_000, max_segments=2,
+    )
+    insert_retention_fixture(store, root, clock, 1500, payload_size=4096)
+    assert store._db.execute("PRAGMA page_count").fetchone()[0] > 1025
+    clock.wall += timedelta(seconds=11)
+    delete_started = Event()
+    store._maintenance_db.set_trace_callback(
+        lambda sql: delete_started.set()
+        if sql.startswith("DELETE FROM access_audit") else None
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        retaining = pool.submit(store.retain)
+        assert delete_started.wait(2)
+        for _ in range(20):
+            run(store.finish(begin(store, ctx), SUCCESS))
+        assert retaining.result(timeout=5) == 500
+    assert store._db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert len(rows(store)) == 1020
+    store.close()
+
+    store = AccessAuditStore(root, clock=clock.now, ttl_seconds=10)
+    try:
+        assert store._db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert len(rows(store)) == 1020
+        assert sum(row["state"] == "terminal" for row in rows(store)) == 1020
     finally:
         store.close()
 
