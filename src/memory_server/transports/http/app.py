@@ -19,7 +19,7 @@ from .guards import Guard, ReadRouteSpec, secure_headers
 from .limits import read_body, validate_config
 from .routes import S06_ROUTE_SPECS, ProfilePort
 from .routes.profiles import validate_profile_id
-from .routes.retrieval import RetrievalRouteSpec
+from .routes.retrieval import RETRIEVAL_ROUTE_SPECS, RetrievalRouteSpec
 
 
 class HttpApp:
@@ -51,7 +51,10 @@ class HttpApp:
                 raise ValueError('read route specification must be a ReadRouteSpec')
             row = CATALOG.by_operation.get(spec.operation)
             if isinstance(spec, RetrievalRouteSpec):
-                owner_matches = row is not None and row.owner == 'S08' and spec.operation == 'search'
+                canonical = RETRIEVAL_ROUTE_SPECS.get(spec.operation)
+                owner_matches = (row is not None and row.owner == 'S08'
+                                 and canonical is spec
+                                 and spec.operation in {'search', 'context'})
             else:
                 owner_matches = row is not None and row.owner == 'S07'
             if (row is None or not owner_matches

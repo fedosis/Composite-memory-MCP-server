@@ -85,15 +85,11 @@ class SQLiteProvider:
         preserving correctness for fresh/migrated databases that need an initial
         backfill.
         """
-        source_has_rows = bool(
-            (await conn.exec_driver_sql(f"SELECT 1 FROM {source_table} LIMIT 1")).first()
-        )
+        source_has_rows = bool((await conn.exec_driver_sql(f"SELECT 1 FROM {source_table} LIMIT 1")).first())
         if not source_has_rows:
             return False
 
-        fts_has_rows = bool(
-            (await conn.exec_driver_sql(f"SELECT 1 FROM {fts_table} LIMIT 1")).first()
-        )
+        fts_has_rows = bool((await conn.exec_driver_sql(f"SELECT 1 FROM {fts_table} LIMIT 1")).first())
         return not fts_has_rows
 
     async def initialize(self):
@@ -107,7 +103,8 @@ class SQLiteProvider:
                 conn,
                 self._busy_timeout_ms,
                 context="SQLiteProvider",
-                allow_degraded_mode=self._url in {
+                allow_degraded_mode=self._url
+                in {
                     "sqlite+aiosqlite://",
                     "sqlite+aiosqlite:///:memory:",
                 },
@@ -144,9 +141,7 @@ class SQLiteProvider:
                 source_table="facts",
                 fts_table="facts_fts",
             ):
-                await conn.exec_driver_sql(
-                    "INSERT INTO facts_fts(facts_fts) VALUES ('rebuild')"
-                )
+                await conn.exec_driver_sql("INSERT INTO facts_fts(facts_fts) VALUES ('rebuild')")
             # Create beliefs FTS5 virtual table
             await conn.exec_driver_sql(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS beliefs_fts "
@@ -176,9 +171,7 @@ class SQLiteProvider:
                 source_table="beliefs",
                 fts_table="beliefs_fts",
             ):
-                await conn.exec_driver_sql(
-                    "INSERT INTO beliefs_fts(beliefs_fts) VALUES ('rebuild')"
-                )
+                await conn.exec_driver_sql("INSERT INTO beliefs_fts(beliefs_fts) VALUES ('rebuild')")
 
         # Immutable for this provider lifetime; external migration requires reopen.
         async with self._engine.connect() as conn:
@@ -230,9 +223,7 @@ class SQLiteProvider:
     @staticmethod
     def _storage_bind(value: Any) -> str:
         """Convert a wire timestamp to SQLite DateTime's canonical UTC text."""
-        return datetime.fromisoformat(SQLiteProvider._utc(value)).replace(tzinfo=None).strftime(
-            "%Y-%m-%d %H:%M:%S.%f"
-        )
+        return datetime.fromisoformat(SQLiteProvider._utc(value)).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
 
     async def _check_read_index_capability(self, conn) -> bool:
         """Check all four indexes and stream all timestamps once at startup.
@@ -244,17 +235,21 @@ class SQLiteProvider:
             table = f"{kind}s"
             name = f"ix_{table}_created_type_id"
             expected = f"CREATE INDEX {name} ON {table} (created_at, CAST('{kind}' AS TEXT), id)"
-            row = (await conn.exec_driver_sql(
-                "SELECT type, tbl_name, sql FROM sqlite_master WHERE name=?", (name,)
-            )).first()
+            row = (
+                await conn.exec_driver_sql("SELECT type, tbl_name, sql FROM sqlite_master WHERE name=?", (name,))
+            ).first()
             if row is None or row[0] != "index" or row[1] != table or row[2] is None:
                 return False
-            if (re.findall(r"'[^']*'", row[2]) != [f"'{kind}'"]
-                    or re.sub(r"\s+", "", row[2]).lower() != re.sub(r"\s+", "", expected).lower()):
+            if (
+                re.findall(r"'[^']*'", row[2]) != [f"'{kind}'"]
+                or re.sub(r"\s+", "", row[2]).lower() != re.sub(r"\s+", "", expected).lower()
+            ):
                 return False
             keys = (await conn.exec_driver_sql(f"PRAGMA index_xinfo('{name}')")).all()
             if [(r[0], r[2], r[3], r[4]) for r in keys if r[5]] != [
-                (0, "created_at", 0, "BINARY"), (1, None, 0, "BINARY"), (2, "id", 0, "BINARY")
+                (0, "created_at", 0, "BINARY"),
+                (1, None, 0, "BINARY"),
+                (2, "id", 0, "BINARY"),
             ]:
                 return False
         for table in ("facts", "beliefs", "decisions", "skills"):
@@ -299,16 +294,19 @@ class SQLiteProvider:
         receipt = await self.read_receipt_metadata(session, memory_id, kind)
         return ReadRecord(memory=memory, memory_type=kind, receipt=receipt)
 
-    def _key_clause(
-        self, prefix: str, key: Any, op: str, *, kind: str | None = None
-    ) -> tuple[str, dict[str, Any]]:
+    def _key_clause(self, prefix: str, key: Any, op: str, *, kind: str | None = None) -> tuple[str, dict[str, Any]]:
         if key is None:
             return "", {}
         memory_type = f"CAST('{kind}' AS TEXT)" if kind is not None else "memory_type"
         return (
             f" AND (created_at,{memory_type},id) {op} (:{prefix}created_at,:{prefix}memory_type,:{prefix}id)",
-            {f"{prefix}created_at": self._storage_bind(key.created_at) if self._read_index_capable else key.created_at,
-             f"{prefix}memory_type": key.memory_type, f"{prefix}id": key.id},
+            {
+                f"{prefix}created_at": self._storage_bind(key.created_at)
+                if self._read_index_capable
+                else key.created_at,
+                f"{prefix}memory_type": key.memory_type,
+                f"{prefix}id": key.id,
+            },
         )
 
     async def read_memory_page(self, session: AsyncSession, query: Any, *, after: Any = None, upper: Any = None):
@@ -333,13 +331,12 @@ class SQLiteProvider:
                 continue
             clauses = ["1=1"]
             if query.lifecycle_states:
-                placeholders = ','.join(':' + kind + '_ls' + str(i) for i in range(len(query.lifecycle_states)))
-                clauses.append(f'lifecycle_state IN ({placeholders})')
+                placeholders = ",".join(":" + kind + "_ls" + str(i) for i in range(len(query.lifecycle_states)))
+                clauses.append(f"lifecycle_state IN ({placeholders})")
                 params.update({f"{kind}_ls{i}": v for i, v in enumerate(query.lifecycle_states)})
             for field, op, value in (
                 ("confidence", ">=", query.min_confidence),
                 ("confidence", "<=", query.max_confidence),
-
                 ("created_at", ">=", query.created_from),
                 ("created_at", "<=", query.created_to),
                 ("updated_at", ">=", query.updated_from),
@@ -387,9 +384,9 @@ class SQLiteProvider:
                 for col in columns
             )
             memory_type = f"CAST('{kind}' AS TEXT)" if self._read_index_capable else f"'{kind}'"
-            selects.append((
-                kind, f"SELECT {fields}, {memory_type} AS memory_type FROM {table} WHERE {' AND '.join(clauses)}"
-            ))
+            selects.append(
+                (kind, f"SELECT {fields}, {memory_type} AS memory_type FROM {table} WHERE {' AND '.join(clauses)}")
+            )
 
         def build(bound):
             # Push both key predicates into EVERY arm, not just the last arm.
@@ -426,9 +423,7 @@ class SQLiteProvider:
             )
         ).all()
         page_rows = rows[: query.limit]
-        receipts = await self._read_receipt_metadata_batch(
-            session, tuple((r.id, r.memory_type) for r in page_rows)
-        )
+        receipts = await self._read_receipt_metadata_batch(session, tuple((r.id, r.memory_type) for r in page_rows))
         records = tuple(
             ReadRecord(self._record(r.memory_type, r), r.memory_type, receipts.get((r.id, r.memory_type)))
             for r in page_rows
@@ -450,7 +445,8 @@ class SQLiteProvider:
                 "SELECT id,memory_type,source,created_by,timestamp,confidence,"
                 "verification_status,lifecycle_state,version FROM receipts "
                 f"WHERE (id,memory_type) IN ({pairs}) LIMIT :receipt_limit"
-            ), params,
+            ),
+            params,
         )
         receipts = {}
         for row in rows:
@@ -469,18 +465,122 @@ class SQLiteProvider:
             return ()
         binds = ",".join(f":id{i}" for i in range(len(ids)))
         params = {f"id{i}": ident for i, ident in enumerate(ids)}
-        rows = (await session.execute(
-            text(f"SELECT * FROM facts WHERE id IN ({binds}) LIMIT :fact_limit"),
-            {**params, "fact_limit": len(ids)},
-        )).all()
+        rows = (
+            await session.execute(
+                text(f"SELECT * FROM facts WHERE id IN ({binds}) LIMIT :fact_limit"),
+                {**params, "fact_limit": len(ids)},
+            )
+        ).all()
         receipts = await self._read_receipt_metadata_batch(session, tuple((i, "fact") for i in ids))
         records = {r.id: ReadRecord(self._record("fact", r), "fact", receipts.get((r.id, "fact"))) for r in rows}
         return tuple(records[i] for i in ids if i in records)
 
-    async def search_facts_in_session(self, session: AsyncSession, *, text: str, limit: int, include_inactive: bool):
-        """Keyword search using the same connection and transaction as hydration."""
-        repo = await self._get_fact_repo(session)
-        return await repo.search(text=text, limit=limit, lifecycle_state=None if include_inactive else "active")
+    async def search_facts_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        text_query: str | None = None,
+        limit: int,
+        include_inactive: bool,
+        memory_types=(),
+        lifecycle_states=(),
+        min_confidence=None,
+        **kwargs,
+    ):
+        """Search facts in the caller transaction, applying S08a filters before LIMIT."""
+        text_query = text_query if text_query is not None else kwargs.get("text")
+        if not memory_types and not lifecycle_states and min_confidence is None:
+            repo = await self._get_fact_repo(session)
+            return await repo.search(
+                text=text_query, limit=limit, lifecycle_state=None if include_inactive else "active"
+            )
+        if memory_types and "fact" not in memory_types:
+            return []
+        clauses = []
+        params = {"limit": limit}
+        if not include_inactive:
+            clauses.append("f.lifecycle_state IN ('candidate','validated','active')")
+        if lifecycle_states:
+            names = []
+            for i, value in enumerate(lifecycle_states):
+                name = f"ls{i}"
+                names.append(f":{name}")
+                params[name] = value
+            clauses.append("f.lifecycle_state IN (" + ",".join(names) + ")")
+        if min_confidence is not None:
+            clauses.append("f.confidence >= :min_confidence")
+            params["min_confidence"] = min_confidence
+        if not text_query or not any(char.isalnum() for char in text_query):
+            return []
+        terms = [f'"{term.replace(chr(34), chr(34) * 2)}"*' for term in text_query.strip().split()]
+        match = " AND ".join(terms)
+        params["query"] = match
+        where = " AND ".join(clauses) or "1=1"
+        try:
+            exists = await session.execute(text("SELECT 1 FROM sqlite_master WHERE type='table' AND name='facts_fts'"))
+            has_fts = exists.first() is not None
+            rows = []
+            if has_fts:
+                result = await session.execute(
+                    text(
+                        "SELECT f.* FROM facts_fts JOIN facts f ON facts_fts.rowid=f.rowid "
+                        f"WHERE facts_fts MATCH :query AND {where} ORDER BY rank LIMIT :limit"
+                    ),
+                    params,
+                )
+                rows = result.mappings().all()
+            if not rows:
+                escaped = text_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                like = f"%{escaped}%"
+                params.update({"like": like})
+                result = await session.execute(
+                    text(
+                        "SELECT f.* FROM facts f WHERE "
+                        "(f.subject LIKE :like ESCAPE '\\\\' "
+                        "OR f.predicate LIKE :like ESCAPE '\\\\' "
+                        "OR f.object LIKE :like ESCAPE '\\\\') "
+                        f"AND {where} ORDER BY f.created_at DESC LIMIT :limit"
+                    ),
+                    params,
+                )
+                rows = result.mappings().all()
+        except Exception as exc:
+            from sqlalchemy.exc import SQLAlchemyError
+
+            if isinstance(exc, SQLAlchemyError):
+                raise
+            raise
+        return [Fact(**dict(row)) for row in rows]
+
+    async def read_memory_records(self, session: AsyncSession, keys):
+        """Hydrate typed fact/decision keys in one transaction and stable order."""
+        from memory_server.application.memory_read_service import ReadRecord
+
+        if len(keys) > 200 or len(set(keys)) != len(keys):
+            raise ValueError("invalid typed key batch")
+        if any(
+            type(k) is not tuple or len(k) != 2 or k[0] not in ("fact", "decision") or type(k[1]) is not str or not k[1]
+            for k in keys
+        ):
+            raise ValueError("invalid typed key")
+        by_type = {kind: [ident for k, ident in keys if k == kind] for kind in ("fact", "decision")}
+        found = {}
+        for kind, ids in by_type.items():
+            if not ids:
+                continue
+            binds = ",".join(f":{kind}{i}" for i in range(len(ids)))
+            params = {f"{kind}{i}": ident for i, ident in enumerate(ids)}
+            result = await session.execute(
+                text(f"SELECT * FROM {kind}s WHERE id IN ({binds}) LIMIT :n"), {**params, "n": len(ids)}
+            )
+            for row in result:
+                found[(kind, row._mapping["id"])] = ReadRecord(self._record(kind, row), kind, None)
+        receipts = await self._read_receipt_metadata_batch(session, tuple((ident, kind) for kind, ident in keys))
+        found = {
+            key: ReadRecord(record.memory, record.memory_type, receipts.get((key[1], key[0])))
+            for key, record in found.items()
+        }
+        return tuple(found[key] for key in keys if key in found)
 
     async def read_receipt_metadata(self, session: AsyncSession, memory_id: str, memory_type: str):
         result = await session.execute(
@@ -547,9 +647,14 @@ class SQLiteProvider:
             if effective_state is None and not include_inactive:
                 effective_state = "active"
             return await repo.search(
-                subject=subject, predicate=predicate, object=object,
-                source=source, text=text, min_confidence=min_confidence,
-                max_confidence=max_confidence, lifecycle_state=effective_state,
+                subject=subject,
+                predicate=predicate,
+                object=object,
+                source=source,
+                text=text,
+                min_confidence=min_confidence,
+                max_confidence=max_confidence,
+                lifecycle_state=effective_state,
                 limit=limit,
             )
 
@@ -604,8 +709,9 @@ class SQLiteProvider:
     ) -> list[Decision]:
         async with await self._get_session() as session:
             repo = await self._get_decision_repo(session)
-            return await repo.search(context=context, choice=choice, reason=reason,
-                                     source=source, text=text, limit=limit)
+            return await repo.search(
+                context=context, choice=choice, reason=reason, source=source, text=text, limit=limit
+            )
 
     async def delete_decision(self, decision_id: str) -> bool:
         async with await self._get_session() as session:
@@ -638,8 +744,9 @@ class SQLiteProvider:
     ) -> list[Skill]:
         async with await self._get_session() as session:
             repo = await self._get_skill_repo(session)
-            return await repo.search(purpose=purpose, name=name, text=text,
-                                     min_success_rate=min_success_rate, limit=limit)
+            return await repo.search(
+                purpose=purpose, name=name, text=text, min_success_rate=min_success_rate, limit=limit
+            )
 
     async def delete_skill(self, skill_id: str) -> bool:
         async with await self._get_session() as session:
@@ -671,8 +778,7 @@ class SQLiteProvider:
     ) -> list[MemoryReceipt]:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
-            return await repo.search(memory_type=memory_type, source=source,
-                                     created_by=created_by, limit=limit)
+            return await repo.search(memory_type=memory_type, source=source, created_by=created_by, limit=limit)
 
     async def count_facts(self, include_inactive: bool = True) -> int:
         async with await self._get_session() as session:
@@ -723,14 +829,9 @@ class SQLiteProvider:
                 MemoryReceiptORM.memory_type,
             )
             if not include_inactive:
-                receipt_stmt = receipt_stmt.where(
-                    MemoryReceiptORM.lifecycle_state.in_(active_states)
-                )
+                receipt_stmt = receipt_stmt.where(MemoryReceiptORM.lifecycle_state.in_(active_states))
             receipt_rows = await session.execute(receipt_stmt)
-            receipt_map = {
-                receipt_id: memory_type
-                for receipt_id, memory_type in receipt_rows.all()
-            }
+            receipt_map = {receipt_id: memory_type for receipt_id, memory_type in receipt_rows.all()}
 
             def _normalize_rows(rows, memory_type: str) -> list[dict[str, Any]]:
                 normalized: list[dict[str, Any]] = []
@@ -769,9 +870,7 @@ class SQLiteProvider:
             )
             if not include_inactive:
                 fact_stmt = fact_stmt.where(FactORM.lifecycle_state.in_(active_states))
-                decision_stmt = decision_stmt.where(
-                    DecisionORM.lifecycle_state.in_(active_states)
-                )
+                decision_stmt = decision_stmt.where(DecisionORM.lifecycle_state.in_(active_states))
                 skill_stmt = skill_stmt.where(SkillORM.lifecycle_state.in_(active_states))
 
             fact_rows = (await session.execute(fact_stmt)).all()
@@ -895,9 +994,7 @@ class SQLiteProvider:
                 limit=limit,
             )
 
-    async def update_belief_confidence(
-        self, belief_id: str, new_confidence: float
-    ) -> Optional[Belief]:
+    async def update_belief_confidence(self, belief_id: str, new_confidence: float) -> Optional[Belief]:
         """Update the confidence of a belief."""
         async with await self._get_session() as session:
             repo = await self._get_belief_repo(session)

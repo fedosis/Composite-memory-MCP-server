@@ -333,9 +333,8 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
             eligible = not (
                 payload.get("trace")
                 or payload.get("mode") in ("semantic", "graph")
-                or any(payload.get("filters", {}).get(f) for f in ("memory_types", "tags", "lifecycle_states"))
+                or any(payload.get("filters", {}).get(f) for f in ("tags",))
                 or payload.get("filters", {}).get("source") is not None
-                or payload.get("filters", {}).get("min_confidence") is not None
             )
             return await checked(
                 "POST",
@@ -371,10 +370,12 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
             assert status == 503 and result["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
         status, result = await search("alpha", {**base, "trace": True})
         assert status == 503 and result["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
-        for field, value in (("memory_types", "fact"), ("tags", "fact"), ("lifecycle_states", "active")):
-            payload = {**base, "filters": {**base["filters"], field: [value]}}
-            status, result = await search("alpha", payload)
-            assert status == 422 and result["error"]["code"] == "E_VALIDATION"
+        status, result = await search("alpha", {**base, "filters": {**base["filters"], "memory_types": ["fact"]}})
+        assert status == 200 and result["total"] == 1
+        status, result = await search("alpha", {**base, "filters": {**base["filters"], "lifecycle_states": ["active"]}})
+        assert status == 200 and result["total"] == 1
+        status, result = await search("alpha", {**base, "filters": {**base["filters"], "tags": ["fact"]}})
+        assert status == 422 and result["error"]["code"] == "E_VALIDATION"
         for profile, query, expected in (("alpha", "beta-unique-marker", 0), ("beta", "alpha-unique-marker", 0)):
             status, result = await search(profile, {**base, "query": query, "mode": "keyword"})
             assert status == 200 and result["total"] == expected
@@ -384,9 +385,10 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
         assert status == 200 and result["total"] == 1, result
         status, result = await search("alpha", {**base, "query": "alpha-inactive-marker", "mode": "keyword"})
         assert status == 200 and result["total"] == 0
-        for filters in ({"source": "", "min_confidence": None}, {"source": None, "min_confidence": 0.0}):
-            status, result = await search("alpha", {**base, "filters": filters})
-            assert status == 422
+        status, result = await search("alpha", {**base, "filters": {"source": "", "min_confidence": None}})
+        assert status == 422
+        status, result = await search("alpha", {**base, "filters": {"source": None, "min_confidence": 0.0}})
+        assert status == 200 and result["total"] == 1
         for profile in ("alpha", "beta"):
             status, result = await search(profile, {**base, "query": "common-marker", "mode": "keyword"})
             assert status == 200 and result["total"] == len(result["results"]) > 0
@@ -485,9 +487,7 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
             payload={**base, "query": "common-marker", "mode": "keyword"},
         )
         assert status == 200 and all(h["memory"]["masked"] for h in result["results"])
-        status, result = await checked(
-            "GET", "/api/v1/profiles/alpha/lookup?kind=trace&id=absent-trace", "lookup"
-        )
+        status, result = await checked("GET", "/api/v1/profiles/alpha/lookup?kind=trace&id=absent-trace", "lookup")
         assert status == 503 and result["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
         status, result = await search("alpha", {**base, "query": "SLICE_CANARY_QUERY", "mode": "keyword"})
         assert status == 200 and result["total"] == 0
@@ -637,8 +637,14 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
         from memory_server.transports.http.app import create_http_app
 
         expected = {
-            "memories.list", "memories.get", "receipts.get", "history.list",
-            "lookup", "memories.reveal", "search",
+            "memories.list",
+            "memories.get",
+            "receipts.get",
+            "history.list",
+            "lookup",
+            "memories.reveal",
+            "search",
+            "context",
         }
         assert set(deps.ports) == expected
         assert {spec.operation for spec in read_routes} == expected
@@ -704,7 +710,7 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
                 ).fetchone()[0]
                 == 0
             )
-        surviving_operation = "search" if operation == "memories.list" else "memories.list"
+        surviving_operation = "search" if operation in {"memories.list", "context"} else "memories.list"
         if surviving_operation == "search":
             status, result = await http_request(
                 port,
