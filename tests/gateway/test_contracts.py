@@ -905,6 +905,22 @@ assert not blocked, blocked
     print(result.stdout.strip())
 
 
+# S07's only frozen C4 delta: nullable, still required, with no new defaults.
+@pytest.mark.parametrize("name,field,types", [
+    ("Receipt", "source", {str, type(None)}),
+    ("Receipt", "created_by", {str, type(None)}),
+    ("Receipt", "source_version", {str, int, type(None)}),
+    ("Memory", "source_version", {str, int, type(None)}),
+    ("Relation", "revision", {int, type(None)}),
+])
+def test_s07_frozen_required_nullable_fields(name, field, types):
+    dto, _, _ = modules()
+    declaration = getattr(dto, name).model_fields[field]
+    assert set(typing.get_args(declaration.annotation)) == types
+    assert declaration.is_required() is True
+    assert TypeAdapter(declaration.annotation).validate_python(None) is None
+
+
 @pytest.mark.parametrize("name", EXPECTED_FIELDS)
 def test_exact_dto_fields_and_closed_strict_finite_models(name):
     dto, _, _ = modules()
