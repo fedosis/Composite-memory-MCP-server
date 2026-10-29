@@ -53,7 +53,9 @@ class HttpApp:
             if isinstance(spec, RetrievalRouteSpec):
                 canonical = RETRIEVAL_ROUTE_SPECS.get(spec.operation)
                 owner_matches = (row is not None and row.owner == 'S08'
-                                 and canonical is spec
+                                 and canonical is not None
+                                 and spec.parse is canonical.parse
+                                 and spec.validate_result is canonical.validate_result
                                  and spec.operation in {'search', 'context'})
             else:
                 owner_matches = row is not None and row.owner == 'S07'

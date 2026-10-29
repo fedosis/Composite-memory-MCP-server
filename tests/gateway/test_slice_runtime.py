@@ -487,7 +487,9 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
             payload={**base, "query": "common-marker", "mode": "keyword"},
         )
         assert status == 200 and all(h["memory"]["masked"] for h in result["results"])
-        status, result = await checked("GET", "/api/v1/profiles/alpha/lookup?kind=trace&id=absent-trace", "lookup")
+        status, result = await checked(
+            "GET", "/api/v1/profiles/alpha/lookup?kind=trace&id=absent-trace", "lookup"
+        )
         assert status == 503 and result["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
         status, result = await search("alpha", {**base, "query": "SLICE_CANARY_QUERY", "mode": "keyword"})
         assert status == 200 and result["total"] == 0
@@ -637,14 +639,8 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
         from memory_server.transports.http.app import create_http_app
 
         expected = {
-            "memories.list",
-            "memories.get",
-            "receipts.get",
-            "history.list",
-            "lookup",
-            "memories.reveal",
-            "search",
-            "context",
+            "memories.list", "memories.get", "receipts.get", "history.list",
+            "lookup", "memories.reveal", "search", "context",
         }
         assert set(deps.ports) == expected
         assert {spec.operation for spec in read_routes} == expected
@@ -710,7 +706,7 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
                 ).fetchone()[0]
                 == 0
             )
-        surviving_operation = "search" if operation in {"memories.list", "context"} else "memories.list"
+        surviving_operation = "search" if operation == "memories.list" else "memories.list"
         if surviving_operation == "search":
             status, result = await http_request(
                 port,
@@ -731,14 +727,16 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
 
 @pytest.mark.parametrize(
     "kind",
-    ["plain-search", "search-as-read", "context", "method", "path", "permission", "duplicate", "foreign", "object"],
+    ["plain-search", "search-as-read", "context", "method", "path", "permission", "duplicate", "foreign", "object",
+     "context-parser", "search-parser", "context-result", "search-result", "plain-context", "context-as-search"],
 )
 def test_slice_mount_catalogue_rejects_substitution(shell, kind):
     from memory_server.transports.http.app import create_http_app
     from memory_server.transports.http.guards import ReadRouteSpec
-    from memory_server.transports.http.routes.retrieval import create_search_routes
+    from memory_server.transports.http.routes.retrieval import create_context_routes, create_search_routes
 
     spec = create_search_routes()[0]
+    context = create_context_routes()[0]
     cases = {
         "plain-search": (ReadRouteSpec(**vars(spec)),),
         "search-as-read": (
@@ -753,9 +751,17 @@ def test_slice_mount_catalogue_rejects_substitution(shell, kind):
             replace(spec, operation="profiles.list", method="GET", path="/api/v1/profiles", permission="profile.read"),
         ),
         "object": (object(),),
+        "context-parser": (replace(context, parse=spec.parse),),
+        "search-parser": (replace(spec, parse=context.parse),),
+        "context-result": (replace(context, validate_result=spec.validate_result),),
+        "search-result": (replace(spec, validate_result=context.validate_result),),
+        "plain-context": (ReadRouteSpec(**vars(context)),),
+        "context-as-search": (replace(context, operation="search", path=spec.path),),
     }
     with pytest.raises(ValueError):
         create_http_app(shell.config, shell.deps, read_routes=cases[kind])
+    # Equivalent copies with canonical callable identities remain valid.
+    create_http_app(shell.config, shell.deps, read_routes=(replace(spec), replace(context)))
 
 
 @pytest.mark.asyncio

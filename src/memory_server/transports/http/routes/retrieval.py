@@ -28,7 +28,7 @@ def _parse_search(request, body, principal):
     if not query.query.isprintable():
         raise HttpError("E_VALIDATION")
     filters = query.filters
-    # C4/T2 source-tags reconciliation: these filters remain intentionally unsupported.
+    # C4/T2: see ops/CONTRACTS_AMENDMENT_C4_T2.md; these filters remain unsupported.
     if filters.source is not None or filters.tags:
         raise HttpError("E_VALIDATION")
     if query.trace or query.mode in ("semantic", "graph"):
@@ -47,8 +47,6 @@ def _parse_context(request, body, principal):
         query = d.ContextRequest.model_validate_json(body)
     except (ValidationError, ValueError, TypeError):
         raise HttpError("E_VALIDATION") from None
-    if not query.task.isprintable():
-        raise HttpError("E_VALIDATION")
     if query.trace:
         raise HttpError("E_CAPABILITY_UNAVAILABLE")
     return d.COMMAND_TYPES["context"](
