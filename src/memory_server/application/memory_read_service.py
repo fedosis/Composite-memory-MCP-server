@@ -341,14 +341,15 @@ class MemoryReadService(MemoryReadPort):
 
                 # Only canonical hashes may cross this provenance boundary.
                 # Unknown/free-text build labels are not safe GET metadata.
+                trace_stages = ("fts", "semantic", "graph", "merge", "context")
                 result = d.Trace(
                     id=result.id,
                     request_id=result.request_id,
                     profile_id=result.profile_id,
                     operation=result.operation,
                     query=None,
-                    stages={k: [contribution(v) for v in items] for k, items in result.stages.items()},
-                    stage_status=dict(result.stage_status),
+                    stages={k: [contribution(v) for v in result.stages[k]] for k in trace_stages if k in result.stages},
+                    stage_status={k: result.stage_status[k] for k in trace_stages if k in result.stage_status},
                     merge=[contribution(v) for v in result.merge],
                     deduplicated=[contribution(v) for v in result.deduplicated],
                     final=[contribution(v) for v in result.final],

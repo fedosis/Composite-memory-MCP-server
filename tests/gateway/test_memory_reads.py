@@ -572,17 +572,24 @@ async def test_t7_lookup_extra_permissions_and_no_fake_port(reads, kind, permiss
 
 
 @pytest.mark.parametrize("safe_provenance", [False, True])
-async def test_t7_trace_scoped_masked_live_and_absent(reads, safe_provenance):
+@pytest.mark.parametrize("caller", ["reader", "revealer"])
+async def test_t7_trace_scoped_masked_live_and_absent(reads, safe_provenance, caller):
     r = reads
     item = d.TraceContribution(source="fts", matched_terms=[C + "matched"], relation_path=[C + "relation_path"])
+    known_stages = ("fts", "semantic", "graph", "merge", "context")
+    stages = {
+        stage: [item.model_copy(update=dict(memory_id=stage, rank_before_merge=rank))]
+        for rank, stage in enumerate(known_stages, start=1)
+    }
+    statuses = dict(zip(known_stages, ("ran", "skipped", "failed", "ran", "skipped"), strict=True))
     trace = d.Trace(
         id="trace-one",
         request_id="req_trace",
         profile_id="alpha",
         operation="search",
         query=C + "query",
-        stages={"fts": [item]},
-        stage_status={"fts": "ran"},
+        stages={**stages, C + "unknown_stage": [item]},
+        stage_status={**statuses, C + "unknown_status": "ran"},
         merge=[item],
         deduplicated=[item],
         final=[item],
@@ -599,17 +606,24 @@ async def test_t7_trace_scoped_masked_live_and_absent(reads, safe_provenance):
             return trace
 
     canary_evidence("trace-fixture-live", trace.model_dump_json(), live=True)
+    original = trace.model_dump()
     r.port.traces = Traces()
-    for bearer in (r.reader, r.revealer):
-        result = await r.call("lookup", query=dict(kind="trace", id="trace-one"), bearer=bearer)
-        assert result.status == 200, result.body
-        assert C.encode() not in result.body and result.json["target"]["id"] == "trace-one"
-        target = result.json["target"]
-        assert target["settings_digest"] == ("a" * 64 if safe_provenance else "")
-        assert target["code_revision"] == ("b" * 40 if safe_provenance else "")
-        for items in [*target["stages"].values(), target["merge"], target["deduplicated"], target["final"]]:
-            assert all(v["matched_terms"] == v["relation_path"] == [] for v in items)
-    assert trace.final[0].relation_path == [C + "relation_path"]
+    result = await r.call("lookup", query=dict(kind="trace", id="trace-one"), bearer=getattr(r, caller))
+    assert result.status == 200, result.body
+    assert C.encode() not in result.body and result.json["target"]["id"] == "trace-one"
+    target = result.json["target"]
+    assert target["settings_digest"] == ("a" * 64 if safe_provenance else "")
+    assert target["code_revision"] == ("b" * 40 if safe_provenance else "")
+    assert target["stages"] == {
+        stage: [v.model_copy(update=dict(matched_terms=[], relation_path=[])).model_dump(mode="json") for v in items]
+        for stage, items in stages.items()
+    }
+    assert target["stage_status"] == statuses
+    for field in ("merge", "deduplicated", "final"):
+        assert target[field] == [
+            item.model_copy(update=dict(matched_terms=[], relation_path=[])).model_dump(mode="json")
+        ]
+    assert trace.model_dump() == original
     trace.profile_id = "beta"
     code(await r.call("lookup", query=dict(kind="trace", id="trace-one")), "E_NOT_FOUND", 404)
     code(await r.call("lookup", query=dict(kind="trace", id="absent")), "E_NOT_FOUND", 404)
