@@ -47,6 +47,8 @@ def _parse_context(request, body, principal):
         query = d.ContextRequest.model_validate_json(body)
     except (ValidationError, ValueError, TypeError):
         raise HttpError("E_VALIDATION") from None
+    if not query.task.isprintable() or (query.subject is not None and not query.subject.isprintable()):
+        raise HttpError("E_VALIDATION")
     if query.trace:
         raise HttpError("E_CAPABILITY_UNAVAILABLE")
     return d.COMMAND_TYPES["context"](

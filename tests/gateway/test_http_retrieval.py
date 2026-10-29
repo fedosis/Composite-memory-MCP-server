@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 from types import SimpleNamespace
@@ -92,8 +94,17 @@ async def test_s08a_metadata_filter_accepted_over_tcp(tmp_path):
 
 @pytest.mark.asyncio
 async def test_s08a_context_mounted_over_tcp(tmp_path):
+    from memory_server.transports.http.routes import retrieval
+
     holder, task, port, auth = await _start(tmp_path)
     try:
+        parsers = {"search": retrieval._parse_search, "context": retrieval._parse_context}
+        mounted = [spec for spec in holder.app.read_routes if spec.operation in parsers]
+        assert {spec.operation for spec in mounted} == set(parsers)
+        for spec in mounted:
+            # Anchor the expected parser independently: the shared map itself may be swapped.
+            canonical = replace(retrieval.RETRIEVAL_ROUTE_SPECS[spec.operation], parse=parsers[spec.operation])
+            assert spec.parse is canonical.parse
         status, body = await http_request(
             port,
             "POST",
@@ -283,6 +294,50 @@ async def test_neutral_filter_parity_real_sqlite(tmp_path, no_fts):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("no_fts", [False, True])
+async def test_debug_logs_exclude_retrieval_bind_parameters(tmp_path, caplog, monkeypatch, no_fts):
+    # Start with inherited DEBUG, including when another daemon test set WARNING.
+    monkeypatch.setattr(logging.getLogger("aiosqlite"), "level", logging.NOTSET)
+    with caplog.at_level(logging.DEBUG):
+        async with live_server(tmp_path) as (holder, port, auth):
+            if no_fts:
+                async with await read_scope(holder, auth) as scope:
+                    resources = scope.application.read_resources()
+                    async with resources.session_factory() as session, session.begin():
+                        await session.execute(text("DROP TABLE facts_fts"))
+            canaries = ("FIX1_CANARY_TASK", "FIX1_CANARY_SUBJECT", "FIX1_CANARY_QUERY")
+            status, body = await post(port, auth, "context", task=canaries[0], subject=canaries[1])
+            assert status == 200, body
+            status, body = await post(port, auth, query=canaries[2], filters={"source": None, "min_confidence": 0.0})
+            assert status == 200, body
+            logging.getLogger("fix1.capture").debug("debug capture is active")
+        assert "debug capture is active" in caplog.text
+        leaked = [record for record in caplog.records if any(value in record.getMessage() for value in canaries)]
+        assert not leaked, [(record.name, record.getMessage()) for record in leaked]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["task", "subject", "query"])
+@pytest.mark.parametrize("control", ["\n", "\t", "\x00"])
+async def test_nonprintable_retrieval_rejected_before_audit_and_lease(tmp_path, monkeypatch, field, control):
+    async with live_server(tmp_path) as (holder, port, auth):
+        calls = []
+        acquire = holder.app.dependencies.leases.acquire
+
+        def counted(ctx):
+            calls.append(ctx.request_id)
+            return acquire(ctx)
+
+        monkeypatch.setattr(holder.app.dependencies.leases, "acquire", counted)
+        operation = "search" if field == "query" else "context"
+        status, body = await post(port, auth, operation, **{field: "FIX1_FORGED" + control + "entry"})
+        assert status == 422 and body["error"]["code"] == "E_VALIDATION", body
+        assert calls == []
+        with sqlite3.connect(tmp_path / "control" / "http-access" / "access.sqlite") as db:
+            assert db.execute("SELECT count(*) FROM access_audit").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_preflight_audit_modes_and_canaries(tmp_path, caplog, monkeypatch):
     async with live_server(tmp_path) as (holder, port, auth):
         deps = holder.app.dependencies
@@ -393,11 +448,15 @@ async def test_retrieval_audit_intent_one_lease_stage_custody(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_search_filter_sql_and_snapshot(tmp_path):
+@pytest.mark.parametrize("no_fts", [False, True])
+async def test_search_filter_sql_and_snapshot(tmp_path, no_fts):
     async with live_server(tmp_path) as (holder, port, auth):
         async with await read_scope(holder, auth) as scope:
             resources = scope.application.read_resources()
             await insert_facts(resources, [{"id": "match", "confidence": 0.9}])
+            if no_fts:
+                async with resources.session_factory() as session, session.begin():
+                    await session.execute(text("DROP TABLE facts_fts"))
             statements = []
 
             def capture(conn, cursor, statement, parameters, context, executemany):
@@ -411,11 +470,16 @@ async def test_search_filter_sql_and_snapshot(tmp_path):
             finally:
                 event.remove(resources.provider.engine.sync_engine, "before_cursor_execute", capture)
             assert status == 200 and body["total"] == 1
-            matching = [(conn, sql) for conn, sql in statements if "MATCH" in sql]
-            assert len(matching) == 1
+            branch = "LIKE" if no_fts else "MATCH"
+            matching = [(conn, sql) for conn, sql in statements if branch in sql]
+            assert len(matching) == 1, statements
             sql = matching[0][1]
-            assert sql.index("confidence") < sql.index("LIMIT")
-            assert "lifecycle_state IN" in sql
+            where_start = sql.index("WHERE")
+            limit_start = sql.index("LIMIT")
+            assert where_start < sql.index("f.confidence >=") < limit_start
+            assert where_start < sql.index("f.lifecycle_state IN") < limit_start
+            # Both the default active restriction and explicit lifecycle filter belong in WHERE.
+            assert sql[where_start:limit_start].count("f.lifecycle_state IN") == 2
             assert any(sql.strip().upper() == "BEGIN" for _, sql in statements)
             assert len({conn for conn, _ in statements}) == 1
 

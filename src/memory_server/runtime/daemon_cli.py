@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import signal
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -79,6 +80,7 @@ def server_config(app, config):
 
 
 async def run_daemon(config, registry_path, profiles_root=None, *, factory=None, server_factory=None):
+    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
     # Resolve and reject absence before local stores or sockets are touched.
     if factory is None:
         raise ValueError('E_CAPABILITY_UNAVAILABLE')
