@@ -83,11 +83,15 @@ class SQLiteProvider:
         preserving correctness for fresh/migrated databases that need an initial
         backfill.
         """
-        source_has_rows = bool((await conn.exec_driver_sql(f"SELECT 1 FROM {source_table} LIMIT 1")).first())
+        source_has_rows = bool(
+            (await conn.exec_driver_sql(f"SELECT 1 FROM {source_table} LIMIT 1")).first()
+        )
         if not source_has_rows:
             return False
 
-        fts_has_rows = bool((await conn.exec_driver_sql(f"SELECT 1 FROM {fts_table} LIMIT 1")).first())
+        fts_has_rows = bool(
+            (await conn.exec_driver_sql(f"SELECT 1 FROM {fts_table} LIMIT 1")).first()
+        )
         return not fts_has_rows
 
     async def initialize(self):
@@ -101,8 +105,7 @@ class SQLiteProvider:
                 conn,
                 self._busy_timeout_ms,
                 context="SQLiteProvider",
-                allow_degraded_mode=self._url
-                in {
+                allow_degraded_mode=self._url in {
                     "sqlite+aiosqlite://",
                     "sqlite+aiosqlite:///:memory:",
                 },
@@ -139,7 +142,9 @@ class SQLiteProvider:
                 source_table="facts",
                 fts_table="facts_fts",
             ):
-                await conn.exec_driver_sql("INSERT INTO facts_fts(facts_fts) VALUES ('rebuild')")
+                await conn.exec_driver_sql(
+                    "INSERT INTO facts_fts(facts_fts) VALUES ('rebuild')"
+                )
             # Create beliefs FTS5 virtual table
             await conn.exec_driver_sql(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS beliefs_fts "
@@ -169,7 +174,9 @@ class SQLiteProvider:
                 source_table="beliefs",
                 fts_table="beliefs_fts",
             ):
-                await conn.exec_driver_sql("INSERT INTO beliefs_fts(beliefs_fts) VALUES ('rebuild')")
+                await conn.exec_driver_sql(
+                    "INSERT INTO beliefs_fts(beliefs_fts) VALUES ('rebuild')"
+                )
 
         self._session_factory = async_sessionmaker(
             self._engine,
@@ -329,14 +336,9 @@ class SQLiteProvider:
             if effective_state is None and not include_inactive:
                 effective_state = "active"
             return await repo.search(
-                subject=subject,
-                predicate=predicate,
-                object=object,
-                source=source,
-                text=text,
-                min_confidence=min_confidence,
-                max_confidence=max_confidence,
-                lifecycle_state=effective_state,
+                subject=subject, predicate=predicate, object=object,
+                source=source, text=text, min_confidence=min_confidence,
+                max_confidence=max_confidence, lifecycle_state=effective_state,
                 limit=limit,
             )
 
@@ -391,9 +393,8 @@ class SQLiteProvider:
     ) -> list[Decision]:
         async with await self._get_session() as session:
             repo = await self._get_decision_repo(session)
-            return await repo.search(
-                context=context, choice=choice, reason=reason, source=source, text=text, limit=limit
-            )
+            return await repo.search(context=context, choice=choice, reason=reason,
+                                     source=source, text=text, limit=limit)
 
     async def delete_decision(self, decision_id: str) -> bool:
         async with await self._get_session() as session:
@@ -426,9 +427,8 @@ class SQLiteProvider:
     ) -> list[Skill]:
         async with await self._get_session() as session:
             repo = await self._get_skill_repo(session)
-            return await repo.search(
-                purpose=purpose, name=name, text=text, min_success_rate=min_success_rate, limit=limit
-            )
+            return await repo.search(purpose=purpose, name=name, text=text,
+                                     min_success_rate=min_success_rate, limit=limit)
 
     async def delete_skill(self, skill_id: str) -> bool:
         async with await self._get_session() as session:
@@ -460,7 +460,8 @@ class SQLiteProvider:
     ) -> list[MemoryReceipt]:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
-            return await repo.search(memory_type=memory_type, source=source, created_by=created_by, limit=limit)
+            return await repo.search(memory_type=memory_type, source=source,
+                                     created_by=created_by, limit=limit)
 
     async def count_facts(self, include_inactive: bool = True) -> int:
         async with await self._get_session() as session:
@@ -511,9 +512,14 @@ class SQLiteProvider:
                 MemoryReceiptORM.memory_type,
             )
             if not include_inactive:
-                receipt_stmt = receipt_stmt.where(MemoryReceiptORM.lifecycle_state.in_(active_states))
+                receipt_stmt = receipt_stmt.where(
+                    MemoryReceiptORM.lifecycle_state.in_(active_states)
+                )
             receipt_rows = await session.execute(receipt_stmt)
-            receipt_map = {receipt_id: memory_type for receipt_id, memory_type in receipt_rows.all()}
+            receipt_map = {
+                receipt_id: memory_type
+                for receipt_id, memory_type in receipt_rows.all()
+            }
 
             def _normalize_rows(rows, memory_type: str) -> list[dict[str, Any]]:
                 normalized: list[dict[str, Any]] = []
@@ -552,7 +558,9 @@ class SQLiteProvider:
             )
             if not include_inactive:
                 fact_stmt = fact_stmt.where(FactORM.lifecycle_state.in_(active_states))
-                decision_stmt = decision_stmt.where(DecisionORM.lifecycle_state.in_(active_states))
+                decision_stmt = decision_stmt.where(
+                    DecisionORM.lifecycle_state.in_(active_states)
+                )
                 skill_stmt = skill_stmt.where(SkillORM.lifecycle_state.in_(active_states))
 
             fact_rows = (await session.execute(fact_stmt)).all()
@@ -676,7 +684,9 @@ class SQLiteProvider:
                 limit=limit,
             )
 
-    async def update_belief_confidence(self, belief_id: str, new_confidence: float) -> Optional[Belief]:
+    async def update_belief_confidence(
+        self, belief_id: str, new_confidence: float
+    ) -> Optional[Belief]:
         """Update the confidence of a belief."""
         async with await self._get_session() as session:
             repo = await self._get_belief_repo(session)
