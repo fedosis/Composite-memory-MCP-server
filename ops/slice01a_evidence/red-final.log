@@ -1,0 +1,59 @@
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+_ test_fresh_initialize_has_exact_created_type_indexes_and_reopen_does_not_migrate _
+
+tmp_path = PosixPath('/home/shtorm/.hermes/workspace/cmms-http-gateway-plan/ops/slice01a_evidence/pytest-red-final/test_fresh_initialize_has_exac0')
+
+    @pytest.mark.asyncio
+    async def test_fresh_initialize_has_exact_created_type_indexes_and_reopen_does_not_migrate(tmp_path):
+        db = tmp_path / "fresh.db"
+        provider = SQLiteProvider(f"sqlite+aiosqlite:///{db}")
+        await provider.initialize()
+        await provider.close()
+        sql = _all_index_sql(db)
+        for kind, name in INDEXES.items():
+>           definition = sql[name].lower()
+                         ^^^^^^^^^
+E           KeyError: 'ix_facts_created_type_id'
+
+tests/gateway/test_memory_read_indexes.py:176: KeyError
+__________ test_real_read_page_eqp_uses_each_index_without_temp_sort ___________
+
+seeded = (<memory_server.providers.sqlite_provider.SQLiteProvider object at 0x7bbef0ae2610>, PosixPath('/home/shtorm/.hermes/workspace/cmms-http-gateway-plan/ops/slice01a_evidence/pytest-red-final/test_real_read_page_eqp_uses_e0/slice01a.db'))
+
+    @pytest.mark.asyncio
+    async def test_real_read_page_eqp_uses_each_index_without_temp_sort(seeded):
+        provider, db = seeded
+        captured = []
+    
+        def trace(conn, cursor, statement, params, context, many):
+            if statement.lstrip().upper().startswith("SELECT"):
+                captured.append((statement, params))
+    
+        event.listen(provider.engine.sync_engine, "before_cursor_execute", trace)
+        try:
+            for limit in (1, 200):
+                for memory_types in ([], ["fact"]):
+                    captured.clear()
+                    await _page(provider, _query(limit, memory_types=memory_types))
+                    selects = [(sql, params) for sql, params in captured if "ORDER BY" in sql.upper()]
+                    assert len(selects) >= 2, captured
+                    plans = [_eqp_lines(sql, params, db) for sql, params in selects[:2]]
+                    joined = "\n".join("; ".join(plan) for plan in plans)
+>                   assert "TEMP B-TREE" not in joined, joined
+E                   AssertionError: CO-ROUTINE memories; COMPOUND QUERY; LEFT-MOST SUBQUERY; SCAN facts; UNION ALL; SCAN beliefs; UNION ALL; SCAN decisions; UNION ALL; SCAN skills; SCAN memories; USE TEMP B-TREE FOR ORDER BY
+E                     CO-ROUTINE memories; COMPOUND QUERY; LEFT-MOST SUBQUERY; SCAN facts; UNION ALL; SCAN beliefs; UNION ALL; SCAN decisions; UNION ALL; SCAN skills; SCAN memories; USE TEMP B-TREE FOR ORDER BY
+E                   assert 'TEMP B-TREE' not in 'CO-ROUTINE ...FOR ORDER BY'
+E                     
+E                     'TEMP B-TREE' is contained here:
+E                       ries; USE TEMP B-TREE FOR ORDER BY
+E                     ?           +++++++++++
+E                       CO-ROUTINE memories; COMPOUND QUERY; LEFT-MOST SUBQUERY; SCAN facts; UNION ALL; SCAN beliefs; UNION ALL; SCAN decisions; UNION ALL; SCAN skills; SCAN memories; USE TEMP B-TREE FOR ORDER BY
+
+tests/gateway/test_memory_read_indexes.py:206: AssertionError
+=========================== short test summary info ============================
+FAILED tests/gateway/test_memory_read_indexes.py::test_fresh_initialize_has_exact_created_type_indexes_and_reopen_does_not_migrate
+FAILED tests/gateway/test_memory_read_indexes.py::test_real_read_page_eqp_uses_each_index_without_temp_sort
+2 failed, 8 deselected in 1.45s
+
+exit=1

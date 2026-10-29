@@ -1,0 +1,28 @@
+............                                                             [100%]
+=============================== warnings summary ===============================
+tests/test_profile_migration.py::test_s304_remote_backend_uses_local_fake_http_endpoint
+tests/test_profile_migration.py::test_s304_remote_backend_uses_local_fake_http_endpoint
+tests/test_profile_migration.py::test_s304_remote_backend_uses_local_fake_http_endpoint
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+  /home/shtorm/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/concurrent/futures/thread.py:58: DeprecationWarning: table_names() is deprecated, use list_tables() instead
+    result = self.fn(*self.args, **self.kwargs)
+
+tests/test_profile_migration.py::test_s304_remote_backend_uses_local_fake_http_endpoint
+tests/test_profile_migration.py::test_s304_remote_backend_uses_local_fake_http_endpoint
+tests/test_profile_migration.py::test_s304_remote_backend_uses_local_fake_http_endpoint
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+tests/test_profile_migration.py::test_s306_adversarial_staged_artifact_never_reaches_staged_verified[tampered_payload]
+  /home/shtorm/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/asyncio/events.py:84: DeprecationWarning: table_names() is deprecated, use list_tables() instead
+    self._context.run(self._callback, *self._args)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+12 passed, 18 warnings in 41.63s

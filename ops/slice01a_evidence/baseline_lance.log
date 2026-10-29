@@ -1,0 +1,56 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+________________ test_s302_real_store_validation_cases[corrupt] ________________
+
+tmp_path = PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-394/test_s302_real_store_validatio0')
+case = 'corrupt'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case",
+        ["corrupt", "dimension", "duplicate", "extra", "missing", "malformed", "nonobject", "missingkey", "wrongtype"],
+    )
+    async def test_s302_real_store_validation_cases(tmp_path, case):
+        path = tmp_path / case
+        rows = _validation_rows(["a", "b"])
+        expected = {"a", "b"}
+        if case == "dimension":
+            rows = _validation_rows(["a", "b"], dimension=2)
+        elif case == "duplicate":
+            rows.append(rows[0].copy())
+        elif case == "extra":
+            rows.append(_validation_rows(["c"])[0])
+        elif case == "missing":
+            rows = rows[:1]
+        elif case == "malformed":
+            rows[0]["_metadata"] = "{bad"
+        elif case == "nonobject":
+            rows[0]["_metadata"] = "[]"
+        elif case == "missingkey":
+            rows[0]["_metadata"] = json.dumps({
+                "subject": "s", "predicate": "p", "object": "o", "memory_type": "fact"
+            })
+        elif case == "wrongtype":
+            rows[0]["_metadata"] = json.dumps({
+                "subject": 3, "predicate": "p", "object": "o", "source": "test", "memory_type": "fact"
+            })
+        if case == "corrupt":
+            _make_validation_store(path, rows)
+            for manifest in (path / "memories.lance" / "_versions").glob("*.manifest"):
+                manifest.unlink()
+        else:
+            _make_validation_store(path, rows, dimension=2 if case == "dimension" else 3)
+        result = await LanceDBProvider(db_path=str(path), table="memories").validate_collection(
+            expected_ids=expected, expected_vector_size=3
+        )
+        assert not result.valid
+        assert result.errors
+        if case == "corrupt":
+>           assert any("unreadable store:" in error for error in result.errors)
+E           assert False
+E            +  where False = any(<generator object test_s302_real_store_validation_cases.<locals>.<genexpr> at 0x715f793d9490>)
+
+tests/test_lancedb_provider.py:736: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_lancedb_provider.py::test_s302_real_store_validation_cases[corrupt]
+1 failed, 51 deselected in 1.32s

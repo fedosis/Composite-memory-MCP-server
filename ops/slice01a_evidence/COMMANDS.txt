@@ -1,0 +1,68 @@
+SLICE-01A evidence command index
+
+Repository/cwd: /home/shtorm/.hermes/workspace/gw-slice01a
+P=/home/shtorm/.hermes/workspace/.venvs/cmms-verify/bin/python
+E=env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/shtorm/.hermes/workspace/gw-slice01a/src:/home/shtorm/.hermes/workspace/gw-slice01a
+TMPDIR is inherited from Hermes: /home/shtorm/.hermes/profiles/coder/cache/scratch
+Every pytest subprocess launched by the runners receives this absolute PYTHONPATH. Unchanged test helpers may prepend their own absolute source_root for children.
+
+Initial RED and baseline:
+  red-command-final.txt is the exact pre-change command (exit 1, 2 failed).
+  baseline_profile_sqlite.command.txt is the exact original baseline command (282 passed / 4 failed).
+  Initial logs were copied byte-for-byte from cmms-http-gateway-plan/ops/slice01a_evidence after the delegated baseline runs; no baseline DB is committed.
+
+Gate runner (each creates <name>.command.json, <name>.log and <name>.xml):
+  python ops/slice01a_evidence/run_gate.py quick tests/gateway/test_memory_read_indexes.py tests/gateway/test_memory_reads.py -k 'not legacy_and_raw' -q
+  python ops/slice01a_evidence/run_gate.py quick_final tests/gateway/test_memory_read_indexes.py tests/gateway/test_memory_reads.py -k 'not legacy_and_raw' -q
+  python ops/slice01a_evidence/run_gate.py quick_latest tests/gateway/test_memory_read_indexes.py tests/gateway/test_memory_reads.py tests/gateway/test_memory_read_isolation.py -k 'not legacy_and_raw' -q
+  python ops/slice01a_evidence/run_gate.py targets_final tests/gateway/test_memory_read_indexes.py tests/gateway/test_memory_reads.py tests/gateway/test_memory_read_isolation.py -k 'not legacy_and_raw' -q
+  python ops/slice01a_evidence/run_gate.py targets_final_v2 tests/gateway/test_memory_read_indexes.py tests/gateway/test_memory_reads.py tests/gateway/test_memory_read_isolation.py -k 'not legacy_and_raw' -q
+  python ops/slice01a_evidence/run_gate.py gateway tests/gateway/ -q
+    This early run was terminated; see gateway.aborted.txt. NOT a completed gate.
+  python ops/slice01a_evidence/run_gate.py provider_profile_graph tests/test_sqlite_provider.py tests/test_profile_migration.py tests/test_pr3_migration_graph.py tests/test_migration_decision_context.py -q
+  python ops/slice01a_evidence/run_gate.py provider_profile_graph_final tests/test_sqlite_provider.py tests/test_profile_migration.py tests/test_pr3_migration_graph.py tests/test_migration_decision_context.py -q
+  python ops/slice01a_evidence/run_gate.py s203 tests/ -k s203 -q
+    Initial collection failed because qdrant-client was missing; NOT a passed S203 gate.
+  python ops/slice01a_evidence/run_gate.py s203_final tests/ -k s203 -q
+  python ops/slice01a_evidence/run_gate.py changed_providers tests/test_graph_provider.py tests/test_lancedb_provider.py -q
+  python ops/slice01a_evidence/run_gate.py hook_drift tests/test_release_candidate.py::test_readme_has_clean_first_run_mcp_and_hermes_paths -q
+  python ops/slice01a_evidence/run_gate.py sqlite_graph_heads tests/test_sqlite_provider.py tests/test_pr3_migration_graph.py tests/test_migration_decision_context.py -q
+  python ops/slice01a_evidence/run_gate.py s305_changed_stamps tests/test_graph_provider.py tests/test_lancedb_provider.py tests/test_profile_migration.py -k s305 -q
+
+Final complete gateway + actual historical provider equivalence:
+  $E $P ops/slice01a_evidence/historical_gateway.py > ops/slice01a_evidence/gateway_final.log 2>&1
+  gateway_final.command.json records argv/pytest args; no tests skipped by the plugin. Only REFERENCE_PROVIDER and the optional trace list of the equivalence test are supplied; all production calls and SQLite boundaries are real.
+
+External DROP expected RED (same positive EQP test, capability remains True):
+  $E $P ops/slice01a_evidence/drop_red.py > ops/slice01a_evidence/drop_red.log 2>&1
+  Exit 1 is intentional and asserted by the runner. drop_red.xml records 1 genuine failure.
+
+Immutable baseline/archive and observed-failure rechecks:
+  python ops/slice01a_evidence/baseline_gate.py
+  python ops/slice01a_evidence/failure_rechecks.py
+  Their *.command.json files record each exact cwd/argv/env. baseline_gate asserts original module locations, ACCEPTED={0005}, and absence of new model indexes before running pytest.
+  Baseline Lance control cwd=/home/shtorm/.hermes/profiles/coder/cache/scratch/slice01a-ad50ec3-baseline:
+    $E $P -m pytest tests/test_lancedb_provider.py -k 'test_s302_real_store_validation_cases and corrupt' -q --junitxml=/home/shtorm/.hermes/workspace/gw-slice01a/ops/slice01a_evidence/baseline_lance.xml > /home/shtorm/.hermes/workspace/gw-slice01a/ops/slice01a_evidence/baseline_lance.log 2>&1
+    Exit 1, same pre-existing corrupt-store assertion.
+
+Measurements (real provider SQL, real databases, real official Alembic env):
+  $E $P ops/slice01a_evidence/measure.py > ops/slice01a_evidence/measure.log 2>&1
+  Executed twice. concurrent_* preserves the first run while gateway pytest was active; unprefixed files are the final repeat after all our pytest processes finished. Both returned exit 0. The script reconstructs synthetic data, captures SQL/params/EQP, times startup, mutations and migrations, and asserts preservation/collision controls. Database files remain in profile scratch, not in git.
+
+Lint / artifact verification:
+  python ops/slice01a_evidence/ruff_gate.py
+  $E $P ops/slice01a_evidence/summarize.py
+  uv pip freeze --python $P > ops/slice01a_evidence/environment.freeze.txt
+  ruff_gate compares exact diagnostics to the immutable baseline, never silently ignores them. The clean-file subset is separately recorded in ruff_clean.command.json / ruff_clean.log.
+  git diff --cached --check was also run: it reports whitespace in raw pytest logs/JUnit; those evidence bytes remain unchanged. The implementation-only diff passed --check before its commit.
+  SHA256SUMS is generated with hashlib.sha256 over all staged evidence files except SHA256SUMS itself, then verified using sha256sum --check SHA256SUMS --quiet from the evidence directory before and after commit.
+
+Environment preparation, no project dependency files modified:
+  $P -m pip install alembic -> failed, venv has no pip.
+  uv pip install --python $P alembic -> installed alembic 1.20.1 + Mako/MarkupSafe.
+  uv pip install --python $P qdrant-client -> installed missing optional collection dependency.
+  uv pip install --python $P openai -> installed missing optional remote-test dependency only AFTER both baseline full runs and the first post-change full run. The original missing-openai failure remains recorded.
+
+Commits:
+  git -c core.hooksPath=/dev/null commit ...
+  Each commit body states the pre-existing tests/test_release_candidate.py:109 reason. No push, rebase, amend, hook edits, or forbidden-scope edits.

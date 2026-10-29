@@ -1,0 +1,20 @@
+{
+  "cwd": "/home/shtorm/.hermes/workspace/gw-slice01a",
+  "env": {
+    "PYTHONPATH": "/home/shtorm/.hermes/workspace/gw-slice01a/src:/home/shtorm/.hermes/workspace/gw-slice01a",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "TMPDIR": "/home/shtorm/.hermes/profiles/coder/cache/scratch"
+  },
+  "argv": [
+    "/home/shtorm/.hermes/workspace/.venvs/cmms-verify/bin/python",
+    "-m",
+    "pytest",
+    "-p",
+    "no:cacheprovider",
+    "--junitxml=/home/shtorm/.hermes/workspace/gw-slice01a/ops/slice01a_evidence/s203_final.xml",
+    "tests/",
+    "-k",
+    "s203",
+    "-q"
+  ]
+}

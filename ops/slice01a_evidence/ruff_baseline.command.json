@@ -1,0 +1,24 @@
+{
+  "cwd": "/home/shtorm/.hermes/profiles/coder/cache/scratch/slice01a-ad50ec3-baseline",
+  "PYTHONPATH": "/home/shtorm/.hermes/workspace/gw-slice01a/src:/home/shtorm/.hermes/workspace/gw-slice01a",
+  "argv": [
+    "/home/shtorm/.hermes/workspace/.venvs/cmms-verify/bin/python",
+    "-m",
+    "ruff",
+    "check",
+    "--output-format=json",
+    "src/memory_server/profile_migration.py",
+    "src/memory_server/providers/sqlite_provider.py",
+    "storage/models/belief.py",
+    "storage/models/decision.py",
+    "storage/models/fact.py",
+    "storage/models/skill.py",
+    "tests/gateway/test_memory_reads.py",
+    "tests/test_graph_provider.py",
+    "tests/test_lancedb_provider.py",
+    "tests/test_migration_decision_context.py",
+    "tests/test_pr3_migration_graph.py",
+    "tests/test_profile_migration.py"
+  ],
+  "exit_code": 1
+}

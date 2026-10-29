@@ -1,0 +1,163 @@
+.F..F................................F.................................. [ 85%]
+............                                                             [100%]
+=================================== FAILURES ===================================
+__________ test_real_read_page_eqp_uses_each_index_without_temp_sort ___________
+
+seeded = (<memory_server.providers.sqlite_provider.SQLiteProvider object at 0x7192f4d46110>, PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-385/test_real_read_page_eqp_uses_e0/slice01a.db'))
+
+    @pytest.mark.asyncio
+    async def test_real_read_page_eqp_uses_each_index_without_temp_sort(seeded):
+        provider, db = seeded
+        captured = []
+    
+        def trace(conn, cursor, statement, params, context, many):
+            if statement.lstrip().upper().startswith("SELECT"):
+                captured.append((statement, params))
+    
+        event.listen(provider.engine.sync_engine, "before_cursor_execute", trace)
+        try:
+            for limit in (1, 200):
+                for memory_types in ([], ["fact"]):
+                    for filters in (
+                        {},
+                        dict(created_from="2024-01-03T00:00:00Z", created_to="2024-01-08T00:00:00+00:00"),
+                        dict(updated_from="2024-01-03T01:00:00Z", updated_to="2024-01-08T01:00:00+00:00"),
+                        dict(lifecycle_states=["active"]),
+                    ):
+>                       query = _query(limit, memory_types=memory_types, **filters)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/gateway/test_memory_read_indexes.py:207: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+limit = 1
+overrides = {'memory_types': [], 'created_from': '2024-01-03T00:00:00Z', 'created_to': '2024-01-08T00:00:00+00:00'}
+
+    def _query(limit=200, **overrides):
+        values = dict(
+            limit=limit,
+            cursor=None,
+            memory_types=[],
+            lifecycle_states=[],
+            min_confidence=None,
+            max_confidence=None,
+            source=None,
+            tags=[],
+            authority_level=None,
+            epistemic_status=None,
+            created_from=None,
+            created_to=None,
+            updated_from=None,
+            updated_to=None,
+            valid_at=None,
+            risk_tags=[],
+        )
+        values.update(overrides)
+        # Strings intentionally reach the production boundary unchanged, as HTTP
+        # inputs do. Dataclass construction does not coerce their runtime types.
+>       return MemoryListQuery(**values)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       pydantic_core._pydantic_core.ValidationError: 2 validation errors for MemoryListQuery
+E       created_from
+E         Input should be a valid datetime [type=datetime_type, input_value='2024-01-03T00:00:00Z', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.14/v/datetime_type
+E       created_to
+E         Input should be a valid datetime [type=datetime_type, input_value='2024-01-08T00:00:00+00:00', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.14/v/datetime_type
+
+tests/gateway/test_memory_read_indexes.py:60: ValidationError
+__________ test_keyset_bounds_upper_empty_after_and_offset_iso_edges ___________
+
+seeded = (<memory_server.providers.sqlite_provider.SQLiteProvider object at 0x7192f5058050>, PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-385/test_keyset_bounds_upper_empty0/slice01a.db'))
+
+    @pytest.mark.asyncio
+    async def test_keyset_bounds_upper_empty_after_and_offset_iso_edges(seeded):
+        provider, _ = seeded
+>       query = _query(200, created_from="2024-01-01T00:00:00Z", created_to="2024-01-01T00:00:00.000001+00:00")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/gateway/test_memory_read_indexes.py:349: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+limit = 200
+overrides = {'created_from': '2024-01-01T00:00:00Z', 'created_to': '2024-01-01T00:00:00.000001+00:00'}
+
+    def _query(limit=200, **overrides):
+        values = dict(
+            limit=limit,
+            cursor=None,
+            memory_types=[],
+            lifecycle_states=[],
+            min_confidence=None,
+            max_confidence=None,
+            source=None,
+            tags=[],
+            authority_level=None,
+            epistemic_status=None,
+            created_from=None,
+            created_to=None,
+            updated_from=None,
+            updated_to=None,
+            valid_at=None,
+            risk_tags=[],
+        )
+        values.update(overrides)
+        # Strings intentionally reach the production boundary unchanged, as HTTP
+        # inputs do. Dataclass construction does not coerce their runtime types.
+>       return MemoryListQuery(**values)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       pydantic_core._pydantic_core.ValidationError: 2 validation errors for MemoryListQuery
+E       created_from
+E         Input should be a valid datetime [type=datetime_type, input_value='2024-01-01T00:00:00Z', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.14/v/datetime_type
+E       created_to
+E         Input should be a valid datetime [type=datetime_type, input_value='2024-01-01T00:00:00.000001+00:00', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.14/v/datetime_type
+
+tests/gateway/test_memory_read_indexes.py:60: ValidationError
+_______________ test_t12_max_and_page_share_real_sqlite_snapshot _______________
+
+reads = namespace(app=<memory_server.transports.http.app.HttpApp object at 0x7192efb93b50>, config=HttpConfig(control_path=Pos...5b920>, <class 'memory_server.gateway_contracts.dto.Memory'>))), call=<function reads.<locals>.call at 0x7192efbf1ee0>)
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7192ef67c850>
+
+    async def test_t12_max_and_page_share_real_sqlite_snapshot(reads, monkeypatch):
+        r = reads
+        provider = r.providers["alpha"]
+        async with provider.engine.connect() as connection:
+            assert (await connection.execute(text("PRAGMA journal_mode=WAL"))).scalar() == "wal"
+        execute = AsyncSession.execute
+        writes = []
+        begins = []
+    
+        def observe(conn, cursor, statement, params, context, many):
+            if statement == "BEGIN":
+                begins.append(conn.connection.driver_connection.in_transaction)
+    
+        event.listen(provider.engine.sync_engine, "before_cursor_execute", observe)
+    
+        async def concurrent_write(session, statement, *args, **kwargs):
+            result = await execute(session, statement, *args, **kwargs)
+            if "AS memories" in str(statement) and "ORDER BY created_at DESC" in str(statement):
+                await seed(provider, ident="backdated-concurrent", at=STAMP - timedelta(days=1))
+                async with provider._session_factory() as writer:
+                    async with writer.begin():
+                        await execute(writer, text("DELETE FROM facts WHERE id=:id"), {"id": IDS["fact"]})
+                writes.append(True)
+            return result
+    
+        monkeypatch.setattr(AsyncSession, "execute", concurrent_write)
+        try:
+            result = await r.call(query={"memory_types": "fact"})
+            assert result.status == 200, result.body
+>           assert writes == [True]
+E           assert [] == [True]
+E             
+E             Right contains one more item: True
+E             Use -v to get more diff
+
+tests/gateway/test_memory_reads.py:468: AssertionError
+=========================== short test summary info ============================
+FAILED tests/gateway/test_memory_read_indexes.py::test_real_read_page_eqp_uses_each_index_without_temp_sort
+FAILED tests/gateway/test_memory_read_indexes.py::test_keyset_bounds_upper_empty_after_and_offset_iso_edges
+FAILED tests/gateway/test_memory_reads.py::test_t12_max_and_page_share_real_sqlite_snapshot
+3 failed, 81 passed, 2 deselected in 18.31s

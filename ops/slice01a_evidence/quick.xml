@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="3" skipped="0" tests="84" time="18.240" timestamp="2026-10-29T12:49:13.945889+03:00" hostname="shtorm-F1"><testcase classname="tests.gateway.test_memory_read_indexes" name="test_fresh_initialize_has_exact_created_type_indexes_and_reopen_does_not_migrate" time="0.052" /><testcase classname="tests.gateway.test_memory_read_indexes" name="test_real_read_page_eqp_uses_each_index_without_temp_sort" time="0.675"><failure message="pydantic_core._pydantic_core.ValidationError: 2 validation errors for MemoryListQuery&#10;created_from&#10;  Input should be a valid datetime [type=datetime_type, input_value='2024-01-03T00:00:00Z', input_type=str]&#10;    For further information visit https://errors.pydantic.dev/2.14/v/datetime_type&#10;created_to&#10;  Input should be a valid datetime [type=datetime_type, input_value='2024-01-08T00:00:00+00:00', input_type=str]&#10;    For further information visit https://errors.pydantic.dev/2.14/v/datetime_type">seeded = (&lt;memory_server.providers.sqlite_provider.SQLiteProvider object at 0x7192f4d46110&gt;, PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-385/test_real_read_page_eqp_uses_e0/slice01a.db'))
+
+    @pytest.mark.asyncio
+    async def test_real_read_page_eqp_uses_each_index_without_temp_sort(seeded):
+        provider, db = seeded
+        captured = []
+    
+        def trace(conn, cursor, statement, params, context, many):
+            if statement.lstrip().upper().startswith("SELECT"):
+                captured.append((statement, params))
+    
+        event.listen(provider.engine.sync_engine, "before_cursor_execute", trace)
+        try:
+            for limit in (1, 200):
+                for memory_types in ([], ["fact"]):
+                    for filters in (
+                        {},
+                        dict(created_from="2024-01-03T00:00:00Z", created_to="2024-01-08T00:00:00+00:00"),
+                        dict(updated_from="2024-01-03T01:00:00Z", updated_to="2024-01-08T01:00:00+00:00"),
+                        dict(lifecycle_states=["active"]),
+                    ):
+&gt;                       query = _query(limit, memory_types=memory_types, **filters)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/gateway/test_memory_read_indexes.py:207: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+limit = 1
+overrides = {'memory_types': [], 'created_from': '2024-01-03T00:00:00Z', 'created_to': '2024-01-08T00:00:00+00:00'}
+
+    def _query(limit=200, **overrides):
+        values = dict(
+            limit=limit,
+            cursor=None,
+            memory_types=[],
+            lifecycle_states=[],
+            min_confidence=None,
+            max_confidence=None,
+            source=None,
+            tags=[],
+            authority_level=None,
+            epistemic_status=None,
+            created_from=None,
+            created_to=None,
+            updated_from=None,
+            updated_to=None,
+            valid_at=None,
+            risk_tags=[],
+        )
+        values.update(overrides)
+        # Strings intentionally reach the production boundary unchanged, as HTTP
+        # inputs do. Dataclass construction does not coerce their runtime types.
+&gt;       return MemoryListQuery(**values)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       pydantic_core._pydantic_core.ValidationError: 2 validation errors for MemoryListQuery
+E       created_from
+E         Input should be a valid datetime [type=datetime_type, input_value='2024-01-03T00:00:00Z', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.14/v/datetime_type
+E       created_to
+E         Input should be a valid datetime [type=datetime_type, input_value='2024-01-08T00:00:00+00:00', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.14/v/datetime_type
+
+tests/gateway/test_memory_read_indexes.py:60: ValidationError</failure></testcase><testcase classname="tests.gateway.test_memory_read_indexes" name="test_negative_drop_after_initialized_capability_fails_eqp_instead_of_fallback" time="0.656" /><testcase classname="tests.gateway.test_memory_read_indexes" name="test_one_noncanonical_table_disables_all_table_raw_path" time="0.823" /><testcase classname="tests.gateway.test_memory_read_indexes" name="test_keyset_bounds_upper_empty_after_and_offset_iso_edges" time="0.656"><failure message="pydantic_core._pydantic_core.ValidationError: 2 validation errors for MemoryListQuery&#10;created_from&#10;  Input should be a valid datetime [type=datetime_type, input_value='2024-01-01T00:00:00Z', input_type=str]&#10;    For further information visit https://errors.pydantic.dev/2.14/v/datetime_type&#10;created_to&#10;  Input should be a valid datetime [type=datetime_type, input_value='2024-01-01T00:00:00.000001+00:00', input_type=str]&#10;    For further information visit https://errors.pydantic.dev/2.14/v/datetime_type">seeded = (&lt;memory_server.providers.sqlite_provider.SQLiteProvider object at 0x7192f5058050&gt;, PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-385/test_keyset_bounds_upper_empty0/slice01a.db'))
+
+    @pytest.mark.asyncio
+    async def test_keyset_bounds_upper_empty_after_and_offset_iso_edges(seeded):
+        provider, _ = seeded
+&gt;       query = _query(200, created_from="2024-01-01T00:00:00Z", created_to="2024-01-01T00:00:00.000001+00:00")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/gateway/test_memory_read_indexes.py:349: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+limit = 200
+overrides = {'created_from': '2024-01-01T00:00:00Z', 'created_to': '2024-01-01T00:00:00.000001+00:00'}
+
+    def _query(limit=200, **overrides):
+        values = dict(
+            limit=limit,
+            cursor=None,
+            memory_types=[],
+            lifecycle_states=[],
+            min_confidence=None,
+            max_confidence=None,
+            source=None,
+            tags=[],
+            authority_level=None,
+            epistemic_status=None,
+            created_from=None,
+            created_to=None,
+            updated_from=None,
+            updated_to=None,
+            valid_at=None,
+            risk_tags=[],
+        )
+        values.update(overrides)
+        # Strings intentionally reach the production boundary unchanged, as HTTP
+        # inputs do. Dataclass construction does not coerce their runtime types.
+&gt;       return MemoryListQuery(**values)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       pydantic_core._pydantic_core.ValidationError: 2 validation errors for MemoryListQuery
+E       created_from
+E         Input should be a valid datetime [type=datetime_type, input_value='2024-01-01T00:00:00Z', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.14/v/datetime_type
+E       created_to
+E         Input should be a valid datetime [type=datetime_type, input_value='2024-01-01T00:00:00.000001+00:00', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.14/v/datetime_type
+
+tests/gateway/test_memory_read_indexes.py:60: ValidationError</failure></testcase><testcase classname="tests.gateway.test_memory_read_indexes" name="test_migration_upgrade_repeat_down_preserves_rows_fts_and_unique_index" time="0.826" /><testcase classname="tests.gateway.test_memory_read_indexes" name="test_capability_check_is_startup_only_and_not_per_page" time="0.677" /><testcase classname="tests.gateway.test_memory_reads" name="test_t1_t14_all_gets_whole_null_and_live_reveal[False-fact]" time="0.226" /><testcase classname="tests.gateway.test_memory_reads" name="test_t1_t14_all_gets_whole_null_and_live_reveal[False-belief]" time="0.228" /><testcase classname="tests.gateway.test_memory_reads" name="test_t1_t14_all_gets_whole_null_and_live_reveal[False-decision]" time="0.235" /><testcase classname="tests.gateway.test_memory_reads" name="test_t1_t14_all_gets_whole_null_and_live_reveal[False-skill]" time="0.226" /><testcase classname="tests.gateway.test_memory_reads" name="test_t1_t14_all_gets_whole_null_and_live_reveal[True-fact]" time="0.231" /><testcase classname="tests.gateway.test_memory_reads" name="test_t1_t14_all_gets_whole_null_and_live_reveal[True-belief]" time="0.221" /><testcase classname="tests.gateway.test_memory_reads" name="test_t1_t14_all_gets_whole_null_and_live_reveal[True-decision]" time="0.300" /><testcase classname="tests.gateway.test_memory_reads" name="test_t1_t14_all_gets_whole_null_and_live_reveal[True-skill]" time="0.224" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[False-source]" time="0.162" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[False-tags]" time="0.142" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[False-risk_tags]" time="0.145" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[False-authority_level]" time="0.143" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[False-epistemic_status]" time="0.144" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[True-source]" time="0.158" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[True-tags]" time="0.148" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[True-risk_tags]" time="0.153" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[True-authority_level]" time="0.153" /><testcase classname="tests.gateway.test_memory_reads" name="test_t2_filter_oracle_denied_before_backend[True-epistemic_status]" time="0.160" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_validation_zero_sessions_audit[query0]" time="0.143" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_validation_zero_sessions_audit[query1]" time="0.138" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_validation_zero_sessions_audit[query2]" time="0.141" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_validation_zero_sessions_audit[query3]" time="0.136" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_validation_zero_sessions_audit[query4]" time="0.142" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_validation_zero_sessions_audit[query5]" time="0.135" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_validation_zero_sessions_audit[query6]" time="0.139" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_validation_zero_sessions_audit[query7]" time="0.139" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_validation_zero_sessions_audit[query8]" time="0.132" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_typed_limit_rejects_string" time="0.001" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_bounded_collection_history_and_receipt" time="0.489" /><testcase classname="tests.gateway.test_memory_reads" name="test_t5_batch_receipts_match_single_reads" time="0.282" /><testcase classname="tests.gateway.test_memory_reads" name="test_t12_max_and_page_share_real_sqlite_snapshot" time="0.150"><failure message="assert [] == [True]&#10;  &#10;  Right contains one more item: True&#10;  Use -v to get more diff">reads = namespace(app=&lt;memory_server.transports.http.app.HttpApp object at 0x7192efb93b50&gt;, config=HttpConfig(control_path=Pos...5b920&gt;, &lt;class 'memory_server.gateway_contracts.dto.Memory'&gt;))), call=&lt;function reads.&lt;locals&gt;.call at 0x7192efbf1ee0&gt;)
+monkeypatch = &lt;_pytest.monkeypatch.MonkeyPatch object at 0x7192ef67c850&gt;
+
+    async def test_t12_max_and_page_share_real_sqlite_snapshot(reads, monkeypatch):
+        r = reads
+        provider = r.providers["alpha"]
+        async with provider.engine.connect() as connection:
+            assert (await connection.execute(text("PRAGMA journal_mode=WAL"))).scalar() == "wal"
+        execute = AsyncSession.execute
+        writes = []
+        begins = []
+    
+        def observe(conn, cursor, statement, params, context, many):
+            if statement == "BEGIN":
+                begins.append(conn.connection.driver_connection.in_transaction)
+    
+        event.listen(provider.engine.sync_engine, "before_cursor_execute", observe)
+    
+        async def concurrent_write(session, statement, *args, **kwargs):
+            result = await execute(session, statement, *args, **kwargs)
+            if "AS memories" in str(statement) and "ORDER BY created_at DESC" in str(statement):
+                await seed(provider, ident="backdated-concurrent", at=STAMP - timedelta(days=1))
+                async with provider._session_factory() as writer:
+                    async with writer.begin():
+                        await execute(writer, text("DELETE FROM facts WHERE id=:id"), {"id": IDS["fact"]})
+                writes.append(True)
+            return result
+    
+        monkeypatch.setattr(AsyncSession, "execute", concurrent_write)
+        try:
+            result = await r.call(query={"memory_types": "fact"})
+            assert result.status == 200, result.body
+&gt;           assert writes == [True]
+E           assert [] == [True]
+E             
+E             Right contains one more item: True
+E             Use -v to get more diff
+
+tests/gateway/test_memory_reads.py:468: AssertionError</failure></testcase><testcase classname="tests.gateway.test_memory_reads" name="test_t6_history_honest_exact_prefix[missing]" time="0.151" /><testcase classname="tests.gateway.test_memory_reads" name="test_t6_history_honest_exact_prefix[null]" time="0.152" /><testcase classname="tests.gateway.test_memory_reads" name="test_t6_history_honest_exact_prefix[unsupported]" time="0.151" /><testcase classname="tests.gateway.test_memory_reads" name="test_t6_history_honest_exact_prefix[malformed]" time="0.154" /><testcase classname="tests.gateway.test_memory_reads" name="test_t6_history_honest_exact_prefix[truncated]" time="0.165" /><testcase classname="tests.gateway.test_memory_reads" name="test_t6_history_honest_exact_prefix[ties]" time="0.156" /><testcase classname="tests.gateway.test_memory_reads" name="test_t6_receipt_consults_history_slice[True-True]" time="0.148" /><testcase classname="tests.gateway.test_memory_reads" name="test_t6_receipt_consults_history_slice[True-False]" time="0.153" /><testcase classname="tests.gateway.test_memory_reads" name="test_t6_receipt_consults_history_slice[False-True]" time="0.145" /><testcase classname="tests.gateway.test_memory_reads" name="test_t6_receipt_consults_history_slice[False-False]" time="0.149" /><testcase classname="tests.gateway.test_memory_reads" name="test_t7_lookup_extra_permissions_and_no_fake_port[request-audit.read]" time="0.164" /><testcase classname="tests.gateway.test_memory_reads" name="test_t7_lookup_extra_permissions_and_no_fake_port[relation-relation.read]" time="0.272" /><testcase classname="tests.gateway.test_memory_reads" name="test_t7_trace_scoped_masked_live_and_absent[reader-False]" time="0.163" /><testcase classname="tests.gateway.test_memory_reads" name="test_t7_trace_scoped_masked_live_and_absent[reader-True]" time="0.168" /><testcase classname="tests.gateway.test_memory_reads" name="test_t7_trace_scoped_masked_live_and_absent[revealer-False]" time="0.167" /><testcase classname="tests.gateway.test_memory_reads" name="test_t7_trace_scoped_masked_live_and_absent[revealer-True]" time="0.173" /><testcase classname="tests.gateway.test_memory_reads" name="test_t8_reveal_permission_revision_audit_privacy[fact]" time="0.170" /><testcase classname="tests.gateway.test_memory_reads" name="test_t8_reveal_permission_revision_audit_privacy[belief]" time="0.176" /><testcase classname="tests.gateway.test_memory_reads" name="test_t8_reveal_permission_revision_audit_privacy[decision]" time="0.172" /><testcase classname="tests.gateway.test_memory_reads" name="test_t8_reveal_permission_revision_audit_privacy[skill]" time="0.171" /><testcase classname="tests.gateway.test_memory_reads" name="test_t8_legacy_version_and_t14_unsafe_list_version[S07_CANARY_unsafe_version]" time="0.168" /><testcase classname="tests.gateway.test_memory_reads" name="test_t8_legacy_version_and_t14_unsafe_list_version[S07_CANARY_unsafe_blob]" time="0.171" /><testcase classname="tests.gateway.test_memory_reads" name="test_t15_real_heuristic_and_unknown_fail_closed[untagged]" time="0.154" /><testcase classname="tests.gateway.test_memory_reads" name="test_t15_real_heuristic_and_unknown_fail_closed[benign]" time="0.152" /><testcase classname="tests.gateway.test_memory_reads" name="test_t15_real_heuristic_and_unknown_fail_closed[stored-risk]" time="0.149" /><testcase classname="tests.gateway.test_memory_reads" name="test_t15_real_heuristic_and_unknown_fail_closed[exception]" time="0.148" /><testcase classname="tests.gateway.test_memory_reads" name="test_t15_real_heuristic_and_unknown_fail_closed[oversize]" time="0.146" /><testcase classname="tests.gateway.test_memory_reads" name="test_t15_real_heuristic_and_unknown_fail_closed[unsupported]" time="0.148" /><testcase classname="tests.gateway.test_memory_reads" name="test_t11_telemetry_filter_content_and_reason_sweep[source]" time="0.160" /><testcase classname="tests.gateway.test_memory_reads" name="test_t11_telemetry_filter_content_and_reason_sweep[tags]" time="0.154" /><testcase classname="tests.gateway.test_memory_reads" name="test_t11_telemetry_filter_content_and_reason_sweep[risk_tags]" time="0.151" /><testcase classname="tests.gateway.test_memory_reads" name="test_t11_telemetry_filter_content_and_reason_sweep[authority_level]" time="0.157" /><testcase classname="tests.gateway.test_memory_reads" name="test_t11_telemetry_filter_content_and_reason_sweep[epistemic_status]" time="0.159" /><testcase classname="tests.gateway.test_memory_reads" name="test_t12_fresh_sessions_errors_and_cancel" time="0.170" /><testcase classname="tests.gateway.test_memory_reads" name="test_t13_reveal_budget_before_storage" time="0.150" /><testcase classname="tests.gateway.test_memory_reads" name="test_t12_real_sqlite_failure_safe_storage_envelope" time="0.266" /><testcase classname="tests.gateway.test_memory_reads" name="test_t9_t10_unknown_disabled_profile_no_sessions" time="0.179" /><testcase classname="tests.gateway.test_memory_reads" name="test_metadata_time_filters_before_limit[created_from]" time="0.154" /><testcase classname="tests.gateway.test_memory_reads" name="test_metadata_time_filters_before_limit[created_to]" time="0.154" /><testcase classname="tests.gateway.test_memory_reads" name="test_metadata_time_filters_before_limit[updated_from]" time="0.153" /><testcase classname="tests.gateway.test_memory_reads" name="test_metadata_time_filters_before_limit[updated_to]" time="0.154" /><testcase classname="tests.gateway.test_memory_reads" name="test_metadata_time_filters_before_limit[valid_at]" time="0.154" /><testcase classname="tests.gateway.test_memory_reads" name="test_read_auth_revalidation_profile_scope[]" time="0.150" /><testcase classname="tests.gateway.test_memory_reads" name="test_read_auth_revalidation_profile_scope[/c3992e95-1dfe-59cc-a9dd-b29f29956be6]" time="0.151" /><testcase classname="tests.gateway.test_memory_reads" name="test_read_auth_revalidation_profile_scope[/c3992e95-1dfe-59cc-a9dd-b29f29956be6/receipt]" time="0.151" /><testcase classname="tests.gateway.test_memory_reads" name="test_read_auth_revalidation_profile_scope[/c3992e95-1dfe-59cc-a9dd-b29f29956be6/history]" time="0.151" /></testsuite></testsuites>

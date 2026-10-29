@@ -1,0 +1,44 @@
+{
+  "current_diagnostics": 8,
+  "baseline_diagnostics": 8,
+  "new_diagnostics": 0,
+  "preexisting": [
+    [
+      "tests/test_lancedb_provider.py",
+      "E501",
+      934,
+      "Line too long (123 > 120)"
+    ],
+    [
+      "tests/test_lancedb_provider.py",
+      "E501",
+      935,
+      "Line too long (166 > 120)"
+    ],
+    [
+      "tests/test_lancedb_provider.py",
+      "E401",
+      954,
+      "Multiple imports on one line"
+    ],
+    [
+      "tests/test_lancedb_provider.py",
+      "I001",
+      954,
+      "Import block is un-sorted or un-formatted"
+    ],
+    [
+      "tests/test_lancedb_provider.py",
+      "E702",
+      956,
+      "Multiple statements on one line (semicolon)"
+    ],
+    [
+      "tests/test_lancedb_provider.py",
+      "E702",
+      979,
+      "Multiple statements on one line (semicolon)"
+    ]
+  ],
+  "new": []
+}

@@ -1,0 +1,25 @@
+{
+  "cwd": "/home/shtorm/.hermes/workspace/gw-slice01a",
+  "PYTHONPATH": "/home/shtorm/.hermes/workspace/gw-slice01a/src:/home/shtorm/.hermes/workspace/gw-slice01a",
+  "argv": [
+    "/home/shtorm/.hermes/workspace/.venvs/cmms-verify/bin/python",
+    "-m",
+    "ruff",
+    "check",
+    "alembic/versions/0006_slice01a_read_indexes.py",
+    "src/memory_server/profile_migration.py",
+    "src/memory_server/providers/sqlite_provider.py",
+    "storage/models/belief.py",
+    "storage/models/decision.py",
+    "storage/models/fact.py",
+    "storage/models/skill.py",
+    "tests/gateway/test_memory_read_indexes.py",
+    "tests/gateway/test_memory_reads.py",
+    "tests/test_graph_provider.py",
+    "tests/test_migration_decision_context.py",
+    "tests/test_pr3_migration_graph.py",
+    "tests/test_profile_migration.py",
+    "ops/slice01a_evidence"
+  ],
+  "excluded_preexisting_drift": "tests/test_lancedb_provider.py only; full comparison recorded separately"
+}

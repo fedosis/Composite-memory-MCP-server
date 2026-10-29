@@ -1,0 +1,236 @@
+........................................................................ [ 23%]
+......................................................................F. [ 47%]
+..F.......................F......................F...................... [ 71%]
+........................................................................ [ 94%]
+................                                                         [100%]
+=================================== FAILURES ===================================
+___ test_s204_every_entrypoint_replans_independently_without_inherited_state ___
+
+tmp_path = PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test_s204_every_entrypoint_rep0')
+synthetic_storage_env = SyntheticStorageEnv(root=PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test...h('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test_s204_every_entrypoint_rep0/tmp'))
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7334cc167510>
+
+    def test_s204_every_entrypoint_replans_independently_without_inherited_state(
+        tmp_path: Path, synthetic_storage_env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = synthetic_storage_env
+        env.assert_injection()
+        home = tmp_path / "home"
+        db_path = _seed_source_sql(home)
+        request, plan = _s204_planned_request(home, db_path)
+        calls: list[str] = []
+        original = profile_migration.plan_profile_migration
+    
+        def counting(candidate: MigrationRequest):
+            calls.append(candidate.mode)
+            return original(candidate)
+    
+        monkeypatch.setattr(profile_migration, "plan_profile_migration", counting)
+        manifest_path = home / ".cmms-migrations" / request.run_id / "manifest.json"
+        # RETARGETED BY S3-06 (disclosed): `apply` is wired, so it now stops at the real
+        # cause instead of the slice-level "not implemented" -- this source carries no
+        # accepted Alembic revision. The property this node exists for (every entrypoint
+        # replans for ITSELF, on its own mode) is unchanged and asserted by `calls`.
+        with pytest.raises(ValueError, match="E_SQLITE_SCHEMA"):
+>           apply_profile_migration(plan)
+
+/home/shtorm/.hermes/workspace/gw-slice01a/tests/test_profile_migration.py:3022: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/home/shtorm/.hermes/workspace/gw-slice01a/src/memory_server/profile_migration.py:4108: in apply_profile_migration
+    return _run_forward(plan, path, embedder=embedder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/shtorm/.hermes/workspace/gw-slice01a/src/memory_server/profile_migration.py:6545: in _run_forward
+    locks = acquire_maintenance_locks(plan)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+plan = MigrationPlan(schema_version=1, request=MigrationRequest(profile_home=PosixPath('/home/shtorm/.hermes/profiles/coder/c...writer state is unknown: no conclusive mutation-free lock evidence', 'artifact': 'lock', 'hint': ''}], 'blockers': []})
+timeout = 5.0, proc_root = '/proc', exclude_pids = ()
+
+    def acquire_maintenance_locks(
+        plan: MigrationPlan,
+        *,
+        timeout: float = storage_lock.DEFAULT_LOCK_TIMEOUT,
+        proc_root: str | Path = DEFAULT_PROC_ROOT,
+        exclude_pids: Iterable[int] = (),
+    ) -> storage_lock.MaintenanceStorageLocks:
+        """DETAIL 6.3 steps 8-9 plus the mixed-version writer re-check.
+    
+        Every source/target root is locked exclusively in canonical sorted order and
+        the applicable graph lock is held without inode replacement. While holding
+        them the writer inventory is repeated, so a writer that appeared between the
+        pure checks and the lock is still fatal. The returned object owns every
+        descriptor for its whole lifetime: ``release`` is refused inside an open
+        critical section (``E_LOCK_RELEASE_UNSAFE``) and never unlinks the lock
+        entry, so the resource stays protected after the lock is dropped. On any
+        refusal the locks taken so far are released before the error propagates.
+        """
+        locks = storage_lock.MaintenanceStorageLocks.acquire(
+            maintenance_lock_roots(plan),
+            timeout=timeout,
+            graph_lock_path=Path(plan.layout.graph_lock_path),
+        )
+        try:
+            inventory = _writer_inventory(plan, proc_root=proc_root, exclude_pids=exclude_pids)
+            if not inventory.covered:
+>               raise storage_lock.StorageLockError(inventory.code or "E_WRITER_STATE_UNKNOWN")
+E               memory_server.storage_lock.StorageLockError: storage lock failure
+
+/home/shtorm/.hermes/workspace/gw-slice01a/src/memory_server/profile_migration.py:2913: StorageLockError
+___________ test_s204_a_symlinked_vector_store_is_never_a_lock_root ____________
+
+tmp_path = PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test_s204_a_symlinked_vector_s0')
+synthetic_storage_env = SyntheticStorageEnv(root=PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test...h('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test_s204_a_symlinked_vector_s0/tmp'))
+
+    def test_s204_a_symlinked_vector_store_is_never_a_lock_root(
+        tmp_path: Path, synthetic_storage_env
+    ) -> None:
+        env = synthetic_storage_env
+        env.assert_injection()
+        home = tmp_path / "home"
+        db_path = _seed_source_sql(home)
+        external = tmp_path / "external-lancedb"
+        external.mkdir()
+        vector = home / "data" / "lancedb"
+        vector.symlink_to(external, target_is_directory=True)
+        request, plan = _s204_planned_request(home, db_path)
+        assert plan.layout.vector.local_path is not None
+        acquire = profile_migration.acquire_maintenance_locks
+>       locks = acquire(plan, timeout=2)
+                ^^^^^^^^^^^^^^^^^^^^^^^^
+
+/home/shtorm/.hermes/workspace/gw-slice01a/tests/test_profile_migration.py:3128: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+plan = MigrationPlan(schema_version=1, request=MigrationRequest(profile_home=PosixPath('/home/shtorm/.hermes/profiles/coder/c...writer state is unknown: no conclusive mutation-free lock evidence', 'artifact': 'lock', 'hint': ''}], 'blockers': []})
+timeout = 2, proc_root = '/proc', exclude_pids = ()
+
+    def acquire_maintenance_locks(
+        plan: MigrationPlan,
+        *,
+        timeout: float = storage_lock.DEFAULT_LOCK_TIMEOUT,
+        proc_root: str | Path = DEFAULT_PROC_ROOT,
+        exclude_pids: Iterable[int] = (),
+    ) -> storage_lock.MaintenanceStorageLocks:
+        """DETAIL 6.3 steps 8-9 plus the mixed-version writer re-check.
+    
+        Every source/target root is locked exclusively in canonical sorted order and
+        the applicable graph lock is held without inode replacement. While holding
+        them the writer inventory is repeated, so a writer that appeared between the
+        pure checks and the lock is still fatal. The returned object owns every
+        descriptor for its whole lifetime: ``release`` is refused inside an open
+        critical section (``E_LOCK_RELEASE_UNSAFE``) and never unlinks the lock
+        entry, so the resource stays protected after the lock is dropped. On any
+        refusal the locks taken so far are released before the error propagates.
+        """
+        locks = storage_lock.MaintenanceStorageLocks.acquire(
+            maintenance_lock_roots(plan),
+            timeout=timeout,
+            graph_lock_path=Path(plan.layout.graph_lock_path),
+        )
+        try:
+            inventory = _writer_inventory(plan, proc_root=proc_root, exclude_pids=exclude_pids)
+            if not inventory.covered:
+>               raise storage_lock.StorageLockError(inventory.code or "E_WRITER_STATE_UNKNOWN")
+E               memory_server.storage_lock.StorageLockError: storage lock failure
+
+/home/shtorm/.hermes/workspace/gw-slice01a/src/memory_server/profile_migration.py:2913: StorageLockError
+__ test_s206_the_public_entrypoints_stay_fail_closed_while_the_seam_is_a_stub __
+
+tmp_path = PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test_s206_the_public_entrypoin0')
+synthetic_storage_env = SyntheticStorageEnv(root=PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test...h('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test_s206_the_public_entrypoin0/tmp'))
+
+    def test_s206_the_public_entrypoints_stay_fail_closed_while_the_seam_is_a_stub(
+        tmp_path: Path, synthetic_storage_env
+    ) -> None:
+        """RETARGETED BY S3-06 (disclosed): `apply` RUNS now, so "closed" means "no false success".
+    
+        The original claim was "the entrypoints stay closed until S3-06". S3-06 IS this
+        card, so the clause that survives is the one the card exists for: no entrypoint
+        reports success for a run it cannot verify. Here the source database's Alembic
+        revision is not accepted, so `apply` must refuse at its snapshot step with the
+        real schema code, must not claim any checkpoint past `backed_up`, and must not
+        reach `complete`; `resume` and `rollback` against an absent manifest keep their
+        own manifest refusal. The original "the tree did not move at all" arm is NOT
+        kept, and that is disclosed: a wired run legitimately creates its own run
+        directory and backup before the snapshot step refuses.
+        """
+        env = synthetic_storage_env
+        env.assert_injection()
+        home = tmp_path / "home"
+        db_path = _seed_source_sql(home)
+        request, plan = _s204_planned_request(home, db_path)
+        live = _s306_manifest_path(home, plan)
+        source_bytes = db_path.read_bytes()
+    
+        with pytest.raises(ValueError, match="E_SQLITE_SCHEMA"):
+            _s306_apply(plan, embedder=_s306_embedder())
+    
+        assert live.exists(), "the run did not even materialize its manifest"
+        manifest = load_manifest(live)
+        assert manifest.status == "failed"
+        assert manifest.checkpoint != "complete"
+        assert "sqlite_snapshotted" not in _s306_advance_events(manifest)
+        assert manifest.failure is not None
+        assert manifest.failure.get("code") == "E_SQLITE_SCHEMA"
+    
+        # `apply` above materialized ITS OWN run at `live`, so the manifest-absent
+        # contract is pinned on a run id that was never materialized (disclosed).
+        absent = (
+            home
+            / ".cmms-migrations"
+            / str(uuid5(NAMESPACE_DNS, "s306-absent-run-entrypoint"))
+            / "manifest.json"
+        )
+        with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
+            profile_migration.resume_profile_migration(absent, request)
+>       with pytest.raises(ValueError, match="E_MANIFEST_ABSENT"):
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'E_MANIFEST_ABSENT'
+E         Actual message: 'E_WRITER_STATE_UNKNOWN'
+
+/home/shtorm/.hermes/workspace/gw-slice01a/tests/test_profile_migration.py:4417: AssertionError
+__ test_s207_a_missing_required_triad_entry_is_refused_and_nothing_is_deleted __
+
+tmp_path = PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test_s207_a_missing_required_t0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7334cbbfe550>
+synthetic_storage_env = SyntheticStorageEnv(root=PosixPath('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test...h('/home/shtorm/.hermes/profiles/coder/cache/scratch/pytest-of-shtorm/pytest-397/test_s207_a_missing_required_t0/tmp'))
+
+    def test_s207_a_missing_required_triad_entry_is_refused_and_nothing_is_deleted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_storage_env
+    ) -> None:
+        """BEHAVIOURAL at BASE; the card's "missing required triad entry" Stop.
+    
+        Two real missing-entry cases, both refused: the staged entry the next
+        operation would publish is gone, and the quarantine entry the run's own event
+        claims is gone. Neither the retained quarantine nor the stale staging is ever
+        deleted by resume.
+        """
+        env = synthetic_storage_env
+        env.assert_injection()
+        state = _s207_crash_state(tmp_path, monkeypatch, "prestate_quarantined")
+    
+        retained = state["quarantine"].parent.parent / "retained-old-entry"
+        os.rename(state["quarantine"], retained)
+>       with pytest.raises(ValueError, match="E_RESUME_TRIAD_INCOMPLETE"):
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'E_RESUME_TRIAD_INCOMPLETE'
+E         Actual message: 'E_WRITER_STATE_UNKNOWN'
+
+/home/shtorm/.hermes/workspace/gw-slice01a/tests/test_profile_migration.py:5593: AssertionError
+=============================== warnings summary ===============================
+tests/test_profile_migration.py: 275 warnings
+  /home/shtorm/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/concurrent/futures/thread.py:58: DeprecationWarning: table_names() is deprecated, use list_tables() instead
+    result = self.fn(*self.args, **self.kwargs)
+
+tests/test_profile_migration.py: 275 warnings
+  /home/shtorm/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/asyncio/events.py:84: DeprecationWarning: table_names() is deprecated, use list_tables() instead
+    self._context.run(self._callback, *self._args)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_profile_migration.py::test_s204_every_entrypoint_replans_independently_without_inherited_state
+FAILED tests/test_profile_migration.py::test_s204_a_symlinked_vector_store_is_never_a_lock_root
+FAILED tests/test_profile_migration.py::test_s206_the_public_entrypoints_stay_fail_closed_while_the_seam_is_a_stub
+FAILED tests/test_profile_migration.py::test_s207_a_missing_required_triad_entry_is_refused_and_nothing_is_deleted
+4 failed, 300 passed, 550 warnings in 253.14s (0:04:13)

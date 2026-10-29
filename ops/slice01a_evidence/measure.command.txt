@@ -1,0 +1,3 @@
+cwd=/home/shtorm/.hermes/workspace/gw-slice01a
+env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/shtorm/.hermes/workspace/gw-slice01a/src:/home/shtorm/.hermes/workspace/gw-slice01a /home/shtorm/.hermes/workspace/.venvs/cmms-verify/bin/python ops/slice01a_evidence/measure.py > ops/slice01a_evidence/measure.log 2>&1
+TMPDIR inherited from Hermes profile scratch; script asserts the exact PYTHONPATH and records SQLite/Python versions.

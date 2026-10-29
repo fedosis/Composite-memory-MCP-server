@@ -1,0 +1,1679 @@
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade 0005 -> 0006, Add the four SLICE-01A creation-key expression indexes.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running downgrade 0006 -> 0005, Add the four SLICE-01A creation-key expression indexes.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade 0005 -> 0006, Add the four SLICE-01A creation-key expression indexes.
+{
+  "python": "3.11.15 (main, Jun 23 2026, 15:19:43) [Clang 22.1.3 ]",
+  "sqlite": "3.53.1",
+  "seed": "4 x 3000 ORM rows; ties, common IDs, microseconds 0/1/999999; no receipts",
+  "notes": "Warm cache; async provider/session; 9 samples, median final 7; synthetic data, not a production SLO.",
+  "base_snapshot": {
+    "rows": {
+      "facts": {
+        "count": 3000,
+        "sha256": "eeca8ecfb86bcec674a35d6dac0b96d8c16cde5398aa50479a4eee1a22623c5f"
+      },
+      "beliefs": {
+        "count": 3000,
+        "sha256": "45dd9db6e4c915b2389d00712e321a6eebd466c596998959d5af3991cc0bd0f0"
+      },
+      "decisions": {
+        "count": 3000,
+        "sha256": "7182da83e6edafcfc94aa1ed795d52a11bc7ffacfdab1a9bb06ce05fcea0deaf"
+      },
+      "skills": {
+        "count": 3000,
+        "sha256": "c7ebb5459f5a7b3ab3c6895bed6a9ae97f9839e5ea0eac8418ad8c9fc25c6c41"
+      }
+    },
+    "fts_match": {
+      "facts_fts": {
+        "count": 3000,
+        "sha256": "dea61c8f6fdd58ff9d0f8bc34d59c724f3ab88c84fe1352332f0f550caae6255"
+      },
+      "beliefs_fts": {
+        "count": 3000,
+        "sha256": "dea61c8f6fdd58ff9d0f8bc34d59c724f3ab88c84fe1352332f0f550caae6255"
+      }
+    },
+    "unique": [
+      [
+        "uq_decisions_context_dedup_active",
+        "CREATE UNIQUE INDEX uq_decisions_context_dedup_active ON decisions (context, dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+      ],
+      [
+        "uq_facts_spo_active",
+        "CREATE UNIQUE INDEX uq_facts_spo_active ON facts (dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+      ]
+    ],
+    "schema_without_new_indexes_and_stamp": [
+      [
+        "beliefs",
+        "table",
+        "CREATE TABLE beliefs (\n\tid VARCHAR NOT NULL, \n\tproposition VARCHAR(2048) NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR(128) NOT NULL, \n\tcreator VARCHAR(128) NOT NULL, \n\tsource_ids JSON NOT NULL, \n\ttags JSON NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tlast_reinforced_at DATETIME NOT NULL, \n\tversion INTEGER NOT NULL, \n\tverification_status VARCHAR(32) NOT NULL, \n\tlifecycle_state VARCHAR(32) NOT NULL, \n\tPRIMARY KEY (id)\n)"
+      ],
+      [
+        "beliefs_ad",
+        "trigger",
+        "CREATE TRIGGER beliefs_ad AFTER DELETE ON beliefs BEGIN INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) VALUES('delete', old.rowid, old.proposition); END"
+      ],
+      [
+        "beliefs_ai",
+        "trigger",
+        "CREATE TRIGGER beliefs_ai AFTER INSERT ON beliefs BEGIN INSERT INTO beliefs_fts(rowid, proposition) VALUES (new.rowid, new.proposition); END"
+      ],
+      [
+        "beliefs_au",
+        "trigger",
+        "CREATE TRIGGER beliefs_au AFTER UPDATE ON beliefs BEGIN INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) VALUES('delete', old.rowid, old.proposition); INSERT INTO beliefs_fts(rowid, proposition) VALUES (new.rowid, new.proposition); END"
+      ],
+      [
+        "beliefs_fts",
+        "table",
+        "CREATE VIRTUAL TABLE beliefs_fts USING fts5(proposition, content=beliefs, content_rowid=rowid)"
+      ],
+      [
+        "beliefs_fts_config",
+        "table",
+        "CREATE TABLE 'beliefs_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+      ],
+      [
+        "beliefs_fts_data",
+        "table",
+        "CREATE TABLE 'beliefs_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+      ],
+      [
+        "beliefs_fts_docsize",
+        "table",
+        "CREATE TABLE 'beliefs_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+      ],
+      [
+        "beliefs_fts_idx",
+        "table",
+        "CREATE TABLE 'beliefs_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+      ],
+      [
+        "claim_relations",
+        "table",
+        "CREATE TABLE claim_relations (\n\tsource_id VARCHAR NOT NULL, \n\ttarget_id VARCHAR NOT NULL, \n\trelation_type VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (source_id, target_id, relation_type)\n)"
+      ],
+      [
+        "decisions",
+        "table",
+        "CREATE TABLE decisions (\n\tid VARCHAR NOT NULL, \n\tcontext VARCHAR NOT NULL, \n\tchoice VARCHAR NOT NULL, \n\tdedup_key VARCHAR NOT NULL, \n\trejected_alternatives TEXT NOT NULL, \n\treason VARCHAR NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+      ],
+      [
+        "entities",
+        "table",
+        "CREATE TABLE entities (\n\tid VARCHAR NOT NULL, \n\ttype VARCHAR NOT NULL, \n\tname VARCHAR NOT NULL, \n\tattributes TEXT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+      ],
+      [
+        "evidence",
+        "table",
+        "CREATE TABLE evidence (\n\tid VARCHAR NOT NULL, \n\tbelief_id VARCHAR NOT NULL, \n\tsource_type VARCHAR(32) NOT NULL, \n\tsource_id VARCHAR NOT NULL, \n\tweight FLOAT NOT NULL, \n\tcontributor VARCHAR(128) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tnote TEXT, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(belief_id) REFERENCES beliefs (id)\n)"
+      ],
+      [
+        "facts",
+        "table",
+        "CREATE TABLE facts (\n\tid VARCHAR NOT NULL, \n\tsubject VARCHAR NOT NULL, \n\tpredicate VARCHAR NOT NULL, \n\tobject VARCHAR NOT NULL, \n\tdedup_key VARCHAR NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+      ],
+      [
+        "facts_ad",
+        "trigger",
+        "CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) VALUES('delete', old.rowid, old.subject, old.predicate, old.object); END"
+      ],
+      [
+        "facts_ai",
+        "trigger",
+        "CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN INSERT INTO facts_fts(rowid, subject, predicate, object) VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+      ],
+      [
+        "facts_au",
+        "trigger",
+        "CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) VALUES('delete', old.rowid, old.subject, old.predicate, old.object); INSERT INTO facts_fts(rowid, subject, predicate, object) VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+      ],
+      [
+        "facts_fts",
+        "table",
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(subject, predicate, object, content=facts, content_rowid=rowid)"
+      ],
+      [
+        "facts_fts_config",
+        "table",
+        "CREATE TABLE 'facts_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+      ],
+      [
+        "facts_fts_data",
+        "table",
+        "CREATE TABLE 'facts_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+      ],
+      [
+        "facts_fts_docsize",
+        "table",
+        "CREATE TABLE 'facts_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+      ],
+      [
+        "facts_fts_idx",
+        "table",
+        "CREATE TABLE 'facts_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+      ],
+      [
+        "ix_beliefs_lifecycle_state",
+        "index",
+        "CREATE INDEX ix_beliefs_lifecycle_state ON beliefs (lifecycle_state)"
+      ],
+      [
+        "ix_beliefs_proposition",
+        "index",
+        "CREATE INDEX ix_beliefs_proposition ON beliefs (proposition)"
+      ],
+      [
+        "ix_claim_relations_relation_type",
+        "index",
+        "CREATE INDEX ix_claim_relations_relation_type ON claim_relations (relation_type)"
+      ],
+      [
+        "ix_claim_relations_target_id",
+        "index",
+        "CREATE INDEX ix_claim_relations_target_id ON claim_relations (target_id)"
+      ],
+      [
+        "ix_evidence_belief_id",
+        "index",
+        "CREATE INDEX ix_evidence_belief_id ON evidence (belief_id)"
+      ],
+      [
+        "ix_facts_predicate",
+        "index",
+        "CREATE INDEX ix_facts_predicate ON facts (predicate)"
+      ],
+      [
+        "ix_facts_subject",
+        "index",
+        "CREATE INDEX ix_facts_subject ON facts (subject)"
+      ],
+      [
+        "ix_lifecycle_events_memory_id",
+        "index",
+        "CREATE INDEX ix_lifecycle_events_memory_id ON lifecycle_events (memory_id)"
+      ],
+      [
+        "ix_lifecycle_states_memory_id",
+        "index",
+        "CREATE INDEX ix_lifecycle_states_memory_id ON lifecycle_states (memory_id)"
+      ],
+      [
+        "ix_outbox_entries_record_id",
+        "index",
+        "CREATE INDEX ix_outbox_entries_record_id ON outbox_entries (record_id)"
+      ],
+      [
+        "ix_outbox_entries_record_type",
+        "index",
+        "CREATE INDEX ix_outbox_entries_record_type ON outbox_entries (record_type)"
+      ],
+      [
+        "ix_outbox_entries_status",
+        "index",
+        "CREATE INDEX ix_outbox_entries_status ON outbox_entries (status)"
+      ],
+      [
+        "ix_receipts_memory_type",
+        "index",
+        "CREATE INDEX ix_receipts_memory_type ON receipts (memory_type)"
+      ],
+      [
+        "ix_receipts_source",
+        "index",
+        "CREATE INDEX ix_receipts_source ON receipts (source)"
+      ],
+      [
+        "lifecycle_events",
+        "table",
+        "CREATE TABLE lifecycle_events (\n\tid VARCHAR NOT NULL, \n\tmemory_id VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tfrom_state VARCHAR NOT NULL, \n\tto_state VARCHAR NOT NULL, \n\treason VARCHAR NOT NULL, \n\ttriggered_by VARCHAR NOT NULL, \n\ttimestamp DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+      ],
+      [
+        "lifecycle_states",
+        "table",
+        "CREATE TABLE lifecycle_states (\n\tid VARCHAR NOT NULL, \n\tmemory_id VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tcurrent_state VARCHAR NOT NULL, \n\tprevious_state VARCHAR, \n\tconfidence FLOAT NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+      ],
+      [
+        "outbox_entries",
+        "table",
+        "CREATE TABLE outbox_entries (\n\tid VARCHAR NOT NULL, \n\trecord_type VARCHAR NOT NULL, \n\trecord_id VARCHAR NOT NULL, \n\toperation VARCHAR NOT NULL, \n\tpayload_json TEXT NOT NULL, \n\tstatus VARCHAR NOT NULL, \n\tretry_count INTEGER NOT NULL, \n\terror VARCHAR, \n\tcreated_at DATETIME NOT NULL, \n\tprocessed_at DATETIME, \n\tPRIMARY KEY (id)\n)"
+      ],
+      [
+        "receipts",
+        "table",
+        "CREATE TABLE receipts (\n\tid VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tsource VARCHAR NOT NULL, \n\tcreated_by VARCHAR NOT NULL, \n\ttimestamp DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\thistory TEXT NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+      ],
+      [
+        "skills",
+        "table",
+        "CREATE TABLE skills (\n\tid VARCHAR NOT NULL, \n\tname VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tpurpose VARCHAR NOT NULL, \n\tsteps TEXT NOT NULL, \n\tconstraints TEXT NOT NULL, \n\tvalidation TEXT NOT NULL, \n\tsuccess_rate FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+      ],
+      [
+        "uq_decisions_context_dedup_active",
+        "index",
+        "CREATE UNIQUE INDEX uq_decisions_context_dedup_active ON decisions (context, dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+      ],
+      [
+        "uq_facts_spo_active",
+        "index",
+        "CREATE UNIQUE INDEX uq_facts_spo_active ON facts (dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+      ]
+    ],
+    "integrity": [
+      [
+        "ok"
+      ]
+    ],
+    "fk_check": []
+  },
+  "page_latency": {
+    "before_ad50ec3_limit1": {
+      "ms": [
+        98.1242039706558,
+        95.76923202257603,
+        95.57142801349983,
+        95.19494295818731,
+        94.84029799932614,
+        96.83132899226621,
+        96.86648496426642,
+        95.9609349956736,
+        95.81272001378238
+      ],
+      "median_final7_ms": 95.81272001378238
+    },
+    "before_ad50ec3_limit200": {
+      "ms": [
+        101.43347404664382,
+        99.84970302321017,
+        99.5608110097237,
+        99.77995499502867,
+        100.71691201301292,
+        100.98819300765172,
+        99.92739598965272,
+        100.77580099459738,
+        103.11961296247318
+      ],
+      "median_final7_ms": 100.71691201301292
+    },
+    "after_limit1": {
+      "ms": [
+        2.5416059652343392,
+        1.0780380107462406,
+        0.9833829826675355,
+        1.0766759514808655,
+        1.0469199623912573,
+        0.9849860216490924,
+        0.9696080232970417,
+        0.9870199719443917,
+        1.0565179982222617
+      ],
+      "median_final7_ms": 0.9870199719443917
+    },
+    "after_limit200": {
+      "ms": [
+        6.5744720050133765,
+        4.698182980064303,
+        4.518791974987835,
+        4.062659980263561,
+        4.425389983225614,
+        4.104507970623672,
+        4.290801007300615,
+        4.044166998937726,
+        4.4299979927018285
+      ],
+      "median_final7_ms": 4.290801007300615
+    }
+  },
+  "eqp_statements": 200,
+  "startup": {
+    "12000": {
+      "rows": {
+        "fact": 3000,
+        "belief": 3000,
+        "decision": 3000,
+        "skill": 3000
+      },
+      "samples": [
+        {
+          "capability_ms": 85.85022704210132,
+          "initialize_ms": 90.86570498766378
+        },
+        {
+          "capability_ms": 81.55130100203678,
+          "initialize_ms": 86.02473902283236
+        },
+        {
+          "capability_ms": 86.82070596842095,
+          "initialize_ms": 91.57010301714763
+        }
+      ],
+      "median_capability_ms": 85.85022704210132,
+      "median_initialize_ms": 90.86570498766378
+    },
+    "200000": {
+      "rows": {
+        "fact": 50000,
+        "belief": 50000,
+        "decision": 50000,
+        "skill": 50000
+      },
+      "samples": [
+        {
+          "capability_ms": 1288.739520998206,
+          "initialize_ms": 1295.632809982635
+        },
+        {
+          "capability_ms": 1329.1376869892702,
+          "initialize_ms": 1333.7676230003126
+        },
+        {
+          "capability_ms": 1412.8713980317116,
+          "initialize_ms": 1418.1927589816041
+        }
+      ],
+      "median_capability_ms": 1329.1376869892702,
+      "median_initialize_ms": 1333.7676230003126
+    }
+  },
+  "writes": [
+    {
+      "indexed": false,
+      "transaction_size": 1,
+      "operation": "INSERT",
+      "mutations": 800,
+      "total_ms": 48.88130305334926,
+      "mean_per_row_ms": 0.06110162881668657,
+      "median_statement_and_commit_ms": 0.05972548387944698,
+      "db_before_bytes": 2846720,
+      "db_after_checkpoint_bytes": 3096576,
+      "wal_before_checkpoint_bytes": 24897192
+    },
+    {
+      "indexed": false,
+      "transaction_size": 1,
+      "operation": "UPDATE",
+      "mutations": 800,
+      "total_ms": 23.527136945631355,
+      "mean_per_row_ms": 0.029408921182039194,
+      "median_statement_and_commit_ms": 0.02452553599141538,
+      "db_before_bytes": 2846720,
+      "db_after_checkpoint_bytes": 2867200,
+      "wal_before_checkpoint_bytes": 14675472
+    },
+    {
+      "indexed": false,
+      "transaction_size": 1,
+      "operation": "DELETE",
+      "mutations": 800,
+      "total_ms": 31.40028298366815,
+      "mean_per_row_ms": 0.039250353729585186,
+      "median_statement_and_commit_ms": 0.03866650513373315,
+      "db_before_bytes": 2846720,
+      "db_after_checkpoint_bytes": 2859008,
+      "wal_before_checkpoint_bytes": 22396352
+    },
+    {
+      "indexed": false,
+      "transaction_size": 200,
+      "operation": "INSERT",
+      "mutations": 800,
+      "total_ms": 18.584624980576336,
+      "mean_per_row_ms": 0.02323078122572042,
+      "median_statement_and_commit_ms": 0.01833401620388031,
+      "db_before_bytes": 2846720,
+      "db_after_checkpoint_bytes": 3096576,
+      "wal_before_checkpoint_bytes": 1516192
+    },
+    {
+      "indexed": false,
+      "transaction_size": 200,
+      "operation": "UPDATE",
+      "mutations": 800,
+      "total_ms": 8.212852000724524,
+      "mean_per_row_ms": 0.010266065000905655,
+      "median_statement_and_commit_ms": 0.0062064791563898325,
+      "db_before_bytes": 2846720,
+      "db_after_checkpoint_bytes": 2867200,
+      "wal_before_checkpoint_bytes": 539752
+    },
+    {
+      "indexed": false,
+      "transaction_size": 200,
+      "operation": "DELETE",
+      "mutations": 800,
+      "total_ms": 7.499998027924448,
+      "mean_per_row_ms": 0.00937499753490556,
+      "median_statement_and_commit_ms": 0.006000977009534836,
+      "db_before_bytes": 2846720,
+      "db_after_checkpoint_bytes": 2859008,
+      "wal_before_checkpoint_bytes": 1248392
+    },
+    {
+      "indexed": true,
+      "transaction_size": 1,
+      "operation": "INSERT",
+      "mutations": 800,
+      "total_ms": 52.878621965646744,
+      "mean_per_row_ms": 0.06609827745705843,
+      "median_statement_and_commit_ms": 0.06414848030544817,
+      "db_before_bytes": 3497984,
+      "db_after_checkpoint_bytes": 3809280,
+      "wal_before_checkpoint_bytes": 29544552
+    },
+    {
+      "indexed": true,
+      "transaction_size": 1,
+      "operation": "UPDATE",
+      "mutations": 800,
+      "total_ms": 33.45109400106594,
+      "mean_per_row_ms": 0.041813867501332425,
+      "median_statement_and_commit_ms": 0.03642201772890985,
+      "db_before_bytes": 3497984,
+      "db_after_checkpoint_bytes": 3538944,
+      "wal_before_checkpoint_bytes": 22210952
+    },
+    {
+      "indexed": true,
+      "transaction_size": 1,
+      "operation": "DELETE",
+      "mutations": 800,
+      "total_ms": 34.89884303417057,
+      "mean_per_row_ms": 0.04362355379271321,
+      "median_statement_and_commit_ms": 0.04237849498167634,
+      "db_before_bytes": 3497984,
+      "db_after_checkpoint_bytes": 3510272,
+      "wal_before_checkpoint_bytes": 25914832
+    },
+    {
+      "indexed": true,
+      "transaction_size": 200,
+      "operation": "INSERT",
+      "mutations": 800,
+      "total_ms": 22.17399195069447,
+      "mean_per_row_ms": 0.02771748993836809,
+      "median_statement_and_commit_ms": 0.019781000446528196,
+      "db_before_bytes": 3497984,
+      "db_after_checkpoint_bytes": 3809280,
+      "wal_before_checkpoint_bytes": 1878752
+    },
+    {
+      "indexed": true,
+      "transaction_size": 200,
+      "operation": "UPDATE",
+      "mutations": 800,
+      "total_ms": 7.319033960811794,
+      "mean_per_row_ms": 0.009148792451014742,
+      "median_statement_and_commit_ms": 0.006562011549249291,
+      "db_before_bytes": 3497984,
+      "db_after_checkpoint_bytes": 3538944,
+      "wal_before_checkpoint_bytes": 1001192
+    },
+    {
+      "indexed": true,
+      "transaction_size": 200,
+      "operation": "DELETE",
+      "mutations": 800,
+      "total_ms": 8.06726299924776,
+      "mean_per_row_ms": 0.0100840787490597,
+      "median_statement_and_commit_ms": 0.006301503162831068,
+      "db_before_bytes": 3497984,
+      "db_after_checkpoint_bytes": 3510272,
+      "wal_before_checkpoint_bytes": 1462632
+    }
+  ],
+  "migration": [
+    {
+      "action": "upgrade",
+      "target": "head",
+      "ms": 9.194541024044156,
+      "stamp": [
+        [
+          "0006"
+        ]
+      ],
+      "indexes": [
+        [
+          "ix_beliefs_created_type_id",
+          "CREATE INDEX ix_beliefs_created_type_id ON beliefs (created_at, CAST('belief' AS TEXT), id)"
+        ],
+        [
+          "ix_decisions_created_type_id",
+          "CREATE INDEX ix_decisions_created_type_id ON decisions (created_at, CAST('decision' AS TEXT), id)"
+        ],
+        [
+          "ix_facts_created_type_id",
+          "CREATE INDEX ix_facts_created_type_id ON facts (created_at, CAST('fact' AS TEXT), id)"
+        ],
+        [
+          "ix_skills_created_type_id",
+          "CREATE INDEX ix_skills_created_type_id ON skills (created_at, CAST('skill' AS TEXT), id)"
+        ]
+      ],
+      "xinfo": {
+        "ix_beliefs_created_type_id": [
+          [
+            0,
+            7,
+            "created_at",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            1,
+            -2,
+            null,
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            2,
+            0,
+            "id",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            3,
+            -1,
+            null,
+            0,
+            "BINARY",
+            0
+          ]
+        ],
+        "ix_decisions_created_type_id": [
+          [
+            0,
+            9,
+            "created_at",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            1,
+            -2,
+            null,
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            2,
+            0,
+            "id",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            3,
+            -1,
+            null,
+            0,
+            "BINARY",
+            0
+          ]
+        ],
+        "ix_facts_created_type_id": [
+          [
+            0,
+            8,
+            "created_at",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            1,
+            -2,
+            null,
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            2,
+            0,
+            "id",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            3,
+            -1,
+            null,
+            0,
+            "BINARY",
+            0
+          ]
+        ],
+        "ix_skills_created_type_id": [
+          [
+            0,
+            10,
+            "created_at",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            1,
+            -2,
+            null,
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            2,
+            0,
+            "id",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            3,
+            -1,
+            null,
+            0,
+            "BINARY",
+            0
+          ]
+        ]
+      },
+      "preservation": {
+        "rows": {
+          "facts": {
+            "count": 3000,
+            "sha256": "eeca8ecfb86bcec674a35d6dac0b96d8c16cde5398aa50479a4eee1a22623c5f"
+          },
+          "beliefs": {
+            "count": 3000,
+            "sha256": "45dd9db6e4c915b2389d00712e321a6eebd466c596998959d5af3991cc0bd0f0"
+          },
+          "decisions": {
+            "count": 3000,
+            "sha256": "7182da83e6edafcfc94aa1ed795d52a11bc7ffacfdab1a9bb06ce05fcea0deaf"
+          },
+          "skills": {
+            "count": 3000,
+            "sha256": "c7ebb5459f5a7b3ab3c6895bed6a9ae97f9839e5ea0eac8418ad8c9fc25c6c41"
+          }
+        },
+        "fts_match": {
+          "facts_fts": {
+            "count": 3000,
+            "sha256": "dea61c8f6fdd58ff9d0f8bc34d59c724f3ab88c84fe1352332f0f550caae6255"
+          },
+          "beliefs_fts": {
+            "count": 3000,
+            "sha256": "dea61c8f6fdd58ff9d0f8bc34d59c724f3ab88c84fe1352332f0f550caae6255"
+          }
+        },
+        "unique": [
+          [
+            "uq_decisions_context_dedup_active",
+            "CREATE UNIQUE INDEX uq_decisions_context_dedup_active ON decisions (context, dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ],
+          [
+            "uq_facts_spo_active",
+            "CREATE UNIQUE INDEX uq_facts_spo_active ON facts (dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ]
+        ],
+        "schema_without_new_indexes_and_stamp": [
+          [
+            "beliefs",
+            "table",
+            "CREATE TABLE beliefs (\n\tid VARCHAR NOT NULL, \n\tproposition VARCHAR(2048) NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR(128) NOT NULL, \n\tcreator VARCHAR(128) NOT NULL, \n\tsource_ids JSON NOT NULL, \n\ttags JSON NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tlast_reinforced_at DATETIME NOT NULL, \n\tversion INTEGER NOT NULL, \n\tverification_status VARCHAR(32) NOT NULL, \n\tlifecycle_state VARCHAR(32) NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "beliefs_ad",
+            "trigger",
+            "CREATE TRIGGER beliefs_ad AFTER DELETE ON beliefs BEGIN INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) VALUES('delete', old.rowid, old.proposition); END"
+          ],
+          [
+            "beliefs_ai",
+            "trigger",
+            "CREATE TRIGGER beliefs_ai AFTER INSERT ON beliefs BEGIN INSERT INTO beliefs_fts(rowid, proposition) VALUES (new.rowid, new.proposition); END"
+          ],
+          [
+            "beliefs_au",
+            "trigger",
+            "CREATE TRIGGER beliefs_au AFTER UPDATE ON beliefs BEGIN INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) VALUES('delete', old.rowid, old.proposition); INSERT INTO beliefs_fts(rowid, proposition) VALUES (new.rowid, new.proposition); END"
+          ],
+          [
+            "beliefs_fts",
+            "table",
+            "CREATE VIRTUAL TABLE beliefs_fts USING fts5(proposition, content=beliefs, content_rowid=rowid)"
+          ],
+          [
+            "beliefs_fts_config",
+            "table",
+            "CREATE TABLE 'beliefs_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+          ],
+          [
+            "beliefs_fts_data",
+            "table",
+            "CREATE TABLE 'beliefs_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+          ],
+          [
+            "beliefs_fts_docsize",
+            "table",
+            "CREATE TABLE 'beliefs_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+          ],
+          [
+            "beliefs_fts_idx",
+            "table",
+            "CREATE TABLE 'beliefs_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+          ],
+          [
+            "claim_relations",
+            "table",
+            "CREATE TABLE claim_relations (\n\tsource_id VARCHAR NOT NULL, \n\ttarget_id VARCHAR NOT NULL, \n\trelation_type VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (source_id, target_id, relation_type)\n)"
+          ],
+          [
+            "decisions",
+            "table",
+            "CREATE TABLE decisions (\n\tid VARCHAR NOT NULL, \n\tcontext VARCHAR NOT NULL, \n\tchoice VARCHAR NOT NULL, \n\tdedup_key VARCHAR NOT NULL, \n\trejected_alternatives TEXT NOT NULL, \n\treason VARCHAR NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "entities",
+            "table",
+            "CREATE TABLE entities (\n\tid VARCHAR NOT NULL, \n\ttype VARCHAR NOT NULL, \n\tname VARCHAR NOT NULL, \n\tattributes TEXT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "evidence",
+            "table",
+            "CREATE TABLE evidence (\n\tid VARCHAR NOT NULL, \n\tbelief_id VARCHAR NOT NULL, \n\tsource_type VARCHAR(32) NOT NULL, \n\tsource_id VARCHAR NOT NULL, \n\tweight FLOAT NOT NULL, \n\tcontributor VARCHAR(128) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tnote TEXT, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(belief_id) REFERENCES beliefs (id)\n)"
+          ],
+          [
+            "facts",
+            "table",
+            "CREATE TABLE facts (\n\tid VARCHAR NOT NULL, \n\tsubject VARCHAR NOT NULL, \n\tpredicate VARCHAR NOT NULL, \n\tobject VARCHAR NOT NULL, \n\tdedup_key VARCHAR NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "facts_ad",
+            "trigger",
+            "CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) VALUES('delete', old.rowid, old.subject, old.predicate, old.object); END"
+          ],
+          [
+            "facts_ai",
+            "trigger",
+            "CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN INSERT INTO facts_fts(rowid, subject, predicate, object) VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+          ],
+          [
+            "facts_au",
+            "trigger",
+            "CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) VALUES('delete', old.rowid, old.subject, old.predicate, old.object); INSERT INTO facts_fts(rowid, subject, predicate, object) VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+          ],
+          [
+            "facts_fts",
+            "table",
+            "CREATE VIRTUAL TABLE facts_fts USING fts5(subject, predicate, object, content=facts, content_rowid=rowid)"
+          ],
+          [
+            "facts_fts_config",
+            "table",
+            "CREATE TABLE 'facts_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+          ],
+          [
+            "facts_fts_data",
+            "table",
+            "CREATE TABLE 'facts_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+          ],
+          [
+            "facts_fts_docsize",
+            "table",
+            "CREATE TABLE 'facts_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+          ],
+          [
+            "facts_fts_idx",
+            "table",
+            "CREATE TABLE 'facts_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+          ],
+          [
+            "ix_beliefs_lifecycle_state",
+            "index",
+            "CREATE INDEX ix_beliefs_lifecycle_state ON beliefs (lifecycle_state)"
+          ],
+          [
+            "ix_beliefs_proposition",
+            "index",
+            "CREATE INDEX ix_beliefs_proposition ON beliefs (proposition)"
+          ],
+          [
+            "ix_claim_relations_relation_type",
+            "index",
+            "CREATE INDEX ix_claim_relations_relation_type ON claim_relations (relation_type)"
+          ],
+          [
+            "ix_claim_relations_target_id",
+            "index",
+            "CREATE INDEX ix_claim_relations_target_id ON claim_relations (target_id)"
+          ],
+          [
+            "ix_evidence_belief_id",
+            "index",
+            "CREATE INDEX ix_evidence_belief_id ON evidence (belief_id)"
+          ],
+          [
+            "ix_facts_predicate",
+            "index",
+            "CREATE INDEX ix_facts_predicate ON facts (predicate)"
+          ],
+          [
+            "ix_facts_subject",
+            "index",
+            "CREATE INDEX ix_facts_subject ON facts (subject)"
+          ],
+          [
+            "ix_lifecycle_events_memory_id",
+            "index",
+            "CREATE INDEX ix_lifecycle_events_memory_id ON lifecycle_events (memory_id)"
+          ],
+          [
+            "ix_lifecycle_states_memory_id",
+            "index",
+            "CREATE INDEX ix_lifecycle_states_memory_id ON lifecycle_states (memory_id)"
+          ],
+          [
+            "ix_outbox_entries_record_id",
+            "index",
+            "CREATE INDEX ix_outbox_entries_record_id ON outbox_entries (record_id)"
+          ],
+          [
+            "ix_outbox_entries_record_type",
+            "index",
+            "CREATE INDEX ix_outbox_entries_record_type ON outbox_entries (record_type)"
+          ],
+          [
+            "ix_outbox_entries_status",
+            "index",
+            "CREATE INDEX ix_outbox_entries_status ON outbox_entries (status)"
+          ],
+          [
+            "ix_receipts_memory_type",
+            "index",
+            "CREATE INDEX ix_receipts_memory_type ON receipts (memory_type)"
+          ],
+          [
+            "ix_receipts_source",
+            "index",
+            "CREATE INDEX ix_receipts_source ON receipts (source)"
+          ],
+          [
+            "lifecycle_events",
+            "table",
+            "CREATE TABLE lifecycle_events (\n\tid VARCHAR NOT NULL, \n\tmemory_id VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tfrom_state VARCHAR NOT NULL, \n\tto_state VARCHAR NOT NULL, \n\treason VARCHAR NOT NULL, \n\ttriggered_by VARCHAR NOT NULL, \n\ttimestamp DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "lifecycle_states",
+            "table",
+            "CREATE TABLE lifecycle_states (\n\tid VARCHAR NOT NULL, \n\tmemory_id VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tcurrent_state VARCHAR NOT NULL, \n\tprevious_state VARCHAR, \n\tconfidence FLOAT NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "outbox_entries",
+            "table",
+            "CREATE TABLE outbox_entries (\n\tid VARCHAR NOT NULL, \n\trecord_type VARCHAR NOT NULL, \n\trecord_id VARCHAR NOT NULL, \n\toperation VARCHAR NOT NULL, \n\tpayload_json TEXT NOT NULL, \n\tstatus VARCHAR NOT NULL, \n\tretry_count INTEGER NOT NULL, \n\terror VARCHAR, \n\tcreated_at DATETIME NOT NULL, \n\tprocessed_at DATETIME, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "receipts",
+            "table",
+            "CREATE TABLE receipts (\n\tid VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tsource VARCHAR NOT NULL, \n\tcreated_by VARCHAR NOT NULL, \n\ttimestamp DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\thistory TEXT NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "skills",
+            "table",
+            "CREATE TABLE skills (\n\tid VARCHAR NOT NULL, \n\tname VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tpurpose VARCHAR NOT NULL, \n\tsteps TEXT NOT NULL, \n\tconstraints TEXT NOT NULL, \n\tvalidation TEXT NOT NULL, \n\tsuccess_rate FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "uq_decisions_context_dedup_active",
+            "index",
+            "CREATE UNIQUE INDEX uq_decisions_context_dedup_active ON decisions (context, dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ],
+          [
+            "uq_facts_spo_active",
+            "index",
+            "CREATE UNIQUE INDEX uq_facts_spo_active ON facts (dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ]
+        ],
+        "integrity": [
+          [
+            "ok"
+          ]
+        ],
+        "fk_check": []
+      }
+    },
+    {
+      "action": "upgrade",
+      "target": "head",
+      "ms": 4.392739036120474,
+      "stamp": [
+        [
+          "0006"
+        ]
+      ],
+      "indexes": [
+        [
+          "ix_beliefs_created_type_id",
+          "CREATE INDEX ix_beliefs_created_type_id ON beliefs (created_at, CAST('belief' AS TEXT), id)"
+        ],
+        [
+          "ix_decisions_created_type_id",
+          "CREATE INDEX ix_decisions_created_type_id ON decisions (created_at, CAST('decision' AS TEXT), id)"
+        ],
+        [
+          "ix_facts_created_type_id",
+          "CREATE INDEX ix_facts_created_type_id ON facts (created_at, CAST('fact' AS TEXT), id)"
+        ],
+        [
+          "ix_skills_created_type_id",
+          "CREATE INDEX ix_skills_created_type_id ON skills (created_at, CAST('skill' AS TEXT), id)"
+        ]
+      ],
+      "xinfo": {
+        "ix_beliefs_created_type_id": [
+          [
+            0,
+            7,
+            "created_at",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            1,
+            -2,
+            null,
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            2,
+            0,
+            "id",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            3,
+            -1,
+            null,
+            0,
+            "BINARY",
+            0
+          ]
+        ],
+        "ix_decisions_created_type_id": [
+          [
+            0,
+            9,
+            "created_at",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            1,
+            -2,
+            null,
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            2,
+            0,
+            "id",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            3,
+            -1,
+            null,
+            0,
+            "BINARY",
+            0
+          ]
+        ],
+        "ix_facts_created_type_id": [
+          [
+            0,
+            8,
+            "created_at",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            1,
+            -2,
+            null,
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            2,
+            0,
+            "id",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            3,
+            -1,
+            null,
+            0,
+            "BINARY",
+            0
+          ]
+        ],
+        "ix_skills_created_type_id": [
+          [
+            0,
+            10,
+            "created_at",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            1,
+            -2,
+            null,
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            2,
+            0,
+            "id",
+            0,
+            "BINARY",
+            1
+          ],
+          [
+            3,
+            -1,
+            null,
+            0,
+            "BINARY",
+            0
+          ]
+        ]
+      },
+      "preservation": {
+        "rows": {
+          "facts": {
+            "count": 3000,
+            "sha256": "eeca8ecfb86bcec674a35d6dac0b96d8c16cde5398aa50479a4eee1a22623c5f"
+          },
+          "beliefs": {
+            "count": 3000,
+            "sha256": "45dd9db6e4c915b2389d00712e321a6eebd466c596998959d5af3991cc0bd0f0"
+          },
+          "decisions": {
+            "count": 3000,
+            "sha256": "7182da83e6edafcfc94aa1ed795d52a11bc7ffacfdab1a9bb06ce05fcea0deaf"
+          },
+          "skills": {
+            "count": 3000,
+            "sha256": "c7ebb5459f5a7b3ab3c6895bed6a9ae97f9839e5ea0eac8418ad8c9fc25c6c41"
+          }
+        },
+        "fts_match": {
+          "facts_fts": {
+            "count": 3000,
+            "sha256": "dea61c8f6fdd58ff9d0f8bc34d59c724f3ab88c84fe1352332f0f550caae6255"
+          },
+          "beliefs_fts": {
+            "count": 3000,
+            "sha256": "dea61c8f6fdd58ff9d0f8bc34d59c724f3ab88c84fe1352332f0f550caae6255"
+          }
+        },
+        "unique": [
+          [
+            "uq_decisions_context_dedup_active",
+            "CREATE UNIQUE INDEX uq_decisions_context_dedup_active ON decisions (context, dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ],
+          [
+            "uq_facts_spo_active",
+            "CREATE UNIQUE INDEX uq_facts_spo_active ON facts (dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ]
+        ],
+        "schema_without_new_indexes_and_stamp": [
+          [
+            "beliefs",
+            "table",
+            "CREATE TABLE beliefs (\n\tid VARCHAR NOT NULL, \n\tproposition VARCHAR(2048) NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR(128) NOT NULL, \n\tcreator VARCHAR(128) NOT NULL, \n\tsource_ids JSON NOT NULL, \n\ttags JSON NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tlast_reinforced_at DATETIME NOT NULL, \n\tversion INTEGER NOT NULL, \n\tverification_status VARCHAR(32) NOT NULL, \n\tlifecycle_state VARCHAR(32) NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "beliefs_ad",
+            "trigger",
+            "CREATE TRIGGER beliefs_ad AFTER DELETE ON beliefs BEGIN INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) VALUES('delete', old.rowid, old.proposition); END"
+          ],
+          [
+            "beliefs_ai",
+            "trigger",
+            "CREATE TRIGGER beliefs_ai AFTER INSERT ON beliefs BEGIN INSERT INTO beliefs_fts(rowid, proposition) VALUES (new.rowid, new.proposition); END"
+          ],
+          [
+            "beliefs_au",
+            "trigger",
+            "CREATE TRIGGER beliefs_au AFTER UPDATE ON beliefs BEGIN INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) VALUES('delete', old.rowid, old.proposition); INSERT INTO beliefs_fts(rowid, proposition) VALUES (new.rowid, new.proposition); END"
+          ],
+          [
+            "beliefs_fts",
+            "table",
+            "CREATE VIRTUAL TABLE beliefs_fts USING fts5(proposition, content=beliefs, content_rowid=rowid)"
+          ],
+          [
+            "beliefs_fts_config",
+            "table",
+            "CREATE TABLE 'beliefs_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+          ],
+          [
+            "beliefs_fts_data",
+            "table",
+            "CREATE TABLE 'beliefs_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+          ],
+          [
+            "beliefs_fts_docsize",
+            "table",
+            "CREATE TABLE 'beliefs_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+          ],
+          [
+            "beliefs_fts_idx",
+            "table",
+            "CREATE TABLE 'beliefs_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+          ],
+          [
+            "claim_relations",
+            "table",
+            "CREATE TABLE claim_relations (\n\tsource_id VARCHAR NOT NULL, \n\ttarget_id VARCHAR NOT NULL, \n\trelation_type VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (source_id, target_id, relation_type)\n)"
+          ],
+          [
+            "decisions",
+            "table",
+            "CREATE TABLE decisions (\n\tid VARCHAR NOT NULL, \n\tcontext VARCHAR NOT NULL, \n\tchoice VARCHAR NOT NULL, \n\tdedup_key VARCHAR NOT NULL, \n\trejected_alternatives TEXT NOT NULL, \n\treason VARCHAR NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "entities",
+            "table",
+            "CREATE TABLE entities (\n\tid VARCHAR NOT NULL, \n\ttype VARCHAR NOT NULL, \n\tname VARCHAR NOT NULL, \n\tattributes TEXT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "evidence",
+            "table",
+            "CREATE TABLE evidence (\n\tid VARCHAR NOT NULL, \n\tbelief_id VARCHAR NOT NULL, \n\tsource_type VARCHAR(32) NOT NULL, \n\tsource_id VARCHAR NOT NULL, \n\tweight FLOAT NOT NULL, \n\tcontributor VARCHAR(128) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tnote TEXT, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(belief_id) REFERENCES beliefs (id)\n)"
+          ],
+          [
+            "facts",
+            "table",
+            "CREATE TABLE facts (\n\tid VARCHAR NOT NULL, \n\tsubject VARCHAR NOT NULL, \n\tpredicate VARCHAR NOT NULL, \n\tobject VARCHAR NOT NULL, \n\tdedup_key VARCHAR NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "facts_ad",
+            "trigger",
+            "CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) VALUES('delete', old.rowid, old.subject, old.predicate, old.object); END"
+          ],
+          [
+            "facts_ai",
+            "trigger",
+            "CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN INSERT INTO facts_fts(rowid, subject, predicate, object) VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+          ],
+          [
+            "facts_au",
+            "trigger",
+            "CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) VALUES('delete', old.rowid, old.subject, old.predicate, old.object); INSERT INTO facts_fts(rowid, subject, predicate, object) VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+          ],
+          [
+            "facts_fts",
+            "table",
+            "CREATE VIRTUAL TABLE facts_fts USING fts5(subject, predicate, object, content=facts, content_rowid=rowid)"
+          ],
+          [
+            "facts_fts_config",
+            "table",
+            "CREATE TABLE 'facts_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+          ],
+          [
+            "facts_fts_data",
+            "table",
+            "CREATE TABLE 'facts_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+          ],
+          [
+            "facts_fts_docsize",
+            "table",
+            "CREATE TABLE 'facts_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+          ],
+          [
+            "facts_fts_idx",
+            "table",
+            "CREATE TABLE 'facts_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+          ],
+          [
+            "ix_beliefs_lifecycle_state",
+            "index",
+            "CREATE INDEX ix_beliefs_lifecycle_state ON beliefs (lifecycle_state)"
+          ],
+          [
+            "ix_beliefs_proposition",
+            "index",
+            "CREATE INDEX ix_beliefs_proposition ON beliefs (proposition)"
+          ],
+          [
+            "ix_claim_relations_relation_type",
+            "index",
+            "CREATE INDEX ix_claim_relations_relation_type ON claim_relations (relation_type)"
+          ],
+          [
+            "ix_claim_relations_target_id",
+            "index",
+            "CREATE INDEX ix_claim_relations_target_id ON claim_relations (target_id)"
+          ],
+          [
+            "ix_evidence_belief_id",
+            "index",
+            "CREATE INDEX ix_evidence_belief_id ON evidence (belief_id)"
+          ],
+          [
+            "ix_facts_predicate",
+            "index",
+            "CREATE INDEX ix_facts_predicate ON facts (predicate)"
+          ],
+          [
+            "ix_facts_subject",
+            "index",
+            "CREATE INDEX ix_facts_subject ON facts (subject)"
+          ],
+          [
+            "ix_lifecycle_events_memory_id",
+            "index",
+            "CREATE INDEX ix_lifecycle_events_memory_id ON lifecycle_events (memory_id)"
+          ],
+          [
+            "ix_lifecycle_states_memory_id",
+            "index",
+            "CREATE INDEX ix_lifecycle_states_memory_id ON lifecycle_states (memory_id)"
+          ],
+          [
+            "ix_outbox_entries_record_id",
+            "index",
+            "CREATE INDEX ix_outbox_entries_record_id ON outbox_entries (record_id)"
+          ],
+          [
+            "ix_outbox_entries_record_type",
+            "index",
+            "CREATE INDEX ix_outbox_entries_record_type ON outbox_entries (record_type)"
+          ],
+          [
+            "ix_outbox_entries_status",
+            "index",
+            "CREATE INDEX ix_outbox_entries_status ON outbox_entries (status)"
+          ],
+          [
+            "ix_receipts_memory_type",
+            "index",
+            "CREATE INDEX ix_receipts_memory_type ON receipts (memory_type)"
+          ],
+          [
+            "ix_receipts_source",
+            "index",
+            "CREATE INDEX ix_receipts_source ON receipts (source)"
+          ],
+          [
+            "lifecycle_events",
+            "table",
+            "CREATE TABLE lifecycle_events (\n\tid VARCHAR NOT NULL, \n\tmemory_id VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tfrom_state VARCHAR NOT NULL, \n\tto_state VARCHAR NOT NULL, \n\treason VARCHAR NOT NULL, \n\ttriggered_by VARCHAR NOT NULL, \n\ttimestamp DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "lifecycle_states",
+            "table",
+            "CREATE TABLE lifecycle_states (\n\tid VARCHAR NOT NULL, \n\tmemory_id VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tcurrent_state VARCHAR NOT NULL, \n\tprevious_state VARCHAR, \n\tconfidence FLOAT NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "outbox_entries",
+            "table",
+            "CREATE TABLE outbox_entries (\n\tid VARCHAR NOT NULL, \n\trecord_type VARCHAR NOT NULL, \n\trecord_id VARCHAR NOT NULL, \n\toperation VARCHAR NOT NULL, \n\tpayload_json TEXT NOT NULL, \n\tstatus VARCHAR NOT NULL, \n\tretry_count INTEGER NOT NULL, \n\terror VARCHAR, \n\tcreated_at DATETIME NOT NULL, \n\tprocessed_at DATETIME, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "receipts",
+            "table",
+            "CREATE TABLE receipts (\n\tid VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tsource VARCHAR NOT NULL, \n\tcreated_by VARCHAR NOT NULL, \n\ttimestamp DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\thistory TEXT NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "skills",
+            "table",
+            "CREATE TABLE skills (\n\tid VARCHAR NOT NULL, \n\tname VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tpurpose VARCHAR NOT NULL, \n\tsteps TEXT NOT NULL, \n\tconstraints TEXT NOT NULL, \n\tvalidation TEXT NOT NULL, \n\tsuccess_rate FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "uq_decisions_context_dedup_active",
+            "index",
+            "CREATE UNIQUE INDEX uq_decisions_context_dedup_active ON decisions (context, dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ],
+          [
+            "uq_facts_spo_active",
+            "index",
+            "CREATE UNIQUE INDEX uq_facts_spo_active ON facts (dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ]
+        ],
+        "integrity": [
+          [
+            "ok"
+          ]
+        ],
+        "fk_check": []
+      }
+    },
+    {
+      "action": "downgrade",
+      "target": "0005",
+      "ms": 4.965043975971639,
+      "stamp": [
+        [
+          "0005"
+        ]
+      ],
+      "indexes": [],
+      "xinfo": {},
+      "preservation": {
+        "rows": {
+          "facts": {
+            "count": 3000,
+            "sha256": "eeca8ecfb86bcec674a35d6dac0b96d8c16cde5398aa50479a4eee1a22623c5f"
+          },
+          "beliefs": {
+            "count": 3000,
+            "sha256": "45dd9db6e4c915b2389d00712e321a6eebd466c596998959d5af3991cc0bd0f0"
+          },
+          "decisions": {
+            "count": 3000,
+            "sha256": "7182da83e6edafcfc94aa1ed795d52a11bc7ffacfdab1a9bb06ce05fcea0deaf"
+          },
+          "skills": {
+            "count": 3000,
+            "sha256": "c7ebb5459f5a7b3ab3c6895bed6a9ae97f9839e5ea0eac8418ad8c9fc25c6c41"
+          }
+        },
+        "fts_match": {
+          "facts_fts": {
+            "count": 3000,
+            "sha256": "dea61c8f6fdd58ff9d0f8bc34d59c724f3ab88c84fe1352332f0f550caae6255"
+          },
+          "beliefs_fts": {
+            "count": 3000,
+            "sha256": "dea61c8f6fdd58ff9d0f8bc34d59c724f3ab88c84fe1352332f0f550caae6255"
+          }
+        },
+        "unique": [
+          [
+            "uq_decisions_context_dedup_active",
+            "CREATE UNIQUE INDEX uq_decisions_context_dedup_active ON decisions (context, dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ],
+          [
+            "uq_facts_spo_active",
+            "CREATE UNIQUE INDEX uq_facts_spo_active ON facts (dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ]
+        ],
+        "schema_without_new_indexes_and_stamp": [
+          [
+            "beliefs",
+            "table",
+            "CREATE TABLE beliefs (\n\tid VARCHAR NOT NULL, \n\tproposition VARCHAR(2048) NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR(128) NOT NULL, \n\tcreator VARCHAR(128) NOT NULL, \n\tsource_ids JSON NOT NULL, \n\ttags JSON NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tlast_reinforced_at DATETIME NOT NULL, \n\tversion INTEGER NOT NULL, \n\tverification_status VARCHAR(32) NOT NULL, \n\tlifecycle_state VARCHAR(32) NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "beliefs_ad",
+            "trigger",
+            "CREATE TRIGGER beliefs_ad AFTER DELETE ON beliefs BEGIN INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) VALUES('delete', old.rowid, old.proposition); END"
+          ],
+          [
+            "beliefs_ai",
+            "trigger",
+            "CREATE TRIGGER beliefs_ai AFTER INSERT ON beliefs BEGIN INSERT INTO beliefs_fts(rowid, proposition) VALUES (new.rowid, new.proposition); END"
+          ],
+          [
+            "beliefs_au",
+            "trigger",
+            "CREATE TRIGGER beliefs_au AFTER UPDATE ON beliefs BEGIN INSERT INTO beliefs_fts(beliefs_fts, rowid, proposition) VALUES('delete', old.rowid, old.proposition); INSERT INTO beliefs_fts(rowid, proposition) VALUES (new.rowid, new.proposition); END"
+          ],
+          [
+            "beliefs_fts",
+            "table",
+            "CREATE VIRTUAL TABLE beliefs_fts USING fts5(proposition, content=beliefs, content_rowid=rowid)"
+          ],
+          [
+            "beliefs_fts_config",
+            "table",
+            "CREATE TABLE 'beliefs_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+          ],
+          [
+            "beliefs_fts_data",
+            "table",
+            "CREATE TABLE 'beliefs_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+          ],
+          [
+            "beliefs_fts_docsize",
+            "table",
+            "CREATE TABLE 'beliefs_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+          ],
+          [
+            "beliefs_fts_idx",
+            "table",
+            "CREATE TABLE 'beliefs_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+          ],
+          [
+            "claim_relations",
+            "table",
+            "CREATE TABLE claim_relations (\n\tsource_id VARCHAR NOT NULL, \n\ttarget_id VARCHAR NOT NULL, \n\trelation_type VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (source_id, target_id, relation_type)\n)"
+          ],
+          [
+            "decisions",
+            "table",
+            "CREATE TABLE decisions (\n\tid VARCHAR NOT NULL, \n\tcontext VARCHAR NOT NULL, \n\tchoice VARCHAR NOT NULL, \n\tdedup_key VARCHAR NOT NULL, \n\trejected_alternatives TEXT NOT NULL, \n\treason VARCHAR NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "entities",
+            "table",
+            "CREATE TABLE entities (\n\tid VARCHAR NOT NULL, \n\ttype VARCHAR NOT NULL, \n\tname VARCHAR NOT NULL, \n\tattributes TEXT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "evidence",
+            "table",
+            "CREATE TABLE evidence (\n\tid VARCHAR NOT NULL, \n\tbelief_id VARCHAR NOT NULL, \n\tsource_type VARCHAR(32) NOT NULL, \n\tsource_id VARCHAR NOT NULL, \n\tweight FLOAT NOT NULL, \n\tcontributor VARCHAR(128) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tnote TEXT, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(belief_id) REFERENCES beliefs (id)\n)"
+          ],
+          [
+            "facts",
+            "table",
+            "CREATE TABLE facts (\n\tid VARCHAR NOT NULL, \n\tsubject VARCHAR NOT NULL, \n\tpredicate VARCHAR NOT NULL, \n\tobject VARCHAR NOT NULL, \n\tdedup_key VARCHAR NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "facts_ad",
+            "trigger",
+            "CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) VALUES('delete', old.rowid, old.subject, old.predicate, old.object); END"
+          ],
+          [
+            "facts_ai",
+            "trigger",
+            "CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN INSERT INTO facts_fts(rowid, subject, predicate, object) VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+          ],
+          [
+            "facts_au",
+            "trigger",
+            "CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) VALUES('delete', old.rowid, old.subject, old.predicate, old.object); INSERT INTO facts_fts(rowid, subject, predicate, object) VALUES (new.rowid, new.subject, new.predicate, new.object); END"
+          ],
+          [
+            "facts_fts",
+            "table",
+            "CREATE VIRTUAL TABLE facts_fts USING fts5(subject, predicate, object, content=facts, content_rowid=rowid)"
+          ],
+          [
+            "facts_fts_config",
+            "table",
+            "CREATE TABLE 'facts_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+          ],
+          [
+            "facts_fts_data",
+            "table",
+            "CREATE TABLE 'facts_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+          ],
+          [
+            "facts_fts_docsize",
+            "table",
+            "CREATE TABLE 'facts_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+          ],
+          [
+            "facts_fts_idx",
+            "table",
+            "CREATE TABLE 'facts_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+          ],
+          [
+            "ix_beliefs_lifecycle_state",
+            "index",
+            "CREATE INDEX ix_beliefs_lifecycle_state ON beliefs (lifecycle_state)"
+          ],
+          [
+            "ix_beliefs_proposition",
+            "index",
+            "CREATE INDEX ix_beliefs_proposition ON beliefs (proposition)"
+          ],
+          [
+            "ix_claim_relations_relation_type",
+            "index",
+            "CREATE INDEX ix_claim_relations_relation_type ON claim_relations (relation_type)"
+          ],
+          [
+            "ix_claim_relations_target_id",
+            "index",
+            "CREATE INDEX ix_claim_relations_target_id ON claim_relations (target_id)"
+          ],
+          [
+            "ix_evidence_belief_id",
+            "index",
+            "CREATE INDEX ix_evidence_belief_id ON evidence (belief_id)"
+          ],
+          [
+            "ix_facts_predicate",
+            "index",
+            "CREATE INDEX ix_facts_predicate ON facts (predicate)"
+          ],
+          [
+            "ix_facts_subject",
+            "index",
+            "CREATE INDEX ix_facts_subject ON facts (subject)"
+          ],
+          [
+            "ix_lifecycle_events_memory_id",
+            "index",
+            "CREATE INDEX ix_lifecycle_events_memory_id ON lifecycle_events (memory_id)"
+          ],
+          [
+            "ix_lifecycle_states_memory_id",
+            "index",
+            "CREATE INDEX ix_lifecycle_states_memory_id ON lifecycle_states (memory_id)"
+          ],
+          [
+            "ix_outbox_entries_record_id",
+            "index",
+            "CREATE INDEX ix_outbox_entries_record_id ON outbox_entries (record_id)"
+          ],
+          [
+            "ix_outbox_entries_record_type",
+            "index",
+            "CREATE INDEX ix_outbox_entries_record_type ON outbox_entries (record_type)"
+          ],
+          [
+            "ix_outbox_entries_status",
+            "index",
+            "CREATE INDEX ix_outbox_entries_status ON outbox_entries (status)"
+          ],
+          [
+            "ix_receipts_memory_type",
+            "index",
+            "CREATE INDEX ix_receipts_memory_type ON receipts (memory_type)"
+          ],
+          [
+            "ix_receipts_source",
+            "index",
+            "CREATE INDEX ix_receipts_source ON receipts (source)"
+          ],
+          [
+            "lifecycle_events",
+            "table",
+            "CREATE TABLE lifecycle_events (\n\tid VARCHAR NOT NULL, \n\tmemory_id VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tfrom_state VARCHAR NOT NULL, \n\tto_state VARCHAR NOT NULL, \n\treason VARCHAR NOT NULL, \n\ttriggered_by VARCHAR NOT NULL, \n\ttimestamp DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "lifecycle_states",
+            "table",
+            "CREATE TABLE lifecycle_states (\n\tid VARCHAR NOT NULL, \n\tmemory_id VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tcurrent_state VARCHAR NOT NULL, \n\tprevious_state VARCHAR, \n\tconfidence FLOAT NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "outbox_entries",
+            "table",
+            "CREATE TABLE outbox_entries (\n\tid VARCHAR NOT NULL, \n\trecord_type VARCHAR NOT NULL, \n\trecord_id VARCHAR NOT NULL, \n\toperation VARCHAR NOT NULL, \n\tpayload_json TEXT NOT NULL, \n\tstatus VARCHAR NOT NULL, \n\tretry_count INTEGER NOT NULL, \n\terror VARCHAR, \n\tcreated_at DATETIME NOT NULL, \n\tprocessed_at DATETIME, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "receipts",
+            "table",
+            "CREATE TABLE receipts (\n\tid VARCHAR NOT NULL, \n\tmemory_type VARCHAR NOT NULL, \n\tsource VARCHAR NOT NULL, \n\tcreated_by VARCHAR NOT NULL, \n\ttimestamp DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\thistory TEXT NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "skills",
+            "table",
+            "CREATE TABLE skills (\n\tid VARCHAR NOT NULL, \n\tname VARCHAR NOT NULL, \n\tversion VARCHAR NOT NULL, \n\tpurpose VARCHAR NOT NULL, \n\tsteps TEXT NOT NULL, \n\tconstraints TEXT NOT NULL, \n\tvalidation TEXT NOT NULL, \n\tsuccess_rate FLOAT NOT NULL, \n\tsource VARCHAR, \n\tcreator VARCHAR NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tverification_status VARCHAR NOT NULL, \n\tlifecycle_state VARCHAR NOT NULL, \n\tPRIMARY KEY (id)\n)"
+          ],
+          [
+            "uq_decisions_context_dedup_active",
+            "index",
+            "CREATE UNIQUE INDEX uq_decisions_context_dedup_active ON decisions (context, dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ],
+          [
+            "uq_facts_spo_active",
+            "index",
+            "CREATE UNIQUE INDEX uq_facts_spo_active ON facts (dedup_key) WHERE lifecycle_state IN ('candidate', 'validated', 'active')"
+          ]
+        ],
+        "integrity": [
+          [
+            "ok"
+          ]
+        ],
+        "fk_check": []
+      }
+    }
+  ],
+  "migration_collision": {
+    "error": "SLICE-01A index name occupied by a different definition: ix_skills_created_type_id",
+    "remaining_indexes": [
+      [
+        "ix_skills_created_type_id"
+      ]
+    ],
+    "no_partial_DDL": true
+  }
+}
