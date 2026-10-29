@@ -80,6 +80,15 @@ class MemorySlice:
     upper: ReadKey | None
 
 
+def receipt_history_complete(page: HistorySlice) -> bool:
+    if page.incomplete or page.has_more:
+        return False
+    # A complete available prefix still has no proof of coverage of all sources.
+    # Keep this separate from known-incomplete; never infer source coverage from
+    # an empty lookahead or the absence of unsupported events.
+    return False
+
+
 def utc(value):
     dt = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
@@ -318,17 +327,41 @@ class MemoryReadService(MemoryReadPort):
                     raise HttpError("E_NOT_FOUND")
 
                 def contribution(item):
-                    return item.model_copy(update={"matched_terms": []}, deep=True)
+                    return d.TraceContribution(
+                        memory_id=item.memory_id,
+                        source=item.source,
+                        raw_score=item.raw_score,
+                        normalized_score=item.normalized_score,
+                        rank_before_merge=item.rank_before_merge,
+                        rank_after_merge=item.rank_after_merge,
+                        matched_terms=[],
+                        relation_path=[],
+                        dedup_winner_id=item.dedup_winner_id,
+                    )
 
-                result = result.model_copy(
-                    update={
-                        "query": None,
-                        "stages": {k: [contribution(v) for v in items] for k, items in result.stages.items()},
-                        "merge": [contribution(v) for v in result.merge],
-                        "deduplicated": [contribution(v) for v in result.deduplicated],
-                        "final": [contribution(v) for v in result.final],
-                    },
-                    deep=True,
+                # Only canonical hashes may cross this provenance boundary.
+                # Unknown/free-text build labels are not safe GET metadata.
+                result = d.Trace(
+                    id=result.id,
+                    request_id=result.request_id,
+                    profile_id=result.profile_id,
+                    operation=result.operation,
+                    query=None,
+                    stages={k: [contribution(v) for v in items] for k, items in result.stages.items()},
+                    stage_status=dict(result.stage_status),
+                    merge=[contribution(v) for v in result.merge],
+                    deduplicated=[contribution(v) for v in result.deduplicated],
+                    final=[contribution(v) for v in result.final],
+                    created_at=result.created_at,
+                    expires_at=result.expires_at,
+                    settings_digest=(
+                        result.settings_digest if re.fullmatch(r"[0-9a-f]{64}", result.settings_digest) else ""
+                    ),
+                    code_revision=(
+                        result.code_revision
+                        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", result.code_revision)
+                        else ""
+                    ),
                 )
                 return d.LookupResult(kind="trace", id=query.id, target=result, found=True)
             resources = self.bind_read(scope)
@@ -412,7 +445,7 @@ class MemoryReadService(MemoryReadPort):
                             verification_status=receipt["verification_status"],
                             lifecycle_state=receipt["lifecycle_state"],
                             history=events,
-                            history_complete=False,
+                            history_complete=receipt_history_complete(page),
                         )
                     else:
                         result = project_for_caller(ctx, command.operation, record, "unknown")

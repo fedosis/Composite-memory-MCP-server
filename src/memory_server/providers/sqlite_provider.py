@@ -355,16 +355,30 @@ class SQLiteProvider:
                 {**params, "page_limit": int(query.limit) + 1},
             )
         ).all()
-        records_list = []
-        for r in rows[: query.limit]:
-            records_list.append(
-                ReadRecord(
-                    self._record(r.memory_type, r),
-                    r.memory_type,
-                    await self.read_receipt_metadata(session, r.id, r.memory_type),
-                )
+        page_rows = rows[: query.limit]
+        receipts = {}
+        if page_rows:
+            # Bound the IN list and result to the returned page, not its lookahead.
+            pairs = ",".join(f"(:id{i},:type{i})" for i in range(len(page_rows)))
+            receipt_params = {f"id{i}": r.id for i, r in enumerate(page_rows)}
+            receipt_params.update({f"type{i}": r.memory_type for i, r in enumerate(page_rows)})
+            receipt_params["receipt_limit"] = len(page_rows)
+            receipt_rows = await session.execute(
+                text(
+                    "SELECT id,memory_type,source,created_by,timestamp,confidence,"
+                    "verification_status,lifecycle_state,version FROM receipts "
+                    f"WHERE (id,memory_type) IN ({pairs}) LIMIT :receipt_limit"
+                ),
+                receipt_params,
             )
-        records = tuple(records_list)
+            for row in receipt_rows:
+                data = dict(row._mapping)
+                data["timestamp"] = self._utc(data["timestamp"])
+                receipts[(row.id, row.memory_type)] = data
+        records = tuple(
+            ReadRecord(self._record(r.memory_type, r), r.memory_type, receipts.get((r.id, r.memory_type)))
+            for r in page_rows
+        )
         return MemorySlice(records, len(rows) > query.limit, upper)
 
     async def read_receipt_metadata(self, session: AsyncSession, memory_id: str, memory_type: str):
