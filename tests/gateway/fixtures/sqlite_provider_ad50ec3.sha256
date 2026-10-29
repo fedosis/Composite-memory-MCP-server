@@ -1,0 +1,3 @@
+76e5ed716134b9370a41f6e894c40c5a854b07a36de827ce47f4697df9d576c4  sqlite_provider_ad50ec3.py
+# Source: git show ad50ec3:src/memory_server/providers/sqlite_provider.py
+# Exact unmodified source; shared ORM and installed dependencies remain a residual.

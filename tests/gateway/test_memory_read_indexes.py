@@ -8,6 +8,8 @@ microsecond/date boundaries.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +26,8 @@ from memory_server.application.memory_read_service import ReadKey
 from memory_server.providers.sqlite_provider import SQLiteProvider
 
 REPO = Path(__file__).resolve().parents[2]
+FIXTURE = Path(__file__).with_name("fixtures") / "sqlite_provider_ad50ec3.py"
+FIXTURE_SHA256 = FIXTURE.with_suffix(".sha256")
 KINDS = ("fact", "belief", "decision", "skill")
 INDEXES = {
     "fact": "ix_facts_created_type_id",
@@ -32,9 +36,12 @@ INDEXES = {
     "skill": "ix_skills_created_type_id",
 }
 BASE = datetime(2024, 1, 1, tzinfo=UTC)
-# The reproducible evidence runner substitutes the immutable ad50ec3 class.
-# Normal regression runs exercise the retained production fallback instead.
-REFERENCE_PROVIDER = SQLiteProvider
+
+_spec = importlib.util.spec_from_file_location("sqlite_provider_ad50ec3", FIXTURE)
+assert _spec is not None and _spec.loader is not None
+_historical = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_historical)
+REFERENCE_PROVIDER = _historical.SQLiteProvider
 EQUIVALENCE_TRACE = None
 
 
@@ -143,6 +150,37 @@ def _eqp_lines(statement, params, db):
     with sqlite3.connect(db) as conn:
         conn.create_function("s07_timestamp", 1, lambda value: value)
         return [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + statement, params)]
+
+
+
+
+def _assert_fixture_hash():
+    expected = FIXTURE_SHA256.read_text().strip().split()[0]
+    actual = hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
+    assert actual == expected
+
+
+@pytest.mark.asyncio
+async def test_historical_fixture_hash_and_small_golden_order(tmp_path):
+    _assert_fixture_hash()
+    db = tmp_path / "golden.db"
+    current = SQLiteProvider(f"sqlite+aiosqlite:///{db}")
+    historical = REFERENCE_PROVIDER(f"sqlite+aiosqlite:///{db}")
+    await current.initialize()
+    async with current._session_factory() as session:
+        for kind in KINDS:
+            session.add(_models(kind, 0, BASE, BASE))
+        await session.commit()
+    expected = tuple(("2024-01-01T00:00:00.000000+00:00", kind, "memory-0000") for kind in sorted(KINDS))
+    assert _keys(await _page(current, _query(20))) == expected
+    await current.close()
+    await historical.initialize()
+    try:
+        query = _query(20)
+        old = await _page(historical, query)
+        assert _keys(old) == expected
+    finally:
+        await historical.close()
 
 
 @pytest.fixture
@@ -541,17 +579,53 @@ async def test_orm_write_after_startup_and_bounded_statement_counts(seeded, rece
 
 
 @pytest.mark.asyncio
-async def test_capability_check_is_startup_only_and_not_per_page(seeded):
-    provider, _ = seeded
-    checks = 0
+@pytest.mark.parametrize("fallback", [False, True], ids=["canonical", "fallback"])
+async def test_capability_check_is_startup_only_and_one_per_instance(tmp_path, fallback):
+    db = tmp_path / ("fallback.db" if fallback else "canonical.db")
+    if fallback:
+        prepared = SQLiteProvider(f"sqlite+aiosqlite:///{db}")
+        await prepared.initialize()
+        await _seed_12k(prepared)
+        await prepared.close()
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE beliefs SET created_at = replace(created_at, ' ', 'T') WHERE id='memory-0000'")
+            conn.commit()
+
+    provider = SQLiteProvider(f"sqlite+aiosqlite:///{db}")
+    calls = 0
     original = provider._check_read_index_capability
 
     async def counted(conn):
-        nonlocal checks
-        checks += 1
+        nonlocal calls
+        calls += 1
         return await original(conn)
 
     provider._check_read_index_capability = counted
-    await _page(provider, _query(1))
-    await _page(provider, _query(200))
-    assert checks == 0
+    await provider.initialize()
+    assert calls == 1
+    assert provider._read_index_capable is not fallback
+    if not fallback:
+        await _seed_12k(provider)
+    try:
+        first = await _page(provider, _query(1))
+        assert first.records and first.has_more
+        await _page(provider, _query(200), after=_next_after(first), upper=first.upper)
+        assert calls == 1
+    finally:
+        await provider.close()
+
+    second = SQLiteProvider(f"sqlite+aiosqlite:///{db}")
+    second_calls = 0
+    second_original = second._check_read_index_capability
+
+    async def second_counted(conn):
+        nonlocal second_calls
+        second_calls += 1
+        return await second_original(conn)
+
+    second._check_read_index_capability = second_counted
+    await second.initialize()
+    try:
+        assert second_calls == 1
+    finally:
+        await second.close()
