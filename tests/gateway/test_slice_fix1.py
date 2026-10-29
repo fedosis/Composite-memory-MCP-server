@@ -184,6 +184,62 @@ async def test_fix1_controls_rejected_before_lease_and_audit(running, monkeypatc
         assert db.execute("SELECT count(*) FROM access_audit WHERE request_id=?", (request_id,)).fetchone() == (0,)
 
 
+async def test_fix2_missing_in_scope_profile_does_not_record_retrieval_stage(running, monkeypatch):
+    deps = running.app.dependencies
+    now = datetime.now(UTC)
+    created = deps.tokens._bootstrap_create(
+        d.TokenCreate(
+            subject="FIX2_TOKEN_CANARY",
+            profiles=["missing-profile"],
+            permissions=["memory.read"],
+            expires_at=now + timedelta(hours=1),
+        ),
+        now=now,
+    )
+    provider_searches = []
+    real_search = SQLiteProvider.search_facts_in_session
+
+    async def counted_search(self, *args, **kwargs):
+        provider_searches.append(True)
+        return await real_search(self, *args, **kwargs)
+
+    monkeypatch.setattr(SQLiteProvider, "search_facts_in_session", counted_search)
+    completed_calls = []
+    real_completed = deps.metrics.retrieval_completed
+
+    def completed(*args):
+        completed_calls.append(args)
+        real_completed(*args)
+
+    monkeypatch.setattr(deps.metrics, "retrieval_completed", completed)
+
+    def stage_counts():
+        return {
+            tuple(sorted(sample.labels.items())): sample.value
+            for family in deps.metrics._registry.collect()
+            for sample in family.samples
+            if sample.name == "cmms_retrieval_duration_seconds_count"
+        }
+
+    before = stage_counts()
+    status, body = await http_request(
+        running.port,
+        "POST",
+        "/api/v1/profiles/missing-profile/search",
+        body=json.dumps(
+            {"query": "FIX2_QUERY_CANARY", "mode": "keyword", "filters": {"source": None, "min_confidence": None}}
+        ).encode(),
+        headers={
+            "Authorization": f"Bearer cmms_{created.token.id}.{created.secret}",
+            "Content-Type": "application/json",
+        },
+    )
+    assert (status, body.get("error", {}).get("code")) == (404, "E_PROFILE_NOT_FOUND")
+    assert provider_searches == []
+    assert stage_counts() == before
+    assert completed_calls == []
+
+
 @pytest.mark.parametrize("outcome", ["hit", "miss", "storage", "unready"])
 async def test_fix1_retrieval_metrics_on_success_and_refusal(running, monkeypatch, outcome):
     deps = running.app.dependencies
