@@ -372,7 +372,7 @@ REQUIRED_SNAPSHOT_TABLES = ("alembic_version", "facts", OUTBOX_TABLE_NAME)
 # ``tests/test_profile_migration.py::test_s203_accepted_revisions_are_the_tree_head_from_both_version_locations``,
 # which recomputes the head from both configured locations (stdlib only) and
 # fails when it changes.
-ACCEPTED_SQLITE_SCHEMA_REVISIONS = frozenset({"0005"})
+ACCEPTED_SQLITE_SCHEMA_REVISIONS = frozenset({"0006"})
 _RUNTIME_STOP_INSTRUCTIONS = (
     "stop every CMMS runtime for this profile and confirm no writer remains",
     "re-run this dry-run after shutdown; a zero-byte WAL is still an apply blocker",

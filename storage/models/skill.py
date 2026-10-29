@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, String, Text
+from sqlalchemy import DateTime, Float, Index, String, Text, literal_column
 from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import Skill
@@ -14,6 +14,9 @@ class SkillORM(Base):
     """SQLAlchemy ORM model for Skills — canonical fields."""
 
     __tablename__ = "skills"
+    __table_args__ = (
+        Index("ix_skills_created_type_id", "created_at", literal_column("CAST('skill' AS TEXT)"), "id"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     name: Mapped[str] = mapped_column(String, default="")

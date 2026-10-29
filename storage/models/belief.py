@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, literal_column
 from sqlalchemy.dialects.sqlite import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -17,6 +17,9 @@ class BeliefORM(Base):
     """SQLAlchemy ORM model for Beliefs."""
 
     __tablename__ = "beliefs"
+    __table_args__ = (
+        Index("ix_beliefs_created_type_id", "created_at", literal_column("CAST('belief' AS TEXT)"), "id"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     proposition: Mapped[str] = mapped_column(String(2048), nullable=False, index=True)

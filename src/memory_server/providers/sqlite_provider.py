@@ -9,6 +9,7 @@ duplicate inline ORM models.
 """
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
@@ -63,6 +64,7 @@ class SQLiteProvider:
         self._busy_timeout_ms = validate_busy_timeout_ms(busy_timeout_ms)
         self._engine = None
         self._session_factory = None
+        self._read_index_capable = False
 
     @property
     def engine(self):
@@ -178,6 +180,10 @@ class SQLiteProvider:
                     "INSERT INTO beliefs_fts(beliefs_fts) VALUES ('rebuild')"
                 )
 
+        # Immutable for this provider lifetime; external migration requires reopen.
+        async with self._engine.connect() as conn:
+            self._read_index_capable = await self._check_read_index_capability(conn)
+
         self._session_factory = async_sessionmaker(
             self._engine,
             class_=AsyncSession,
@@ -222,6 +228,48 @@ class SQLiteProvider:
         return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
     @staticmethod
+    def _storage_bind(value: Any) -> str:
+        """Convert a wire timestamp to SQLite DateTime's canonical UTC text."""
+        return datetime.fromisoformat(SQLiteProvider._utc(value)).replace(tzinfo=None).strftime(
+            "%Y-%m-%d %H:%M:%S.%f"
+        )
+
+    async def _check_read_index_capability(self, conn) -> bool:
+        """Check all four indexes and stream all timestamps once at startup.
+
+        A revision stamp does not prove canonical data. External writers must preserve
+        the storage format for the lifetime of this provider (no mixed UNION).
+        """
+        for kind in ("fact", "belief", "decision", "skill"):
+            table = f"{kind}s"
+            name = f"ix_{table}_created_type_id"
+            expected = f"CREATE INDEX {name} ON {table} (created_at, CAST('{kind}' AS TEXT), id)"
+            row = (await conn.exec_driver_sql(
+                "SELECT type, tbl_name, sql FROM sqlite_master WHERE name=?", (name,)
+            )).first()
+            if row is None or row[0] != "index" or row[1] != table or row[2] is None:
+                return False
+            if (re.findall(r"'[^']*'", row[2]) != [f"'{kind}'"]
+                    or re.sub(r"\s+", "", row[2]).lower() != re.sub(r"\s+", "", expected).lower()):
+                return False
+            keys = (await conn.exec_driver_sql(f"PRAGMA index_xinfo('{name}')")).all()
+            if [(r[0], r[2], r[3], r[4]) for r in keys if r[5]] != [
+                (0, "created_at", 0, "BINARY"), (1, None, 0, "BINARY"), (2, "id", 0, "BINARY")
+            ]:
+                return False
+        for table in ("facts", "beliefs", "decisions", "skills"):
+            async with conn.stream(text(f"SELECT created_at,updated_at FROM {table}")) as result:
+                async for batch in result.partitions(1000):
+                    for row in batch:
+                        for value in row:
+                            try:
+                                if not isinstance(value, str) or value != self._storage_bind(value):
+                                    return False
+                            except (ValueError, TypeError, OverflowError):
+                                return False
+        return True
+
+    @staticmethod
     def _record(kind: str, row: Any) -> dict[str, Any]:
         data = dict(row._mapping)
         data["memory_type"] = kind
@@ -251,13 +299,16 @@ class SQLiteProvider:
         receipt = await self.read_receipt_metadata(session, memory_id, kind)
         return ReadRecord(memory=memory, memory_type=kind, receipt=receipt)
 
-    @staticmethod
-    def _key_clause(prefix: str, key: Any, op: str) -> tuple[str, dict[str, Any]]:
+    def _key_clause(
+        self, prefix: str, key: Any, op: str, *, kind: str | None = None
+    ) -> tuple[str, dict[str, Any]]:
         if key is None:
             return "", {}
+        memory_type = f"CAST('{kind}' AS TEXT)" if kind is not None else "memory_type"
         return (
-            f" AND (created_at,memory_type,id) {op} (:{prefix}created_at,:{prefix}memory_type,:{prefix}id)",
-            {f"{prefix}created_at": key.created_at, f"{prefix}memory_type": key.memory_type, f"{prefix}id": key.id},
+            f" AND (created_at,{memory_type},id) {op} (:{prefix}created_at,:{prefix}memory_type,:{prefix}id)",
+            {f"{prefix}created_at": self._storage_bind(key.created_at) if self._read_index_capable else key.created_at,
+             f"{prefix}memory_type": key.memory_type, f"{prefix}id": key.id},
         )
 
     async def read_memory_page(self, session: AsyncSession, query: Any, *, after: Any = None, upper: Any = None):
@@ -296,9 +347,14 @@ class SQLiteProvider:
             ):
                 if value is not None:
                     name = f"{kind}_{field}_{len(params)}"
-                    column = f"s07_timestamp({field})" if field.endswith("_at") else field
+                    column = (
+                        f"s07_timestamp({field})" if field.endswith("_at") and not self._read_index_capable else field
+                    )
                     clauses.append(f"{column} {op} :{name}")
-                    params[name] = self._utc(value) if isinstance(value, datetime) else value
+                    if field.endswith("_at") and self._read_index_capable:
+                        params[name] = self._storage_bind(value)
+                    else:
+                        params[name] = self._utc(value) if isinstance(value, datetime) else value
             if query.valid_at is not None:
                 # Validity is receipt admission metadata, not a new schema field.
                 # Missing bounds are open; use the latest stored admission entry.
@@ -324,21 +380,37 @@ class SQLiteProvider:
             present = set(common + variants[kind].split())
             fields = ",".join(
                 f"s07_timestamp({col}) AS {col}"
-                if col in ("created_at", "updated_at")
+                if col in ("created_at", "updated_at") and not self._read_index_capable
                 else col
                 if col in present
                 else f"NULL AS {col}"
                 for col in columns
             )
-            selects.append(f"SELECT {fields}, '{kind}' AS memory_type FROM {table} WHERE {' AND '.join(clauses)}")
-        union = " UNION ALL ".join(selects)
-        # SQLite's compound SELECT can order by aliases from the first arm.
-        sql = f"SELECT * FROM ({union}) AS memories WHERE 1=1"
-        low, lowp = self._key_clause("a_", after, ">")
-        high, highp = self._key_clause("u_", upper, "<=")
-        sql += low + high
-        params.update(lowp)
-        params.update(highp)
+            memory_type = f"CAST('{kind}' AS TEXT)" if self._read_index_capable else f"'{kind}'"
+            selects.append((
+                kind, f"SELECT {fields}, {memory_type} AS memory_type FROM {table} WHERE {' AND '.join(clauses)}"
+            ))
+
+        def build(bound):
+            # Push both key predicates into EVERY arm, not just the last arm.
+            # The legacy wrapper and ISO normalization remain intact as a unit.
+            if self._read_index_capable:
+                arms = []
+                for kind, arm in selects:
+                    low, lowp = self._key_clause("a_", after, ">", kind=kind)
+                    high, highp = self._key_clause("u_", bound, "<=", kind=kind)
+                    params.update(lowp)
+                    params.update(highp)
+                    arms.append(arm + low + high)
+                return " UNION ALL ".join(arms)
+            union = " UNION ALL ".join(arm for _, arm in selects)
+            low, lowp = self._key_clause("a_", after, ">")
+            high, highp = self._key_clause("u_", bound, "<=")
+            params.update(lowp)
+            params.update(highp)
+            return f"SELECT * FROM ({union}) AS memories WHERE 1=1" + low + high
+
+        sql = build(upper)
         if upper is None:
             maxrow = (
                 await session.execute(
@@ -346,9 +418,7 @@ class SQLiteProvider:
                 )
             ).first()
             upper = None if maxrow is None else ReadKey(self._utc(maxrow.created_at), maxrow.memory_type, maxrow.id)
-            high, highp = self._key_clause("u_", upper, "<=")
-            sql += high
-            params.update(highp)
+            sql = build(upper)
         rows = (
             await session.execute(
                 text(sql + " ORDER BY created_at ASC, memory_type ASC, id ASC LIMIT :page_limit"),

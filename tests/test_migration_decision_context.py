@@ -35,7 +35,7 @@ _ACTIVE = ("candidate", "validated", "active")
 _INDEX = "uq_decisions_context_dedup_active"
 _PR4_REV = "6a7b8c9d0e1f"
 _NEW_REV = "7a1b2c3d4e5f"
-_HEAD = "0005"
+_HEAD = "0006"
 
 
 def _canonical(context: object) -> str:
@@ -260,7 +260,7 @@ def test_canonical_context_backfill_on_collision_rich_db(tmp_path):
 
 
 def test_upgrade_collision_rich_copy_to_single_head(tmp_path):
-    """Full production path: 6a collision-rich copy -> head (0005)."""
+    """Full production path: 6a collision-rich copy -> head (0006)."""
     db = tmp_path / "head.db"
     _fixture(db)
     _seed(db)

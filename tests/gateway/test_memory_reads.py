@@ -453,7 +453,8 @@ async def test_t12_max_and_page_share_real_sqlite_snapshot(reads, monkeypatch):
 
     async def concurrent_write(session, statement, *args, **kwargs):
         result = await execute(session, statement, *args, **kwargs)
-        if "AS memories" in str(statement) and "ORDER BY created_at DESC" in str(statement):
+        if (str(statement).lstrip().startswith("SELECT")
+                and "ORDER BY created_at DESC, memory_type DESC, id DESC LIMIT 1" in str(statement)):
             await seed(provider, ident="backdated-concurrent", at=STAMP - timedelta(days=1))
             async with provider._session_factory() as writer:
                 async with writer.begin():

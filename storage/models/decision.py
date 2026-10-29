@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, Index, String, Text, text
+from sqlalchemy import DateTime, Float, Index, String, Text, literal_column, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import Decision
@@ -26,6 +26,7 @@ class DecisionORM(Base):
     __tablename__ = "decisions"
 
     __table_args__ = (
+        Index("ix_decisions_created_type_id", "created_at", literal_column("CAST('decision' AS TEXT)"), "id"),
         Index(
             "uq_decisions_context_dedup_active",
             "context",
