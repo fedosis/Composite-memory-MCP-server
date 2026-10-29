@@ -83,15 +83,11 @@ class SQLiteProvider:
         preserving correctness for fresh/migrated databases that need an initial
         backfill.
         """
-        source_has_rows = bool(
-            (await conn.exec_driver_sql(f"SELECT 1 FROM {source_table} LIMIT 1")).first()
-        )
+        source_has_rows = bool((await conn.exec_driver_sql(f"SELECT 1 FROM {source_table} LIMIT 1")).first())
         if not source_has_rows:
             return False
 
-        fts_has_rows = bool(
-            (await conn.exec_driver_sql(f"SELECT 1 FROM {fts_table} LIMIT 1")).first()
-        )
+        fts_has_rows = bool((await conn.exec_driver_sql(f"SELECT 1 FROM {fts_table} LIMIT 1")).first())
         return not fts_has_rows
 
     async def initialize(self):
@@ -105,7 +101,8 @@ class SQLiteProvider:
                 conn,
                 self._busy_timeout_ms,
                 context="SQLiteProvider",
-                allow_degraded_mode=self._url in {
+                allow_degraded_mode=self._url
+                in {
                     "sqlite+aiosqlite://",
                     "sqlite+aiosqlite:///:memory:",
                 },
@@ -142,9 +139,7 @@ class SQLiteProvider:
                 source_table="facts",
                 fts_table="facts_fts",
             ):
-                await conn.exec_driver_sql(
-                    "INSERT INTO facts_fts(facts_fts) VALUES ('rebuild')"
-                )
+                await conn.exec_driver_sql("INSERT INTO facts_fts(facts_fts) VALUES ('rebuild')")
             # Create beliefs FTS5 virtual table
             await conn.exec_driver_sql(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS beliefs_fts "
@@ -174,9 +169,7 @@ class SQLiteProvider:
                 source_table="beliefs",
                 fts_table="beliefs_fts",
             ):
-                await conn.exec_driver_sql(
-                    "INSERT INTO beliefs_fts(beliefs_fts) VALUES ('rebuild')"
-                )
+                await conn.exec_driver_sql("INSERT INTO beliefs_fts(beliefs_fts) VALUES ('rebuild')")
 
         self._session_factory = async_sessionmaker(
             self._engine,
@@ -209,6 +202,99 @@ class SQLiteProvider:
 
     async def _get_evidence_repo(self, session: AsyncSession) -> EvidenceRepository:
         return EvidenceRepository(session)
+
+    async def read_memory(self, session: AsyncSession, memory_id: str, memory_type: str | None = None):
+        """Read one typed memory using the caller-owned session."""
+        from memory_server.application.memory_read_service import ReadRecord
+        from memory_server.gateway_contracts import dto as d
+
+        models = (
+            ("fact", FactORM, "to_pydantic"),
+            ("belief", __import__("storage.models.belief", fromlist=["BeliefORM"]).BeliefORM, "to_pydantic"),
+            ("decision", DecisionORM, "to_pydantic"),
+            ("skill", SkillORM, "to_pydantic"),
+        )
+        hits = []
+        for kind, model, _ in models:
+            if memory_type is not None and memory_type != kind:
+                continue
+            row = (await session.execute(select(model).where(model.id == memory_id).limit(1))).scalar_one_or_none()
+            if row is not None:
+                value = row.to_pydantic()
+                payload = {
+                    "fact": d.FactPayload(subject=value.subject, predicate=value.predicate, object=value.object),
+                    "belief": d.BeliefPayload(
+                        proposition=value.proposition, tags=value.tags, source_ids=value.source_ids
+                    ),
+                    "decision": d.DecisionPayload(
+                        context=value.context,
+                        choice=value.choice,
+                        rejected_alternatives=value.rejected_alternatives,
+                        reason=value.reason,
+                    ),
+                    "skill": d.SkillPayload(
+                        name=value.name,
+                        purpose=value.purpose,
+                        steps=value.steps,
+                        constraints=value.constraints,
+                        validation=value.validation,
+                        success_rate=value.success_rate,
+                        skill_version=value.version,
+                    ),
+                }[kind]
+                memory = d.Memory(
+                    id=value.id,
+                    memory_type=kind,
+                    content=None,
+                    payload=payload,
+                    confidence=value.confidence,
+                    lifecycle_state=value.lifecycle_state,
+                    revision=None if kind in {"fact", "decision", "skill"} else value.version,
+                    source_version=value.version,
+                    source=value.source,
+                    creator=value.creator,
+                    created_at=value.created_at,
+                    updated_at=value.updated_at,
+                    valid_from=None,
+                    valid_to=None,
+                    epistemic_status=None,
+                    authority_level=None,
+                    risk_tags=[],
+                    receipt_id=None,
+                    masked=False,
+                    projection=d.ItemProjection(vector="unknown", graph="unknown", outbox="unknown"),
+                )
+                hits.append(ReadRecord(memory, kind))
+        if len(hits) != 1:
+            if not hits:
+                raise KeyError(memory_id)
+            raise ValueError("ambiguous memory id")
+        return hits[0]
+
+    async def read_memory_page(self, session: AsyncSession, query: Any, *, after: Any = None, upper: Any = None):
+        """Bounded page adapter; each source query is capped at limit+1."""
+        from memory_server.application.memory_read_service import MemorySlice
+
+        rows = []
+        for kind, model in (
+            ("fact", FactORM),
+            ("belief", __import__("storage.models.belief", fromlist=["BeliefORM"]).BeliefORM),
+            ("decision", DecisionORM),
+            ("skill", SkillORM),
+        ):
+            if query.memory_types and kind not in query.memory_types:
+                continue
+            result = await session.execute(select(model).order_by(model.created_at, model.id).limit(query.limit + 1))
+            for row in result.scalars().all():
+                rows.append(await self.read_memory(session, row.id, kind))
+        rows.sort(key=lambda item: (item.memory.created_at, item.memory.memory_type, item.memory.id))
+        return MemorySlice(
+            tuple(rows[: query.limit]),
+            len(rows) > query.limit,
+            None
+            if not rows
+            else (rows[-1].memory.created_at.isoformat(), rows[-1].memory.memory_type, rows[-1].memory.id),
+        )
 
     # --- Fact CRUD ---
 
@@ -243,9 +329,14 @@ class SQLiteProvider:
             if effective_state is None and not include_inactive:
                 effective_state = "active"
             return await repo.search(
-                subject=subject, predicate=predicate, object=object,
-                source=source, text=text, min_confidence=min_confidence,
-                max_confidence=max_confidence, lifecycle_state=effective_state,
+                subject=subject,
+                predicate=predicate,
+                object=object,
+                source=source,
+                text=text,
+                min_confidence=min_confidence,
+                max_confidence=max_confidence,
+                lifecycle_state=effective_state,
                 limit=limit,
             )
 
@@ -300,8 +391,9 @@ class SQLiteProvider:
     ) -> list[Decision]:
         async with await self._get_session() as session:
             repo = await self._get_decision_repo(session)
-            return await repo.search(context=context, choice=choice, reason=reason,
-                                     source=source, text=text, limit=limit)
+            return await repo.search(
+                context=context, choice=choice, reason=reason, source=source, text=text, limit=limit
+            )
 
     async def delete_decision(self, decision_id: str) -> bool:
         async with await self._get_session() as session:
@@ -334,8 +426,9 @@ class SQLiteProvider:
     ) -> list[Skill]:
         async with await self._get_session() as session:
             repo = await self._get_skill_repo(session)
-            return await repo.search(purpose=purpose, name=name, text=text,
-                                     min_success_rate=min_success_rate, limit=limit)
+            return await repo.search(
+                purpose=purpose, name=name, text=text, min_success_rate=min_success_rate, limit=limit
+            )
 
     async def delete_skill(self, skill_id: str) -> bool:
         async with await self._get_session() as session:
@@ -367,8 +460,7 @@ class SQLiteProvider:
     ) -> list[MemoryReceipt]:
         async with await self._get_session() as session:
             repo = await self._get_receipt_repo(session)
-            return await repo.search(memory_type=memory_type, source=source,
-                                     created_by=created_by, limit=limit)
+            return await repo.search(memory_type=memory_type, source=source, created_by=created_by, limit=limit)
 
     async def count_facts(self, include_inactive: bool = True) -> int:
         async with await self._get_session() as session:
@@ -419,14 +511,9 @@ class SQLiteProvider:
                 MemoryReceiptORM.memory_type,
             )
             if not include_inactive:
-                receipt_stmt = receipt_stmt.where(
-                    MemoryReceiptORM.lifecycle_state.in_(active_states)
-                )
+                receipt_stmt = receipt_stmt.where(MemoryReceiptORM.lifecycle_state.in_(active_states))
             receipt_rows = await session.execute(receipt_stmt)
-            receipt_map = {
-                receipt_id: memory_type
-                for receipt_id, memory_type in receipt_rows.all()
-            }
+            receipt_map = {receipt_id: memory_type for receipt_id, memory_type in receipt_rows.all()}
 
             def _normalize_rows(rows, memory_type: str) -> list[dict[str, Any]]:
                 normalized: list[dict[str, Any]] = []
@@ -465,9 +552,7 @@ class SQLiteProvider:
             )
             if not include_inactive:
                 fact_stmt = fact_stmt.where(FactORM.lifecycle_state.in_(active_states))
-                decision_stmt = decision_stmt.where(
-                    DecisionORM.lifecycle_state.in_(active_states)
-                )
+                decision_stmt = decision_stmt.where(DecisionORM.lifecycle_state.in_(active_states))
                 skill_stmt = skill_stmt.where(SkillORM.lifecycle_state.in_(active_states))
 
             fact_rows = (await session.execute(fact_stmt)).all()
@@ -591,9 +676,7 @@ class SQLiteProvider:
                 limit=limit,
             )
 
-    async def update_belief_confidence(
-        self, belief_id: str, new_confidence: float
-    ) -> Optional[Belief]:
+    async def update_belief_confidence(self, belief_id: str, new_confidence: float) -> Optional[Belief]:
         """Update the confidence of a belief."""
         async with await self._get_session() as session:
             repo = await self._get_belief_repo(session)

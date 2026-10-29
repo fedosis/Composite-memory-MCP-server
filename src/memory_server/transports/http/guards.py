@@ -91,7 +91,10 @@ class Guard:
             validate_profile_id(profile)
         require_permission(principal, spec.permission, profile_id=profile)
         idem = None
-        if spec.operation == 'profiles.list':
+        if hasattr(spec, 'parse'):
+            payload_command = spec.parse(request, body, principal)
+            command = payload_command
+        elif spec.operation == 'profiles.list':
             if body:
                 raise HttpError('E_VALIDATION')
             payload = validate_query(spec.operation, request.query_params)
@@ -120,12 +123,13 @@ class Guard:
                        for item in exc.errors()):
                     raise HttpError('E_PRECONDITION_REQUIRED') from None
                 raise HttpError('E_VALIDATION') from None
-        command = d.COMMAND_TYPES[spec.operation](
-            operation=spec.operation, profile_id=profile, path_ids={}, payload=payload)
+        if not hasattr(spec, 'parse'):
+            command = d.COMMAND_TYPES[spec.operation](
+                operation=spec.operation, profile_id=profile, path_ids={}, payload=payload)
         port = self.dependencies.ports.get(spec.operation)
         if port is None:
             raise HttpError('E_CAPABILITY_UNAVAILABLE')
-        if spec.operation == 'profiles.list' and payload.cursor:
+        if not hasattr(spec, 'parse') and spec.operation == 'profiles.list' and payload.cursor:
             # Validation remains before audit and every registry/port call.
             cursor = self.cursor_validator.validate_cursor(principal, payload.cursor)
             if payload.limit > cursor['limit']:
@@ -183,6 +187,10 @@ class Guard:
         if cancelled:
             raise asyncio.CancelledError
         return response
+
+    async def execute_read(self, request, spec, body: bytes, request_id: str, deadline: float):
+        """Named S07 seam; read descriptors use the same execute lifecycle."""
+        return await self.execute(request, spec, body, request_id, deadline)
 
 
 def secure_headers(response: Response, request_id: str, origin: str | None, allowed_origins):

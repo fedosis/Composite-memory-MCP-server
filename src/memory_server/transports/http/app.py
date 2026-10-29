@@ -22,7 +22,7 @@ from .routes.profiles import validate_profile_id
 
 
 class HttpApp:
-    def __init__(self, config, dependencies, *, denial=None, publish=None, saturation=None):
+    def __init__(self, config, dependencies, *, denial=None, publish=None, saturation=None, read_routes=()):
         validate_config(config)  # F4: exactly once on the received object.
         self.config = config
         self.guard = Guard(config, dependencies, denial=denial, publish=publish, saturation=saturation)
@@ -32,6 +32,7 @@ class HttpApp:
         self.tasks = set()
         self._idle = asyncio.Event()
         self._idle.set()
+        self.read_routes = tuple(read_routes)
         self.routes = []
         # Check the projection against the frozen executable catalogue.
         for spec in S06_ROUTE_SPECS:
@@ -43,10 +44,20 @@ class HttpApp:
             route.permission = row.permission
             route.spec = row
             self.routes.append(route)
+        for spec in self.read_routes:
+            row = CATALOG.by_operation.get(spec.operation)
+            if (row is None or row.owner != 'S07'
+                    or (spec.method, spec.path, spec.permission) != (row.method, row.route, row.permission)):
+                raise ValueError('S07 route specification does not match catalogue')
+            route = Route(row.route, self.endpoint, methods=[row.method], name=row.operation)
+            route.permission, route.spec = row.permission, spec
+            self.routes.append(route)
         self.router = Starlette(routes=self.routes)
 
     async def endpoint(self, request):
         state = request.scope['s06']
+        if hasattr(state['spec'], 'parse'):
+            return await self.guard.execute_read(request, state['spec'], state['body'], state['request_id'], state['deadline'])
         return await self.guard.execute(request, state['spec'], state['body'], state['request_id'], state['deadline'])
 
     async def close(self):
@@ -208,9 +219,9 @@ class HttpApp:
         await response(scope, receive, send)
 
 
-def create_http_app(config, dependencies, *, denial=None, publish=None, saturation=None):
+def create_http_app(config, dependencies, *, denial=None, publish=None, saturation=None, read_routes=()):
     """Build without opening profiles; missing operation ports stay unavailable."""
-    return HttpApp(config, dependencies, denial=denial, publish=publish, saturation=saturation)
+    return HttpApp(config, dependencies, denial=denial, publish=publish, saturation=saturation, read_routes=read_routes)
 
 
 def with_profile_ports(app, *, pending_control=None):

@@ -44,9 +44,9 @@ async def _cas_transition(
     confidence: float | None = None,
 ) -> Any:
     """Shared fact/belief CAS primitive; no commit or rollback here."""
-    row = (await session.execute(
-        select(model.version, model.lifecycle_state).where(model.id == memory_id)
-    )).one_or_none()
+    row = (
+        await session.execute(select(model.version, model.lifecycle_state).where(model.id == memory_id))
+    ).one_or_none()
     if row is None or normalize_version(row.version) != expected_version or row.lifecycle_state != expected_state:
         raise LifecycleConflictError(f"expected_version mismatch for {memory_id}: expected {expected_version}")
     values = {
@@ -174,11 +174,45 @@ class LifecycleRepository:
                 "to_state": e.to_state,
                 "reason": e.reason,
                 "triggered_by": e.triggered_by,
-                "timestamp": (
-                e.timestamp.isoformat()
-                if isinstance(e.timestamp, datetime)
-                else str(e.timestamp)
-            ),
+                "timestamp": (e.timestamp.isoformat() if isinstance(e.timestamp, datetime) else str(e.timestamp)),
             }
             for e in result.scalars().all()
         ]
+
+    async def get_events_page(
+        self,
+        memory_id: str,
+        memory_type: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+        upper: tuple[str, str] | None = None,
+    ):
+        """Return a bounded, stable lifecycle slice for the S07 read port."""
+        from memory_server.application.memory_read_service import HistorySlice
+
+        limit = max(1, min(200, int(limit)))
+        stmt = (
+            select(LifecycleEventORM)
+            .where(LifecycleEventORM.memory_id == memory_id, LifecycleEventORM.memory_type == memory_type)
+            .order_by(LifecycleEventORM.timestamp.asc(), LifecycleEventORM.id.asc())
+            .limit(limit + 1)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.scalars().all()
+        events = tuple(
+            {
+                "id": e.id,
+                "kind": "lifecycle",
+                "timestamp": e.timestamp,
+                "actor": e.triggered_by,
+                "reason": e.reason,
+                "revision": None,
+                "from_state": e.from_state,
+                "to_state": e.to_state,
+                "receipt_id": None,
+                "evidence": None,
+            }
+            for e in rows[:limit]
+        )
+        return HistorySlice(events=events, has_more=len(rows) > limit, incomplete=False, upper=None)
