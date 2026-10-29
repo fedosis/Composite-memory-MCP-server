@@ -321,7 +321,7 @@ class Memory(DTO):
     confidence: float = Field(ge=0, le=1)
     lifecycle_state: str
     revision: int | None = Field(default=None)
-    source_version: str | int
+    source_version: str | int | None
     source: str | None = Field(default=None)
     creator: str | None = Field(default=None)
     created_at: UTCDatetime
@@ -345,13 +345,13 @@ class ItemProjection(DTO):
 class Receipt(DTO):
     id: str
     memory_type: MemoryType
-    source: str
-    created_by: str
+    source: str | None
+    created_by: str | None
     timestamp: UTCDatetime
     confidence: float = Field(ge=0, le=1)
     verification_status: str
     lifecycle_state: str
-    source_version: str | int
+    source_version: str | int | None
     history: list[HistoryEvent]
     history_complete: bool
 
@@ -464,7 +464,7 @@ class Relation(DTO):
     target_id: str
     relation_type: Literal["supports", "contradicts", "derives", "derived_from"]
     canonical: TrueLiteral
-    revision: int
+    revision: int | None
     created_at: UTCDatetime
 
 
