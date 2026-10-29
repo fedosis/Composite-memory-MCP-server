@@ -12,7 +12,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from storage.base import Base
 from storage.models.decision import DecisionORM
@@ -210,97 +210,193 @@ class SQLiteProvider:
     async def _get_evidence_repo(self, session: AsyncSession) -> EvidenceRepository:
         return EvidenceRepository(session)
 
-    async def read_memory(self, session: AsyncSession, memory_id: str, memory_type: str | None = None):
-        """Read one typed memory using the caller-owned session."""
-        from memory_server.application.memory_read_service import ReadRecord
-        from memory_server.gateway_contracts import dto as d
+    @staticmethod
+    def _utc(value: Any) -> str:
+        if isinstance(value, datetime):
+            dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        else:
+            raw = str(value).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
-        models = (
-            ("fact", FactORM, "to_pydantic"),
-            ("belief", __import__("storage.models.belief", fromlist=["BeliefORM"]).BeliefORM, "to_pydantic"),
-            ("decision", DecisionORM, "to_pydantic"),
-            ("skill", SkillORM, "to_pydantic"),
-        )
-        hits = []
-        for kind, model, _ in models:
+    @staticmethod
+    def _record(kind: str, row: Any) -> dict[str, Any]:
+        data = dict(row._mapping)
+        data["memory_type"] = kind
+        data["created_at"] = SQLiteProvider._utc(data["created_at"])
+        data["updated_at"] = SQLiteProvider._utc(data["updated_at"])
+        return data
+
+    async def read_memory(self, session: AsyncSession, memory_id: str, memory_type: str | None = None):
+        """Read raw storage columns; an untyped collision is a validation error."""
+        from memory_server.application.memory_read_service import ReadRecord
+        from memory_server.transports.http.errors import HttpError
+
+        tables = (("fact", "facts"), ("belief", "beliefs"), ("decision", "decisions"), ("skill", "skills"))
+        hits: list[tuple[str, dict[str, Any]]] = []
+        for kind, table in tables:
             if memory_type is not None and memory_type != kind:
                 continue
-            row = (await session.execute(select(model).where(model.id == memory_id).limit(1))).scalar_one_or_none()
+            result = await session.execute(text(f"SELECT * FROM {table} WHERE id=:id LIMIT 1"), {"id": memory_id})
+            row = result.first()
             if row is not None:
-                value = row.to_pydantic()
-                payload = {
-                    "fact": d.FactPayload(subject=value.subject, predicate=value.predicate, object=value.object),
-                    "belief": d.BeliefPayload(
-                        proposition=value.proposition, tags=value.tags, source_ids=value.source_ids
-                    ),
-                    "decision": d.DecisionPayload(
-                        context=value.context,
-                        choice=value.choice,
-                        rejected_alternatives=value.rejected_alternatives,
-                        reason=value.reason,
-                    ),
-                    "skill": d.SkillPayload(
-                        name=value.name,
-                        purpose=value.purpose,
-                        steps=value.steps,
-                        constraints=value.constraints,
-                        validation=value.validation,
-                        success_rate=value.success_rate,
-                        skill_version=value.version,
-                    ),
-                }[kind]
-                memory = d.Memory(
-                    id=value.id,
-                    memory_type=kind,
-                    content=None,
-                    payload=payload,
-                    confidence=value.confidence,
-                    lifecycle_state=value.lifecycle_state,
-                    revision=None if kind in {"fact", "decision", "skill"} else value.version,
-                    source_version=value.version,
-                    source=value.source,
-                    creator=value.creator,
-                    created_at=value.created_at,
-                    updated_at=value.updated_at,
-                    valid_from=None,
-                    valid_to=None,
-                    epistemic_status=None,
-                    authority_level=None,
-                    risk_tags=[],
-                    receipt_id=None,
-                    masked=False,
-                    projection=d.ItemProjection(vector="unknown", graph="unknown", outbox="unknown"),
-                )
-                hits.append(ReadRecord(memory, kind))
-        if len(hits) != 1:
-            if not hits:
-                raise KeyError(memory_id)
-            raise ValueError("ambiguous memory id")
-        return hits[0]
+                hits.append((kind, self._record(kind, row)))
+        if len(hits) == 0:
+            raise HttpError("E_NOT_FOUND")
+        if len(hits) > 1:
+            raise HttpError("E_VALIDATION")
+        kind, memory = hits[0]
+        receipt = await self.read_receipt_metadata(session, memory_id, kind)
+        return ReadRecord(memory=memory, memory_type=kind, receipt=receipt)
+
+    @staticmethod
+    def _key_clause(prefix: str, key: Any, op: str) -> tuple[str, dict[str, Any]]:
+        if key is None:
+            return "", {}
+        return (
+            f" AND (created_at,memory_type,id) {op} (:{prefix}created_at,:{prefix}memory_type,:{prefix}id)",
+            {f"{prefix}created_at": key.created_at, f"{prefix}memory_type": key.memory_type, f"{prefix}id": key.id},
+        )
 
     async def read_memory_page(self, session: AsyncSession, query: Any, *, after: Any = None, upper: Any = None):
-        """Bounded page adapter; each source query is capped at limit+1."""
-        from memory_server.application.memory_read_service import MemorySlice
+        """Read a metadata-filtered UNION page, with a fixed creation-key upper bound."""
+        from memory_server.application.memory_read_service import MemorySlice, ReadKey, ReadRecord
+        from memory_server.transports.http.errors import HttpError
 
-        rows = []
-        for kind, model in (
-            ("fact", FactORM),
-            ("belief", __import__("storage.models.belief", fromlist=["BeliefORM"]).BeliefORM),
-            ("decision", DecisionORM),
-            ("skill", SkillORM),
-        ):
-            if query.memory_types and kind not in query.memory_types:
+        if type(query.limit) is not int or not 1 <= query.limit <= 200:
+            raise HttpError("E_VALIDATION")
+        conn = await session.connection()
+        await conn.run_sync(
+            lambda c: c.connection.dbapi_connection.run_async(
+                lambda a: a.create_function("s07_timestamp", 1, self._utc, deterministic=True)
+            )
+        )
+        tables = (("fact", "facts"), ("belief", "beliefs"), ("decision", "decisions"), ("skill", "skills"))
+        allowed = set(query.memory_types or ())
+        params: dict[str, Any] = {}
+        selects = []
+        for kind, table in tables:
+            if allowed and kind not in allowed:
                 continue
-            result = await session.execute(select(model).order_by(model.created_at, model.id).limit(query.limit + 1))
-            for row in result.scalars().all():
-                rows.append(await self.read_memory(session, row.id, kind))
-        rows.sort(key=lambda item: (item.memory.created_at, item.memory.memory_type, item.memory.id))
-        return MemorySlice(
-            tuple(rows[: query.limit]),
-            len(rows) > query.limit,
-            None
-            if not rows
-            else (rows[-1].memory.created_at.isoformat(), rows[-1].memory.memory_type, rows[-1].memory.id),
+            clauses = ["1=1"]
+            if query.lifecycle_states:
+                placeholders = ','.join(':' + kind + '_ls' + str(i) for i in range(len(query.lifecycle_states)))
+                clauses.append(f'lifecycle_state IN ({placeholders})')
+                params.update({f"{kind}_ls{i}": v for i, v in enumerate(query.lifecycle_states)})
+            for field, op, value in (
+                ("confidence", ">=", query.min_confidence),
+                ("confidence", "<=", query.max_confidence),
+
+                ("created_at", ">=", query.created_from),
+                ("created_at", "<=", query.created_to),
+                ("updated_at", ">=", query.updated_from),
+                ("updated_at", "<=", query.updated_to),
+            ):
+                if value is not None:
+                    name = f"{kind}_{field}_{len(params)}"
+                    column = f"s07_timestamp({field})" if field.endswith("_at") else field
+                    clauses.append(f"{column} {op} :{name}")
+                    params[name] = self._utc(value) if isinstance(value, datetime) else value
+            if query.valid_at is not None:
+                # Validity is receipt admission metadata, not a new schema field.
+                # Missing bounds are open; use the latest stored admission entry.
+                params["valid_at"] = self._utc(query.valid_at)
+                for field, op in (("valid_from", "<="), ("valid_to", ">")):
+                    expr = f"""(SELECT json_extract(j.value,'$.metadata.admission.{field}')
+                      FROM receipts r, json_each(CASE WHEN json_valid(r.history) THEN
+                        CASE WHEN json_type(r.history)='array' THEN r.history ELSE '[]' END ELSE '[]' END) j
+                      WHERE r.id={table}.id AND r.memory_type='{kind}' AND j.type='object'
+                        AND json_type(j.value,'$.metadata.admission')='object'
+                      ORDER BY CAST(j.key AS INTEGER) DESC LIMIT 1)"""
+                    clauses.append(f"({expr} IS NULL OR s07_timestamp({expr}) {op} :valid_at)")
+            common = (
+                "id confidence source creator created_at updated_at verification_status lifecycle_state version".split()
+            )
+            variants = {
+                "fact": "subject predicate object dedup_key",
+                "belief": "proposition source_ids tags",
+                "decision": "context choice rejected_alternatives reason",
+                "skill": "name purpose steps constraints validation success_rate",
+            }
+            columns = common + " ".join(variants.values()).split()
+            present = set(common + variants[kind].split())
+            fields = ",".join(
+                f"s07_timestamp({col}) AS {col}"
+                if col in ("created_at", "updated_at")
+                else col
+                if col in present
+                else f"NULL AS {col}"
+                for col in columns
+            )
+            selects.append(f"SELECT {fields}, '{kind}' AS memory_type FROM {table} WHERE {' AND '.join(clauses)}")
+        union = " UNION ALL ".join(selects)
+        # SQLite's compound SELECT can order by aliases from the first arm.
+        sql = f"SELECT * FROM ({union}) AS memories WHERE 1=1"
+        low, lowp = self._key_clause("a_", after, ">")
+        high, highp = self._key_clause("u_", upper, "<=")
+        sql += low + high
+        params.update(lowp)
+        params.update(highp)
+        if upper is None:
+            maxrow = (
+                await session.execute(
+                    text(sql + " ORDER BY created_at DESC, memory_type DESC, id DESC LIMIT 1"), params
+                )
+            ).first()
+            upper = None if maxrow is None else ReadKey(self._utc(maxrow.created_at), maxrow.memory_type, maxrow.id)
+            high, highp = self._key_clause("u_", upper, "<=")
+            sql += high
+            params.update(highp)
+        rows = (
+            await session.execute(
+                text(sql + " ORDER BY created_at ASC, memory_type ASC, id ASC LIMIT :page_limit"),
+                {**params, "page_limit": int(query.limit) + 1},
+            )
+        ).all()
+        records_list = []
+        for r in rows[: query.limit]:
+            records_list.append(
+                ReadRecord(
+                    self._record(r.memory_type, r),
+                    r.memory_type,
+                    await self.read_receipt_metadata(session, r.id, r.memory_type),
+                )
+            )
+        records = tuple(records_list)
+        return MemorySlice(records, len(rows) > query.limit, upper)
+
+    async def read_receipt_metadata(self, session: AsyncSession, memory_id: str, memory_type: str):
+        result = await session.execute(
+            text(
+                "SELECT id,memory_type,source,created_by,timestamp,confidence,"
+                "verification_status,lifecycle_state,version FROM receipts "
+                "WHERE id=:id AND memory_type=:memory_type LIMIT 1"
+            ),
+            {"id": memory_id, "memory_type": memory_type},
+        )
+        row = result.first()
+        if row is None:
+            return None
+        data = dict(row._mapping)
+        data["timestamp"] = self._utc(data["timestamp"])
+        return data
+
+    async def read_history_page(
+        self,
+        session: AsyncSession,
+        memory_id: str,
+        memory_type: str,
+        *,
+        limit: int,
+        after: Any = None,
+        upper: Any = None,
+    ):
+        from storage.repositories.lifecycle_repo import LifecycleRepository
+
+        return await LifecycleRepository(session).get_events_page(
+            memory_id, memory_type, limit=limit, after=after, upper=upper
         )
 
     # --- Fact CRUD ---
