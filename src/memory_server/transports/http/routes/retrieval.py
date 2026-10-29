@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from time import monotonic
 
 from pydantic import ValidationError
 from sqlalchemy import text
@@ -23,6 +24,9 @@ class RetrievalRouteSpec(ReadRouteSpec):
 
 
 def _preflight(query):
+    # Single-line printable text only: no C0/C1 controls, including LF/TAB/NUL.
+    if not query.query.isprintable():
+        raise HttpError("E_VALIDATION")
     filters = query.filters
     if (
         filters.memory_types
@@ -67,10 +71,23 @@ class KeywordRetrievalPort(RetrievalPort):
     ordering; score is reserved for S08. Confidence remains Memory.confidence.
     """
 
-    def __init__(self, leases, bind_read):
-        self.leases, self.bind_read = leases, bind_read
+    def __init__(self, leases, bind_read, metrics):
+        self.leases, self.bind_read, self.metrics = leases, bind_read, metrics
 
     async def execute(self, ctx, command):
+        started = monotonic()
+        code = "E_INTERNAL"
+        try:
+            result = await self._execute(ctx, command)
+            code = None
+            return result
+        except HttpError as exc:
+            code = exc.code
+            raise
+        finally:
+            self.metrics.retrieval_completed(ctx, "fts", monotonic() - started, code)
+
+    async def _execute(self, ctx, command):
         if "memory.read" not in ctx.principal.permissions or ctx.profile_id not in ctx.principal.profiles:
             raise HttpError("E_PERMISSION_DENIED")
         if command.operation != "search" or command.profile_id != ctx.profile_id:

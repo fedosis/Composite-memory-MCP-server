@@ -184,6 +184,10 @@ async def test_slice_production_mount_and_search(tmp_path):
             now=now,
         )
         bearer = f"cmms_{created.token.id}.{created.secret}"
+        principal = await holder.app.dependencies.tokens.authenticate(bearer, now=now)
+        ctx = RequestContext("seed-mount", principal, "alpha", None, monotonic() + 30)
+        async with holder.app.dependencies.leases.acquire(ctx) as scope:
+            await seed_fact(scope.application.read_resources(), "alpha-mount-marker", "alpha")
         auth = {"Authorization": "Bearer " + bearer}
         get_status, get_body = await http_request(port, "GET", "/api/v1/profiles/alpha/memories", headers=auth)
         search_status, search_body = await http_request(
@@ -197,6 +201,8 @@ async def test_slice_production_mount_and_search(tmp_path):
             {"get_status": get_status, "get_body": get_body},
             {"search_status": search_status, "search_body": search_body},
         )
+        assert search_body["total"] == 1
+        assert [hit["memory"]["id"] for hit in search_body["results"]] == ["alpha-mount-marker"]
     finally:
         if holder.server is not None:
             holder.server.should_exit = True

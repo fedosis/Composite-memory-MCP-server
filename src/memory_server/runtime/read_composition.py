@@ -25,5 +25,5 @@ def compose_read_ports(deps, config):
     specs = create_memory_read_routes(reader, None, cursor_codec=codec) + create_search_routes()
     ports = dict(deps.ports)
     ports.update({spec.operation: reader for spec in specs if spec.operation != "search"})
-    ports["search"] = KeywordRetrievalPort(deps.leases, bind_read)
+    ports["search"] = KeywordRetrievalPort(deps.leases, bind_read, deps.metrics)
     return replace(deps, ports=ports), specs
