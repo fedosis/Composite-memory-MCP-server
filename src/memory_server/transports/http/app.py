@@ -15,14 +15,15 @@ from starlette.routing import Route
 from memory_server.gateway_contracts.catalog import CATALOG
 
 from .errors import HttpError, error_code, error_response
-from .guards import Guard, secure_headers
+from .guards import Guard, ReadRouteSpec, secure_headers
 from .limits import read_body, validate_config
 from .routes import S06_ROUTE_SPECS, ProfilePort
 from .routes.profiles import validate_profile_id
 
 
 class HttpApp:
-    def __init__(self, config, dependencies, *, denial=None, publish=None, saturation=None, read_routes=()):
+    def __init__(self, config, dependencies, *, denial=None, publish=None, saturation=None,
+                 read_routes: tuple[ReadRouteSpec, ...] = ()):
         validate_config(config)  # F4: exactly once on the received object.
         self.config = config
         self.guard = Guard(config, dependencies, denial=denial, publish=publish, saturation=saturation)
@@ -46,7 +47,8 @@ class HttpApp:
             self.routes.append(route)
         for spec in self.read_routes:
             row = CATALOG.by_operation.get(spec.operation)
-            if (row is None or row.owner != 'S07'
+            if (not isinstance(spec, ReadRouteSpec) or row is None or row.owner != 'S07'
+                    or any(route.name == spec.operation or route.path == spec.path for route in self.routes)
                     or (spec.method, spec.path, spec.permission) != (row.method, row.route, row.permission)):
                 raise ValueError('S07 route specification does not match catalogue')
             route = Route(row.route, self.endpoint, methods=[row.method], name=row.operation)
@@ -56,8 +58,9 @@ class HttpApp:
 
     async def endpoint(self, request):
         state = request.scope['s06']
-        if hasattr(state['spec'], 'parse'):
-            return await self.guard.execute_read(request, state['spec'], state['body'], state['request_id'], state['deadline'])
+        if isinstance(state['spec'], ReadRouteSpec):
+            return await self.guard.execute_read(
+                request, state['spec'], state['body'], state['request_id'], state['deadline'])
         return await self.guard.execute(request, state['spec'], state['body'], state['request_id'], state['deadline'])
 
     async def close(self):
@@ -219,7 +222,8 @@ class HttpApp:
         await response(scope, receive, send)
 
 
-def create_http_app(config, dependencies, *, denial=None, publish=None, saturation=None, read_routes=()):
+def create_http_app(config, dependencies, *, denial=None, publish=None, saturation=None,
+                    read_routes: tuple[ReadRouteSpec, ...] = ()):
     """Build without opening profiles; missing operation ports stay unavailable."""
     return HttpApp(config, dependencies, denial=denial, publish=publish, saturation=saturation, read_routes=read_routes)
 

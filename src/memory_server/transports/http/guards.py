@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
+from typing import Callable, Literal
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -14,10 +16,20 @@ from starlette.responses import JSONResponse, Response
 
 from memory_server.control.policy import bearer_from_headers, require_permission
 from memory_server.gateway_contracts import dto as d
-from memory_server.gateway_contracts.ports import AuditOutcome, RequestContext
+from memory_server.gateway_contracts.ports import AuditOutcome, Principal, RequestContext
 
 from .errors import HttpError, error_code, error_response
 from .routes.profiles import audit_ticket, control_pending, control_reply, validate_profile_id, validate_query
+
+
+@dataclass(frozen=True)
+class ReadRouteSpec:
+    operation: d.Operation
+    method: Literal['GET', 'POST']
+    path: str
+    permission: d.Permission
+    parse: Callable[[Request, bytes, Principal], d.MemoryReadCommand]
+    validate_result: Callable[[d.MemoryReadResult], d.MemoryReadResult]
 
 
 class Budget:
@@ -91,9 +103,8 @@ class Guard:
             validate_profile_id(profile)
         require_permission(principal, spec.permission, profile_id=profile)
         idem = None
-        if hasattr(spec, 'parse'):
-            payload_command = spec.parse(request, body, principal)
-            command = payload_command
+        if isinstance(spec, ReadRouteSpec):
+            command = spec.parse(request, body, principal)
         elif spec.operation == 'profiles.list':
             if body:
                 raise HttpError('E_VALIDATION')
@@ -123,13 +134,13 @@ class Guard:
                        for item in exc.errors()):
                     raise HttpError('E_PRECONDITION_REQUIRED') from None
                 raise HttpError('E_VALIDATION') from None
-        if not hasattr(spec, 'parse'):
+        if not isinstance(spec, ReadRouteSpec):
             command = d.COMMAND_TYPES[spec.operation](
                 operation=spec.operation, profile_id=profile, path_ids={}, payload=payload)
         port = self.dependencies.ports.get(spec.operation)
         if port is None:
             raise HttpError('E_CAPABILITY_UNAVAILABLE')
-        if not hasattr(spec, 'parse') and spec.operation == 'profiles.list' and payload.cursor:
+        if not isinstance(spec, ReadRouteSpec) and spec.operation == 'profiles.list' and payload.cursor:
             # Validation remains before audit and every registry/port call.
             cursor = self.cursor_validator.validate_cursor(principal, payload.cursor)
             if payload.limit > cursor['limit']:
@@ -149,7 +160,9 @@ class Guard:
         try:
             result = await port.execute(ctx, command)
             # Validate injected DTOs as well; only closed typed success shapes.
-            if spec.operation == 'profiles.list':
+            if isinstance(spec, ReadRouteSpec):
+                result = spec.validate_result(result)
+            elif spec.operation == 'profiles.list':
                 result = d.Page[d.Profile].model_validate(result.model_dump())
                 result = result.model_copy(update={'items': [p.model_copy(update={'storage_root': None})
                                                             for p in result.items]})
