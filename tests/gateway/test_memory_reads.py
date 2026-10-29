@@ -30,6 +30,7 @@ from storage.models.skill import SkillORM
 
 from memory_server.admission import MemoryAdmissionGate
 from memory_server.application.memory_read_service import (
+    HistorySlice,
     MemoryReadService,
     ReadRecord,
     ReadResources,
@@ -375,6 +376,7 @@ async def test_t5_bounded_collection_history_and_receipt(reads):
     page = await r.call(query={"limit": 200, "memory_types": "fact"})
     assert page.status == 200, page.body
     assert len(page.json["items"]) == 200 and page.json["has_more"] and page.json["next_cursor"]
+    assert len(r.sql) <= 8, r.sql
     history = await r.call(f"memories/{IDS['fact']}/history", query={"limit": 200})
     receipt = await r.call(f"memories/{IDS['fact']}/receipt")
     assert history.status == receipt.status == 200, (history.body, receipt.body)
@@ -386,6 +388,92 @@ async def test_t5_bounded_collection_history_and_receipt(reads):
     assert any("UNION ALL" in q and 201 in tuple(p) for q, p in selects)
     assert not any("SELECT history FROM" in q for q, p in selects)
     assert C.encode() not in history.body + receipt.body
+
+
+async def test_t5_batch_receipts_match_single_reads(reads):
+    r = reads
+    provider = r.providers["alpha"]
+    for i in range(51):
+        for kind in KINDS:
+            await seed(
+                provider,
+                kind,
+                ident=f"batch-{i:03}",
+                marker=f"{kind}-{i}",
+                receipt=i % 2 == 0 and kind == KINDS[(i // 2) % 4],
+            )
+    async with provider._session_factory() as session:
+        r.sql.clear()
+        page = await provider.read_memory_page(
+            session,
+            d.MemoryListQuery(
+                limit=200,
+                cursor=None,
+                min_confidence=None,
+                max_confidence=None,
+                source=None,
+                authority_level=None,
+                epistemic_status=None,
+                created_from=None,
+                created_to=None,
+                updated_from=None,
+                updated_to=None,
+                valid_at=None,
+            ),
+        )
+        count = len(r.sql)
+        assert len(page.records) == 200 and page.has_more
+        # Reconstruct the old per-row receipt result, including absent receipts
+        # and same-id/different-type collisions. Ordering/LIMIT must not change.
+        old = [await provider.read_receipt_metadata(session, v.memory["id"], v.memory_type) for v in page.records]
+        assert [v.receipt for v in page.records] == old
+        assert any(v is None for v in old) and any(v is not None for v in old)
+        expected = sorted(
+            [(STAMP.isoformat(timespec="microseconds"), kind, f"batch-{i:03}") for i in range(51) for kind in KINDS]
+            + [(STAMP.isoformat(timespec="microseconds"), kind, IDS[kind]) for kind in KINDS]
+        )[:200]
+        assert [(v.memory["created_at"], v.memory_type, v.memory["id"]) for v in page.records] == expected
+        assert count <= 8, count
+
+
+async def test_t12_max_and_page_share_real_sqlite_snapshot(reads, monkeypatch):
+    r = reads
+    provider = r.providers["alpha"]
+    async with provider.engine.connect() as connection:
+        assert (await connection.execute(text("PRAGMA journal_mode=WAL"))).scalar() == "wal"
+    execute = AsyncSession.execute
+    writes = []
+    begins = []
+
+    def observe(conn, cursor, statement, params, context, many):
+        if statement == "BEGIN":
+            begins.append(conn.connection.driver_connection.in_transaction)
+
+    event.listen(provider.engine.sync_engine, "before_cursor_execute", observe)
+
+    async def concurrent_write(session, statement, *args, **kwargs):
+        result = await execute(session, statement, *args, **kwargs)
+        if "AS memories" in str(statement) and "ORDER BY created_at DESC" in str(statement):
+            await seed(provider, ident="backdated-concurrent", at=STAMP - timedelta(days=1))
+            async with provider._session_factory() as writer:
+                async with writer.begin():
+                    await execute(writer, text("DELETE FROM facts WHERE id=:id"), {"id": IDS["fact"]})
+            writes.append(True)
+        return result
+
+    monkeypatch.setattr(AsyncSession, "execute", concurrent_write)
+    try:
+        result = await r.call(query={"memory_types": "fact"})
+        assert result.status == 200, result.body
+        assert writes == [True]
+        assert [v["id"] for v in result.json["items"]] == [IDS["fact"]]
+        # session.begin() starts SQLAlchemy bookkeeping, not a sqlite read txn.
+        # Exactly one actual BEGIN is sent, while the driver is not in a txn.
+        assert begins == [False]
+    finally:
+        event.remove(provider.engine.sync_engine, "before_cursor_execute", observe)
+    async with provider._session_factory() as session:
+        assert (await execute(session, text("SELECT id FROM facts"))).scalars().all() == ["backdated-concurrent"]
 
 
 @pytest.mark.parametrize("case", ["missing", "null", "unsupported", "malformed", "truncated", "ties"])
@@ -441,6 +529,34 @@ async def test_t6_history_honest_exact_prefix(reads, case):
             assert page.incomplete
 
 
+@pytest.mark.parametrize("incomplete", [True, False])
+@pytest.mark.parametrize("lookup", [True, False])
+async def test_t6_receipt_consults_history_slice(reads, monkeypatch, incomplete, lookup):
+    provider = reads.providers["alpha"]
+    original = provider.read_history_page
+    consulted = []
+
+    class Incomplete:
+        def __bool__(self):
+            consulted.append(incomplete)
+            return incomplete
+
+    async def history(*args, **kwargs):
+        page = await original(*args, **kwargs)
+        assert isinstance(page, HistorySlice) and page.events and not page.has_more
+        return replace(page, incomplete=Incomplete())
+
+    monkeypatch.setattr(provider, "read_history_page", history)
+    result = await reads.call(
+        "lookup" if lookup else f"memories/{IDS['fact']}/receipt",
+        query=dict(kind="receipt", id=IDS["fact"]) if lookup else {},
+    )
+    assert result.status == 200, result.body
+    receipt = result.json["target"] if lookup else result.json
+    assert receipt["history"] and receipt["history_complete"] is False
+    assert consulted == [incomplete]
+
+
 @pytest.mark.parametrize("kind,permission", [("request", "audit.read"), ("relation", "relation.read")])
 async def test_t7_lookup_extra_permissions_and_no_fake_port(reads, kind, permission):
     r = reads
@@ -455,9 +571,10 @@ async def test_t7_lookup_extra_permissions_and_no_fake_port(reads, kind, permiss
     assert len(r.sessions) == before[0]
 
 
-async def test_t7_trace_scoped_masked_live_and_absent(reads):
+@pytest.mark.parametrize("safe_provenance", [False, True])
+async def test_t7_trace_scoped_masked_live_and_absent(reads, safe_provenance):
     r = reads
-    item = d.TraceContribution(source="fts", matched_terms=[C + "matched"], relation_path=[])
+    item = d.TraceContribution(source="fts", matched_terms=[C + "matched"], relation_path=[C + "relation_path"])
     trace = d.Trace(
         id="trace-one",
         request_id="req_trace",
@@ -471,8 +588,8 @@ async def test_t7_trace_scoped_masked_live_and_absent(reads):
         final=[item],
         created_at=STAMP,
         expires_at=STAMP + timedelta(hours=1),
-        settings_digest="digest",
-        code_revision="revision",
+        settings_digest="a" * 64 if safe_provenance else C + "digest",
+        code_revision="b" * 40 if safe_provenance else C + "revision",
     )
 
     class Traces:
@@ -481,12 +598,18 @@ async def test_t7_trace_scoped_masked_live_and_absent(reads):
                 raise KeyError("absent")
             return trace
 
+    canary_evidence("trace-fixture-live", trace.model_dump_json(), live=True)
     r.port.traces = Traces()
     for bearer in (r.reader, r.revealer):
         result = await r.call("lookup", query=dict(kind="trace", id="trace-one"), bearer=bearer)
         assert result.status == 200, result.body
         assert C.encode() not in result.body and result.json["target"]["id"] == "trace-one"
-        assert result.json["target"]["final"][0]["matched_terms"] == []
+        target = result.json["target"]
+        assert target["settings_digest"] == ("a" * 64 if safe_provenance else "")
+        assert target["code_revision"] == ("b" * 40 if safe_provenance else "")
+        for items in [*target["stages"].values(), target["merge"], target["deduplicated"], target["final"]]:
+            assert all(v["matched_terms"] == v["relation_path"] == [] for v in items)
+    assert trace.final[0].relation_path == [C + "relation_path"]
     trace.profile_id = "beta"
     code(await r.call("lookup", query=dict(kind="trace", id="trace-one")), "E_NOT_FOUND", 404)
     code(await r.call("lookup", query=dict(kind="trace", id="absent")), "E_NOT_FOUND", 404)
@@ -614,9 +737,10 @@ async def test_t15_real_heuristic_and_unknown_fail_closed(reads, mode):
         assert classify_read_content(raw, MemoryAdmissionGate()) == "sensitive"
 
 
-async def test_t11_telemetry_filter_content_and_reason_sweep(reads, caplog):
+@pytest.mark.parametrize("field", ["source", "tags", "risk_tags", "authority_level", "epistemic_status"])
+async def test_t11_telemetry_filter_content_and_reason_sweep(reads, caplog, field):
     r = reads
-    code(await r.call(query={"source": C + "FILTER"}), "E_PERMISSION_DENIED", 403)
+    code(await r.call(query={field: C + "FILTER_" + field}), "E_PERMISSION_DENIED", 403)
     result = await r.call(
         "memories/" + IDS["fact"] + "/reveal",
         method="POST",
@@ -624,8 +748,8 @@ async def test_t11_telemetry_filter_content_and_reason_sweep(reads, caplog):
         body=dict(reason=C + "REASON", memory_type="fact", expected_revision=1),
     )
     assert result.status == 200 and C.encode() in result.body
-    assert C not in repr(rows(r)) + caplog.text
-    assert C.encode() not in generate_latest(r.metrics._registry)
+    canary_evidence("filter-audit-logs", repr(rows(r)) + repr([vars(v) for v in caplog.records]))
+    canary_evidence("filter-metrics", generate_latest(r.metrics._registry))
 
 
 async def test_t12_fresh_sessions_errors_and_cancel(reads, monkeypatch, caplog):
@@ -660,29 +784,39 @@ async def test_t12_fresh_sessions_errors_and_cancel(reads, monkeypatch, caplog):
 async def test_t13_reveal_budget_before_storage(reads):
     r = reads
     r.app.guard.per_token.config = replace(r.config, rate_burst=2, rate_per_minute=1)
+    misses = []
     for _ in range(2):
-        code(
-            await r.call(
-                "memories/" + str(uuid4()) + "/reveal",
-                method="POST",
-                bearer=r.revealer,
-                body=dict(reason="inspection", memory_type="fact", expected_revision=1),
-            ),
-            "E_NOT_FOUND",
-            404,
+        result = await r.call(
+            "memories/" + str(uuid4()) + "/reveal",
+            method="POST",
+            bearer=r.revealer,
+            body=dict(reason="inspection", memory_type="fact", expected_revision=1),
         )
+        code(result, "E_NOT_FOUND", 404)
+        misses.append(result)
+    assert misses[0].status == misses[1].status
+    assert set(misses[0].json) == set(misses[1].json)
+    assert set(misses[0].json["error"]) == set(misses[1].json["error"])
+    assert len(misses[0].body) == len(misses[1].body)
+    # Authorized misses must read storage and receive terminal audit records.
+    assert len(r.sessions) == len(rows(r)) == 2
     before = (len(r.sessions), len(rows(r)))
-    for _ in range(3):
-        code(
-            await r.call(
-                "memories/" + str(uuid4()) + "/reveal",
-                method="POST",
-                bearer=r.revealer,
-                body=dict(reason=C + "RANDOM_REASON", memory_type="fact", expected_revision=1),
-            ),
-            "E_RATE_LIMIT",
-            429,
+    limited = []
+    for ident in (str(uuid4()), IDS["fact"], str(uuid4())):
+        result = await r.call(
+            "memories/" + ident + "/reveal",
+            method="POST",
+            bearer=r.revealer,
+            body=dict(reason=C + "RANDOM_REASON", memory_type="fact", expected_revision=1),
         )
+        code(result, "E_RATE_LIMIT", 429)
+        assert ident.encode() not in result.body and C.encode() not in result.body
+        limited.append(result)
+    assert all(set(v.json) == set(limited[0].json) for v in limited)
+    assert all(set(v.json["error"]) == set(limited[0].json["error"]) for v in limited)
+    assert all(len(v.body) == len(limited[0].body) for v in limited)
+    errors = [{k: value for k, value in v.json["error"].items() if k != "request_id"} for v in limited]
+    assert errors[0] == errors[1] == errors[2]
     assert before == (len(r.sessions), len(rows(r)))
 
 
