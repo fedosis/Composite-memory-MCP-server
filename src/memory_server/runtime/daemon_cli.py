@@ -128,7 +128,11 @@ async def run_daemon(config, registry_path, profiles_root=None, *, factory=None,
 
             deps = GatewayDependencies(registry, tokens, access, BoundedMetricsSink(observer.profiles), {},
                                        leases=daemon_owner, readiness=readiness)
-            app = with_profile_ports(factory(config, deps), pending_control=bind_control_pending(registry, store))
+            from memory_server.runtime.read_composition import compose_read_ports
+
+            deps, specs = compose_read_ports(deps, config)
+            app = with_profile_ports(factory(config, deps, read_routes=specs),
+                                     pending_control=bind_control_pending(registry, store))
             managed_signals = server_factory is None
             if managed_signals:
                 import uvicorn

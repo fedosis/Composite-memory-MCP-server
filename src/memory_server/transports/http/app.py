@@ -19,6 +19,7 @@ from .guards import Guard, ReadRouteSpec, secure_headers
 from .limits import read_body, validate_config
 from .routes import S06_ROUTE_SPECS, ProfilePort
 from .routes.profiles import validate_profile_id
+from .routes.retrieval import RetrievalRouteSpec
 
 
 class HttpApp:
@@ -46,11 +47,17 @@ class HttpApp:
             route.spec = row
             self.routes.append(route)
         for spec in self.read_routes:
+            if not isinstance(spec, ReadRouteSpec):
+                raise ValueError('read route specification must be a ReadRouteSpec')
             row = CATALOG.by_operation.get(spec.operation)
-            if (not isinstance(spec, ReadRouteSpec) or row is None or row.owner != 'S07'
+            if isinstance(spec, RetrievalRouteSpec):
+                owner_matches = row is not None and row.owner == 'S08' and spec.operation == 'search'
+            else:
+                owner_matches = row is not None and row.owner == 'S07'
+            if (row is None or not owner_matches
                     or any(route.name == spec.operation or route.path == spec.path for route in self.routes)
                     or (spec.method, spec.path, spec.permission) != (row.method, row.route, row.permission)):
-                raise ValueError('S07 route specification does not match catalogue')
+                raise ValueError('read route specification does not match catalogue')
             route = Route(row.route, self.endpoint, methods=[row.method], name=row.operation)
             route.permission, route.spec = row.permission, spec
             self.routes.append(route)

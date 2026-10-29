@@ -426,30 +426,61 @@ class SQLiteProvider:
             )
         ).all()
         page_rows = rows[: query.limit]
-        receipts = {}
-        if page_rows:
-            # Bound the IN list and result to the returned page, not its lookahead.
-            pairs = ",".join(f"(:id{i},:type{i})" for i in range(len(page_rows)))
-            receipt_params = {f"id{i}": r.id for i, r in enumerate(page_rows)}
-            receipt_params.update({f"type{i}": r.memory_type for i, r in enumerate(page_rows)})
-            receipt_params["receipt_limit"] = len(page_rows)
-            receipt_rows = await session.execute(
-                text(
-                    "SELECT id,memory_type,source,created_by,timestamp,confidence,"
-                    "verification_status,lifecycle_state,version FROM receipts "
-                    f"WHERE (id,memory_type) IN ({pairs}) LIMIT :receipt_limit"
-                ),
-                receipt_params,
-            )
-            for row in receipt_rows:
-                data = dict(row._mapping)
-                data["timestamp"] = self._utc(data["timestamp"])
-                receipts[(row.id, row.memory_type)] = data
+        receipts = await self._read_receipt_metadata_batch(
+            session, tuple((r.id, r.memory_type) for r in page_rows)
+        )
         records = tuple(
             ReadRecord(self._record(r.memory_type, r), r.memory_type, receipts.get((r.id, r.memory_type)))
             for r in page_rows
         )
         return MemorySlice(records, len(rows) > query.limit, upper)
+
+    async def _read_receipt_metadata_batch(self, session: AsyncSession, keys: tuple):
+        """One bounded receipt query for returned records, never lookahead."""
+        if len(keys) > 200 or len(set(keys)) != len(keys):
+            raise ValueError("invalid receipt batch")
+        if not keys:
+            return {}
+        pairs = ",".join(f"(:id{i},:type{i})" for i in range(len(keys)))
+        params = {f"id{i}": key[0] for i, key in enumerate(keys)}
+        params.update({f"type{i}": key[1] for i, key in enumerate(keys)})
+        params["receipt_limit"] = len(keys)
+        rows = await session.execute(
+            text(
+                "SELECT id,memory_type,source,created_by,timestamp,confidence,"
+                "verification_status,lifecycle_state,version FROM receipts "
+                f"WHERE (id,memory_type) IN ({pairs}) LIMIT :receipt_limit"
+            ), params,
+        )
+        receipts = {}
+        for row in rows:
+            data = dict(row._mapping)
+            data["timestamp"] = self._utc(data["timestamp"])
+            receipts[(row.id, row.memory_type)] = data
+        return receipts
+
+    async def read_fact_records(self, session: AsyncSession, ids: tuple[str, ...]):
+        """Hydrate a bounded ordered hit list in the caller's existing snapshot."""
+        from memory_server.application.memory_read_service import ReadRecord
+
+        if len(ids) > 100 or len(set(ids)) != len(ids) or any(type(i) is not str or not i for i in ids):
+            raise ValueError("invalid fact batch")
+        if not ids:
+            return ()
+        binds = ",".join(f":id{i}" for i in range(len(ids)))
+        params = {f"id{i}": ident for i, ident in enumerate(ids)}
+        rows = (await session.execute(
+            text(f"SELECT * FROM facts WHERE id IN ({binds}) LIMIT :fact_limit"),
+            {**params, "fact_limit": len(ids)},
+        )).all()
+        receipts = await self._read_receipt_metadata_batch(session, tuple((i, "fact") for i in ids))
+        records = {r.id: ReadRecord(self._record("fact", r), "fact", receipts.get((r.id, "fact"))) for r in rows}
+        return tuple(records[i] for i in ids if i in records)
+
+    async def search_facts_in_session(self, session: AsyncSession, *, text: str, limit: int, include_inactive: bool):
+        """Keyword search using the same connection and transaction as hydration."""
+        repo = await self._get_fact_repo(session)
+        return await repo.search(text=text, limit=limit, lifecycle_state=None if include_inactive else "active")
 
     async def read_receipt_metadata(self, session: AsyncSession, memory_id: str, memory_type: str):
         result = await session.execute(
