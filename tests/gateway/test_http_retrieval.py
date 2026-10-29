@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import sqlite3
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -38,14 +40,55 @@ def offline_embedder(monkeypatch):
     monkeypatch.setitem(runtime_factory._DEFAULT_RECIPES, "embedder", lambda runtime: MockEmbeddingProvider())
 
 
-async def _start(tmp_path):
-    registry, _ = await build_registry(tmp_path)
+class SimilarityEmbeddingProvider:
+    """Deterministic unit vectors for the real LanceDB/outbox path."""
+
+    def __init__(self, vector_size=384, mapping=None, **_kwargs):
+        self.vector_size = vector_size
+        self.mapping = dict(mapping or {})
+        self._fallback = self._basis(vector_size - 1)
+
+    @staticmethod
+    def _basis(index, size=384):
+        vector = [0.0] * size
+        vector[index] = 1.0
+        return vector
+
+    def embed(self, text):
+        return list(self.mapping.get(text, self._fallback))
+
+    def embed_batch(self, texts):
+        return [self.embed(text) for text in texts]
+
+
+@pytest.fixture
+def similarity_embedder(monkeypatch):
+    mapping = {
+        "alpha owns beta": SimilarityEmbeddingProvider._basis(0),
+        "alpha distractor one": SimilarityEmbeddingProvider._basis(1),
+        "alpha distractor two": SimilarityEmbeddingProvider._basis(2),
+        "graph source relates target": SimilarityEmbeddingProvider._basis(3),
+    }
+    monkeypatch.setitem(
+        runtime_factory._DEFAULT_RECIPES,
+        "embedder",
+        lambda runtime: SimilarityEmbeddingProvider(mapping=mapping),
+    )
+    return mapping
+
+
+async def _start(tmp_path, *, request_timeout_seconds: float = 30, retrieval_concurrency=4, registry=None):
+    if registry is None:
+        registry, _ = await build_registry(tmp_path)
     config = HttpConfig(
         control_path=tmp_path / "control" / "control.sqlite",
         host="127.0.0.1",
         port=free_port(),
         rate_per_minute=10000,
         rate_burst=1000,
+        request_timeout_seconds=request_timeout_seconds,
+        header_timeout_seconds=min(5, request_timeout_seconds),
+        retrieval_concurrency=retrieval_concurrency,
     )
     holder = SimpleNamespace(server=None, app=None)
 
@@ -57,6 +100,8 @@ async def _start(tmp_path):
     task = asyncio.create_task(run_daemon(config, registry, factory=create_http_app, server_factory=factory))
     async with asyncio.timeout(5):
         while holder.server is None:
+            if task.done():
+                await task
             await asyncio.sleep(0.01)
     port = await wait_started(holder.server)
     now = datetime.now(UTC)
@@ -72,6 +117,803 @@ async def _start(tmp_path):
     async with holder.app.dependencies.leases.acquire(ctx) as scope:
         await seed_fact(scope.application.read_resources(), "s08a-marker", "alpha")
     return holder, task, port, {"Authorization": "Bearer " + bearer}
+
+
+async def prepare_indexed_registry(
+    tmp_path, rows, *, registry=None, profile="alpha", graph_nodes=(), graph_edges=(), vector_points=()
+):
+    """Prepare real projections, close runtime, then let HTTP serve stable stores."""
+    from memory_server.models import Fact, MemoryReceipt
+    from memory_server.runtime import daemon_cli
+    from memory_server.runtime.runtime_factory import RuntimeFactory
+    from memory_server.runtime.runtime_manager import RuntimeManager
+
+    if registry is None:
+        registry, _ = await build_registry(tmp_path)
+    binding = next(b for b in daemon_cli.load_bindings(registry) if b.profile.id == profile)
+    manager = RuntimeManager(factory_builder=RuntimeFactory.create)
+    runtime = await manager.start_profile(binding.descriptor, layout=binding.layout, config=binding.config)
+    try:
+        provider = runtime.dependencies.sqlite
+        for row in rows:
+            created = row.get("created_at", datetime(2026, 1, 1, tzinfo=UTC))
+            ident = row["id"]
+            subject, predicate, object_ = row["subject"], row["predicate"], row["object"]
+            lifecycle = row.get("lifecycle_state", "active")
+            confidence = row.get("confidence", 0.8)
+            fact = Fact(
+                id=ident,
+                subject=subject,
+                predicate=predicate,
+                object=object_,
+                dedup_key=ident,
+                confidence=confidence,
+                source="s08b-test-source",
+                creator="s08b-test-creator",
+                created_at=created,
+                updated_at=created,
+                lifecycle_state=lifecycle,
+            )
+            receipt = MemoryReceipt(
+                id=ident,
+                memory_type="fact",
+                source="s08b-test-receipt",
+                created_by="s08b-test-creator",
+                timestamp=created,
+                confidence=confidence,
+                lifecycle_state=lifecycle,
+            )
+            outbox = (
+                None
+                if not row.get("index", True)
+                else [
+                    {
+                        "record_type": "fact",
+                        "record_id": ident,
+                        "operation": "index_fact",
+                        "payload": {
+                            "subject": subject,
+                            "predicate": predicate,
+                            "object": object_,
+                            "source": "s08b-test-source",
+                        },
+                    }
+                ]
+            )
+            await provider.create_in_transaction(fact=fact, receipt=receipt, outbox_entries=outbox)
+        worker = runtime.dependencies.outbox_worker
+        if worker is not None:
+            await worker.process_all_pending()
+        # Bounded, real readback precedes closing the preparation runtime.
+        for row in rows:
+            if not row.get("index", True):
+                continue
+            deadline = monotonic() + 10
+            while True:
+                hits = await runtime.dependencies.vector.search(
+                    collection=runtime.config.vector_collection,
+                    vector=runtime.dependencies.embedder.embed(f"{row['subject']} {row['predicate']} {row['object']}"),
+                    limit=100,
+                )
+                graph = runtime.dependencies.graph
+                names = {node.name for node in graph.get_all_nodes()}
+                if (
+                    any(hit["id"] == str(uuid.uuid5(uuid.NAMESPACE_DNS, f"fact:{row['id']}")) for hit in hits)
+                    and {row["subject"], row["object"]} <= names
+                ):
+                    break
+                assert monotonic() < deadline, "real outbox projection readback failed"
+                await asyncio.sleep(0.001)
+        async with provider.engine.connect() as connection:
+            statuses = (await connection.execute(text("SELECT status FROM outbox_entries"))).scalars().all()
+            assert all(status == "completed" for status in statuses), statuses
+        for node_id, node_type, name in graph_nodes:
+            runtime.dependencies.graph.add_node(node_id, node_type, name)
+        for source_id, target_id, relation in graph_edges:
+            runtime.dependencies.graph.add_edge(source_id, target_id, relation)
+        if vector_points:
+            vector = runtime.dependencies.vector
+            collection = runtime.config.vector_collection
+            embedder = runtime.dependencies.embedder
+            for point in vector_points:
+                await vector.upsert(
+                    collection=collection,
+                    point_id=point["id"],
+                    vector=embedder.embed(point["text"]),
+                    payload=point["payload"],
+                )
+        async with provider.engine.begin() as connection:
+            for row in rows:
+                if row.get("delete_after_index"):
+                    await connection.execute(text("DELETE FROM facts WHERE id=:id"), {"id": row["id"]})
+    finally:
+        await manager.close_all()
+    return registry
+
+
+@pytest.mark.asyncio
+async def test_s08b_similarity_fixture_outbox_control(tmp_path, similarity_embedder):
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-control", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        async with await read_scope(holder, auth) as scope:
+            router = await scope.application.retrieval._get_embedding_router()
+            hits = await router._vector_provider.search(
+                collection=router._collection,
+                vector=similarity_embedder["alpha owns beta"],
+                limit=3,
+            )
+            assert hits and hits[0]["id"] == str(uuid.uuid5(uuid.NAMESPACE_DNS, "fact:s08b-control"))
+            assert hits[0]["score"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,query,expected_source",
+    [
+        ("semantic", "alpha owns beta", "semantic"),
+        ("graph", "alpha beta", "graph"),
+        ("hybrid", "alpha owns beta", "fts"),
+    ],
+)
+@pytest.mark.parametrize("revealer", [False, True])
+async def test_s08b_modes_seeded_fact(tmp_path, similarity_embedder, mode, query, expected_source, revealer):
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-seeded", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        if revealer:
+            now = datetime.now(UTC)
+            token = holder.app.dependencies.tokens._bootstrap_create(
+                d.TokenCreate(
+                    subject="revealer",
+                    profiles=["alpha"],
+                    permissions=["memory.read", "memory.reveal"],
+                    expires_at=now + timedelta(hours=1),
+                ),
+                now=now,
+            )
+            auth = {"Authorization": f"Bearer cmms_{token.token.id}.{token.secret}"}
+        status, body = await post(
+            port,
+            auth,
+            query=query,
+            mode=mode,
+            limit=10,
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 200, body
+        assert body["total"] == 1
+        assert body["results"][0]["memory"]["id"] == "s08b-seeded"
+        assert body["results"][0]["rank"] == 1
+        assert body["trace_id"] is None
+        assert body["results"][0]["memory"]["content"] is None
+        assert body["results"][0]["memory"]["payload"] is None
+        assert body["results"][0]["memory"]["masked"] is True
+        assert body["degraded"] == []
+        if expected_source is not None:
+            assert body["results"][0]["source"] == expected_source
+        else:
+            assert body["results"][0]["source"] in {"fts", "semantic", "graph"}
+        assert "s08b-test-source" not in json.dumps(body)
+        assert body["results"][0]["score"] == pytest.approx(0.8 if mode == "graph" else 1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_hit",
+    [
+        {
+            "id": "not-a-canonical-point",
+            "score": 0.99,
+            "payload": {"subject": "forged", "predicate": "owns", "object": "gamma", "memory_type": "fact"},
+        },
+        {
+            "id": "override",
+            "score": 0.99,
+            "payload": {
+                "id": "s08b-good",
+                "subject": "alpha",
+                "predicate": "owns",
+                "object": "beta",
+                "memory_type": "fact",
+            },
+        },
+        {"id": "missing", "score": 0.99, "payload": {"memory_type": "fact", "subject": "alpha"}},
+        {
+            "id": "nonfinite",
+            "score": math.nan,
+            "payload": {"memory_type": "fact", "subject": "alpha", "predicate": "owns", "object": "beta"},
+        },
+        {
+            "id": "belief",
+            "score": 0.99,
+            "payload": {"memory_type": "belief", "subject": "alpha", "predicate": "owns", "object": "beta"},
+        },
+        None,
+        {
+            "id": "bool-score",
+            "score": True,
+            "payload": {"memory_type": "fact", "subject": "alpha", "predicate": "owns", "object": "beta"},
+        },
+    ],
+)
+async def test_s08b_untrusted_projection_selective_drop(tmp_path, similarity_embedder, monkeypatch, bad_hit):
+    registry = await prepare_indexed_registry(
+        tmp_path,
+        [
+            {"id": "s08b-good", "subject": "alpha", "predicate": "owns", "object": "beta"},
+            {"id": "s08b-forged-target", "subject": "forged", "predicate": "owns", "object": "gamma", "index": False},
+        ],
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        async with await read_scope(holder, auth) as scope:
+            router = await scope.application.retrieval._get_embedding_router()
+            original = router._vector_provider.search
+
+            async def polluted(*args, **kwargs):
+                hits = await original(*args, **kwargs)
+                return [*hits, bad_hit]
+
+            monkeypatch.setattr(router._vector_provider, "search", polluted)
+        status, body = await post(
+            port,
+            auth,
+            query="alpha owns beta",
+            mode="semantic",
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 200, body
+        assert [hit["memory"]["id"] for hit in body["results"]] == ["s08b-good"]
+        assert body["degraded"] == []
+
+
+@pytest.mark.asyncio
+async def test_s08b_foreign_same_uuid_two_roots_and_missing_identity(tmp_path, similarity_embedder):
+    shared_id = "s08b-shared-uuid"
+    registry = await prepare_indexed_registry(
+        tmp_path,
+        [
+            {"id": shared_id, "subject": "beta", "predicate": "owns", "object": "gamma"},
+        ],
+        profile="beta",
+    )
+    registry = await prepare_indexed_registry(
+        tmp_path,
+        [
+            {"id": "s08b-alpha-control", "subject": "alpha", "predicate": "owns", "object": "beta"},
+            {"id": shared_id, "subject": "alpha", "predicate": "controls", "object": "beta"},
+            {
+                "id": "s08b-stale",
+                "subject": "alpha",
+                "predicate": "stale",
+                "object": "beta",
+                "delete_after_index": True,
+            },
+        ],
+        registry=registry,
+        vector_points=[
+            {
+                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"fact:{shared_id}")),
+                "text": "beta owns gamma",
+                "payload": {"subject": "beta", "predicate": "owns", "object": "gamma", "memory_type": "fact"},
+            },
+            {
+                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, "fact:s08b-missing")),
+                "text": "alpha owns beta",
+                "payload": {"subject": "alpha", "predicate": "owns", "object": "beta", "memory_type": "fact"},
+            },
+        ],
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        status, body = await post(
+            port,
+            auth,
+            profile="alpha",
+            query="alpha owns beta",
+            mode="semantic",
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 200, body
+        assert [hit["memory"]["id"] for hit in body["results"]] == ["s08b-alpha-control"], body
+        assert body["degraded"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["graph", "hybrid"])
+async def test_s08b_graph_ambiguous_triple_expands(tmp_path, similarity_embedder, mode):
+    registry = await prepare_indexed_registry(
+        tmp_path,
+        [
+            {"id": "s08b-active", "subject": "alpha", "predicate": "owns", "object": "beta"},
+            {
+                "id": "s08b-inactive",
+                "subject": "alpha",
+                "predicate": "owns",
+                "object": "beta",
+                "lifecycle_state": "rejected",
+                "index": False,
+                "created_at": datetime(2025, 1, 1, tzinfo=UTC),
+            },
+        ],
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        for include_inactive, expected in ((False, ["s08b-active"]), (True, ["s08b-active", "s08b-inactive"])):
+            status, body = await post(
+                port,
+                auth,
+                query="alpha beta",
+                mode=mode,
+                include_inactive=include_inactive,
+                limit=2,
+                filters={"source": None, "min_confidence": None},
+            )
+            assert status == 200, body
+            assert [hit["memory"]["id"] for hit in body["results"]] == expected
+            assert body["degraded"] == []
+
+
+@pytest.mark.asyncio
+async def test_s08b_graph_expansion_timestamp_tie(tmp_path, similarity_embedder):
+    rows = [
+        dict(id=ident, subject="alpha", predicate="owns", object="beta", lifecycle_state=state, index=state == "active")
+        for ident, state in (("a-active", "active"), ("b-inactive", "rejected"), ("c-inactive", "rejected"))
+    ]
+    registry = await prepare_indexed_registry(tmp_path, rows)
+    async with live_server(tmp_path, registry=registry) as (_, port, auth):
+        status, body = await post(port, auth, query="alpha beta", mode="graph", include_inactive=True)
+        assert status == 200, body
+        assert [hit["memory"]["id"] for hit in body["results"]] == ["a-active", "b-inactive", "c-inactive"]
+        assert all(hit["score"] == 0.8 for hit in body["results"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,mode,code",
+    [
+        ("vector", "semantic", "E_VECTOR_BACKEND"),
+        ("embed", "semantic", "E_VECTOR_BACKEND"),
+        ("graph", "graph", "E_GRAPH_BACKEND"),
+    ],
+)
+async def test_s08b_typed_backend_failure(tmp_path, similarity_embedder, monkeypatch, failure, mode, code):
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-fault", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        async with await read_scope(holder, auth) as scope:
+            if failure == "embed":
+                router = await scope.application.retrieval._get_embedding_router()
+
+                def embed_failed(*args, **kwargs):
+                    raise RuntimeError("embedding failure")
+
+                monkeypatch.setattr(router._embedder, "embed", embed_failed)
+            elif mode == "semantic":
+                router = await scope.application.retrieval._get_embedding_router()
+
+                async def failed(*args, **kwargs):
+                    from memory_server.providers.exceptions import ProviderSearchError
+
+                    raise ProviderSearchError("backend failure")
+
+                monkeypatch.setattr(router._vector_provider, "search", failed)
+            else:
+                graph_service = scope.application.graph
+                graph_router = await graph_service._get_graph_router()
+                monkeypatch.setattr(
+                    graph_router.graph,
+                    "get_all_nodes",
+                    lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("graph failure")),
+                )
+        status, body = await post(
+            port,
+            auth,
+            query="alpha owns beta",
+            mode=mode,
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 503, body
+        assert body["error"]["code"] == code
+        status, body = await post(port, auth, query="alpha owns beta", mode="hybrid")
+        assert status == 200, body
+        assert body["results"][0]["memory"]["id"] == "s08b-fault"
+        assert body["degraded"] == [{"source": mode, "code": code}]
+
+
+@pytest.mark.asyncio
+async def test_s08b_healthy_empty_vs_failed(tmp_path, similarity_embedder):
+    async with live_server(tmp_path) as (holder, port, auth):
+        for mode in ("semantic", "graph", "hybrid"):
+            status, body = await post(
+                port,
+                auth,
+                query="no such indexed fact",
+                mode=mode,
+                filters={"source": None, "min_confidence": None},
+            )
+            assert status == 200, body
+            assert body["results"] == [] and body["total"] == 0
+            assert body["degraded"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["semantic", "graph"])
+async def test_s08b_post_resolve_filter_matrix(tmp_path, similarity_embedder, monkeypatch, mode):
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-high", "subject": "alpha", "predicate": "owns", "object": "beta", "confidence": 0.9}]
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        async with await read_scope(holder, auth) as scope:
+            router = await scope.application.retrieval._get_embedding_router()
+            calls = 0
+            graph_router = await scope.application.graph._get_graph_router()
+            original = router._vector_provider.search
+
+            async def counted(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                return await original(*args, **kwargs)
+
+            if mode == "semantic":
+                monkeypatch.setattr(router._vector_provider, "search", counted)
+            else:
+                original_graph = graph_router.graph.get_all_nodes
+
+                def graph_counted(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    return original_graph(*args, **kwargs)
+
+                monkeypatch.setattr(graph_router.graph, "get_all_nodes", graph_counted)
+        for filters, expected in (
+            ({"min_confidence": 0.95}, 0),
+            ({"min_confidence": 0.8}, 1),
+            ({"memory_types": ["belief"]}, 0),
+            ({"lifecycle_states": ["rejected"]}, 0),
+        ):
+            status, body = await post(
+                port,
+                auth,
+                query="alpha owns beta",
+                mode=mode,
+                filters={"source": None, "min_confidence": None, **filters},
+            )
+            assert status == 200 and body["total"] == expected, body
+            assert body["degraded"] == []
+        assert calls >= 4
+        status, body = await post(
+            port,
+            auth,
+            query="alpha owns beta",
+            mode="semantic",
+            filters={"source": "forbidden", "min_confidence": None},
+        )
+        assert status == 422 and body["error"]["code"] == "E_VALIDATION"
+
+
+@pytest.mark.asyncio
+async def test_s08b_limits_scores_rank(tmp_path, similarity_embedder):
+    registry = await prepare_indexed_registry(
+        tmp_path,
+        [
+            {"id": ident, "subject": "alpha", "predicate": "owns", "object": obj}
+            for ident, obj in (("s08b-one", "beta"), ("s08b-two", "gamma"), ("s08b-three", "delta"))
+        ],
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        status, body = await post(
+            port,
+            auth,
+            query="alpha owns beta",
+            mode="semantic",
+            limit=1,
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 200 and body["total"] == 1 and body["results"][0]["rank"] == 1, body
+        assert body["results"][0]["memory"]["id"] == "s08b-one"
+        for limit in (0, 101):
+            status, body = await post(
+                port,
+                auth,
+                query="alpha owns beta",
+                mode="semantic",
+                limit=limit,
+                filters={"source": None, "min_confidence": None},
+            )
+            assert status == 422 and body["error"]["code"] == "E_VALIDATION"
+
+
+@pytest.mark.asyncio
+async def test_s08b_all_failed_is_storage_not_empty(tmp_path, similarity_embedder, monkeypatch):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-all-failed", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        async with await read_scope(holder, auth) as scope:
+            router = await scope.application.retrieval._get_embedding_router()
+
+            async def vector_failed(*args, **kwargs):
+                raise RuntimeError("vector failed")
+
+            monkeypatch.setattr(router._vector_provider, "search", vector_failed)
+            graph_router = await scope.application.graph._get_graph_router()
+            monkeypatch.setattr(
+                graph_router.graph,
+                "get_all_nodes",
+                lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("graph failed")),
+            )
+            provider = scope.application.read_resources().provider
+            original = provider.search_facts_in_session
+
+            async def storage_failed(*args, **kwargs):
+                raise SQLAlchemyError("storage failed")
+
+            monkeypatch.setattr(provider, "search_facts_in_session", storage_failed)
+        status, body = await post(
+            port,
+            auth,
+            query="alpha owns beta",
+            mode="hybrid",
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 503 and body["error"]["code"] == "E_STORAGE", body
+        assert "results" not in body and body.get("degraded") is None
+        monkeypatch.setattr(provider, "search_facts_in_session", original)
+        for query in ("alpha owns beta", "healthy-empty-fts"):
+            status, body = await post(port, auth, query=query, mode="hybrid")
+            assert status == 200, body
+            assert body["degraded"] == [
+                {"source": "semantic", "code": "E_VECTOR_BACKEND"},
+                {"source": "graph", "code": "E_GRAPH_BACKEND"},
+            ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["vector", "graph"])
+async def test_s08b_projection_absence_layout_two_phase(tmp_path, similarity_embedder, monkeypatch, missing):
+    # Phase 1 must finish real outbox indexing before either projection is hidden.
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-absence", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    )
+
+    # Phase 2 reuses those stores and changes only the captured layout flags.
+    from memory_server.runtime import daemon
+    from memory_server.runtime.runtime_factory import RuntimeFactory
+    from memory_server.runtime.runtime_manager import RuntimeManager
+
+    original_init = daemon.Daemon.__init__
+
+    def patched_init(self, registry_obj, *, policies, manager=None, clock=None):
+        def builder(layout, **kwargs):
+            return RuntimeFactory.create(layout, overrides={missing: lambda runtime: None}, **kwargs)
+
+        manager = RuntimeManager(factory_builder=builder)
+        original_init(
+            self, registry_obj, policies=policies, manager=manager, **({} if clock is None else {"clock": clock})
+        )
+
+    monkeypatch.setattr(daemon.Daemon, "__init__", patched_init)
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        status, body = await post(
+            port,
+            auth,
+            query="alpha owns beta",
+            mode="semantic",
+            filters={"source": None, "min_confidence": None},
+        )
+        if missing == "vector":
+            assert status == 503 and body["error"]["code"] == "E_CAPABILITY_UNAVAILABLE", body
+            status, body = await post(
+                port,
+                auth,
+                query="alpha beta",
+                mode="graph",
+                filters={"source": None, "min_confidence": None},
+            )
+            assert status == 200 and body["results"][0]["memory"]["id"] == "s08b-absence", body
+            status, body = await post(
+                port,
+                auth,
+                query="alpha owns beta",
+                mode="hybrid",
+                filters={"source": None, "min_confidence": None},
+            )
+            assert status == 200 and body["degraded"] == [{"source": "semantic", "code": "E_CAPABILITY_UNAVAILABLE"}], (
+                body
+            )
+        else:
+            assert status == 200 and body["results"][0]["memory"]["id"] == "s08b-absence", body
+            status, body = await post(
+                port,
+                auth,
+                query="alpha beta",
+                mode="graph",
+                filters={"source": None, "min_confidence": None},
+            )
+            assert status == 503 and body["error"]["code"] == "E_CAPABILITY_UNAVAILABLE", body
+            status, body = await post(
+                port,
+                auth,
+                query="alpha owns beta",
+                mode="hybrid",
+                filters={"source": None, "min_confidence": None},
+            )
+            assert status == 200 and body["degraded"] == [{"source": "graph", "code": "E_CAPABILITY_UNAVAILABLE"}], body
+
+
+@pytest.mark.asyncio
+async def test_s08b_sources_stage_audit_contract(tmp_path, similarity_embedder, monkeypatch):
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-stage", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        deps = holder.app.dependencies
+        active, stages, acquired = set(), [], []
+        acquire, measured = deps.leases.acquire, deps.metrics.retrieval_completed
+
+        @asynccontextmanager
+        async def watched(ctx):
+            with sqlite3.connect(tmp_path / "control" / "http-access" / "access.sqlite") as db:
+                assert db.execute(
+                    "SELECT state FROM access_audit WHERE request_id=?", (ctx.request_id,)
+                ).fetchone() == ("intent",)
+            async with acquire(ctx) as scope:
+                acquired.append(ctx.request_id)
+                active.add(ctx.request_id)
+                try:
+                    yield scope
+                finally:
+                    active.remove(ctx.request_id)
+
+        def record(ctx, stage, duration, code):
+            assert ctx.request_id in active and duration >= 0
+            stages.append((ctx.request_id, stage, code))
+            measured(ctx, stage, duration, code)
+
+        monkeypatch.setattr(deps.leases, "acquire", watched)
+        monkeypatch.setattr(deps.metrics, "retrieval_completed", record)
+        for mode, expected in (
+            ("semantic", {"semantic", "merge"}),
+            ("graph", {"graph", "merge"}),
+            ("hybrid", {"fts", "semantic", "graph", "merge"}),
+        ):
+            status, body = await post(port, auth, query="alpha owns beta", mode=mode)
+            assert status == 200, body
+            ident = body["request_id"]
+            observations = [(stage, code) for request, stage, code in stages if request == ident]
+            assert len(observations) == len(expected) and {stage for stage, _ in observations} == expected
+            assert all(code is None for _, code in observations)
+            assert acquired.count(ident) == 1
+            with sqlite3.connect(tmp_path / "control" / "http-access" / "access.sqlite") as db:
+                assert db.execute("SELECT state FROM access_audit WHERE request_id=?", (ident,)).fetchall() == [
+                    ("terminal",)
+                ]
+
+
+@pytest.mark.asyncio
+async def test_s08b_graph_untrusted_relations_are_not_memories(tmp_path, similarity_embedder):
+    registry = await prepare_indexed_registry(
+        tmp_path,
+        [
+            {"id": "s08b-graph-control", "subject": "alpha", "predicate": "owns", "object": "beta"},
+            {
+                "id": "s08b-decision-trap",
+                "subject": "trapdecision",
+                "predicate": "owns",
+                "object": "beta",
+                "index": False,
+            },
+            {"id": "s08b-skill-trap", "subject": "trapskill", "predicate": "owns", "object": "beta", "index": False},
+            {"id": "s08b-case-collision", "subject": "ALPHA", "predicate": "owns", "object": "beta", "index": False},
+        ],
+        graph_nodes=[
+            ("trapdecision", "decision", "trapdecision"),
+            ("trapskill", "skill", "trapskill"),
+            ("uuid-trap", "entity", "s08b-graph-control"),
+        ],
+        graph_edges=[
+            ("trapdecision", "beta", "owns"),
+            ("trapskill", "beta", "owns"),
+            ("uuid-trap", "beta", "owns"),
+            ("beta", "alpha", "owns"),
+        ],
+    )
+    async with live_server(tmp_path, registry=registry) as (_, port, auth):
+        status, body = await post(
+            port, auth, query="alpha beta trapdecision trapskill s08b-graph-control", mode="graph"
+        )
+        assert status == 200, body
+        assert [hit["memory"]["id"] for hit in body["results"]] == ["s08b-graph-control"]
+        assert body["degraded"] == []
+
+
+@pytest.mark.asyncio
+async def test_s08b_repeated_cancel_retains_native_lease(tmp_path, similarity_embedder, monkeypatch):
+    import threading
+
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-cancel", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        status, body = await post(port, auth, query="alpha owns beta", mode="semantic")
+        assert status == 200, body
+        entered, release = threading.Event(), threading.Event()
+        async with await read_scope(holder, auth) as scope:
+            runtime = scope.runtime
+            router = await scope.application.retrieval._get_embedding_router()
+            embed = router._embedder.embed
+
+            def held(text):
+                entered.set()
+                release.wait()
+                return embed(text)
+
+            monkeypatch.setattr(router._embedder, "embed", held)
+        principal = await holder.app.dependencies.tokens.authenticate(
+            auth["Authorization"].removeprefix("Bearer "), now=datetime.now(UTC)
+        )
+        ctx = RequestContext("s08b-repeat-cancel", principal, "alpha", None, monotonic() + 30)
+        command = d.COMMAND_TYPES["search"](
+            operation="search",
+            profile_id="alpha",
+            path_ids={},
+            payload=d.SearchRequest(
+                query="alpha owns beta", mode="semantic", filters=d.SearchFilters(source=None, min_confidence=None)
+            ),
+        )
+        task = asyncio.create_task(holder.app.dependencies.ports["search"].execute(ctx, command))
+        try:
+            async with asyncio.timeout(5):
+                while not entered.is_set():
+                    await asyncio.sleep(0.001)
+            captured = runtime.owned_snapshot()[2]
+            for _ in range(2):
+                task.cancel()
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                assert not task.done()
+                assert holder.app.dependencies.leases.snapshot()["alpha"].admissions == 1
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert all(record.state == "TERMINATED" for record in captured)
+        assert holder.app.dependencies.leases.snapshot()["alpha"].admissions == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["getter", "vector-submit"])
+async def test_s08b_runtime_authority_is_not_backend_failure(tmp_path, similarity_embedder, monkeypatch, boundary):
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-ready", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        status, body = await post(port, auth, query="alpha owns beta", mode="semantic")
+        assert status == 200, body
+        from memory_server.runtime.errors import RuntimeNotReadyError
+
+        async with await read_scope(holder, auth) as scope:
+            retrieval = scope.application.retrieval
+
+            async def not_ready():
+                raise RuntimeNotReadyError()
+
+            if boundary == "getter":
+                monkeypatch.setattr(retrieval, "_get_embedding_router", not_ready)
+            else:
+                router = await retrieval._get_embedding_router()
+
+                async def submit_not_ready(*args, **kwargs):
+                    raise RuntimeNotReadyError()
+
+                monkeypatch.setattr(router._vector_provider, "_native_submitter", submit_not_ready)
+        for mode in ("semantic", "hybrid"):
+            status, body = await post(port, auth, query="alpha owns beta", mode=mode)
+            assert status == 503 and body["error"]["code"] == "E_RUNTIME_NOT_READY", body
 
 
 @pytest.mark.asyncio
@@ -90,6 +932,294 @@ async def test_s08a_metadata_filter_accepted_over_tcp(tmp_path):
     finally:
         holder.server.should_exit = True
         await asyncio.wait_for(task, 10)
+
+
+@pytest.mark.asyncio
+async def test_s08b_case3b_inactive_window_keeps_active_and_newest_eight(tmp_path, similarity_embedder):
+    rows = [{"id": "s08b-window-active", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    rows += [
+        {
+            "id": f"s08b-window-inactive-{index}",
+            "subject": "alpha",
+            "predicate": "owns",
+            "object": "beta",
+            "lifecycle_state": "rejected",
+            "index": False,
+            "created_at": datetime(2025, 1, 1, tzinfo=UTC) + timedelta(days=index),
+        }
+        for index in range(9)
+    ]
+    registry = await prepare_indexed_registry(
+        tmp_path,
+        rows,
+        vector_points=[
+            {
+                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"fact:s08b-window-inactive-{index}")),
+                "text": "alpha owns beta",
+                "payload": {"subject": "alpha", "predicate": "owns", "object": "beta", "memory_type": "fact"},
+            }
+            for index in range(9)
+        ],
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        status, body = await post(
+            port,
+            auth,
+            query="alpha beta",
+            mode="graph",
+            include_inactive=True,
+            limit=100,
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 200, body
+        ids = [hit["memory"]["id"] for hit in body["results"]]
+        assert "s08b-window-active" in ids
+        assert "s08b-window-inactive-0" not in ids
+        assert {ident for ident in ids if ident.startswith("s08b-window-inactive-")} == {
+            f"s08b-window-inactive-{index}" for index in range(1, 9)
+        }
+        for inactive, expected_count in ((False, 1), (True, 9)):
+            status, body = await post(
+                port, auth, query="alpha owns beta", mode="semantic", include_inactive=inactive, limit=100
+            )
+            assert status == 200 and body["total"] == expected_count, body
+            ids = {hit["memory"]["id"] for hit in body["results"]}
+            assert "s08b-window-active" in ids and "s08b-window-inactive-0" not in ids
+
+
+@pytest.mark.asyncio
+async def test_s08b_graph_budget_refuses_501_nodes(tmp_path, similarity_embedder):
+    registry = await prepare_indexed_registry(
+        tmp_path, [], graph_nodes=[(f"s08b-budget-{index}", "entity", f"budget-{index}") for index in range(501)]
+    )
+    async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+        status, body = await post(
+            port,
+            auth,
+            query="budget-1",
+            mode="graph",
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 503 and body["error"]["code"] == "E_GRAPH_BACKEND", body
+        status, body = await post(
+            port,
+            auth,
+            query="budget-1",
+            mode="hybrid",
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 200, body
+        assert body["degraded"] == [{"source": "graph", "code": "E_GRAPH_BACKEND"}]
+        # Only reached after the real HTTP bounded path succeeds; baseline RED
+        # remains assertion-level rather than importing an absent production API.
+        from memory_server.providers.graph_provider import GraphBudgetExceeded, SimpleGraph
+        from memory_server.router.graph_router import GraphRouter
+
+        caps = dict(max_nodes=500, max_edges=1000, max_pairs=100, max_depth=4)
+
+        class NoValues(dict):
+            def values(self):
+                raise AssertionError("materialized oversized graph")
+
+        oversized = SimpleGraph()
+        for index in range(501):
+            oversized.add_node(f"n{index}", "entity", f"name{index}")
+        oversized._nodes = NoValues(oversized._nodes)
+        with pytest.raises(GraphBudgetExceeded) as caught:
+            GraphRouter(graph=oversized).query_bounded("none", **caps)
+        assert (caught.value.dimension, caught.value.limit, caught.value.attempted) == ("nodes", 500, 501)
+        for size in (499, 500):
+            graph = SimpleGraph()
+            for index in range(size):
+                graph.add_node(f"n{index}", "entity", "focus" if index == 0 else f"name{index}")
+            assert len(GraphRouter(graph=graph).query_bounded("focus", **caps)["entities"]) == 1
+        graph = SimpleGraph()
+        graph.add_node("a", "entity", "focus")
+        graph.add_node("b", "entity", "other")
+        for index in range(1001):
+            graph.add_edge("a", "b", f"r{index}")
+        with pytest.raises(GraphBudgetExceeded) as caught:
+            GraphRouter(graph=graph).query_bounded("focus", **caps)
+        assert (caught.value.dimension, caught.value.limit, caught.value.attempted) == ("edges", 1000, 1001)
+        with pytest.raises(GraphBudgetExceeded) as caught:
+            graph.get_neighbors("a", edge_limit=1000)
+        assert (caught.value.dimension, caught.value.limit, caught.value.attempted) == ("edges", 1000, 1001)
+        graph = SimpleGraph()
+        for index in range(15):
+            graph.add_node(f"n{index}", "entity", f"match{index}")
+        with pytest.raises(GraphBudgetExceeded) as caught:
+            GraphRouter(graph=graph).query_bounded(" ".join(f"match{i}" for i in range(15)), **caps)
+        assert (caught.value.dimension, caught.value.limit, caught.value.attempted) == ("pairs", 100, 101)
+        graph = SimpleGraph()
+        for index in range(6):
+            graph.add_node(f"n{index}", "entity", f"chain{index}")
+        for index in range(5):
+            graph.add_edge(f"n{index}", f"n{index + 1}", "r")
+        with pytest.raises(GraphBudgetExceeded) as caught:
+            GraphRouter(graph=graph).query_bounded("chain0 chain5", **caps)
+        assert (caught.value.dimension, caught.value.limit, caught.value.attempted) == ("depth", 4, 5)
+        graph = SimpleGraph()
+        for ident in ("s", "a", "b", "t"):
+            graph.add_node(ident, "entity", ident)
+        for source, target in (("s", "a"), ("s", "b"), ("a", "t"), ("b", "t")):
+            graph.add_edge(source, target, "r")
+        assert [[n.id for n in path] for path in graph.find_path("s", "t", node_limit=10)] == [
+            ["s", "a", "t"],
+            ["s", "b", "t"],
+        ]
+        dense = SimpleGraph()
+        for ident in ["source", "target", *[f"left{i}" for i in range(16)], *[f"right{i}" for i in range(16)]]:
+            dense.add_node(ident, "entity", ident)
+        for i in range(16):
+            dense.add_edge("source", f"left{i}", "r")
+            dense.add_edge(f"right{i}", "target", "r")
+            for j in range(16):
+                dense.add_edge(f"left{i}", f"right{j}", "r")
+        with pytest.raises(GraphBudgetExceeded) as caught:
+            GraphRouter(graph=dense).query_bounded("source target", **caps)
+        assert (caught.value.dimension, caught.value.limit, caught.value.attempted) == ("nodes", 500, 501)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_path", ["embed", "graph", "vector"])
+async def test_s08b_deadline_late_native_custody(tmp_path, similarity_embedder, monkeypatch, native_path):
+    import threading
+
+    registry = await prepare_indexed_registry(
+        tmp_path, [{"id": "s08b-late", "subject": "alpha", "predicate": "owns", "object": "beta"}]
+    )
+    holder, task, port, auth = await _start(
+        tmp_path, request_timeout_seconds=0.2, retrieval_concurrency=1, registry=registry
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    request = None
+    try:
+        status, body = await post(port, auth, query="alpha owns beta", mode="semantic")
+        assert status == 200, body
+        async with await read_scope(holder, auth) as scope:
+            runtime = scope.runtime
+            original_submit = runtime.submit_native
+            gate_used = False
+
+            async def wrapped_submit(function, /, *args, kind, **kwargs):
+                nonlocal gate_used
+                should_gate = (
+                    (native_path == "embed" and kind == "retrieval-embed")
+                    or (native_path == "vector" and "lancedb" in kind)
+                    or (native_path == "graph" and not gate_used)
+                )
+                if not should_gate:
+                    return await original_submit(function, *args, kind=kind, **kwargs)
+
+                gate_used = True
+
+                def held(*call_args, **call_kwargs):
+                    entered.set()
+                    while not release.wait(0.01):
+                        pass
+                    return function(*call_args, **call_kwargs)
+
+                return await original_submit(held, *args, kind=kind, **kwargs)
+
+            monkeypatch.setattr(runtime, "submit_native", wrapped_submit)
+            if native_path == "vector":
+                # The provider captured its bound submitter at construction.
+                # Wrap that real boundary too, not a fake async search result.
+                router = await scope.application.retrieval._get_embedding_router()
+                monkeypatch.setattr(router._vector_provider, "_native_submitter", wrapped_submit)
+
+        request = asyncio.create_task(
+            post(
+                port,
+                auth,
+                query="alpha owns beta" if native_path != "graph" else "alpha beta",
+                mode="semantic" if native_path != "graph" else "graph",
+                filters={"source": None, "min_confidence": None},
+            )
+        )
+        async with asyncio.timeout(5):
+            while not entered.is_set():
+                await asyncio.sleep(0.01)
+        deadline = monotonic() + 0.3
+        while monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert not request.done()
+        observation = holder.app.dependencies.leases.snapshot()["alpha"]
+        assert observation.admissions == 1
+        captured = runtime.owned_snapshot()[2]
+        assert any(record.state != "TERMINATED" for record in captured)
+        with sqlite3.connect(tmp_path / "control" / "http-access" / "access.sqlite") as db:
+            assert db.execute("SELECT count(*) FROM access_audit WHERE state='intent'").fetchone()[0] == 1
+
+        concurrent_status, _ = await post(
+            port,
+            auth,
+            query="alpha owns beta",
+            mode="keyword",
+            filters={"source": None, "min_confidence": None},
+        )
+        assert concurrent_status == 429
+    finally:
+        # This must run even when an assertion above fails, or the native thread
+        # would retain the lease and prevent daemon shutdown.
+        release.set()
+        if request is not None:
+            status, body = await request
+            assert status == 504, body
+            assert all(record.state == "TERMINATED" for record in captured)
+            assert holder.app.dependencies.leases.snapshot()["alpha"].admissions == 0
+            with sqlite3.connect(tmp_path / "control" / "http-access" / "access.sqlite") as db:
+                state = db.execute(
+                    "SELECT state FROM access_audit WHERE request_id=?", (body["error"]["request_id"],)
+                ).fetchone()
+            assert state == ("terminal",)
+            assert body["error"]["code"] == "E_TIMEOUT"
+            status, body = await post(
+                port,
+                auth,
+                query="alpha",
+                mode="keyword",
+                filters={"source": None, "min_confidence": None},
+            )
+            assert status == 200, body
+        holder.server.should_exit = True
+        await asyncio.wait_for(task, 10)
+
+
+@pytest.mark.asyncio
+async def test_s08b_filter_and_trace_rejections_remain_prelease(tmp_path, similarity_embedder, monkeypatch):
+    async with live_server(tmp_path) as (holder, port, auth):
+        calls = []
+        original = holder.app.dependencies.leases.acquire
+
+        def counted(ctx):
+            calls.append(ctx.request_id)
+            return original(ctx)
+
+        monkeypatch.setattr(holder.app.dependencies.leases, "acquire", counted)
+        for payload in (
+            {
+                "query": "alpha owns beta",
+                "mode": "semantic",
+                "trace": True,
+                "filters": {"source": None, "min_confidence": None},
+            },
+            {
+                "query": "alpha owns beta",
+                "mode": "semantic",
+                "filters": {"source": "forbidden", "min_confidence": None},
+            },
+            {
+                "query": "alpha owns beta",
+                "mode": "semantic",
+                "filters": {"tags": ["forbidden"], "source": None, "min_confidence": None},
+            },
+        ):
+            status, body = await post(port, auth, **payload)
+            assert status in {422, 503}
+            assert body["error"]["code"] in {"E_VALIDATION", "E_CAPABILITY_UNAVAILABLE"}
+        assert calls == []
 
 
 @pytest.mark.asyncio
@@ -121,8 +1251,8 @@ async def test_s08a_context_mounted_over_tcp(tmp_path):
 
 
 @asynccontextmanager
-async def live_server(tmp_path):
-    holder, task, port, auth = await _start(tmp_path)
+async def live_server(tmp_path, *, registry=None):
+    holder, task, port, auth = await _start(tmp_path, registry=registry)
     try:
         yield holder, port, auth
     finally:
@@ -181,6 +1311,87 @@ async def insert_facts(resources, rows):
             )
             values.update(row)
             session.add(FactORM(**values))
+
+
+async def seed_indexed_fact(scope, ident, subject, predicate, object_, *, confidence=0.8, lifecycle_state="active"):
+    """Write canonical SQLite plus the real transactional indexing outbox."""
+    from memory_server.models import Fact, MemoryReceipt
+
+    created = datetime(2026, 1, 1, tzinfo=UTC)
+    fact = Fact(
+        id=ident,
+        subject=subject,
+        predicate=predicate,
+        object=object_,
+        dedup_key=ident,
+        confidence=confidence,
+        source="s08b-test-source",
+        creator="s08b-test-creator",
+        created_at=created,
+        updated_at=created,
+        lifecycle_state=lifecycle_state,
+    )
+    receipt = MemoryReceipt(
+        id=ident,
+        memory_type="fact",
+        source="s08b-test-receipt",
+        created_by="s08b-test-creator",
+        timestamp=created,
+        confidence=confidence,
+        lifecycle_state=lifecycle_state,
+    )
+    resources = scope.application.read_resources()
+    await resources.provider.create_in_transaction(
+        fact=fact,
+        receipt=receipt,
+        outbox_entries=[
+            {
+                "record_type": "fact",
+                "record_id": ident,
+                "operation": "index_fact",
+                "payload": {
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": object_,
+                    "source": "s08b-test-source",
+                },
+            }
+        ],
+    )
+    return fact
+
+
+async def wait_for_index(scope, ident, query_text, *, graph_names=()):
+    """Poll real vector/graph projections and outbox state without fixed sleeps."""
+    vector_service = getattr(scope.application, "retrieval", None)
+    deadline = monotonic() + 10
+    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"fact:{ident}"))
+    while monotonic() < deadline:
+        vector_ready = False
+        if vector_service is not None:
+            try:
+                router = await vector_service._get_embedding_router()
+                hits = await router._vector_provider.search(
+                    collection=router._collection,
+                    vector=router._embedder.embed(query_text),
+                    limit=10,
+                )
+                vector_ready = any(hit.get("id") == point_id for hit in hits)
+            except (AttributeError, ValueError):
+                vector_ready = False
+        graph_ready = True
+        if graph_names:
+            try:
+                graph_service = scope.application.graph
+                graph_router = await graph_service._get_graph_router()
+                names = {node.name for node in graph_router.graph.get_all_nodes()}
+                graph_ready = set(graph_names) <= names
+            except (AttributeError, TypeError, ValueError):
+                graph_ready = False
+        if vector_ready and graph_ready:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"index readback timed out for {ident}")
 
 
 @pytest.mark.asyncio
@@ -317,6 +1528,73 @@ async def test_debug_logs_exclude_retrieval_bind_parameters(tmp_path, caplog, mo
 
 
 @pytest.mark.asyncio
+async def test_s08b_audit_stages_privacy_real_lancedb_failure(tmp_path, similarity_embedder, caplog):
+    from pathlib import Path
+
+    with caplog.at_level(logging.DEBUG):
+        registry = await prepare_indexed_registry(
+            tmp_path,
+            [
+                {
+                    "id": "s08b-real-failure",
+                    "subject": "PRIVACY_SUBJECT_CANARY",
+                    "predicate": "PRIVACY_PREDICATE_CANARY",
+                    "object": "PRIVACY_OBJECT_CANARY",
+                }
+            ],
+        )
+        async with live_server(tmp_path, registry=registry) as (holder, port, auth):
+            async with await read_scope(holder, auth) as scope:
+                router = await scope.application.retrieval._get_embedding_router()
+                provider = router._vector_provider
+                store = Path(provider._db_path)
+                manifests = tuple((store / "memories.lance" / "_versions").glob("*.manifest"))
+                assert manifests
+                backups = {path: path.read_bytes() for path in manifests}
+                # Corrupt real backend manifests without replacing the admitted
+                # projection root (which would test runtime identity instead).
+                for path in manifests:
+                    path.write_bytes(b"not a LanceDB manifest")
+            try:
+                status, body = await post(
+                    port,
+                    auth,
+                    query="REAL_BACKEND_QUERY_CANARY",
+                    mode="semantic",
+                    filters={"source": None, "min_confidence": None},
+                )
+                assert status == 503 and body["error"]["code"] == "E_VECTOR_BACKEND", body
+                assert "REAL_BACKEND_QUERY_CANARY" not in json.dumps(body)
+                with sqlite3.connect(tmp_path / "control" / "http-access" / "access.sqlite") as db:
+                    state = db.execute(
+                        "SELECT state FROM access_audit WHERE request_id=?", (body["error"]["request_id"],)
+                    ).fetchone()
+                assert state == ("terminal",)
+            finally:
+                for path, original in backups.items():
+                    path.write_bytes(original)
+
+        provider_records = [record for record in caplog.records if "lancedb" in record.name.lower()]
+        assert provider_records, [(record.name, record.getMessage()) for record in caplog.records]
+        assert any("Search failed:" in record.getMessage() for record in provider_records)
+        leaked = [
+            record
+            for record in caplog.records
+            if any(
+                canary in record.getMessage()
+                for canary in (
+                    "REAL_BACKEND_QUERY_CANARY",
+                    "PRIVACY_SUBJECT_CANARY",
+                    "PRIVACY_PREDICATE_CANARY",
+                    "PRIVACY_OBJECT_CANARY",
+                    "TASK_CANARY",
+                )
+            )
+        ]
+        assert not leaked, [(record.name, record.getMessage()) for record in leaked]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["task", "subject", "query"])
 @pytest.mark.parametrize("control", ["\n", "\t", "\x00"])
 async def test_nonprintable_retrieval_rejected_before_audit_and_lease(tmp_path, monkeypatch, field, control):
@@ -374,20 +1652,21 @@ async def test_preflight_audit_modes_and_canaries(tmp_path, caplog, monkeypatch)
                 ("context", {"trace": True}),
             ):
                 status, body = await post(port, auth, operation=operation, profile=profile, **change)
-                assert status == 503 and body["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
-        assert not calls
-        # Rejections precede audit and lease, not merely before SQL.
+                if change.get("trace"):
+                    assert status == 503 and body["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
+                else:
+                    assert status == 200, body
+        assert len(calls) == 4
+        # Validation and trace rejection still precede audit and lease.
         with sqlite3.connect(tmp_path / "control" / "http-access" / "access.sqlite") as db:
-            assert db.execute("SELECT count(*) FROM access_audit").fetchone()[0] == 0
+            rows = db.execute("SELECT operation,state FROM access_audit ORDER BY rowid").fetchall()
+        assert len(rows) == 4 and all(state == "terminal" for _, state in rows)
         status, keyword = await post(port, auth, query="alpha")
         status2, hybrid = await post(port, auth, query="alpha", mode="hybrid")
         assert status == status2 == 200
-        assert keyword["results"] == hybrid["results"] and keyword["total"] == 1
-        assert keyword["degraded"] == []
-        assert hybrid["degraded"] == [
-            {"source": source, "code": "E_CAPABILITY_UNAVAILABLE"} for source in ("semantic", "graph")
-        ]
-        for hit in hybrid["results"]:
+        assert keyword["total"] == hybrid["total"] == 1
+        assert keyword["degraded"] == [] and hybrid["degraded"] == []
+        for hit in keyword["results"]:
             assert hit["source"] == "fts" and hit["score"] == 0.0 and hit["memory"]["masked"]
         assert "CANARY_filter" not in caplog.text and "CANARY_tag" not in caplog.text
 

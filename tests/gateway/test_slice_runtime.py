@@ -332,7 +332,6 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
         async def search(profile, payload):
             eligible = not (
                 payload.get("trace")
-                or payload.get("mode") in ("semantic", "graph")
                 or any(payload.get("filters", {}).get(f) for f in ("tags",))
                 or payload.get("filters", {}).get("source") is not None
             )
@@ -345,7 +344,7 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
                 eligible=eligible,
             )
 
-        base = {"query": "alpha-unique-marker", "filters": {"source": None, "min_confidence": None}}
+        base = {"query": "alpha-unique-marker", "mode": "keyword", "filters": {"source": None, "min_confidence": None}}
         status, result = await search("alpha", base)
         assert status == 200 and result["total"] == 1, result
         assert result["results"][0]["memory"]["id"] == "alpha-marker"
@@ -354,20 +353,19 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
         assert result["results"][0]["source"] == "fts"
         assert result["results"][0]["memory"]["content"] is None
         assert result["trace_id"] is None
-        assert result["degraded"] == [
-            {"source": source, "code": "E_CAPABILITY_UNAVAILABLE"} for source in ("semantic", "graph")
-        ]
+        assert result["degraded"] == []
         for limit in (1, 100):
             status, limited = await search("alpha", {**base, "query": "common-marker", "limit": limit})
             assert status == 200 and limited["total"] == min(limit, 3)
 
         status, result = await search("alpha", {**base, "mode": "hybrid"})
-        assert status == 200 and [item["source"] for item in result["degraded"]] == ["semantic", "graph"]
+        assert status == 200 and result["degraded"] == []
+        assert result["results"][0]["score"] == 1.0
         status, result = await search("alpha", {**base, "mode": "keyword"})
         assert status == 200 and result["degraded"] == []
         for mode in ("semantic", "graph"):
             status, result = await search("alpha", {**base, "mode": mode})
-            assert status == 503 and result["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
+            assert status == 200 and result["degraded"] == [], result
         status, result = await search("alpha", {**base, "trace": True})
         assert status == 503 and result["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
         status, result = await search("alpha", {**base, "filters": {**base["filters"], "memory_types": ["fact"]}})
