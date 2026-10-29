@@ -1,39 +1,54 @@
-"""Bounded, profile-scoped memory reads and fail-closed projections.
+"""Scoped, borrowed-session reads; fresh allowlisted DTOs, never raw caches.
 
-The service deliberately receives its lease and read binder.  It never reaches
-through a runtime/application object to discover a provider, and every response
-is projected into a new DTO before it crosses the transport boundary.
+upper is the maximum matching creation key at issue time, not an insertion
+watermark; backdated inserts at or below upper may appear; pages are not an
+MVCC snapshot. Admission heuristics are not a complete secret-detection policy.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import hmac
 import json
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Literal
 
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from memory_server.admission import MemoryAdmissionGate
 from memory_server.gateway_contracts import dto as d
-from memory_server.gateway_contracts.ports import MemoryReadPort, ProfileLeases, RequestContext
+from memory_server.gateway_contracts.ports import (
+    MemoryReadPort,
+    ProfileLeases,
+    ProfileSession,
+    RequestContext,
+    TracePort,
+)
 from memory_server.transports.http.errors import HttpError
+
+if TYPE_CHECKING:
+    from memory_server.providers.sqlite_provider import SQLiteProvider
 
 ReadClassification = Literal["clean", "sensitive", "unknown"]
 
 
 @dataclass(frozen=True)
 class ReadResources:
-    provider: Any
-    session_factory: Any
+    provider: SQLiteProvider
+    session_factory: Callable[[], AsyncSession]
 
 
 @dataclass(frozen=True)
 class ReadRecord:
-    memory: Any
+    memory: dict
     memory_type: str
-    receipt: Any | None = None
-    history: tuple[Any, ...] = ()
+    receipt: dict | None = None
+    history: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -44,11 +59,18 @@ class ReadKey:
 
 
 @dataclass(frozen=True)
+class HistoryKey:
+    timestamp: str | None
+    id: str
+
+
+@dataclass(frozen=True)
 class HistorySlice:
-    events: tuple[Any, ...]
+    events: tuple
     has_more: bool
     incomplete: bool
-    upper: Any | None
+    upper: HistoryKey | None
+    keys: tuple[HistoryKey, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,243 +80,365 @@ class MemorySlice:
     upper: ReadKey | None
 
 
-class CursorCodec:
-    """Canonical signed cursors bound to the authenticated read identity."""
-
-    def __init__(self, key: bytes, ttl_seconds: int = 900):
-        if len(key) < 32 or not 1 <= ttl_seconds <= 900:
-            raise ValueError("invalid cursor configuration")
-        self._key, self.ttl = key, ttl_seconds
-
-    @staticmethod
-    def _b64(value: bytes) -> str:
-        return base64.urlsafe_b64encode(value).decode().rstrip("=")
-
-    @staticmethod
-    def _unb64(value: str) -> bytes:
-        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-
-    def issue(
-        self, ctx: RequestContext, command: Any, *, last: ReadKey, upper: ReadKey, limit: int, now: datetime
-    ) -> str:
-        payload = {
-            "v": 1,
-            "profile_id": ctx.profile_id,
-            "subject": ctx.principal.subject,
-            "operation": command.operation,
-            "filter_sha256": _filter_digest(command),
-            "last": [last.created_at, last.memory_type, last.id],
-            "upper": [upper.created_at, upper.memory_type, upper.id],
-            "limit": limit,
-            "issued_at": now.astimezone(UTC).isoformat(),
-            "expires_at": (now + timedelta(seconds=self.ttl)).astimezone(UTC).isoformat(),
-        }
-        body = self._b64(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
-        sig = self._b64(hmac.new(self._key, body.encode(), hashlib.sha256).digest())
-        return body + "." + sig
-
-    def validate(self, principal: Any, command: Any, token: str, *, now: datetime) -> dict[str, Any]:
-        try:
-            body, sig = token.split(".")
-            raw = self._unb64(body)
-            data = json.loads(raw)
-            expected = hmac.new(self._key, body.encode(), hashlib.sha256).digest()
-        except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-            raise HttpError("E_CURSOR_INVALID") from None
-        if not hmac.compare_digest(expected, self._unb64(sig)) or not isinstance(data, dict):
-            raise HttpError("E_CURSOR_INVALID")
-        if (
-            data.get("v"),
-            data.get("profile_id"),
-            data.get("subject"),
-            data.get("operation"),
-            data.get("filter_sha256"),
-        ) != (1, command.profile_id, principal.subject, command.operation, _filter_digest(command)):
-            raise HttpError("E_CURSOR_INVALID")
-        try:
-            expiry = datetime.fromisoformat(data["expires_at"])
-            issued = datetime.fromisoformat(data["issued_at"])
-        except (KeyError, TypeError, ValueError):
-            raise HttpError("E_CURSOR_INVALID") from None
-        if now >= expiry:
-            raise HttpError("E_CURSOR_EXPIRED")
-        if expiry < issued or expiry - issued > timedelta(seconds=self.ttl):
-            raise HttpError("E_CURSOR_INVALID")
-        if type(data.get("limit")) is not int or not 1 <= data["limit"] <= 200:
-            raise HttpError("E_CURSOR_INVALID")
-        if data["limit"] < command.payload.limit:
-            raise HttpError("E_CURSOR_INVALID")
-        if not (isinstance(data.get("last"), list) and len(data["last"]) == 3):
-            raise HttpError("E_CURSOR_INVALID")
-        return data
+def utc(value):
+    dt = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
 
 
-def _filter_digest(command: Any) -> str:
-    payload = command.payload.model_dump(mode="json") if hasattr(command.payload, "model_dump") else command.payload
-    payload = {k: v for k, v in payload.items() if k != "cursor"} if isinstance(payload, dict) else payload
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
-def classify_read_content(record: ReadRecord, gate: Any) -> ReadClassification:
-    """Visit all exposed content; unknown, malformed and over-budget are masked."""
-    values: list[str] = []
+def b64(value):
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+
+def unb64(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("invalid encoding")
+    raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+    if b64(raw) != value:
+        raise ValueError("noncanonical encoding")
+    return raw
+
+
+def filter_digest(command):
+    return hashlib.sha256(
+        canonical(
+            {
+                "path_ids": command.path_ids,
+                "filters": command.payload.model_dump(mode="json", exclude={"cursor", "limit"}),
+            }
+        )
+    ).hexdigest()
+
+
+def key_order(key):
+    if isinstance(key, ReadKey):
+        return key.created_at, key.memory_type, key.id
+    source, source_id, index = json.loads(unb64(key.id))
+    return (key.timestamp is not None, key.timestamp or "", 0 if source == "receipt" else 1, source_id, index)
+
+
+def classify_read_content(record: ReadRecord, gate) -> ReadClassification:
+    """Visit raw fields before projection; no truncated-prefix declassification."""
+    budget = 32768
+    sensitive = False
     try:
 
-        def visit(value: Any) -> None:
+        def visit(value, depth=0):
+            nonlocal budget, sensitive
+            if depth > 32:
+                raise ValueError
             if isinstance(value, str):
-                values.append(value)
+                budget -= len(value)
+                if budget < 0:
+                    raise ValueError
+                if value:
+                    decision = gate.classify(value, force=False, source_scope="server")
+                    if not decision.admitted:
+                        raise ValueError
+                    sensitive |= bool(decision.metadata.get("risk_tags"))
             elif isinstance(value, dict):
-                for item in value.values():
-                    visit(item)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    visit(item)
-            elif value is not None and not isinstance(value, (int, float, bool)):
-                raise ValueError("unsupported content")
+                if value.get("risk_tags"):
+                    sensitive = True
+                for k, v in value.items():
+                    if not isinstance(k, str):
+                        raise ValueError
+                    visit(k, depth + 1)
+                    visit(v, depth + 1)
+            elif isinstance(value, (tuple, list)):
+                for child in value:
+                    visit(child, depth + 1)
+            elif value is not None and type(value) not in (float, int, bool, datetime):
+                raise ValueError
 
-        visit(getattr(record.memory, "__dict__", record.memory))
-        visit(getattr(record.receipt, "__dict__", record.receipt))
-        if sum(map(len, values)) > 32768:
-            return "unknown"
-        for value in values:
-            if getattr(gate, "admit", None) is None or not gate.admit(value, force=False, scope="server"):
-                return "sensitive"
-        tags = getattr(record.memory, "risk_tags", ()) or ()
-        if tags:
-            return "sensitive"
-        return "clean"
+        memory = dict(record.memory)
+        for field in ("tags", "source_ids", "rejected_alternatives", "steps", "constraints", "validation"):
+            if field in memory and memory[field] is not None:
+                if isinstance(memory[field], str):
+                    memory[field] = json.loads(memory[field])
+                if not isinstance(memory[field], list) or not all(isinstance(v, str) for v in memory[field]):
+                    raise ValueError
+        visit(memory)
+        visit(record.receipt)
+        visit(record.history)
+        if record.memory.get("risk_tags"):
+            sensitive = True
+        return "sensitive" if sensitive else "clean"
     except Exception:
         return "unknown"
 
 
-def project_for_caller(
-    ctx: RequestContext, operation: str, record: ReadRecord, classification: ReadClassification
-) -> Any:
-    """Construct a fresh masked DTO; only clean authorized reveal can be raw."""
-    reveal = (
-        operation == "memories.reveal" and "memory.reveal" in ctx.principal.permissions and classification == "clean"
-    )
-    value = record.memory
-    if isinstance(value, d.Memory):
-        if reveal:
-            return value.model_copy(deep=True)
-        return value.model_copy(
-            update={
-                "content": None,
-                "payload": None,
-                "source": None,
-                "creator": None,
-                "source_version": value.source_version if type(value.source_version) in (str, int) else None,
-                "risk_tags": [],
-                "masked": True,
-            },
-            deep=True,
-        )
-    if isinstance(value, d.Receipt):
-        if reveal:
-            return value.model_copy(deep=True)
-        return value.model_copy(
-            update={
-                "source": None,
-                "created_by": None,
-                "source_version": None,
-                "history": [],
-                "history_complete": False,
-            },
-            deep=True,
-        )
-    if isinstance(value, d.HistoryEvent):
-        return value.model_copy(update={"actor": None, "reason": None, "evidence": None}, deep=True)
-    return value
+def revision(record):
+    value = record.memory.get("version")
+    if record.memory_type == "belief":
+        return value if type(value) is int and value > 0 else None
+    if record.memory_type == "fact" and type(value) is str and re.fullmatch(r"[0-9]+", value):
+        try:
+            parsed = int(value)
+            return parsed if parsed > 0 else None
+        except ValueError:
+            return None
+    return None
 
 
-def check_reveal_revision(memory_type: str, expected_revision: int | None, observed_revision: int | None) -> None:
-    if expected_revision is None:
-        if memory_type in {"fact", "belief"}:
-            raise HttpError("E_PRECONDITION_REQUIRED")
-        return
-    if observed_revision is None:
+def check_reveal_revision(memory_type, expected_revision, observed_revision):
+    if memory_type in {"decision", "skill"}:
+        if expected_revision is not None:
+            raise HttpError("E_VALIDATION")
+    elif expected_revision is None:
+        raise HttpError("E_PRECONDITION_REQUIRED")
+    elif observed_revision is None:
         raise HttpError("E_CAPABILITY_UNAVAILABLE")
-    if expected_revision != observed_revision:
+    elif expected_revision != observed_revision:
         raise HttpError("E_VERSION_CONFLICT")
 
 
+def _payload(record):
+    value, kind = record.memory, record.memory_type
+    fields = {
+        "fact": ("subject", "predicate", "object"),
+        "belief": ("proposition", "tags", "source_ids"),
+        "decision": ("context", "choice", "rejected_alternatives", "reason"),
+        "skill": ("name", "purpose", "steps", "constraints", "validation", "success_rate"),
+    }[kind]
+    values = {field: value[field] for field in fields}
+    for field in {"tags", "source_ids", "rejected_alternatives", "steps", "constraints", "validation"} & values.keys():
+        if isinstance(values[field], str):
+            values[field] = json.loads(values[field])
+    if kind == "skill":
+        values["skill_version"] = value["version"]
+    cls = {"fact": d.FactPayload, "belief": d.BeliefPayload, "decision": d.DecisionPayload, "skill": d.SkillPayload}[
+        kind
+    ]
+    return cls.model_validate(values)
+
+
+def project_for_caller(ctx, operation, record, classification):
+    """Fresh C4 allowlist, whole-null payload/evidence, no mutable raw cache."""
+    raw = operation == "memories.reveal" and "memory.reveal" in ctx.principal.permissions and classification == "clean"
+    value = record.memory
+    payload = None
+    if raw:
+        try:
+            payload = _payload(record)
+        except (ValueError, TypeError, KeyError):
+            raw = False
+    version = value.get("version")
+    safe_version = type(version) is int or (
+        type(version) is str and len(version) <= 128 and re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version)
+    )
+    return d.Memory(
+        id=value["id"],
+        memory_type=record.memory_type,
+        content=json.dumps(payload.model_dump(), ensure_ascii=False) if raw else None,
+        payload=payload if raw else None,
+        confidence=value["confidence"],
+        lifecycle_state=value["lifecycle_state"],
+        revision=revision(record),
+        source_version=version if raw or safe_version else None,
+        source=value.get("source") if raw else None,
+        creator=value.get("creator") if raw else None,
+        created_at=utc(value["created_at"]),
+        updated_at=utc(value["updated_at"]),
+        risk_tags=[],
+        receipt_id=record.receipt["id"] if record.receipt else None,
+        masked=not raw,
+        projection=d.ItemProjection(vector="unknown", graph="unknown", outbox="unknown"),
+    )
+
+
+def masked_event(event):
+    value = event.model_dump() if isinstance(event, d.HistoryEvent) else event
+    return d.HistoryEvent(
+        id=value["id"],
+        kind=value["kind"],
+        timestamp=utc(value["timestamp"]) if value.get("timestamp") else None,
+        revision=value.get("revision"),
+        from_state=value.get("from_state"),
+        to_state=value.get("to_state"),
+        receipt_id=value.get("receipt_id"),
+        actor=None,
+        reason=None,
+        evidence=None,
+    )
+
+
 class MemoryReadService(MemoryReadPort):
-    """Application port implementation; upper is not an insertion watermark.
+    """One acquired scope, fresh explicit session and read transaction per read.
 
     upper is the maximum matching creation key at issue time, not an insertion
     watermark; backdated inserts at or below upper may appear; pages are not an
     MVCC snapshot.
     """
 
-    def __init__(
-        self, leases: ProfileLeases, bind_read: Any, *, classifier: Any, cursor_codec: CursorCodec | None = None
-    ):
-        self.leases, self.bind_read, self.classifier, self.cursor_codec = leases, bind_read, classifier, cursor_codec
+    def __init__(self, leases, bind_read, *, classifier, traces=None, cursor_codec=None):
+        self.leases, self.bind_read, self.classifier = leases, bind_read, classifier
+        self.traces, self.cursor_codec = traces, cursor_codec
 
-    async def execute(self, ctx: RequestContext, command: Any) -> Any:
-        if command.operation in {"memories.list", "memories.get", "receipts.get", "history.list", "lookup"}:
-            return await self._read(ctx, command)
-        if command.operation == "memories.reveal":
-            if "memory.reveal" not in ctx.principal.permissions:
+    async def execute(self, ctx: RequestContext, command: d.MemoryReadCommand) -> d.MemoryReadResult:
+        try:
+            return await self._execute(ctx, command)
+        except SQLAlchemyError:
+            raise HttpError("E_STORAGE") from None
+
+    async def _execute(self, ctx: RequestContext, command):
+        permission = "memory.reveal" if command.operation == "memories.reveal" else "memory.read"
+        if permission not in ctx.principal.permissions or ctx.profile_id not in ctx.principal.profiles:
+            raise HttpError("E_PERMISSION_DENIED")
+        if command.profile_id != ctx.profile_id:
+            raise HttpError("E_VALIDATION")
+        query = command.payload
+        if command.operation == "memories.list" and any(
+            getattr(query, n) for n in ("source", "tags", "risk_tags", "authority_level", "epistemic_status")
+        ):
+            raise HttpError("E_PERMISSION_DENIED")
+        if command.operation == "lookup" and query.kind in ("request", "relation"):
+            if ("audit.read" if query.kind == "request" else "relation.read") not in ctx.principal.permissions:
                 raise HttpError("E_PERMISSION_DENIED")
-            return await self._read(ctx, command)
-        raise HttpError("E_VALIDATION")
-
-    async def _read(self, ctx: RequestContext, command: Any) -> Any:
-        if command.operation == "lookup" and command.payload.kind in {"request", "relation"}:
             raise HttpError("E_CAPABILITY_UNAVAILABLE")
+        state = None
+        if getattr(query, "cursor", None):
+            if self.cursor_codec is None:
+                raise HttpError("E_CAPABILITY_UNAVAILABLE")
+            state = self.cursor_codec.validate(ctx.principal, command, now=self.cursor_codec.clock())
         async with self.leases.acquire(ctx) as scope:
+            if command.operation == "lookup" and query.kind == "trace":
+                if self.traces is None:
+                    raise HttpError("E_CAPABILITY_UNAVAILABLE")
+                result = await self.traces.execute(
+                    ctx,
+                    d.TracesGetCommand(
+                        operation="traces.get", profile_id=ctx.profile_id, path_ids={"id": query.id}, payload=d.Empty()
+                    ),
+                )
+                result = d.Trace.model_validate(result.model_dump())
+                if result.profile_id != ctx.profile_id or result.id != query.id:
+                    raise HttpError("E_NOT_FOUND")
+
+                def contribution(item):
+                    return item.model_copy(update={"matched_terms": []}, deep=True)
+
+                result = result.model_copy(
+                    update={
+                        "query": None,
+                        "stages": {k: [contribution(v) for v in items] for k, items in result.stages.items()},
+                        "merge": [contribution(v) for v in result.merge],
+                        "deduplicated": [contribution(v) for v in result.deduplicated],
+                        "final": [contribution(v) for v in result.final],
+                    },
+                    deep=True,
+                )
+                return d.LookupResult(kind="trace", id=query.id, target=result, found=True)
             resources = self.bind_read(scope)
             async with resources.session_factory() as session:
-                provider = resources.provider
-                if command.operation == "memories.list":
-                    query = command.payload
-                    if any(
-                        getattr(query, name)
-                        for name in ("source", "tags", "risk_tags", "authority_level", "epistemic_status")
+                async with session.begin():
+                    # sqlite3 legacy transaction mode does not BEGIN on SELECT.
+                    # Establish the actual read snapshot before max/page queries.
+                    await session.execute(text("BEGIN"))
+                    provider = resources.provider
+                    if command.operation == "memories.list":
+                        page = await provider.read_memory_page(
+                            session,
+                            query,
+                            after=state["last"] if state else None,
+                            upper=state["upper"] if state else None,
+                        )
+                        items = [
+                            project_for_caller(ctx, command.operation, record, "unknown") for record in page.records
+                        ]
+                        last = (
+                            None
+                            if not items
+                            else ReadKey(
+                                utc(items[-1].created_at).isoformat(timespec="microseconds"),
+                                items[-1].memory_type,
+                                items[-1].id,
+                            )
+                        )
+                        return d.Page[d.Memory](
+                            items=items,
+                            has_more=page.has_more,
+                            next_cursor=self._cursor(ctx, command, page, last),
+                            request_id=ctx.request_id,
+                        )
+                    ident = query.id if command.operation == "lookup" else command.path_ids["id"]
+                    record = await provider.read_memory(session, ident, getattr(query, "memory_type", None))
+                    if command.operation == "memories.reveal":
+                        check_reveal_revision(record.memory_type, query.expected_revision, revision(record))
+                        history = await provider.read_history_page(
+                            session, ident, record.memory_type, limit=200, after=None, upper=None
+                        )
+                        classified = ReadRecord(record.memory, record.memory_type, record.receipt, history.events)
+                        classification = (
+                            "unknown"
+                            if history.incomplete or history.has_more
+                            else classify_read_content(classified, self.classifier)
+                        )
+                        return project_for_caller(ctx, command.operation, record, classification)
+                    if (
+                        command.operation == "history.list"
+                        or command.operation == "receipts.get"
+                        or (command.operation == "lookup" and query.kind == "receipt")
                     ):
-                        raise HttpError("E_PERMISSION_DENIED")
-                    result = await provider.read_memory_page(session, query, after=None, upper=None)
-                    items = [
-                        project_for_caller(ctx, command.operation, r, classify_read_content(r, self.classifier))
-                        for r in result.records
-                    ]
-                    return d.Page[d.Memory](
-                        items=items, next_cursor=None, has_more=result.has_more, request_id=ctx.request_id
-                    )
-                record = await provider.read_memory(
-                    session,
-                    command.path_ids.get("id"),
-                    command.payload.memory_type if hasattr(command.payload, "memory_type") else None,
-                )
-                if command.operation == "memories.reveal":
-                    check_reveal_revision(
-                        record.memory_type,
-                        command.payload.expected_revision,
-                        getattr(record.memory, "revision", None),
-                    )
-                if command.operation == "receipts.get":
-                    record = ReadRecord(record.receipt, record.memory_type, record.receipt)
-                if command.operation == "history.list":
-                    events = tuple(
-                        project_for_caller(ctx, command.operation, ReadRecord(e, record.memory_type), "sensitive")
-                        for e in record.history
-                    )
-                    return d.Page[d.HistoryEvent](
-                        items=list(events), next_cursor=None, has_more=False, request_id=ctx.request_id
-                    )
-                projected = project_for_caller(
-                    ctx, command.operation, record, classify_read_content(record, self.classifier)
-                )
-                if command.operation == "lookup":
-                    return d.LookupResult(
-                        kind=command.payload.kind, id=command.payload.id, target=projected, found=True
-                    )
-                return projected
+                        page = await provider.read_history_page(
+                            session,
+                            ident,
+                            record.memory_type,
+                            limit=query.limit if command.operation == "history.list" else 200,
+                            after=state["last"] if state else None,
+                            upper=state["upper"] if state else None,
+                        )
+                        events = [masked_event(event) for event in page.events]
+                        if command.operation == "history.list":
+                            return d.Page[d.HistoryEvent](
+                                items=events,
+                                has_more=page.has_more,
+                                next_cursor=self._cursor(ctx, command, page, page.keys[-1] if page.keys else None),
+                                request_id=ctx.request_id,
+                            )
+                        receipt = record.receipt
+                        if receipt is None:
+                            raise HttpError("E_NOT_FOUND")
+                        result = d.Receipt(
+                            id=receipt["id"],
+                            memory_type=record.memory_type,
+                            source=None,
+                            created_by=None,
+                            source_version=None,
+                            timestamp=utc(receipt["timestamp"]),
+                            confidence=receipt["confidence"],
+                            verification_status=receipt["verification_status"],
+                            lifecycle_state=receipt["lifecycle_state"],
+                            history=events,
+                            history_complete=False,
+                        )
+                    else:
+                        result = project_for_caller(ctx, command.operation, record, "unknown")
+                    if command.operation == "lookup":
+                        return d.LookupResult(kind=query.kind, id=query.id, target=result, found=True)
+                    return result
+
+    def _cursor(self, ctx, command, page, last):
+        if not page.has_more:
+            return None
+        if self.cursor_codec is None or last is None or page.upper is None:
+            raise HttpError("E_CAPABILITY_UNAVAILABLE")
+        return self.cursor_codec.issue(
+            ctx, command, last=last, upper=page.upper, limit=command.payload.limit, now=self.cursor_codec.clock()
+        )
+
+    async def lookup(self, ctx: RequestContext, query: d.LookupQuery) -> d.LookupResult:
+        command = d.COMMAND_TYPES["lookup"](operation="lookup", profile_id=ctx.profile_id, path_ids={}, payload=query)
+        return await self.execute(ctx, command)
 
 
 def compose_memory_read_port(
-    leases: ProfileLeases, bind_read: Any, *, classifier: Any, traces: Any = None
+    leases: ProfileLeases,
+    bind_read: Callable[[ProfileSession], ReadResources],
+    *,
+    classifier: MemoryAdmissionGate,
+    traces: TracePort | None = None,
 ) -> MemoryReadPort:
-    return MemoryReadService(leases, bind_read, classifier=classifier)
+    return MemoryReadService(leases, bind_read, classifier=classifier, traces=traces)
