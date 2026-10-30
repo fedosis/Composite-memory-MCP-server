@@ -126,10 +126,17 @@ async def test_projection_unknown_is_not_invented_zero(tmp_path):
                 assert status == 200, absent
                 consistency = absent["graph_consistency"]
                 assert consistency["projection"] == "unavailable"
-                assert all(consistency[field] is None for field in (
-                    "outbox_lag", "last_sync", "missing_projection", "extra_projection",
-                    "canonical_edges", "projected_edges",
-                ))
+                assert all(
+                    consistency[field] is None
+                    for field in (
+                        "outbox_lag",
+                        "last_sync",
+                        "missing_projection",
+                        "extra_projection",
+                        "canonical_edges",
+                        "projected_edges",
+                    )
+                )
                 assert absent["nodes"] and absent["edges"]
             finally:
                 object.__setattr__(dependencies, "graph", previous)

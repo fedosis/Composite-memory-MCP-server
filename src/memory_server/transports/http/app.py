@@ -18,6 +18,7 @@ from .errors import HttpError, error_code, error_response
 from .guards import Guard, ReadRouteSpec, secure_headers
 from .limits import read_body, validate_config
 from .routes import S06_ROUTE_SPECS, ProfilePort
+from .routes.diagnostics import DIAGNOSTICS_ROUTE_SPECS, DiagnosticsRouteSpec, OutboxCursorCodec
 from .routes.graph import GRAPH_READ_ROUTE_SPECS, GraphReadRouteSpec, RelationCursorCodec
 from .routes.profiles import validate_profile_id
 from .routes.retrieval import RETRIEVAL_ROUTE_SPECS, RetrievalRouteSpec
@@ -66,6 +67,16 @@ class HttpApp:
                                  and spec.validate_result is canonical.validate_result
                                  and (spec.operation not in {'relations.list', 'relations.for_memory'}
                                       or type(spec.cursor_codec) is RelationCursorCodec))
+            elif type(spec) is DiagnosticsRouteSpec:
+                canonical = DIAGNOSTICS_ROUTE_SPECS.get(spec.operation)
+                owner_matches = (row is not None and row.owner == 'S10'
+                                 and canonical is not None
+                                 and spec.parse is canonical.parse
+                                 and spec.validate_result is canonical.validate_result
+                                 and spec.operation in {'audit', 'indexes.status', 'outbox.list', 'overview', 'reflect'}
+                                 and ((spec.operation == 'outbox.list'
+                                       and type(spec.cursor_codec) is OutboxCursorCodec)
+                                      or (spec.operation != 'outbox.list' and spec.cursor_codec is None)))
             else:
                 owner_matches = row is not None and row.owner == 'S07'
             if (row is None or not owner_matches

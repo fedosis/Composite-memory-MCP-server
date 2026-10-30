@@ -6,20 +6,26 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from types import MappingProxyType
+from typing import Callable, Final
 from uuid import UUID
 
+from pydantic import ValidationError
+from starlette.requests import Request
 from storage.outbox import OutboxKey
 
 from memory_server.application.graph_read_service import wire_json
 from memory_server.application.memory_read_service import b64, unb64, utc
 from memory_server.gateway_contracts import dto as d
+from memory_server.gateway_contracts.catalog import CATALOG
 from memory_server.gateway_contracts.ports import Principal, RequestContext
 from memory_server.transports.http.errors import HttpError
+from memory_server.transports.http.guards import ReadRouteSpec
 
 
 @dataclass(frozen=True)
@@ -225,3 +231,228 @@ class OutboxCursorCodec:
         if current >= expiry:
             raise HttpError("E_CURSOR_EXPIRED")
         return OutboxCursorState(last, upper, data["limit"], issued, expiry)
+
+
+Parser = Callable[[Request, bytes, Principal], d.DiagnosticsCommand]
+ResultValidator = Callable[[d.DiagnosticsResult], d.DiagnosticsResult]
+
+
+@dataclass(frozen=True)
+class DiagnosticsRouteSpec(ReadRouteSpec):
+    parse: Parser
+    validate_result: ResultValidator
+    cursor_codec: OutboxCursorCodec | None = None
+
+
+def _command(operation: str, request: Request, payload: d.DTO) -> d.DiagnosticsCommand:
+    return d.COMMAND_TYPES[operation](
+        operation=operation, profile_id=request.path_params["profile"], path_ids={}, payload=payload
+    )
+
+
+def _get(operation: str, model: type[d.DTO], request: Request, body: bytes, principal: Principal):
+    if body:
+        raise HttpError("E_VALIDATION")
+    values: dict[str, object] = {}
+    try:
+        for key, value in request.query_params.multi_items():
+            if key not in model.model_fields or key in values:
+                raise ValueError
+            if key == "limit":
+                if not re.fullmatch(r"[0-9]{1,3}", value):
+                    raise ValueError
+                values[key] = int(value)
+            else:
+                values[key] = value
+        if model is d.Empty and values:
+            raise ValueError
+        if model is d.AuditQuery:
+            values.setdefault("cursor", None)
+        if model is d.OutboxQuery:
+            for key in ("cursor", "status", "memory_id"):
+                values.setdefault(key, None)
+        payload = model.model_validate(values, strict=True)
+        if model is d.AuditQuery and payload.cursor is not None:
+            raise HttpError("E_CURSOR_INVALID")
+        if model is d.OutboxQuery and payload.memory_id is not None:
+            value = payload.memory_id
+            if not value or len(value.encode()) > 1024 or value.startswith(("rel_", "ent_", "proj_")):
+                raise ValueError
+        command = _command(operation, request, payload)
+        if model is d.OutboxQuery and payload.cursor is not None:
+            codec = request.scope["s06"]["spec"].cursor_codec
+            codec.validate(principal, command, now=codec.clock())
+        return command
+    except HttpError:
+        raise
+    except (ValidationError, ValueError, UnicodeError):
+        raise HttpError("E_VALIDATION") from None
+
+
+def parse_audit(request, body, principal):
+    return _get("audit", d.AuditQuery, request, body, principal)
+
+
+def parse_indexes_status(request, body, principal):
+    return _get("indexes.status", d.Empty, request, body, principal)
+
+
+def parse_outbox_list(request, body, principal):
+    return _get("outbox.list", d.OutboxQuery, request, body, principal)
+
+
+def parse_overview(request, body, principal):
+    return _get("overview", d.Empty, request, body, principal)
+
+
+def parse_reflect(request: Request, body: bytes, principal: Principal):
+    del principal
+    if request.query_params:
+        raise HttpError("E_VALIDATION")
+    if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
+        raise HttpError("E_UNSUPPORTED_MEDIA_TYPE")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    try:
+        values = json.loads(body, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        if not {"topic", "min_confidence", "context"} <= set(values):
+            raise ValueError
+        payload = d.ReflectRequest.model_validate(values, strict=True)
+        return _command("reflect", request, payload)
+    except (ValidationError, ValueError, TypeError, UnicodeError, RecursionError):
+        raise HttpError("E_VALIDATION") from None
+
+
+_REFLECT_KEYS = {
+    "overview": {
+        "sampled_at",
+        "selected_count",
+        "total_beliefs",
+        "lifecycle_counts",
+        "confidence",
+        "contradiction_count",
+        "stale_count",
+        "decaying_next_7d",
+        "no_evidence_count",
+        "evidence_stats_status",
+    },
+    "contradictions": {"sampled_at", "selected_count", "total", "pairs"},
+    "decay": {"sampled_at", "selected_count", "stale_now", "stale_7d", "archived_7d", "forgotten_7d"},
+    "topics": {"sampled_at", "selected_count", "topic_count", "untagged_count"},
+    "evidence_audit": {
+        "sampled_at",
+        "selected_count",
+        "total",
+        "with_evidence",
+        "without_evidence",
+        "avg_evidence_per_belief",
+        "zero_weight_entries",
+        "evidence_stats_status",
+    },
+    "confidence": {"sampled_at", "selected_count", "histogram", "lowest_count", "beliefs"},
+    "relations": {"sampled_at", "selected_count", "total", "contradictions", "entailments", "neutral_pairs", "pairs"},
+}
+_ERROR_CODES = {
+    "E_TIMEOUT",
+    "E_STORAGE",
+    "E_VECTOR_BACKEND",
+    "E_GRAPH_BACKEND",
+    "E_PROJECTION_UNAVAILABLE",
+    "E_CAPABILITY_UNAVAILABLE",
+}
+
+
+def validate_audit_result(value):
+    result = d.AuditResult.model_validate(value.model_dump(), strict=True)
+    if not set(result.sections) <= {
+        "lifecycle",
+        "receipts",
+        "relations",
+        "indexes",
+        "confidence",
+        "consistency",
+        "graph_orphans",
+    }:
+        raise HttpError("E_INTERNAL")
+    return result
+
+
+def validate_index_status(value):
+    return d.IndexStatus.model_validate(value.model_dump(), strict=True)
+
+
+def validate_outbox_page(value):
+    result = d.Page[d.OutboxItem].model_validate(value.model_dump(), strict=True)
+    if any(item.last_error_code is not None and item.last_error_code not in _ERROR_CODES for item in result.items):
+        raise HttpError("E_INTERNAL")
+    return result
+
+
+def validate_overview(value):
+    return d.Overview.model_validate(value.model_dump(), strict=True)
+
+
+def validate_reflect_result(value):
+    result = d.ReflectResult.model_validate(value.model_dump(), strict=True)
+    if result.mode not in _REFLECT_KEYS or set(result.sections) != _REFLECT_KEYS[result.mode]:
+        raise HttpError("E_INTERNAL")
+    forbidden = {
+        "proposition",
+        "proposition_a",
+        "proposition_b",
+        "tag",
+        "recommendation",
+        "by_topics",
+        "by_tag_stale",
+        "by_source_type",
+        "evidence_stats_error",
+        "detection_method",
+    }
+
+    def walk(item):
+        if isinstance(item, dict):
+            if forbidden & set(item):
+                raise HttpError("E_INTERNAL")
+            for nested in item.values():
+                walk(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                walk(nested)
+
+    walk(result.sections)
+    return result
+
+
+DIAGNOSTICS_ROUTE_SPECS: Final = MappingProxyType(
+    {
+        operation: DiagnosticsRouteSpec(
+            operation,
+            CATALOG.by_operation[operation].method,
+            CATALOG.by_operation[operation].route,
+            CATALOG.by_operation[operation].permission,
+            parser,
+            validator,
+        )
+        for operation, parser, validator in (
+            ("audit", parse_audit, validate_audit_result),
+            ("indexes.status", parse_indexes_status, validate_index_status),
+            ("outbox.list", parse_outbox_list, validate_outbox_page),
+            ("overview", parse_overview, validate_overview),
+            ("reflect", parse_reflect, validate_reflect_result),
+        )
+    }
+)
+
+
+def create_diagnostics_routes(*, cursor_codec: OutboxCursorCodec) -> tuple[DiagnosticsRouteSpec, ...]:
+    return tuple(
+        replace(spec, cursor_codec=cursor_codec) if operation == "outbox.list" else spec
+        for operation, spec in DIAGNOSTICS_ROUTE_SPECS.items()
+    )

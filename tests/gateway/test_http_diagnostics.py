@@ -11,13 +11,14 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event, text
+from storage.models.belief import BeliefORM, EvidenceORM
 from storage.outbox import OutboxEntryORM, OutboxRepository
 
 from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.ports import Principal, RequestContext
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.transports.http.errors import HttpError
-from tests.gateway.test_http_shell import request, shell  # noqa: F401
+from tests.gateway.test_http_retrieval import http_request, live_server, read_scope
 
 IDS = tuple(f"00000000-0000-4000-8000-{number:012d}" for number in range(1, 1201))
 AT = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
@@ -107,29 +108,128 @@ async def _seed_outbox(provider, count=1000):
                 )
 
 
-@pytest.mark.parametrize(
-    "method,suffix,body",
-    (
-        ("GET", "audit", b""),
-        ("GET", "indexes/status", b""),
-        ("GET", "outbox", b""),
-        ("GET", "overview", b""),
-        ("POST", "reflect", {"topic": None, "min_confidence": None, "context": None}),
-    ),
-)
-async def test_s10_routes_are_mounted(shell, method, suffix, body):  # noqa: F811 - imported fixture
-    """All five diagnostics operations must be published together by PR B."""
-    _foundation()
-    bearer, _ = shell.mint(permissions=("profile.read", "audit.read"))
-    response = await request(
-        shell.app,
-        f"/api/v1/profiles/alpha/{suffix}",
-        method=method,
-        bearer=bearer,
-        body=body,
+async def _diagnostic_auth(holder, *, permissions=("profile.read", "audit.read"), profiles=("alpha", "beta")):
+    now = datetime.now(UTC)
+    created = holder.app.dependencies.tokens._bootstrap_create(
+        d.TokenCreate(
+            subject="s10-reader", profiles=list(profiles), permissions=list(permissions), expires_at=now + timedelta(hours=1)
+        ),
+        now=now,
     )
-    assert response.status == 200, response.json
-    assert shell.leases.snapshot() == {}
+    return {"Authorization": f"Bearer cmms_{created.token.id}.{created.secret}"}
+
+
+async def _seed_runtime_diagnostics(holder, auth, *, profile="alpha"):
+    async with await read_scope(holder, auth, profile) as scope:
+        resources = scope.application.read_resources()
+        async with resources.session_factory() as session, session.begin():
+            session.add(
+                BeliefORM(
+                    id=IDS[0], proposition="Docker containers are better", confidence=0.8, source="source",
+                    creator="creator", source_ids=[], tags=["s10-topic"], created_at=AT.replace(tzinfo=None),
+                    updated_at=AT.replace(tzinfo=None), last_reinforced_at=AT.replace(tzinfo=None), version=1,
+                    verification_status="candidate", lifecycle_state="active",
+                )
+            )
+            session.add(
+                BeliefORM(
+                    id=IDS[3], proposition="Docker containers are worse", confidence=0.7, source="source",
+                    creator="creator", source_ids=[], tags=["s10-topic"], created_at=AT.replace(tzinfo=None),
+                    updated_at=AT.replace(tzinfo=None), last_reinforced_at=AT.replace(tzinfo=None), version=1,
+                    verification_status="candidate", lifecycle_state="active",
+                )
+            )
+            session.add(
+                EvidenceORM(
+                    id="evidence-s10", belief_id=IDS[0], source_type="S10_SOURCE_CANARY", source_id="secret",
+                    weight=0.7, contributor="creator", created_at=AT.replace(tzinfo=None), note="S10_NOTE_CANARY",
+                )
+            )
+            for offset, status in enumerate(("pending", "processing"), 1):
+                session.add(
+                    OutboxEntryORM(
+                        id=IDS[offset], record_id=IDS[0], record_type="belief", operation="index_belief",
+                        payload_json='{"canary":"S10_OUTBOX_CANARY"}', status=status, retry_count=0,
+                        error=None, created_at=AT.replace(tzinfo=None), processed_at=None,
+                    )
+                )
+
+
+async def test_s10_five_routes_mount_and_permissions(tmp_path):
+    """Exercise production composition, runtime leases, borrowed SQL, and reflection over TCP."""
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await _diagnostic_auth(holder)
+        await _seed_runtime_diagnostics(holder, auth)
+        calls = (
+            ("GET", "audit", b""),
+            ("GET", "indexes/status", b""),
+            ("GET", "outbox", b""),
+            ("GET", "overview", b""),
+            (
+                "POST",
+                "reflect",
+                json.dumps({"topic": None, "min_confidence": None, "context": None}).encode(),
+            ),
+        )
+        results = {}
+        for method, suffix, body in calls:
+            headers = auth | ({"Content-Type": "application/json"} if method == "POST" else {})
+            status, result = await http_request(
+                port, method, f"/api/v1/profiles/alpha/{suffix}", body=body, headers=headers
+            )
+            assert status == 200, (suffix, result)
+            results[suffix] = result
+        assert results["indexes/status"]["outbox_pending"] == 1
+        assert results["overview"]["writer_owned"] is True
+        assert results["reflect"]["sections"]["evidence_stats_status"] == "ok"
+        assert results["reflect"]["sections"]["no_evidence_count"] == 1
+        assert "Docker containers are better" not in json.dumps(results)
+        assert "Docker containers are worse" not in json.dumps(results)
+        assert "S10_SOURCE_CANARY" not in json.dumps(results)
+        profile_only = await _diagnostic_auth(holder, permissions=("profile.read",))
+        audit_only = await _diagnostic_auth(holder, permissions=("audit.read",))
+        for suffix in ("indexes/status", "overview"):
+            assert (await http_request(port, "GET", f"/api/v1/profiles/alpha/{suffix}", headers=profile_only))[0] == 200
+            assert (await http_request(port, "GET", f"/api/v1/profiles/alpha/{suffix}", headers=audit_only))[0] == 403
+        for suffix in ("audit", "outbox"):
+            assert (await http_request(port, "GET", f"/api/v1/profiles/alpha/{suffix}", headers=audit_only))[0] == 200
+            assert (await http_request(port, "GET", f"/api/v1/profiles/alpha/{suffix}", headers=profile_only))[0] == 403
+
+
+async def test_reflect_borrowed_evidence_and_limits(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await _diagnostic_auth(holder)
+        await _seed_runtime_diagnostics(holder, auth)
+        payload = json.dumps({"topic": None, "min_confidence": None, "context": None}).encode()
+        status, overview = await http_request(
+            port,
+            "POST",
+            "/api/v1/profiles/alpha/reflect",
+            body=payload,
+            headers=auth | {"Content-Type": "application/json"},
+        )
+        assert status == 200, overview
+        assert overview["sections"]["evidence_stats_status"] == "ok"
+        assert overview["sections"]["no_evidence_count"] == 1
+        contradictions = json.dumps(
+            {"mode": "contradictions", "topic": None, "min_confidence": 0.0, "context": None}
+        ).encode()
+        status, result = await http_request(
+            port,
+            "POST",
+            "/api/v1/profiles/alpha/reflect",
+            body=contradictions,
+            headers=auth | {"Content-Type": "application/json"},
+        )
+        assert status == 200, result
+        assert result["sections"]["total"] == 1
+        assert len(result["sections"]["pairs"]) == 1
+        assert set(result["sections"]["pairs"][0]) == {
+            "belief_a_id", "belief_b_id", "confidence_a", "confidence_b", "overlap_score",
+            "detection_score", "detected_at",
+        }
+        assert "Docker containers are better" not in json.dumps(result)
+        assert "Docker containers are worse" not in json.dumps(result)
 
 
 async def test_outbox_keyset_ties_filters_and_raw_projection(database):
@@ -165,9 +265,7 @@ async def test_outbox_keyset_ties_filters_and_raw_projection(database):
                     rows = page.rows[:37]
                     assert all(isinstance(row.created_at, datetime) for row in rows)
                     assert all(row.created_at == AT for row in rows)
-                    assert all(
-                        row.processed_at is None or isinstance(row.processed_at, datetime) for row in rows
-                    )
+                    assert all(row.processed_at is None or isinstance(row.processed_at, datetime) for row in rows)
                     seen.extend(row.id for row in rows)
                     if len(page.rows) <= 37:
                         break
@@ -236,13 +334,13 @@ def test_outbox_cursor_golden_binding_tamper_expiry_and_from_path(tmp_path):
     command = _command(limit=100, status="applied", memory_id=IDS[2])
     token = codec.issue(ctx, command, last=key1, upper=key2, limit=100, now=AT)
     assert token == (
-        'eyJleHBpcmVzX2F0IjoiMjAyNi0xMC0zMFQxMjowNTowMCswMDowMCIsImZpbHRlcl9zaGEyNTYiOiIyNGMyMzNiNTQwNDdmNmEx'
-        'YmZiZjZmZTc1MzU3YzhmNDQ0ZjJmOTkxZGE3NjVlMDFkZjQ1M2I5OWQ5NmVjNDY0IiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0zMFQx'
-        'MjowMDowMCswMDowMCIsImxhc3QiOlsiMjAyNi0xMC0zMFQxMjowMDowMC4wMDAwMDArMDA6MDAiLCIwMDAwMDAwMC0wMDAwLTQw'
-        'MDAtODAwMC0wMDAwMDAwMDAwMDEiXSwibGltaXQiOjEwMCwib3BlcmF0aW9uIjoib3V0Ym94Lmxpc3QiLCJwcm9maWxlX2lkIjoi'
-        'YWxwaGEiLCJzdWJqZWN0IjoiZGlhZ25vc3RpYy1yZWFkZXIiLCJ1cHBlciI6WyIyMDI2LTEwLTMwVDEyOjAwOjAwLjAwMDAwMCsw'
-        'MDowMCIsIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMTAwMCJdLCJ2IjoxfQ.v15tnX4XUE-oJFlFWJoTNIAiRcmY6'
-        'kmJM4Itjp9vi5c'
+        "eyJleHBpcmVzX2F0IjoiMjAyNi0xMC0zMFQxMjowNTowMCswMDowMCIsImZpbHRlcl9zaGEyNTYiOiIyNGMyMzNiNTQwNDdmNmEx"
+        "YmZiZjZmZTc1MzU3YzhmNDQ0ZjJmOTkxZGE3NjVlMDFkZjQ1M2I5OWQ5NmVjNDY0IiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0zMFQx"
+        "MjowMDowMCswMDowMCIsImxhc3QiOlsiMjAyNi0xMC0zMFQxMjowMDowMC4wMDAwMDArMDA6MDAiLCIwMDAwMDAwMC0wMDAwLTQw"
+        "MDAtODAwMC0wMDAwMDAwMDAwMDEiXSwibGltaXQiOjEwMCwib3BlcmF0aW9uIjoib3V0Ym94Lmxpc3QiLCJwcm9maWxlX2lkIjoi"
+        "YWxwaGEiLCJzdWJqZWN0IjoiZGlhZ25vc3RpYy1yZWFkZXIiLCJ1cHBlciI6WyIyMDI2LTEwLTMwVDEyOjAwOjAwLjAwMDAwMCsw"
+        "MDowMCIsIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMTAwMCJdLCJ2IjoxfQ.v15tnX4XUE-oJFlFWJoTNIAiRcmY6"
+        "kmJM4Itjp9vi5c"
     )
     state = codec.validate(ctx.principal, _command(limit=20, cursor=token, status="applied", memory_id=IDS[2]), now=AT)
     assert (state.last, state.upper, state.limit, state.expires_at) == (key1, key2, 100, AT + timedelta(seconds=300))
@@ -359,9 +457,9 @@ async def test_borrowed_runner_one_begin_sample_and_typed_failures(database, ove
             work.statements = work.statements_max
             work.check(statement=True)
         setattr(work, overflow_kind + "_limit", 2_000)
-        await session.execute(text(
-            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n"
-        ))
+        await session.execute(
+            text("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n")
+        )
 
     with pytest.raises(HttpError, match="E_STORAGE"):
         await service.run_borrowed_diagnostics(ctx, resources, overflow)
