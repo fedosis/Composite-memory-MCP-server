@@ -919,3 +919,28 @@ async def test_path_quota_retains_source_and_target_before_middle(tmp_path):
         assert status == 200, body
         assert {node["id"] for node in body["nodes"]} == {H, F}
         assert body["paths"] == [] and body["truncation_reason"] == "nodes"
+
+
+@pytest.mark.asyncio
+async def test_soft_native_stop_without_validated_entity_prefix_is_504(tmp_path, monkeypatch):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        graph = await seed_projection(holder, auth)
+        original = graph.read_window
+
+        def stop_before_admission(*args, **kwargs):
+            # Exercise the real native checkpoint before any node is copied.
+            kwargs["clock"] = lambda: kwargs["soft_deadline"]
+            result = original(*args, **kwargs)
+            assert result.soft_stopped and not result.nodes
+            return result
+
+        monkeypatch.setattr(graph, "read_window", stop_before_admission)
+        status, body = await get(port, auth, "graph/entity/" + ENT_SUBJECT)
+        assert status == 504, body
+        assert body["error"]["code"] == "E_TIMEOUT"
+        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}")
+        assert status == 200, body
+        assert body["nodes"][0]["id"] == F
+        assert body["truncation_reason"] == "timeout"
