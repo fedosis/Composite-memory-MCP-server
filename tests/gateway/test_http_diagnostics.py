@@ -107,26 +107,28 @@ async def _seed_outbox(provider, count=1000):
                 )
 
 
-async def test_s10a_routes_remain_unmounted_404(shell):  # noqa: F811 - imported fixture
-    """PR A must not publish any of the five diagnostics operations."""
-    _foundation()
-    bearer, _ = shell.mint(permissions=("profile.read", "audit.read"))
-    calls = (
+@pytest.mark.parametrize(
+    "method,suffix,body",
+    (
         ("GET", "audit", b""),
         ("GET", "indexes/status", b""),
         ("GET", "outbox", b""),
         ("GET", "overview", b""),
         ("POST", "reflect", {"topic": None, "min_confidence": None, "context": None}),
+    ),
+)
+async def test_s10_routes_are_mounted(shell, method, suffix, body):  # noqa: F811 - imported fixture
+    """All five diagnostics operations must be published together by PR B."""
+    _foundation()
+    bearer, _ = shell.mint(permissions=("profile.read", "audit.read"))
+    response = await request(
+        shell.app,
+        f"/api/v1/profiles/alpha/{suffix}",
+        method=method,
+        bearer=bearer,
+        body=body,
     )
-    for method, suffix, body in calls:
-        response = await request(
-            shell.app,
-            f"/api/v1/profiles/alpha/{suffix}",
-            method=method,
-            bearer=bearer,
-            body=body,
-        )
-        assert (response.status, response.json["error"]["code"]) == (404, "E_NOT_FOUND")
+    assert response.status == 200, response.json
     assert shell.leases.snapshot() == {}
 
 
