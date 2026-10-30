@@ -772,7 +772,9 @@ async def test_graph_consistency_absence_lag_unknown(tmp_path):
         assert status == 200, body
         consistency = body["graph_consistency"]
         assert consistency["projection"] == "unknown"
-        assert all(consistency[field] is None for field in ("outbox_lag", "last_sync", "missing_projection", "extra_projection"))
+        assert all(consistency[field] is None for field in (
+            "outbox_lag", "last_sync", "missing_projection", "extra_projection", "canonical_edges", "projected_edges",
+        ))
 
 
 @pytest.mark.asyncio
@@ -816,7 +818,8 @@ async def test_filtered_work_and_path_amplification(tmp_path):
                 [dict(s=F, t=f"filtered-{i:03}", r="ignored", d="2026-10-30 00:00:00.000000") for i in range(101)],
             )
         status, body = await get(
-            port, auth, "graph/neighborhood?" + urlencode({"memory_id": F, "relation_types": "supports", "edge_limit": 1})
+            port, auth,
+            "graph/neighborhood?" + urlencode({"memory_id": F, "relation_types": "supports", "edge_limit": 1}),
         )
         assert status == 200, body
         assert [edge["relation_type"] for edge in body["edges"]] == ["supports"]
@@ -827,7 +830,7 @@ async def test_filtered_work_and_path_amplification(tmp_path):
         ])
         status, body = await http_request(
             port, "POST", "/api/v1/profiles/alpha/graph/path",
-            body=json.dumps({"source_id": ids[0], "target_id": ids[-1], "max_depth": 6}).encode(),
+            body=json.dumps({"source_id": ids[0], "target_id": ids[-1], "max_depth": 4}).encode(),
             headers={**auth, "Content-Type": "application/json"},
         )
         assert status == 503, body
@@ -862,10 +865,11 @@ async def test_soft_native_stop_preserves_root_prefix_priority(tmp_path, monkeyp
             return replace(original(*args, **kwargs), soft_stopped=True)
 
         monkeypatch.setattr(graph, "read_window", stopped)
-        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}")
-        assert status == 200, body
-        assert body["nodes"] and body["nodes"][0]["id"] == F
-        assert body["truncated"] is True and body["truncation_reason"] == "timeout"
+        for limits in ("", "&limit=1&edge_limit=1&depth=1"):
+            status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}" + limits)
+            assert status == 200, body
+            assert body["nodes"] and body["nodes"][0]["id"] == F
+            assert body["truncated"] is True and body["truncation_reason"] == "timeout"
 
 
 @pytest.mark.asyncio

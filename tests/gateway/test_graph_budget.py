@@ -12,7 +12,7 @@ from sqlalchemy import event, text
 from storage.repositories.relation_repo import RelationRepository
 
 from memory_server.gateway_contracts import dto as d
-from tests.gateway.test_graph_reads import ENT_SUBJECT, F, G, get, relation_auth, seed, seed_projection
+from tests.gateway.test_graph_reads import F, G, get, relation_auth, seed
 from tests.gateway.test_http_retrieval import live_server, read_scope
 from tests.gateway.test_slice_runtime import seed_fact
 
