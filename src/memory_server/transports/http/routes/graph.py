@@ -176,7 +176,8 @@ class RelationCursorCodec:
                 or not timedelta(0) < expiry - issued <= timedelta(seconds=self.ttl)
             ):
                 raise ValueError
-        except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError, HttpError):
+        except (ValueError, TypeError, KeyError, AttributeError, UnicodeError,
+                RecursionError, OverflowError, HttpError):
             raise HttpError("E_CURSOR_INVALID") from None
         if now >= expiry:
             raise HttpError("E_CURSOR_EXPIRED")

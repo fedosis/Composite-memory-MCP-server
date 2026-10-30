@@ -462,11 +462,12 @@ async def test_relation_cursor_golden_schema_and_key_custody(tmp_path):
             sign(dict(payload, extra=1)),
             sign(dict(payload, last=["bad", F, G, "supports"])),
             sign(dict(payload, issued_at="2026-10-30T00:00:01+00:00")),
+            sign(dict(payload, issued_at="0001-01-01T00:00:00+01:00")),
             sign(dict(payload, expires_at="2026-10-30T00:15:01+00:00")),
         ):
             with pytest.raises(Exception) as error:
                 codec.validate(principal, command, bad, now=now)
-            assert error.value.code == "E_CURSOR_INVALID"
+            assert getattr(error.value, "code", None) == "E_CURSOR_INVALID"
         with pytest.raises(Exception) as error:
             codec.validate(principal, command, token, now=now + timedelta(seconds=900))
         assert error.value.code == "E_CURSOR_EXPIRED"
