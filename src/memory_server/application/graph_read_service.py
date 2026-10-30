@@ -1,4 +1,4 @@
-"""Scoped canonical relation reads. Graph traversal is deliberately not mounted."""
+"""Scoped canonical relation reads and bounded, masked graph traversal."""
 
 from __future__ import annotations
 
@@ -435,7 +435,8 @@ class GraphReadService:
         validate_memory_id(value)
         return "memory", value
 
-    async def _resolve_root(self, ctx, operation, resources, session, repo, work, value):
+    async def _resolve_root(self, ctx, operation, resources, session, repo, work, value, ledger):
+        ledger.charge("candidates")
         kind, value = self._root(value)
         if kind == "entity":
             fact_id, slot = decode_entity_id(value)
@@ -476,6 +477,7 @@ class GraphReadService:
         visited = set()
         rows = {}
         depth_pending = False
+        edge_pending = False
         while queue:
             root, level = queue.popleft()
             if root in visited:
@@ -486,7 +488,8 @@ class GraphReadService:
                 continue
             remaining = ledger.remaining("edges")
             if remaining <= 0:
-                raise GraphBudgetExceeded("edges", GRAPH_MAX_EDGES, ledger.edges + 1)
+                edge_pending = True
+                break
             page = await repo.expand_incident(
                 root,
                 direction=direction,
@@ -497,8 +500,13 @@ class GraphReadService:
                 last=None,
                 work=work,
             )
-            for row in page.rows:
+            limit = min(100, remaining)
+            # Lookahead is inspected work, not an admitted response edge.
+            for index, row in enumerate(page.rows):
                 ledger.charge("edges")
+                if index >= limit:
+                    edge_pending = True
+                    continue
                 key = (row.source_id, row.target_id, row.relation_type)
                 rows[key] = row
                 if direction == "out":
@@ -510,9 +518,9 @@ class GraphReadService:
                 for neighbor in neighbors:
                     if neighbor not in visited:
                         queue.append((neighbor, level + 1))
-            if len(page.rows) > min(100, remaining):
-                raise GraphBudgetExceeded("edges", GRAPH_MAX_EDGES, ledger.edges + 1)
-        return tuple(rows.values()), depth_pending
+            if edge_pending:
+                break
+        return tuple(rows.values()), depth_pending, edge_pending
 
     async def _projection(self, repo, window, query, ledger, work):
         if window is None:
@@ -607,7 +615,9 @@ class GraphReadService:
                     repo = RelationRepository(session)
                     for root in raw_roots:
                         resolved.append(
-                            await self._resolve_root(ctx, command.operation, resources, session, repo, work, root)
+                            await self._resolve_root(
+                                ctx, command.operation, resources, session, repo, work, root, ledger,
+                            )
                         )
 
                 native_roots = []
@@ -652,11 +662,11 @@ class GraphReadService:
                     await session.execute(text("BEGIN"))
                     repo = RelationRepository(session)
                     final_roots = [
-                        await self._resolve_root(ctx, command.operation, resources, session, repo, work, root)
+                        await self._resolve_root(ctx, command.operation, resources, session, repo, work, root, ledger)
                         for root in raw_roots
                     ]
                     canonical_root_ids = tuple(root["wire"] for root in final_roots if root["kind"] == "memory")
-                    canonical_rows, canonical_depth = await self._canonical_window(
+                    canonical_rows, canonical_depth, canonical_edges_pending = await self._canonical_window(
                         repo,
                         canonical_root_ids,
                         depth=depth,
@@ -664,7 +674,7 @@ class GraphReadService:
                         query=query,
                         ledger=ledger,
                         work=work,
-                    ) if canonical_root_ids else ((), False)
+                    ) if canonical_root_ids else ((), False, False)
                     canonical_ids = set(canonical_root_ids)
                     for row in canonical_rows:
                         canonical_ids.update((row.source_id, row.target_id))
@@ -683,9 +693,10 @@ class GraphReadService:
                 for root in final_roots:
                     if root["kind"] == "memory":
                         wire_roots.append(root["wire"])
-                        wire_roots.extend(
-                            representatives[seed[1]] for seed in root["seeds"] if seed[1] in representatives
-                        )
+                        if command.operation != "graph.path":
+                            wire_roots.extend(
+                                representatives[seed[1]] for seed in root["seeds"] if seed[1] in representatives
+                            )
                     else:
                         representative = representatives.get(root["wire"])
                         if representative is None:
@@ -706,10 +717,13 @@ class GraphReadService:
                         soft_stop,
                         depth_stop,
                         resources.graph is not None,
+                        canonical_edges_pending,
+                        ledger,
                     )
                 return self._neighborhood_result(
                     ctx, query, tuple(wire_roots), nodes, tuple(edges.values()), soft_stop, depth_stop,
                     resources.graph is not None,
+                    canonical_edges_pending,
                 )
             except HttpError:
                 raise
@@ -720,7 +734,13 @@ class GraphReadService:
             finally:
                 await custody.drain()
 
-    def _neighborhood_result(self, ctx, query, roots, nodes, edges, soft_stop, depth_stop, graph_present):
+    @staticmethod
+    def _stop_reason(flags):
+        return next((reason for reason in ("timeout", "nodes", "edges", "depth") if reason in flags), None)
+
+    def _neighborhood_result(
+        self, ctx, query, roots, nodes, edges, soft_stop, depth_stop, graph_present, edge_stop=False,
+    ):
         adjacency = {ident: [] for ident in nodes}
         for edge in edges:
             if edge.source_id in nodes and edge.target_id in nodes:
@@ -728,36 +748,46 @@ class GraphReadService:
                 adjacency[edge.target_id].append((edge.source_id, edge))
         queue = deque((root, 0) for root in roots if root in nodes)
         selected_nodes, selected_edges, seen = {}, {}, set()
-        reason = "timeout" if soft_stop else None
-        while queue and reason is None:
-            current, level = queue.popleft()
-            if current not in selected_nodes:
+        flags = set()
+        if soft_stop:
+            flags.add("timeout")
+        if edge_stop:
+            flags.add("edges")
+        if depth_stop:
+            flags.add("depth")
+        # Admit a coherent root prefix even when native traversal stopped softly.
+        for root, _ in queue:
+            if root not in selected_nodes:
                 if len(selected_nodes) >= query.limit:
-                    reason = "nodes"
+                    flags.add("nodes")
                     break
-                selected_nodes[current] = nodes[current]
-            if current in seen:
+                selected_nodes[root] = nodes[root]
+        if not selected_nodes:
+            raise HttpError("E_TIMEOUT")
+        while queue and not soft_stop:
+            current, level = queue.popleft()
+            if current not in selected_nodes or current in seen:
                 continue
             seen.add(current)
             candidates = sorted(adjacency.get(current, ()), key=lambda item: (item[0], item[1].id))
             if level >= query.depth:
                 if candidates:
-                    reason = "depth"
+                    flags.add("depth")
                 continue
             for neighbor, edge in candidates:
+                node_full = neighbor not in selected_nodes and len(selected_nodes) >= query.limit
+                edge_full = edge.id not in selected_edges and len(selected_edges) >= query.edge_limit
+                if node_full:
+                    flags.add("nodes")
+                if edge_full:
+                    flags.add("edges")
+                if node_full or edge_full:
+                    continue
                 if neighbor not in selected_nodes:
-                    if len(selected_nodes) >= query.limit:
-                        reason = "nodes"
-                        break
                     selected_nodes[neighbor] = nodes[neighbor]
                     queue.append((neighbor, level + 1))
-                if edge.id not in selected_edges:
-                    if len(selected_edges) >= query.edge_limit:
-                        reason = "edges"
-                        break
-                    selected_edges[edge.id] = edge
-        if reason is None and depth_stop:
-            reason = "depth"
+                selected_edges[edge.id] = edge
+        reason = self._stop_reason(flags)
         return map_graph_result(
             ctx,
             tuple(selected_nodes.values()),
@@ -767,55 +797,75 @@ class GraphReadService:
             stop=reason,
         )
 
-    def _path_result(self, ctx, query, roots, nodes, edges, soft_stop, depth_stop, graph_present):
+    def _path_result(
+        self, ctx, query, roots, nodes, edges, soft_stop, depth_stop, graph_present,
+        edge_stop=False, ledger=None,
+    ):
         source, target = roots
         if source not in nodes or target not in nodes:
             raise HttpError("E_NOT_FOUND")
+        ledger = ledger if ledger is not None else _ReadLedger()
         adjacency = {ident: [] for ident in nodes}
         edge_by_pair = {}
         for edge in edges:
             if edge.source_id in nodes and edge.target_id in nodes:
                 adjacency[edge.source_id].append(edge.target_id)
                 edge_by_pair.setdefault((edge.source_id, edge.target_id), edge)
+        flags = set()
+        if soft_stop:
+            flags.add("timeout")
+        if edge_stop:
+            flags.add("edges")
+        selected_ids, selected_edges = {}, {}
+        # Endpoints precede all intermediate nodes; no sorted-prefix slicing.
+        for root in roots:
+            if root not in selected_ids:
+                if len(selected_ids) >= query.node_limit:
+                    flags.add("nodes")
+                    break
+                selected_ids[root] = None
         paths = []
-        queue = deque([(source, (source,))])
-        while queue and not soft_stop:
+        queue = deque()
+        if not flags.intersection({"timeout", "nodes"}):
+            ledger.charge("pairs")
+            queue.append((source, (source,)))
+        while queue:
+            if self.clock() >= ctx.deadline:
+                raise HttpError("E_TIMEOUT")
             current, path = queue.popleft()
             if current == target:
                 paths.append(path)
                 continue
+            candidates = sorted(set(adjacency.get(current, ())))
             if len(path) - 1 >= query.max_depth:
+                if any(neighbor not in path for neighbor in candidates):
+                    flags.add("depth")
                 continue
-            for neighbor in sorted(set(adjacency.get(current, ()))):
-                if neighbor not in path:
-                    queue.append((neighbor, path + (neighbor,)))
-        paths.sort(key=lambda path: (len(path), path))
-        selected_ids = set(roots)
-        selected_edges = {}
-        for path in paths:
-            selected_ids.update(path)
-            for pair in zip(path, path[1:]):
-                edge = edge_by_pair[pair]
+            for neighbor in candidates:
+                if neighbor in path:
+                    continue
+                edge = edge_by_pair[current, neighbor]
+                # Check response quotas and charge work BEFORE copying/enqueueing.
+                if neighbor not in selected_ids and len(selected_ids) >= query.node_limit:
+                    flags.add("nodes")
+                    continue
+                if edge.id not in selected_edges and len(selected_edges) >= query.edge_limit:
+                    flags.add("edges")
+                    continue
+                ledger.charge("pairs")
+                selected_ids[neighbor] = None
                 selected_edges[edge.id] = edge
-        reason = "timeout" if soft_stop else ("depth" if depth_stop and not paths else None)
-        if len(selected_ids) > query.node_limit:
-            reason = reason or "nodes"
-            selected_ids = set(sorted(selected_ids)[: query.node_limit])
-        selected_edges = {
-            ident: edge for ident, edge in selected_edges.items()
-            if edge.source_id in selected_ids and edge.target_id in selected_ids
-        }
-        if len(selected_edges) > query.edge_limit:
-            reason = reason or "edges"
-            selected_edges = dict(list(sorted(selected_edges.items()))[: query.edge_limit])
-        paths = [path for path in paths if all(vertex in selected_ids for vertex in path)]
+                queue.append((neighbor, path + (neighbor,)))
+        paths.sort(key=lambda path: (len(path), path))
+        if depth_stop and not paths:
+            flags.add("depth")
         return map_graph_result(
             ctx,
-            tuple(nodes[ident] for ident in sorted(selected_ids)),
+            tuple(nodes[ident] for ident in selected_ids),
             tuple(selected_edges.values()),
             tuple(paths),
             consistency=map_consistency("unknown" if graph_present else "unavailable"),
-            stop=reason,
+            stop=self._stop_reason(flags),
         )
 
     async def relations_for_memory(self, ctx: RequestContext, memory_id: str, query: d.PageQuery) -> d.Page[d.Relation]:
