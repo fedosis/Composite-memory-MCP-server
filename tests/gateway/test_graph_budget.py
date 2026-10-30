@@ -12,8 +12,9 @@ from sqlalchemy import event, text
 from storage.repositories.relation_repo import RelationRepository
 
 from memory_server.gateway_contracts import dto as d
-from tests.gateway.test_graph_reads import F, G, get, relation_auth, seed
+from tests.gateway.test_graph_reads import ENT_SUBJECT, F, G, get, relation_auth, seed, seed_projection
 from tests.gateway.test_http_retrieval import live_server, read_scope
+from tests.gateway.test_slice_runtime import seed_fact
 
 
 def _read_window(graph, roots, **kwargs):
@@ -278,3 +279,35 @@ async def test_repeated_cancellation_retains_producer_lease(tmp_path, monkeypatc
             await task
         assert error.value.code == "E_TIMEOUT"
         assert holder.app.dependencies.leases.snapshot()["alpha"].admissions == 0
+
+
+@pytest.mark.asyncio
+async def test_101_incident_rows_200_truncation_not503(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        resources = await seed(holder, auth, ids=(F,), relations=[])
+        incident_ids = [f"00000000-0000-4000-8000-{index + 100:012d}" for index in range(101)]
+        for ident in incident_ids:
+            await seed_fact(resources, ident, "incident")
+        async with resources.session_factory() as session, session.begin():
+            await session.execute(
+                text("INSERT INTO claim_relations VALUES (:s,:t,'supports','2026-10-30 00:00:00.000000')"),
+                [dict(s=F, t=ident) for ident in incident_ids],
+            )
+        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}&limit=200&edge_limit=200")
+        assert status == 200, body
+        assert len(body["edges"]) == 100
+        assert body["truncated"] is True and body["truncation_reason"] == "edges"
+
+
+@pytest.mark.asyncio
+async def test_root_candidate_charge_pre_inspect(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        resources = await seed(holder, auth, ids=(F,), relations=[])
+        await seed_projection(holder, auth)
+        for index in range(101):
+            ident = f"00000000-0000-4000-8000-{index + 200:012d}"
+            await seed_fact(resources, ident, "candidate")
+        status, body = await get(port, auth, "graph/entity/" + ENT_SUBJECT)
+        assert (status, body["error"]["code"]) == (503, "E_GRAPH_BACKEND")

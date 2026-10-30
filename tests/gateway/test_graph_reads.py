@@ -374,9 +374,30 @@ async def test_graph_read_audit_metrics_canaries(tmp_path, caplog):
             for response in captured
             for item in response.get("items", [])
         ]
+        graph_codec = importlib.import_module("memory_server.application.graph_read_service")
+        decoded_handles = []
+
+        def decode_handles(value):
+            if isinstance(value, dict):
+                for child in value.values():
+                    decode_handles(child)
+            elif isinstance(value, list):
+                for child in value:
+                    decode_handles(child)
+            elif isinstance(value, str) and value.startswith(("ent_", "proj_", "rel_")):
+                decoded_handles.append(value)
+                if value.startswith("ent_"):
+                    decode_handles(list(graph_codec.decode_entity_id(value)))
+                elif value.startswith("proj_"):
+                    decode_handles(list(graph_codec.decode_projection_id(value)))
+                else:
+                    decode_handles(list(graph_codec.decode_relation_id(value)))
+
+        decode_handles(captured)
         output = (
             json.dumps(captured)
             + str(decoded_ids)
+            + str(decoded_handles)
             + str(rows)
             + str(exposition)
             + "\n".join(record.getMessage() for record in caplog.records)
@@ -717,3 +738,150 @@ async def test_relation_explicit_snapshot_survives_concurrent_delete(tmp_path, m
         assert status == 200 and [item["id"] for item in body["items"]] == [BASIC], body
         status, body = await get(port, auth, "relations")
         assert status == 200 and body["items"] == [], body
+
+
+@pytest.mark.asyncio
+async def test_graph_filters_before_response_quotas(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        resources = await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        async with resources.session_factory() as session, session.begin():
+            await session.execute(
+                text("INSERT INTO claim_relations VALUES (:s,:t,:r,:d)"),
+                [
+                    dict(s=F, t=f"noise-{i:03}", r="unrelated", d="2026-10-30 00:00:00.000000")
+                    for i in range(20)
+                ],
+            )
+        status, body = await get(
+            port,
+            auth,
+            "graph/neighborhood?" + urlencode({"memory_id": F, "relation_types": "supports", "edge_limit": 1}),
+        )
+        assert status == 200, body
+        assert [edge["relation_type"] for edge in body["edges"]] == ["supports"]
+        assert body["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_graph_consistency_absence_lag_unknown(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}")
+        assert status == 200, body
+        consistency = body["graph_consistency"]
+        assert consistency["projection"] == "unknown"
+        assert all(consistency[field] is None for field in ("outbox_lag", "last_sync", "missing_projection", "extra_projection"))
+
+
+@pytest.mark.asyncio
+async def test_node_cap_independent(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G, H), relations=[(F, G, "supports"), (G, H, "supports")])
+        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}&limit=1&edge_limit=200")
+        assert status == 200, body
+        assert len(body["nodes"]) == 1 and body["truncation_reason"] == "nodes"
+
+
+@pytest.mark.asyncio
+async def test_edge_cap_independent(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G, H), relations=[(F, G, "supports"), (F, H, "contradicts")])
+        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}&limit=100&edge_limit=1")
+        assert status == 200, body
+        assert len(body["edges"]) == 1 and body["truncation_reason"] == "edges"
+
+
+@pytest.mark.asyncio
+async def test_depth_cap_independent(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G, H), relations=[(F, G, "supports"), (G, H, "supports")])
+        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}&depth=1&limit=100&edge_limit=200")
+        assert status == 200, body
+        assert body["truncation_reason"] == "depth"
+
+
+@pytest.mark.asyncio
+async def test_filtered_work_and_path_amplification(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        resources = await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        async with resources.session_factory() as session, session.begin():
+            await session.execute(
+                text("INSERT INTO claim_relations VALUES (:s,:t,:r,:d)"),
+                [dict(s=F, t=f"filtered-{i:03}", r="ignored", d="2026-10-30 00:00:00.000000") for i in range(101)],
+            )
+        status, body = await get(
+            port, auth, "graph/neighborhood?" + urlencode({"memory_id": F, "relation_types": "supports", "edge_limit": 1})
+        )
+        assert status == 200, body
+        assert [edge["relation_type"] for edge in body["edges"]] == ["supports"]
+
+
+@pytest.mark.asyncio
+async def test_c1_canonical_f_g_path_seed_projection_positive(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        await seed_projection(holder, auth)
+        payload = json.dumps({"source_id": F, "target_id": G, "max_depth": 2}).encode()
+        status, body = await http_request(
+            port, "POST", "/api/v1/profiles/alpha/graph/path", body=payload,
+            headers={**auth, "Content-Type": "application/json"},
+        )
+        assert status == 200, body
+        assert body["paths"] == [[F, G]]
+        assert {edge["canonical_relation_id"] for edge in body["edges"]} == {BASIC}
+
+
+@pytest.mark.asyncio
+async def test_soft_native_stop_preserves_root_prefix_priority(tmp_path, monkeypatch):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        graph = await seed_projection(holder, auth)
+        original = graph.read_window
+
+        def stopped(*args, **kwargs):
+            return replace(original(*args, **kwargs), soft_stopped=True)
+
+        monkeypatch.setattr(graph, "read_window", stopped)
+        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}")
+        assert status == 200, body
+        assert body["nodes"] and body["nodes"][0]["id"] == F
+        assert body["truncated"] is True and body["truncation_reason"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_graph_unavailable_is_bound_from_scoped_runtime(tmp_path, monkeypatch):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        async with await read_scope(holder, auth) as scope:
+            previous = scope.runtime.dependencies.graph
+            scope.runtime.dependencies.graph = None
+            try:
+                status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}")
+            finally:
+                scope.runtime.dependencies.graph = previous
+        assert status == 200, body
+        assert body["graph_consistency"]["projection"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_path_quota_retains_source_and_target_before_middle(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G, H), relations=[(H, G, "supports"), (G, F, "supports")])
+        payload = json.dumps({"source_id": H, "target_id": F, "max_depth": 3, "node_limit": 2}).encode()
+        status, body = await http_request(
+            port, "POST", "/api/v1/profiles/alpha/graph/path", body=payload,
+            headers={**auth, "Content-Type": "application/json"},
+        )
+        assert status == 200, body
+        assert {node["id"] for node in body["nodes"]} == {H, F}
+        assert body["paths"] == [] and body["truncation_reason"] == "nodes"
