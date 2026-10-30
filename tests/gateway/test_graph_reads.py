@@ -748,7 +748,7 @@ async def test_relation_explicit_snapshot_survives_concurrent_delete(tmp_path, m
 async def test_graph_filters_before_response_quotas(tmp_path):
     async with live_server(tmp_path) as (holder, port, _):
         auth = await relation_auth(holder, permissions=("graph.read",))
-        resources = await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        resources = await seed(holder, auth, ids=(F, G), relations=[(F, F, "contradicts"), (F, G, "supports")])
         async with resources.session_factory() as session, session.begin():
             await session.execute(
                 text("INSERT INTO claim_relations VALUES (:s,:t,:r,:d)"),
@@ -779,6 +779,18 @@ async def test_graph_consistency_absence_lag_unknown(tmp_path):
         assert all(consistency[field] is None for field in (
             "outbox_lag", "last_sync", "missing_projection", "extra_projection", "canonical_edges", "projected_edges",
         ))
+        async with await read_scope(holder, auth) as scope:
+            previous = scope.runtime.dependencies.graph
+            object.__setattr__(scope.runtime.dependencies, "graph", None)
+            try:
+                status, absent = await get(port, auth, f"graph/neighborhood?memory_id={F}")
+                assert status == 200, absent
+                assert absent["graph_consistency"] == {**consistency, "projection": "unavailable"}
+                status, entity = await get(port, auth, "graph/entity/" + ENT_SUBJECT)
+                assert status == 503, entity
+                assert entity["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
+            finally:
+                object.__setattr__(scope.runtime.dependencies, "graph", previous)
 
 
 @pytest.mark.asyncio
@@ -809,6 +821,8 @@ async def test_depth_cap_independent(tmp_path):
         status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}&depth=1&limit=100&edge_limit=200")
         assert status == 200, body
         assert body["truncation_reason"] == "depth"
+        assert {node["id"] for node in body["nodes"]} == {F, G}
+        assert {edge["canonical_relation_id"] for edge in body["edges"]} == {BASIC}
 
 
 @pytest.mark.asyncio
