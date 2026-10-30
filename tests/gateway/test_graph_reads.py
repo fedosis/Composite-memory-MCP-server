@@ -820,6 +820,18 @@ async def test_filtered_work_and_path_amplification(tmp_path):
         )
         assert status == 200, body
         assert [edge["relation_type"] for edge in body["edges"]] == ["supports"]
+        # Dense canonical DAG: few nodes/edges, exponentially many path states.
+        ids = [f"00000000-0000-4000-8000-{i + 300:012d}" for i in range(9)]
+        await seed(holder, auth, ids=ids, relations=[
+            (source, target, "supports") for i, source in enumerate(ids) for target in ids[i + 1:]
+        ])
+        status, body = await http_request(
+            port, "POST", "/api/v1/profiles/alpha/graph/path",
+            body=json.dumps({"source_id": ids[0], "target_id": ids[-1], "max_depth": 6}).encode(),
+            headers={**auth, "Content-Type": "application/json"},
+        )
+        assert status == 503, body
+        assert body["error"]["code"] == "E_GRAPH_BACKEND"
 
 
 @pytest.mark.asyncio
@@ -863,11 +875,11 @@ async def test_graph_unavailable_is_bound_from_scoped_runtime(tmp_path, monkeypa
         await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
         async with await read_scope(holder, auth) as scope:
             previous = scope.runtime.dependencies.graph
-            scope.runtime.dependencies.graph = None
+            object.__setattr__(scope.runtime.dependencies, "graph", None)
             try:
                 status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}")
             finally:
-                scope.runtime.dependencies.graph = previous
+                object.__setattr__(scope.runtime.dependencies, "graph", previous)
         assert status == 200, body
         assert body["graph_consistency"]["projection"] == "unavailable"
 

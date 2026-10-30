@@ -301,13 +301,14 @@ async def test_101_incident_rows_200_truncation_not503(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_root_candidate_charge_pre_inspect(tmp_path):
+async def test_root_candidate_charge_pre_inspect(tmp_path, monkeypatch):
+    from memory_server.application.graph_read_service import _ReadLedger
+
     async with live_server(tmp_path) as (holder, port, _):
         auth = await relation_auth(holder, permissions=("graph.read",))
-        resources = await seed(holder, auth, ids=(F,), relations=[])
-        await seed_projection(holder, auth)
-        for index in range(101):
-            ident = f"00000000-0000-4000-8000-{index + 200:012d}"
-            await seed_fact(resources, ident, "candidate")
-        status, body = await get(port, auth, "graph/entity/" + ENT_SUBJECT)
-        assert (status, body["error"]["code"]) == (503, "E_GRAPH_BACKEND")
+        await seed(holder, auth, ids=(F,), relations=[])
+        # Two real root resolutions (initial and final snapshot), one candidate slot.
+        monkeypatch.setitem(_ReadLedger._LIMITS, "candidates", 1)
+        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}")
+        assert status == 503, body
+        assert body["error"]["code"] == "E_GRAPH_BACKEND"
