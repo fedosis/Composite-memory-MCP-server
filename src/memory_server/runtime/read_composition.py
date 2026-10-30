@@ -6,9 +6,11 @@ from dataclasses import replace
 from memory_server.admission import MemoryAdmissionGate
 from memory_server.application.errors import UnknownDependencyError
 from memory_server.application.gateway_retrieval import GatewayRetrievalPort, NativeCustody
+from memory_server.application.graph_read_service import GraphReadResources, create_graph_read_port
 from memory_server.application.memory_read_service import MemoryReadService
 from memory_server.gateway_contracts.ports import ProfileSession
 from memory_server.transports.http.errors import HttpError
+from memory_server.transports.http.routes.graph import RelationCursorCodec, create_graph_read_routes
 from memory_server.transports.http.routes.memories_read import CursorCodec, create_memory_read_routes
 from memory_server.transports.http.routes.retrieval import create_context_routes, create_search_routes
 
@@ -18,6 +20,10 @@ def bind_read(scope):
         return scope.application.read_resources()
     except UnknownDependencyError:
         raise HttpError("E_RUNTIME_NOT_READY") from None
+
+
+def bind_graph_read(scope: ProfileSession) -> GraphReadResources:
+    return GraphReadResources(bind_read(scope), scope.runtime.dependencies.graph)
 
 
 class _BoundNativeCustody:
@@ -63,4 +69,11 @@ def compose_read_ports(deps, config):
     gateway = GatewayRetrievalPort(deps.leases, bind_read, deps.metrics, native=bind_native)
     ports["search"] = gateway
     ports["context"] = gateway
+    relation_codec = RelationCursorCodec.from_path(
+        config.control_path.parent / 'http-relation-cursor.key', config.cursor_ttl_seconds)
+    relation_reader = create_graph_read_port(deps.leases, bind_graph_read, native=bind_native,
+                                             cursor_codec=relation_codec, metrics=deps.metrics)
+    relation_specs = create_graph_read_routes(cursor_codec=relation_codec)
+    ports.update({spec.operation: relation_reader for spec in relation_specs})
+    specs += relation_specs
     return replace(deps, ports=ports), specs

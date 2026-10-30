@@ -18,6 +18,7 @@ from .errors import HttpError, error_code, error_response
 from .guards import Guard, ReadRouteSpec, secure_headers
 from .limits import read_body, validate_config
 from .routes import S06_ROUTE_SPECS, ProfilePort
+from .routes.graph import GRAPH_READ_ROUTE_SPECS, GraphReadRouteSpec, RelationCursorCodec
 from .routes.profiles import validate_profile_id
 from .routes.retrieval import RETRIEVAL_ROUTE_SPECS, RetrievalRouteSpec
 
@@ -57,6 +58,14 @@ class HttpApp:
                                  and spec.parse is canonical.parse
                                  and spec.validate_result is canonical.validate_result
                                  and spec.operation in {'search', 'context'})
+            elif type(spec) is GraphReadRouteSpec:
+                canonical = GRAPH_READ_ROUTE_SPECS.get(spec.operation)
+                owner_matches = (row is not None and row.owner == 'S09'
+                                 and canonical is not None
+                                 and spec.parse is canonical.parse
+                                 and spec.validate_result is canonical.validate_result
+                                 and (spec.operation not in {'relations.list', 'relations.for_memory'}
+                                      or type(spec.cursor_codec) is RelationCursorCodec))
             else:
                 owner_matches = row is not None and row.owner == 'S07'
             if (row is None or not owner_matches
