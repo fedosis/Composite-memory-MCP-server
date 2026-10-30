@@ -554,3 +554,212 @@ async def test_outbox_cursor_validation_precedes_lease(tmp_path):
     for candidate in (command(token, "failed"), command(token[:-1] + ("A" if token[-1] != "A" else "B"))):
         with pytest.raises(HttpError, match="E_CURSOR_INVALID"):
             await service.DiagnosticsService(None, None, cursor_codec=codec).execute(ctx, candidate)
+
+
+def _command(*, limit=100, cursor=None, status=None, memory_id=None):
+    from memory_server.gateway_contracts import dto as d
+
+    return d.COMMAND_TYPES["outbox.list"](
+        operation="outbox.list",
+        profile_id="alpha",
+        path_ids={},
+        payload=d.OutboxQuery(limit=limit, cursor=cursor, status=status, memory_id=memory_id),
+    )
+
+
+def test_outbox_cursor_golden_binding_tamper_expiry_and_from_path(tmp_path):
+    import base64
+    import hashlib
+    import hmac
+    import importlib
+
+    from memory_server.gateway_contracts.ports import RequestContext
+    from memory_server.transports.http.errors import HttpError
+
+    _, _, outbox = _foundation(require_b1=False)
+    routes = importlib.import_module("memory_server.transports.http.routes.diagnostics")
+    codec = routes.OutboxCursorCodec(b"k" * 32, ttl_seconds=300, clock=lambda: AT)
+    ctx = RequestContext("request", _principal("diagnostic-reader"), "alpha", None, 1.0)
+    key1 = outbox.OutboxKey("2026-10-30T12:00:00.000000+00:00", IDS[0])
+    key2 = outbox.OutboxKey("2026-10-30T12:00:00.000000+00:00", IDS[999])
+    command = _command(limit=100, status="applied", memory_id=IDS[2])
+    token = codec.issue(ctx, command, last=key1, upper=key2, limit=100, now=AT)
+    golden = (
+        "eyJleHBpcmVzX2F0IjoiMjAyNi0xMC0zMFQxMjowNTowMCswMDowMCIsImZpbHRlcl9zaGEyNTYiOiIyNGMyMzNiNTQwNDdmNmEx"
+        "YmZiZjZmZTc1MzU3YzhmNDQ0ZjJmOTkxZGE3NjVlMDFkZjQ1M2I5OWQ5NmVjNDY0IiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0zMFQx"
+        "MjowMDowMCswMDowMCIsImxhc3QiOlsiMjAyNi0xMC0zMFQxMjowMDowMC4wMDAwMDArMDA6MDAiLCIwMDAwMDAwMC0wMDAwLTQw"
+        "MDAtODAwMC0wMDAwMDAwMDAwMDEiXSwibGltaXQiOjEwMCwib3BlcmF0aW9uIjoib3V0Ym94Lmxpc3QiLCJwcm9maWxlX2lkIjoi"
+        "YWxwaGEiLCJzdWJqZWN0IjoiZGlhZ25vc3RpYy1yZWFkZXIiLCJ1cHBlciI6WyIyMDI2LTEwLTMwVDEyOjAwOjAwLjAwMDAwMCsw"
+        "MDowMCIsIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMTAwMCJdLCJ2IjoxfQ.v15tnX4XUE-oJFlFWJoTNIAiRcmY6"
+        "kmJM4Itjp9vi5c"
+    )
+    assert len(golden.encode("ascii")) == 614
+    assert token.encode("ascii") == golden.encode("ascii")
+    state = codec.validate(ctx.principal, _command(limit=20, cursor=token, status="applied", memory_id=IDS[2]), now=AT)
+    assert (state.last, state.upper, state.limit, state.expires_at) == (key1, key2, 100, AT + timedelta(seconds=300))
+    for changed in (
+        token[:-1] + ("A" if token[-1] != "A" else "B"),
+        routes.OutboxCursorCodec(b"z" * 32).issue(ctx, command, last=key1, upper=key2, limit=100, now=AT),
+    ):
+        with pytest.raises(HttpError, match="E_CURSOR_INVALID"):
+            codec.validate(ctx.principal, _command(cursor=changed, status="applied", memory_id=IDS[2]), now=AT)
+    for wrong in (
+        _command(limit=100, cursor=token, status="pending", memory_id=IDS[2]),
+        _command(limit=100, cursor=token, status="applied", memory_id=IDS[3]),
+        _command(limit=101, cursor=token, status="applied", memory_id=IDS[2]),
+    ):
+        with pytest.raises(HttpError, match="E_CURSOR_INVALID"):
+            codec.validate(ctx.principal, wrong, now=AT)
+    with pytest.raises(HttpError, match="E_CURSOR_EXPIRED"):
+        codec.validate(
+            ctx.principal, _command(cursor=token, status="applied", memory_id=IDS[2]), now=AT + timedelta(seconds=300)
+        )
+    with pytest.raises(HttpError, match="E_CURSOR_INVALID"):
+        codec.validate(
+            ctx.principal, _command(cursor=token + "x", status="applied", memory_id=IDS[2]), now=AT + timedelta(days=1)
+        )
+
+    # Sign malformed bodies correctly: rejection must not be a bad-MAC shortcut.
+    raw = base64.urlsafe_b64decode(token.split(".")[0] + "==")
+    extra = json.loads(raw)
+    extra["extra"] = "forbidden"
+    for malformed in (
+        json.dumps(extra, sort_keys=True, separators=(",", ":")).encode(),
+        json.dumps(json.loads(raw), sort_keys=True, indent=1).encode(),
+    ):
+        body = base64.urlsafe_b64encode(malformed).decode().rstrip("=")
+        signature = base64.urlsafe_b64encode(hmac.digest(b"k" * 32, body.encode(), hashlib.sha256)).decode().rstrip("=")
+        with pytest.raises(HttpError, match="E_CURSOR_INVALID"):
+            codec.validate(
+                ctx.principal, _command(cursor=body + "." + signature, status="applied", memory_id=IDS[2]), now=AT
+            )
+
+    path = tmp_path / "control" / "http-outbox-cursor.key"
+    disk = routes.OutboxCursorCodec.from_path(path, ttl_seconds=900)
+    assert path.stat().st_mode & 0o777 == 0o600 and len(path.read_bytes()) == 32
+    assert (
+        disk.validate(
+            ctx.principal,
+            _command(cursor=disk.issue(ctx, _command(), last=key1, upper=key2, limit=100, now=AT)),
+            now=AT,
+        ).upper
+        == key2
+    )
+    with pytest.raises(ValueError):
+        routes.OutboxCursorCodec.from_path(path, ttl_seconds=901)
+    reopened = routes.OutboxCursorCodec.from_path(path, ttl_seconds=900)
+    disk_token = disk.issue(ctx, _command(), last=key1, upper=key2, limit=100, now=AT)
+    assert reopened.validate(ctx.principal, _command(cursor=disk_token), now=AT).last == key1
+    path.chmod(0o644)
+    with pytest.raises(HttpError, match="E_STORAGE"):
+        routes.OutboxCursorCodec.from_path(path)
+
+
+@pytest.mark.asyncio
+async def test_work_window_statement_vm_sticky_cleanup_and_deadline(database):
+    service, provider_module, _ = _foundation(require_b1=False)
+    now = asyncio.get_running_loop().time()
+    async with database._session_factory() as session:
+        work = provider_module.DiagnosticsReadWork(
+            statements_max=1,
+            soft_deadline=now + 10,
+            hard_deadline=now + 10,
+        )
+        with pytest.raises(provider_module.DiagnosticsWorkExceeded):
+            async with database.diagnostics_window(session, work=work):
+                await session.execute(text("SELECT 1"))
+                await session.execute(text("SELECT 2"))
+        assert "s10_diagnostics_work" not in session.info
+        assert work.stop == "statements"
+        with pytest.raises(provider_module.DiagnosticsWorkExceeded):
+            work.check()
+        assert (await session.execute(text("SELECT 3"))).scalar_one() == 3
+
+    async with database._session_factory() as session:
+        work = provider_module.DiagnosticsReadWork(
+            statement_vm_limit=2_000,
+            operation_vm_limit=2_000,
+            soft_deadline=now + 10,
+            hard_deadline=now + 10,
+        )
+        with pytest.raises(provider_module.DiagnosticsWorkExceeded):
+            async with database.diagnostics_window(session, work=work):
+                await session.execute(
+                    text(
+                        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL "
+                        "SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n"
+                    )
+                )
+        assert work.stop in {"statement_vm", "operation_vm"}
+        with pytest.raises(provider_module.DiagnosticsWorkExceeded):
+            work.check()
+        assert "s10_diagnostics_work" not in session.info
+        # The same connection must no longer have the SQLite progress hook.
+        assert (
+            await session.execute(
+                text(
+                    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n"
+                )
+            )
+        ).scalar_one() == sum(range(1, 10001))
+
+    deadline = provider_module.DiagnosticsReadWork(soft_deadline=now - 1, hard_deadline=now - 1)
+    with pytest.raises(provider_module.DiagnosticsDeadlineExceeded):
+        deadline.check()
+    assert deadline.stop == "timeout"
+    from memory_server.transports.http.errors import HttpError
+
+    observed = []
+
+    async def overflow(session, work, sampled):
+        observed.append(work)
+        assert service._diagnostics_active.get() is True
+        assert work.statements_max == 256
+        for _ in range(257):
+            await session.execute(text("SELECT 1"))
+
+    assert service._diagnostics_active.get() is False
+    with pytest.raises(HttpError, match="E_STORAGE"):
+        await service.run_borrowed_diagnostics(_ctx(), _resources(database), overflow)
+    assert len(observed) == 1
+    assert (observed[0].statements, observed[0].stop) == (257, "statements")
+    assert service._diagnostics_active.get() is False
+
+    # Exercise exceptional finally in this task, not just the producer's context.
+    async with database._session_factory() as session:
+        work = provider_module.DiagnosticsReadWork()
+        with pytest.raises(RuntimeError, match="cleanup sentinel"):
+            async with service.diagnostics_log_scope(), database.diagnostics_window(session, work=work):
+                assert service._diagnostics_active.get() is True
+                await session.execute(text("SELECT 1"))
+                raise RuntimeError("cleanup sentinel")
+        assert service._diagnostics_active.get() is False
+        assert "s10_diagnostics_work" not in session.info
+        assert (await session.execute(text("SELECT 3"))).scalar_one() == 3
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_audit_does_not_spend_statements_on_discarded_groups(database):
+    service, _, _ = _foundation()
+    from memory_server.gateway_contracts import dto as d
+
+    statements = []
+
+    def trace(*args):
+        statements.append(args[2])
+
+    resources = _resources(database)
+    event.listen(database.engine.sync_engine, "before_cursor_execute", trace)
+    try:
+        result = await service.run_borrowed_diagnostics(
+            _ctx(),
+            resources,
+            lambda session, work, sampled: service.DiagnosticsService(None, None)._audit(
+                _ctx(), d.AuditQuery(audit_type="lifecycle", limit=200, cursor=None), resources, session, work, sampled
+            ),
+        )
+    finally:
+        event.remove(database.engine.sync_engine, "before_cursor_execute", trace)
+    assert result.sections == {"lifecycle": "ok"}
+    assert result.complete is True and result.findings.items == []
+    assert statements and not any("GROUP BY" in sql.upper() for sql in statements)

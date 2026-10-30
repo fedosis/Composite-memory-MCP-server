@@ -303,9 +303,6 @@ class DiagnosticsService:
             counts = {
                 table: await provider.diagnostics_count(session, table, work=work) for table in (*_TABLES, "receipts")
             }
-        if "lifecycle" in requested:
-            for table in (*_TABLES, "receipts"):
-                await provider.diagnostics_lifecycle_counts(session, table, work=work)
         # One executor for the frozen SQL predicates. Table domains are explicit:
         # receipt metadata participates in lifecycle/confidence, not canonical joins.
         predicates = (

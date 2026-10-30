@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 import pytest
 from sqlalchemy import event, text
 
-from tests.gateway.test_http_diagnostics import _ctx, _foundation, _resources
+from tests.gateway.test_http_diagnostics import _ctx, _foundation, _resources, _seed_outbox
 from tests.gateway.test_http_diagnostics import database as database
+
+
+async def _hash_tables(provider):
+    async with provider._session_factory() as session:
+        hashes = {}
+        for table in ("facts", "beliefs", "decisions", "skills", "receipts", "claim_relations", "outbox_entries"):
+            rows = (await session.execute(text(f"SELECT * FROM {table}"))).all()
+            hashes[table] = hashlib.sha256(repr(sorted(tuple(row) for row in rows)).encode()).hexdigest()
+        return hashes
 
 
 @pytest.mark.asyncio
@@ -18,6 +28,8 @@ async def test_drift_audit_indexes_unavailable_without_fake_graph_zero(database)
 
     resources = _resources(database)
     query = d.AuditQuery(audit_type="indexes", limit=200, cursor=None)
+    await _seed_outbox(database, 4)
+    before = await _hash_tables(database)
     statements = []
 
     def trace(*args):
@@ -34,8 +46,12 @@ async def test_drift_audit_indexes_unavailable_without_fake_graph_zero(database)
         )
     finally:
         event.remove(database.engine.sync_engine, "before_cursor_execute", trace)
+    assert await _hash_tables(database) == before
     assert result.sections == {"indexes": "unavailable"}
-    assert result.complete is False and result.findings.items == []
+    assert result.complete is False
+    assert [(item.code, item.aggregate, item.object_id) for item in result.findings.items] == [
+        ("OUTBOX_FAILED", True, None)
+    ]
     assert statements and all(sql.lstrip().split()[0].upper() in {"SELECT", "BEGIN"} for sql in statements)
 
 
