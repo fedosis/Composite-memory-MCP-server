@@ -282,7 +282,10 @@ async def test_repeated_cancellation_retains_producer_lease(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_101_incident_rows_200_truncation_not503(tmp_path):
+@pytest.mark.parametrize("ceiling", [1000, 100])
+async def test_101_incident_rows_200_truncation_not503(tmp_path, monkeypatch, ceiling):
+    from memory_server.application.graph_read_service import _ReadLedger
+
     async with live_server(tmp_path) as (holder, port, _):
         auth = await relation_auth(holder, permissions=("graph.read",))
         resources = await seed(holder, auth, ids=(F,), relations=[])
@@ -294,7 +297,12 @@ async def test_101_incident_rows_200_truncation_not503(tmp_path):
                 text("INSERT INTO claim_relations VALUES (:s,:t,'supports','2026-10-30 00:00:00.000000')"),
                 [dict(s=F, t=ident) for ident in incident_ids],
             )
+        monkeypatch.setitem(_ReadLedger._LIMITS, "edges", ceiling)
         status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}&limit=200&edge_limit=200")
+        if ceiling == 100:
+            assert status == 503, body
+            assert body["error"]["code"] == "E_GRAPH_BACKEND"
+            return
         assert status == 200, body
         assert len(body["edges"]) == 100
         assert body["truncated"] is True and body["truncation_reason"] == "edges"

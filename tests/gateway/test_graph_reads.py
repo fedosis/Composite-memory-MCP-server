@@ -387,13 +387,16 @@ async def test_graph_read_audit_metrics_canaries(tmp_path, caplog):
             elif isinstance(value, str) and value.startswith(("ent_", "proj_", "rel_")):
                 decoded_handles.append(value)
                 if value.startswith("ent_"):
-                    decode_handles(list(graph_codec.decode_entity_id(value)))
+                    decoded = list(graph_codec.decode_entity_id(value))
                 elif value.startswith("proj_"):
-                    decode_handles(list(graph_codec.decode_projection_id(value)))
+                    decoded = list(graph_codec.decode_projection_id(value))
                 else:
-                    decode_handles(list(graph_codec.decode_relation_id(value)))
+                    decoded = list(graph_codec.decode_relation_id(value))
+                decoded_handles.append(json.dumps(decoded))
+                decode_handles(decoded)
 
         decode_handles(captured)
+        assert all(any(item.startswith(prefix) for item in decoded_handles) for prefix in ("ent_", "proj_", "rel_"))
         output = (
             json.dumps(captured)
             + str(decoded_ids)
@@ -403,6 +406,7 @@ async def test_graph_read_audit_metrics_canaries(tmp_path, caplog):
             + "\n".join(record.getMessage() for record in caplog.records)
         )
         assert CANARY not in output
+        assert CANARY.lower() not in output and "slice01b" not in output
         for forbidden in ("query=", "cursor=", "task=", "subject="):
             assert forbidden not in str(exposition)
         for operation in (
@@ -416,7 +420,7 @@ async def test_graph_read_audit_metrics_canaries(tmp_path, caplog):
             assert f'operation="{operation}"' in exposition
         assert 'stage="graph"' in exposition
         assert F not in str(rows) and G not in str(rows)
-        print("CANARY_SWEEP_OK responses audit metrics captured_logs decoded_relation_ids")
+        print("CANARY_SWEEP_OK responses audit metrics captured_logs decoded_ent_proj_rel_recursive")
 
 
 @pytest.mark.asyncio
