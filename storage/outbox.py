@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Optional
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Integer, String, Text, select, text, update
+from sqlalchemy import DateTime, Integer, String, Text, bindparam, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -74,8 +74,9 @@ def classify_diagnostic_error(error: object) -> LastErrorCode | None:
     return error if type(error) is str and error in _DIAGNOSTIC_ERROR_CODES else None
 
 
-def _wire_time(value: datetime) -> str:
-    aware = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+def _wire_time(value: datetime | str) -> str:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+    aware = parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
     return aware.isoformat(timespec="microseconds")
 
 
@@ -84,6 +85,13 @@ def _storage_time(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("cursor timestamp must be aware")
     return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _dto_time(value: datetime | str | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 # ──────────────────────────────────────────────────────────────────────
 # ORM Model
@@ -474,14 +482,27 @@ class OutboxRepository:
             page_filter += " AND (created_at,id)>(:last_date,:last_id)"
             page_params.update(last_date=_storage_time(last.created_at), last_id=last.id)
         page_params["limit"] = limit + 1
+        date_binds = [bindparam("upper_date", type_=DateTime)]
+        if last is not None:
+            date_binds.append(bindparam("last_date", type_=DateTime))
+        page_sql = text(
+            "SELECT id,record_id,record_type,operation,status,retry_count,error,created_at,processed_at "
+            f"FROM outbox_entries WHERE {page_filter} ORDER BY created_at,id LIMIT :limit"
+        ).bindparams(*date_binds)
         result = await self._session.execute(
-            text(
-                "SELECT id,record_id,record_type,operation,status,retry_count,error,created_at,processed_at "
-                f"FROM outbox_entries WHERE {page_filter} ORDER BY created_at,id LIMIT :limit"
-            ),
+            page_sql,
             page_params,
         )
-        rows = tuple(OutboxDiagnosticRow(**dict(row)) for row in result.mappings())
+        rows = tuple(
+            OutboxDiagnosticRow(
+                **{
+                    **dict(row),
+                    "created_at": _dto_time(row["created_at"]),
+                    "processed_at": _dto_time(row["processed_at"]),
+                }
+            )
+            for row in result.mappings()
+        )
         work.check()
         return OutboxDiagnosticPage(rows, upper)
 

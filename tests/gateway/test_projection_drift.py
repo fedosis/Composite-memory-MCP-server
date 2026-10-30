@@ -107,8 +107,9 @@ async def test_foundation_counts_lifecycle_snapshot_and_no_write(tmp_path):
 
 
 async def test_projection_unknown_is_not_invented_zero(tmp_path):
-    """Foundation exposes canonical facts only; unavailable projections stay absent."""
+    """An absent production graph resource yields an unavailable projection."""
     module = _api()
+    graph = importlib.import_module("memory_server.application.graph_read_service")
     provider = await _provider(tmp_path)
     try:
         async with provider._session_factory() as session:
@@ -119,8 +120,12 @@ async def test_projection_unknown_is_not_invented_zero(tmp_path):
                     table: await provider.diagnostics_count(session, table, work=work)
                     for table in ("facts", "beliefs", "decisions", "skills")
                 }
-        observation = {"canonical": counts, "vector": None, "graph": None}
-        assert observation["vector"] is None and observation["graph"] is None
+        observation = {
+            "canonical": counts,
+            "vector": None,
+            "graph": graph.map_consistency("unavailable").projection,
+        }
+        assert observation["vector"] is None and observation["graph"] == "unavailable"
         assert observation["canonical"] == {"facts": 0, "beliefs": 0, "decisions": 0, "skills": 0}
     finally:
         await provider.close()

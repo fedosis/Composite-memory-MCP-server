@@ -17,7 +17,15 @@ from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.ports import Principal, RequestContext
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.transports.http.errors import HttpError
-from tests.gateway.test_http_shell import request
+from tests.gateway.test_http_shell import request  # noqa: F401
+from tests.gateway.test_http_shell import shell as _shell_fixture  # noqa: F401
+
+pytest_plugins = ("tests.gateway.test_http_shell",)
+
+
+@pytest.fixture
+async def shell(_shell_fixture):  # noqa: F811
+    yield _shell_fixture
 
 IDS = tuple(f"00000000-0000-4000-8000-{number:012d}" for number in range(1, 1201))
 AT = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
@@ -228,6 +236,7 @@ def test_outbox_cursor_golden_binding_tamper_expiry_and_from_path(tmp_path):
     key2 = outbox.OutboxKey("2026-10-30T12:00:00.000000+00:00", IDS[999])
     command = _command(limit=100, status="applied", memory_id=IDS[2])
     token = codec.issue(ctx, command, last=key1, upper=key2, limit=100, now=AT)
+    assert token == "eyJleHBpcmVzX2F0IjoiMjAyNi0xMC0zMFQxMjowNTowMCswMDowMCIsImZpbHRlcl9zaGEyNTYiOiIyNGMyMzNiNTQwNDdmNmExYmZiZjZmZTc1MzU3YzhmNDQ0ZjJmOTkxZGE3NjVlMDFkZjQ1M2I5OWQ5NmVjNDY0IiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0zMFQxMjowMDowMCswMDowMCIsImxhc3QiOlsiMjAyNi0xMC0zMFQxMjowMDowMC4wMDAwMDArMDA6MDAiLCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiXSwibGltaXQiOjEwMCwib3BlcmF0aW9uIjoib3V0Ym94Lmxpc3QiLCJwcm9maWxlX2lkIjoiYWxwaGEiLCJzdWJqZWN0IjoiZGlhZ25vc3RpYy1yZWFkZXIiLCJ1cHBlciI6WyIyMDI2LTEwLTMwVDEyOjAwOjAwLjAwMDAwMCswMDowMCIsIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMTAwMCJdLCJ2IjoxfQ.v15tnX4XUE-oJFlFWJoTNIAiRcmY6kmJM4Itjp9vi5c"  # noqa: E501
     state = codec.validate(ctx.principal, _command(limit=20, cursor=token, status="applied", memory_id=IDS[2]), now=AT)
     assert (state.last, state.upper, state.limit, state.expires_at) == (key1, key2, 100, AT + timedelta(seconds=300))
     for changed in (
