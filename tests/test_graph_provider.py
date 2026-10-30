@@ -821,7 +821,7 @@ def _s305_graph_fixture(tmp_path: Path) -> tuple[str, Path, Path, str]:
         CREATE TABLE skills (id TEXT PRIMARY KEY, purpose TEXT, steps TEXT,
             lifecycle_state TEXT);
         CREATE TABLE outbox_entries (id TEXT PRIMARY KEY, status TEXT, created_at TEXT);
-        INSERT INTO alembic_version VALUES ('0006');
+        INSERT INTO alembic_version VALUES ('0007');
         INSERT INTO facts VALUES ('f1', 'Widget', 'uses', 'Caddy', 's', 'active');
         INSERT INTO outbox_entries VALUES ('o1', 'pending', '2026-09-13T00:00:00Z');
     """)

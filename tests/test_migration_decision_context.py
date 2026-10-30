@@ -35,7 +35,7 @@ _ACTIVE = ("candidate", "validated", "active")
 _INDEX = "uq_decisions_context_dedup_active"
 _PR4_REV = "6a7b8c9d0e1f"
 _NEW_REV = "7a1b2c3d4e5f"
-_HEAD = "0006"
+_HEAD = "0007"
 
 
 def _canonical(context: object) -> str:

@@ -509,7 +509,7 @@ async def test_migration_upgrade_repeat_down_preserves_rows_fts_and_unique_index
         assert conn.execute("SELECT count(*) FROM facts_fts").fetchone()[0] == before_fts
         unique = conn.execute("SELECT name FROM sqlite_master WHERE name='uq_facts_spo_active'").fetchall()
         assert unique == before_unique
-        assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0006"
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0007"
     downgraded = run("downgrade", "0005")
     assert downgraded.returncode == 0, downgraded.stderr
     with sqlite3.connect(db) as conn:

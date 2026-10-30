@@ -2139,7 +2139,7 @@ def test_s203_accepted_revisions_are_the_tree_head_from_both_version_locations()
     ``ACCEPTED_SQLITE_SCHEMA_REVISIONS`` must be updated together.
     """
     heads = _s203_tree_head_revisions()
-    assert heads == frozenset({"0006"}), heads
+    assert heads == frozenset({"0007"}), heads
     assert frozenset(profile_migration.ACCEPTED_SQLITE_SCHEMA_REVISIONS) == heads
     # 7a1b2c3d4e5f is consumed as a parent by the merge revision 0005, so it is
     # an interior node of the merged DAG and never a head.
@@ -7071,7 +7071,7 @@ _S305_CANONICAL_TABLES = """
         CREATE TABLE skills (id TEXT PRIMARY KEY, purpose TEXT, steps TEXT,
             lifecycle_state TEXT);
         CREATE TABLE outbox_entries (id TEXT PRIMARY KEY, status TEXT, created_at TEXT);
-        INSERT INTO alembic_version VALUES ('0006');
+        INSERT INTO alembic_version VALUES ('0007');
 """
 
 
@@ -7213,7 +7213,7 @@ async def test_s305_staged_verification_is_green_on_real_artifacts(tmp_path: Pat
     assert verdict.graph_edge_count == 3
     # Snapshot integrity / schema / revision (DETAIL 10.3 first bullet).
     assert verdict.snapshot_integrity == "ok"
-    assert verdict.snapshot_revision == "0006"
+    assert verdict.snapshot_revision == "0007"
     assert verdict.outbox_counts.get("pending") == 1
     # R-S302-a: the plain-table metric is NOT artifact evidence.
     assert verdict.metric_verifiable is False

@@ -17,7 +17,7 @@ PYTHON = REPO / ".venv/bin/python3.12"
 if not PYTHON.exists():
     PYTHON = Path(sys.executable)
 LEGACY_REVISIONS = ("0001", "0002", "0003", "0004", "70e6afc8d15d", "5d4e3c2b1a0f", "6a7b8c9d0e1f", "b2f3a4c5d6e7")
-HEAD = "0006"
+HEAD = "0007"
 
 
 def _ini(tmp_path, db):
@@ -249,7 +249,7 @@ def test_obsolete_migrations_entrypoint_fails_closed():
     )
     # The official entrypoint resolves alembic/env.py and sees the merged graph.
     assert run.returncode == 0, run.stderr
-    assert "0006 (head)" in run.stdout
+    assert "0007 (head)" in run.stdout
 
 
 def test_irreversible_downgrade_messages_are_honest():
