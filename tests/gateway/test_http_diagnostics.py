@@ -35,11 +35,12 @@ def _ctx(profile="alpha"):
     return RequestContext("req-b1", _principal(), profile, None, asyncio.get_running_loop().time() + 30)
 
 
-def _foundation():
+def _foundation(*, require_b1=True):
     import importlib
 
     service = importlib.import_module("memory_server.application.diagnostics_service")
-    assert hasattr(service, "DiagnosticsService"), "B1 service not implemented"
+    if require_b1:
+        assert hasattr(service, "DiagnosticsService"), "B1 service not implemented"
     provider = importlib.import_module("memory_server.providers.sqlite_provider")
     outbox = importlib.import_module("storage.outbox")
     return service, provider, outbox
@@ -89,8 +90,15 @@ async def shell(tmp_path):
 
 @pytest.mark.asyncio
 async def test_b1_http_routes_are_unmounted_until_b3(shell, caplog):
+    from memory_server.runtime.read_composition import compose_read_ports
+    from memory_server.transports.http.app import create_http_app
     from tests.gateway.test_http_shell import request, rows
 
+    deps, specs = compose_read_ports(shell.deps, shell.config)
+    assert {spec.operation for spec in specs}.isdisjoint(
+        {"audit", "indexes.status", "outbox.list", "overview", "reflect"}
+    )
+    app = create_http_app(shell.config, deps, read_routes=specs)
     before = rows(shell)
     for method, suffix, body in (
         ("GET", "audit", b""),
@@ -100,7 +108,7 @@ async def test_b1_http_routes_are_unmounted_until_b3(shell, caplog):
         ("POST", "reflect", b'{"topic":null,"min_confidence":null,"context":null}'),
     ):
         response = await request(
-            shell.app,
+            app,
             f"/api/v1/profiles/alpha/{suffix}",
             method=method,
             bearer=shell.bearer,
@@ -116,6 +124,9 @@ async def test_b1_http_routes_are_unmounted_until_b3(shell, caplog):
 
     surfaces = repr(rows(shell)) + caplog.text + generate_latest(shell.metrics._registry).decode()
     assert all(secret not in surfaces for secret in ("B1_CURSOR_CANARY", "B1_PAYLOAD_CANARY"))
+
+    assert shell.leases.snapshot() == {}
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -158,7 +169,7 @@ async def test_audit_dispatcher_truncation_unavailable_and_coalescing(database):
 
 @pytest.mark.asyncio
 async def test_outbox_real_page_tie_filters_and_six_known_unknown_codes(database):
-    _, provider_module, outbox_module = _foundation()
+    _, provider_module, outbox_module = _foundation(require_b1=False)
     await _seed_outbox(database)
     statements = []
 
@@ -219,17 +230,25 @@ async def test_outbox_real_page_tie_filters_and_six_known_unknown_codes(database
     )
 
 
+@pytest.mark.parametrize(
+    "provider_logger", ["memory_server.providers.lancedb_provider", "memory_server.providers.qdrant_provider"]
+)
 @pytest.mark.asyncio
-async def test_b1_canary_provider_logs(database, caplog):
-    service, provider_module, _ = _foundation()
+async def test_b1_canary_provider_logs(database, caplog, provider_logger):
+    service, provider_module, _ = _foundation(require_b1=False)
     before = []
     async with database._session_factory() as session:
         before = (await session.execute(text("SELECT COUNT(*) FROM outbox_entries"))).scalar_one()
-    logger = logging.getLogger("memory_server.providers.lancedb_provider")
+    logger = logging.getLogger(provider_logger)
     async with service.diagnostics_log_scope():
         with caplog.at_level(logging.ERROR, logger=logger.name):
             logger.error("B1_LOG_CANARY %s", "secret")
     assert "B1_LOG_CANARY" not in caplog.text and "secret" not in caplog.text
+    with caplog.at_level(logging.ERROR):
+        logger.error("OUTSIDE_SCOPE_VISIBLE")
+        async with service.diagnostics_log_scope():
+            logging.getLogger("b1.foreign").error("FOREIGN_LOGGER_VISIBLE")
+    assert "OUTSIDE_SCOPE_VISIBLE" in caplog.text and "FOREIGN_LOGGER_VISIBLE" in caplog.text
     async with database._session_factory() as session:
         after = (await session.execute(text("SELECT COUNT(*) FROM outbox_entries"))).scalar_one()
     assert after == before
@@ -338,6 +357,15 @@ def test_audit_coalescing_is_deterministic_and_closed_validators():
     reverse = service.map_audit_result(ctx, checks[::-1], query=query, sampled_at=AT, snapshot_truncated=False)
     assert result == reverse and len(result.findings.items) == 1
     assert validate_audit_result(result) == result
+    unavailable = service.map_audit_result(
+        ctx,
+        checks + [service.AuditCheck("receipts", "RECEIPT_MISSING", "warning", None, False)],
+        query=query,
+        sampled_at=AT,
+        snapshot_truncated=False,
+    )
+    assert unavailable.sections == {"receipts": "unavailable"}
+    assert unavailable.complete is False and len(unavailable.findings.items) == 1
     for change in ({"raw": "B1_CONTENT_CANARY"}, {"receipts": "healthy"}):
         with pytest.raises(HttpError, match="E_INTERNAL"):
             validate_audit_result(result.model_copy(update={"sections": change}))

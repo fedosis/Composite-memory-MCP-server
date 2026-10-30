@@ -142,8 +142,10 @@ class OutboxCursorCodec:
             if last > upper:
                 raise ValueError
             now = utc(now)
-            expiry = min(now + timedelta(seconds=self.ttl), utc(expires_at)) if expires_at else now + timedelta(
-                seconds=self.ttl
+            expiry = (
+                min(now + timedelta(seconds=self.ttl), utc(expires_at))
+                if expires_at
+                else now + timedelta(seconds=self.ttl)
             )
             if now >= expiry:
                 raise HttpError("E_CURSOR_EXPIRED")
@@ -264,8 +266,6 @@ def _get(operation: str, model: type[d.DTO], request: Request, body: bytes, prin
                 values[key] = int(value)
             else:
                 values[key] = value
-        if model is d.Empty and values:
-            raise ValueError
         if model is d.AuditQuery:
             values.setdefault("cursor", None)
         if model is d.OutboxQuery:
@@ -293,72 +293,10 @@ def parse_audit(request, body, principal):
     return _get("audit", d.AuditQuery, request, body, principal)
 
 
-def parse_indexes_status(request, body, principal):
-    return _get("indexes.status", d.Empty, request, body, principal)
-
-
 def parse_outbox_list(request, body, principal):
     return _get("outbox.list", d.OutboxQuery, request, body, principal)
 
 
-def parse_overview(request, body, principal):
-    return _get("overview", d.Empty, request, body, principal)
-
-
-def parse_reflect(request: Request, body: bytes, principal: Principal):
-    del principal
-    if request.query_params:
-        raise HttpError("E_VALIDATION")
-    if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
-        raise HttpError("E_UNSUPPORTED_MEDIA_TYPE")
-
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError
-            result[key] = value
-        return result
-
-    try:
-        values = json.loads(body, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
-        if not {"topic", "min_confidence", "context"} <= set(values):
-            raise ValueError
-        payload = d.ReflectRequest.model_validate(values, strict=True)
-        return _command("reflect", request, payload)
-    except (ValidationError, ValueError, TypeError, UnicodeError, RecursionError):
-        raise HttpError("E_VALIDATION") from None
-
-
-_REFLECT_KEYS = {
-    "overview": {
-        "sampled_at",
-        "selected_count",
-        "total_beliefs",
-        "lifecycle_counts",
-        "confidence",
-        "contradiction_count",
-        "stale_count",
-        "decaying_next_7d",
-        "no_evidence_count",
-        "evidence_stats_status",
-    },
-    "contradictions": {"sampled_at", "selected_count", "total", "pairs"},
-    "decay": {"sampled_at", "selected_count", "stale_now", "stale_7d", "archived_7d", "forgotten_7d"},
-    "topics": {"sampled_at", "selected_count", "topic_count", "untagged_count"},
-    "evidence_audit": {
-        "sampled_at",
-        "selected_count",
-        "total",
-        "with_evidence",
-        "without_evidence",
-        "avg_evidence_per_belief",
-        "zero_weight_entries",
-        "evidence_stats_status",
-    },
-    "confidence": {"sampled_at", "selected_count", "histogram", "lowest_count", "beliefs"},
-    "relations": {"sampled_at", "selected_count", "total", "contradictions", "entailments", "neutral_pairs", "pairs"},
-}
 _ERROR_CODES = {
     "E_TIMEOUT",
     "E_STORAGE",
@@ -367,66 +305,108 @@ _ERROR_CODES = {
     "E_PROJECTION_UNAVAILABLE",
     "E_CAPABILITY_UNAVAILABLE",
 }
+_AUDIT_RESULT_KEYS = {"findings", "sections", "sampled_at", "complete"}
+_AUDIT_PAGE_KEYS = {"items", "next_cursor", "has_more", "request_id"}
+_AUDIT_FINDING_KEYS = {"id", "category", "severity", "object_kind", "object_id", "code", "aggregate"}
+_AUDIT_SECTIONS = {"lifecycle", "receipts", "relations", "indexes", "confidence", "consistency", "graph_orphans"}
+_OUTBOX_PAGE_KEYS = {"items", "next_cursor", "has_more", "request_id"}
+_OUTBOX_ITEM_KEYS = {
+    "event_id",
+    "memory_id",
+    "record_type",
+    "operation",
+    "status",
+    "attempts",
+    "target_backend",
+    "last_error_code",
+    "next_retry",
+    "created_at",
+    "processed_at",
+}
+_OUTBOX_OPERATIONS = {"index_fact", "index_belief", "index_decision", "index_skill"}
+
+
+def _canonical_uuid(value):
+    try:
+        return type(value) is str and str(UUID(value)) == value
+    except ValueError:
+        return False
 
 
 def validate_audit_result(value):
-    result = d.AuditResult.model_validate(value.model_dump(), strict=True)
-    if not set(result.sections) <= {
-        "lifecycle",
-        "receipts",
-        "relations",
-        "indexes",
-        "confidence",
-        "consistency",
-        "graph_orphans",
-    }:
+    raw = value.model_dump()
+    if not isinstance(raw, dict):
+        raise HttpError("E_INTERNAL")
+    findings = raw.get("findings", {})
+    if (
+        set(raw) != _AUDIT_RESULT_KEYS
+        or not isinstance(findings, dict)
+        or set(findings) != _AUDIT_PAGE_KEYS
+        or not isinstance(findings.get("items"), list)
+        or any(not isinstance(item, dict) or set(item) != _AUDIT_FINDING_KEYS for item in findings["items"])
+        or not isinstance(raw.get("sections"), dict)
+        or not set(raw["sections"]) <= _AUDIT_SECTIONS
+    ):
+        raise HttpError("E_INTERNAL")
+    try:
+        result = d.AuditResult.model_validate(raw, strict=True)
+    except ValidationError:
+        raise HttpError("E_INTERNAL") from None
+    errors = {"STATE_METADATA_INVALID", "CONFIDENCE_INVALID", "RELATION_ENDPOINT_INVALID", "RELATION_TYPE_INVALID"}
+    warnings = {
+        "RECEIPT_STATE_MISMATCH",
+        "RECEIPT_MISSING",
+        "RECEIPT_TYPE_MISMATCH",
+        "RECEIPT_ORPHAN",
+        "CONFIDENCE_LOW",
+        "CONFIDENCE_STATE_MISMATCH",
+        "VECTOR_COUNT_MISMATCH",
+        "OUTBOX_FAILED",
+        "OUTBOX_STATUS_INVALID",
+    }
+    if (
+        any(state not in {"ok", "warning", "unavailable"} for state in result.sections.values())
+        or result.findings.has_more
+        or result.findings.next_cursor is not None
+        or any(
+            item.category not in _AUDIT_SECTIONS - {"graph_orphans"}
+            or item.code not in errors | warnings
+            or item.severity != ("error" if item.code in errors else "warning")
+            or not re.fullmatch(
+                r"s10:(?:" + "|".join(sorted(_AUDIT_SECTIONS)) + "):" + item.code + r":[1-9][0-9]*", item.id
+            )
+            or (item.aggregate and (item.object_kind is not None or item.object_id is not None))
+            or (not item.aggregate and (item.object_kind is None or not _canonical_uuid(item.object_id)))
+            for item in result.findings.items
+        )
+    ):
         raise HttpError("E_INTERNAL")
     return result
-
-
-def validate_index_status(value):
-    return d.IndexStatus.model_validate(value.model_dump(), strict=True)
 
 
 def validate_outbox_page(value):
-    result = d.Page[d.OutboxItem].model_validate(value.model_dump(), strict=True)
-    if any(item.last_error_code is not None and item.last_error_code not in _ERROR_CODES for item in result.items):
+    raw = value.model_dump()
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != _OUTBOX_PAGE_KEYS
+        or not isinstance(raw.get("items"), list)
+        or any(not isinstance(item, dict) or set(item) != _OUTBOX_ITEM_KEYS for item in raw["items"])
+    ):
         raise HttpError("E_INTERNAL")
-    return result
-
-
-def validate_overview(value):
-    return d.Overview.model_validate(value.model_dump(), strict=True)
-
-
-def validate_reflect_result(value):
-    result = d.ReflectResult.model_validate(value.model_dump(), strict=True)
-    if result.mode not in _REFLECT_KEYS or set(result.sections) != _REFLECT_KEYS[result.mode]:
+    try:
+        result = d.Page[d.OutboxItem].model_validate(raw, strict=True)
+    except ValidationError:
+        raise HttpError("E_INTERNAL") from None
+    if any(
+        item.operation not in _OUTBOX_OPERATIONS
+        or not _canonical_uuid(item.event_id)
+        or not _canonical_uuid(item.memory_id)
+        or item.target_backend is not None
+        or item.next_retry is not None
+        or (item.last_error_code is not None and item.last_error_code not in _ERROR_CODES)
+        for item in result.items
+    ):
         raise HttpError("E_INTERNAL")
-    forbidden = {
-        "proposition",
-        "proposition_a",
-        "proposition_b",
-        "tag",
-        "recommendation",
-        "by_topics",
-        "by_tag_stale",
-        "by_source_type",
-        "evidence_stats_error",
-        "detection_method",
-    }
-
-    def walk(item):
-        if isinstance(item, dict):
-            if forbidden & set(item):
-                raise HttpError("E_INTERNAL")
-            for nested in item.values():
-                walk(nested)
-        elif isinstance(item, list):
-            for nested in item:
-                walk(nested)
-
-    walk(result.sections)
     return result
 
 
@@ -442,10 +422,7 @@ DIAGNOSTICS_ROUTE_SPECS: Final = MappingProxyType(
         )
         for operation, parser, validator in (
             ("audit", parse_audit, validate_audit_result),
-            ("indexes.status", parse_indexes_status, validate_index_status),
             ("outbox.list", parse_outbox_list, validate_outbox_page),
-            ("overview", parse_overview, validate_overview),
-            ("reflect", parse_reflect, validate_reflect_result),
         )
     }
 )

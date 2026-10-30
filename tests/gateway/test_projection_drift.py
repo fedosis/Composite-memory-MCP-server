@@ -41,7 +41,7 @@ async def test_drift_audit_indexes_unavailable_without_fake_graph_zero(database)
 
 @pytest.mark.asyncio
 async def test_runner_statement_overflow_is_storage_and_hooks_reset(database):
-    service, _, _ = _foundation()
+    service, _, _ = _foundation(require_b1=False)
     from memory_server.transports.http.errors import HttpError
 
     observed = []
@@ -61,7 +61,7 @@ async def test_runner_statement_overflow_is_storage_and_hooks_reset(database):
 
 @pytest.mark.asyncio
 async def test_runner_cancellation_drains_before_return(database):
-    service, _, _ = _foundation()
+    service, _, _ = _foundation(require_b1=False)
     from memory_server.transports.http.errors import HttpError
 
     started, finished = asyncio.Event(), asyncio.Event()
