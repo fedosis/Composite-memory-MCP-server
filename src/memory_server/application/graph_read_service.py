@@ -700,6 +700,8 @@ class GraphReadService:
                     else:
                         representative = representatives.get(root["wire"])
                         if representative is None:
+                            if window is not None and window.soft_stopped:
+                                raise HttpError("E_TIMEOUT")
                             raise HttpError("E_NOT_FOUND")
                         wire_roots.append(representative)
 
