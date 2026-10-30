@@ -42,6 +42,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -60,6 +61,66 @@ GRAPH_LOCK_TIMEOUT = float(os.environ.get("MEMORY_GRAPH_LOCK_TIMEOUT", "30"))
 # leaves substantial headroom over the observed ~14 MiB production snapshot while
 # keeping malformed or hostile inputs from becoming an unbounded read.
 _MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
+
+
+class GraphBudgetExceeded(Exception):  # noqa: N818 - frozen public contract name
+    """Raised when bounded graph traversal exceeds a cumulative budget."""
+
+    def __init__(self, dimension: str, limit: int, attempted: int) -> None:
+        self.dimension = dimension
+        self.limit = limit
+        self.attempted = attempted
+        super().__init__("graph budget exceeded")
+
+
+@dataclass
+class _TraversalBudget:
+    max_nodes: int
+    max_edges: int
+    max_pairs: int
+    max_depth: int
+    nodes: int = 0
+    edges: int = 0
+    pairs: int = 0
+
+
+_TRAVERSAL_BUDGET: ContextVar[_TraversalBudget | None] = ContextVar(
+    "memory_graph_traversal_budget", default=None
+)
+
+
+@contextmanager
+def _bounded_traversal(
+    max_nodes: int, max_edges: int, max_pairs: int, max_depth: int
+) -> Iterator[_TraversalBudget]:
+    budget = _TraversalBudget(max_nodes, max_edges, max_pairs, max_depth)
+    token = _TRAVERSAL_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _TRAVERSAL_BUDGET.reset(token)
+
+
+def _charge(dimension: str, amount: int = 1) -> None:
+    budget = _TRAVERSAL_BUDGET.get()
+    if budget is None:
+        return
+    current = getattr(budget, dimension) + amount
+    limit = getattr(budget, f"max_{dimension}")
+    if current > limit:
+        raise GraphBudgetExceeded(dimension, limit, current)
+    setattr(budget, dimension, current)
+
+
+def _remaining(dimension: str) -> int | None:
+    budget = _TRAVERSAL_BUDGET.get()
+    if budget is None:
+        return None
+    return getattr(budget, f"max_{dimension}") - getattr(budget, dimension)
+
+
+def _charge_pair() -> None:
+    _charge("pairs")
 
 
 @dataclass
@@ -305,12 +366,28 @@ class SimpleGraph:
             self._journal.append(("delete_node", id))
         self._persist_if_needed()
 
-    def get_all_nodes(self) -> list[GraphNode]:
+    def get_all_nodes(self, *, scan_limit: int | None = None) -> list[GraphNode]:
         """Get all nodes in the graph.
 
         Returns:
             List of all GraphNode objects.
         """
+        if scan_limit is not None or _TRAVERSAL_BUDGET.get() is not None:
+            if scan_limit is not None and len(self._nodes) > scan_limit:
+                budget = _TRAVERSAL_BUDGET.get()
+                used = budget.nodes if budget is not None else 0
+                limit = budget.max_nodes if budget is not None else scan_limit
+                raise GraphBudgetExceeded("nodes", limit, used + len(self._nodes))
+            nodes: list[GraphNode] = []
+            for node in self._nodes.values():
+                if scan_limit is not None and len(nodes) >= scan_limit:
+                    budget = _TRAVERSAL_BUDGET.get()
+                    limit = budget.max_nodes if budget is not None else scan_limit
+                    used = budget.nodes if budget is not None else len(nodes)
+                    raise GraphBudgetExceeded("nodes", limit, used + 1)
+                _charge("nodes")
+                nodes.append(node)
+            return nodes
         return list(self._nodes.values())
 
     # --- Edge operations ---
@@ -410,6 +487,8 @@ class SimpleGraph:
         self,
         node_id: str,
         relation: str | None = None,
+        *,
+        edge_limit: int | None = None,
     ) -> list[tuple[GraphNode, GraphEdge]]:
         """Get all neighbors of a node, optionally filtered by relation.
 
@@ -420,6 +499,8 @@ class SimpleGraph:
         Returns:
             List of (neighbor_node, edge) tuples.
         """
+        if edge_limit is not None or _TRAVERSAL_BUDGET.get() is not None:
+            return self._get_neighbors_bounded(node_id, relation, edge_limit)
         if node_id not in self._nodes:
             return []
 
@@ -445,6 +526,46 @@ class SimpleGraph:
 
         return neighbors
 
+    def _get_neighbors_bounded(
+        self,
+        node_id: str,
+        relation: str | None,
+        edge_limit: int | None,
+    ) -> list[tuple[GraphNode, GraphEdge]]:
+        if node_id not in self._nodes:
+            return []
+        neighbors: list[tuple[GraphNode, GraphEdge]] = []
+        inspected = 0
+
+        def inspect(edge: GraphEdge, neighbor_id: str) -> None:
+            nonlocal inspected
+            inspected += 1
+            if edge_limit is not None and inspected > edge_limit:
+                budget = _TRAVERSAL_BUDGET.get()
+                used = budget.edges if budget is not None else inspected - 1
+                limit = budget.max_edges if budget is not None else edge_limit
+                raise GraphBudgetExceeded("edges", limit, used + 1)
+            _charge("edges")
+            if not isinstance(edge, GraphEdge):
+                return
+            if relation is not None and edge.relation != relation:
+                return
+            neighbor_node = self._nodes.get(neighbor_id)
+            if neighbor_node is not None:
+                neighbors.append((neighbor_node, edge))
+
+        if node_id in self._edges:
+            for target_id, edges in self._edges[node_id].items():
+                for edge in edges:
+                    inspect(edge, target_id)
+        for source_id, targets in self._edges.items():
+            if source_id == node_id:
+                continue
+            if node_id in targets:
+                for edge in targets[node_id]:
+                    inspect(edge, source_id)
+        return neighbors
+
     # --- Pathfinding ---
 
     def find_path(
@@ -452,6 +573,8 @@ class SimpleGraph:
         source_id: str,
         target_id: str,
         max_depth: int = 4,
+        *,
+        node_limit: int | None = None,
     ) -> list[list[GraphNode]]:
         """Find all simple paths between two nodes up to max_depth.
 
@@ -472,6 +595,9 @@ class SimpleGraph:
             List of simple paths, where each path is a list of GraphNode
             objects ordered from source to target.
         """
+        if node_limit is not None or _TRAVERSAL_BUDGET.get() is not None:
+            return self._find_path_bounded(source_id, target_id, max_depth, node_limit)
+
         if source_id not in self._nodes or target_id not in self._nodes:
             return []
 
@@ -498,6 +624,56 @@ class SimpleGraph:
                 elif len(new_path) - 1 < max_depth:
                     queue.append((target_id_candidate, new_path))
 
+        return paths
+
+    def _find_path_bounded(
+        self,
+        source_id: str,
+        target_id: str,
+        max_depth: int,
+        node_limit: int | None,
+    ) -> list[list[GraphNode]]:
+        if source_id not in self._nodes or target_id not in self._nodes:
+            return []
+        budget = _TRAVERSAL_BUDGET.get()
+        if budget is None:
+            with _bounded_traversal(node_limit, 1000, 100, max_depth):
+                return self._find_path_bounded(source_id, target_id, max_depth, node_limit)
+
+        local_nodes = 0
+
+        def charge_node() -> None:
+            nonlocal local_nodes
+            if node_limit is not None and local_nodes >= node_limit:
+                raise GraphBudgetExceeded("nodes", budget.max_nodes, budget.nodes + 1)
+            local_nodes += 1
+            _charge("nodes")
+
+        charge_node()
+        if source_id == target_id:
+            return [[self._nodes[source_id]]]
+        queue: deque[tuple[str, tuple[str, ...]]] = deque([(source_id, (source_id,))])
+        paths: list[list[GraphNode]] = []
+        while queue:
+            current, path = queue.popleft()
+            depth = len(path) - 1
+            for candidate, entries in self._edges.get(current, {}).items():
+                eligible = candidate not in path and candidate in self._nodes
+                charged_node = False
+                for _edge in entries:
+                    if eligible and not charged_node:
+                        charge_node()
+                        charged_node = True
+                    _charge("edges")
+                    if eligible and depth >= max_depth:
+                        raise GraphBudgetExceeded("depth", max_depth, max_depth + 1)
+                if not charged_node:
+                    continue
+                new_path = path + (candidate,)
+                if candidate == target_id:
+                    paths.append([self._nodes[nid] for nid in new_path])
+                else:
+                    queue.append((candidate, new_path))
         return paths
 
     # --- Search ---

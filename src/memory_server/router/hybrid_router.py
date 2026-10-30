@@ -14,8 +14,11 @@ result set.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 
+from memory_server.application.errors import UnknownDependencyError
 from memory_server.providers.embedding_provider import (
     EmbeddingProvider,
 )
@@ -40,6 +43,53 @@ if TYPE_CHECKING:
     VectorProvider = QdrantProvider | LanceDBProvider
 else:
     VectorProvider = Any
+
+
+Source = Literal["fts", "semantic", "graph"]
+BackendCode = Literal["E_VECTOR_BACKEND", "E_GRAPH_BACKEND"]
+FailureCode = Literal["E_CAPABILITY_UNAVAILABLE", "E_VECTOR_BACKEND", "E_GRAPH_BACKEND"]
+RankCollector = Callable[[], Awaitable[list[RankResult]]]
+
+
+class StrictSourceFailed(Exception):  # noqa: N818 - frozen public contract name
+    def __init__(self, code: BackendCode) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True, slots=True)
+class HybridOutcome:
+    ranked: list[RankResult]
+    failures: dict[Source, FailureCode]
+    executed: set[Source]
+
+
+async def collect_strict(*, fts: RankCollector | None, semantic: RankCollector | None,
+                         graph: RankCollector | None, merger: RankMerger,
+                         limit: int) -> HybridOutcome:
+    failures: dict[Source, FailureCode] = {}
+    executed: set[Source] = set()
+    batches = []
+    for source, callback in (("fts", fts), ("semantic", semantic), ("graph", graph)):
+        batch = []
+        if callback is None:
+            failures[source] = "E_CAPABILITY_UNAVAILABLE"
+        else:
+            try:
+                batch = await callback()
+            except StrictSourceFailed as exc:
+                if source == "fts":
+                    raise
+                failures[source] = exc.code
+            else:
+                executed.add(source)
+        batches.append(batch)
+    if not executed:
+        for source in ("semantic", "graph"):
+            if failures.get(source) in ("E_VECTOR_BACKEND", "E_GRAPH_BACKEND"):
+                raise StrictSourceFailed(failures[source])
+        raise UnknownDependencyError("retrieval sources")
+    return HybridOutcome(merger.merge(*batches)[:limit], failures, executed)
 
 
 class HybridRouter:

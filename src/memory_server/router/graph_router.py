@@ -11,7 +11,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from memory_server.providers.graph_provider import SimpleGraph
+from memory_server.providers import graph_provider as _graph_provider
+from memory_server.providers.graph_provider import GraphBudgetExceeded, SimpleGraph
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,94 @@ class GraphRouter:
             "relations": relations,
             "paths": paths,
         }
+
+    def query_bounded(
+        self,
+        text: str,
+        *,
+        max_nodes: int,
+        max_edges: int,
+        max_pairs: int,
+        max_depth: int,
+    ) -> dict[str, Any]:
+        """Run the opt-in cumulative-budget graph traversal."""
+        limits = (
+            ("nodes", max_nodes, 500),
+            ("edges", max_edges, 1000),
+            ("pairs", max_pairs, 100),
+            ("depth", max_depth, 4),
+        )
+        for dimension, value, hard_cap in limits:
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"invalid graph {dimension} budget")
+            if value > hard_cap:
+                raise GraphBudgetExceeded(dimension, hard_cap, value)
+
+        with _graph_provider._bounded_traversal(
+            max_nodes, max_edges, max_pairs, max_depth
+        ):
+            entities = self._extract_entities_bounded(text)
+            relations: list[dict[str, Any]] = []
+            seen_rel: set[str] = set()
+            for entity in entities:
+                neighbors = self._graph.get_neighbors(
+                    entity["id"],
+                    edge_limit=_graph_provider._remaining("edges"),
+                )
+                for neighbor_node, edge in neighbors:
+                    if not all(type(getattr(edge, field, None)) is str and getattr(edge, field)
+                               for field in ("source_id", "target_id", "relation")):
+                        continue
+                    rel_key = (edge.source_id, edge.target_id, edge.relation)
+                    if rel_key in seen_rel:
+                        continue
+                    seen_rel.add(rel_key)
+                    source_node = self._graph.get_node(edge.source_id)
+                    target_node = self._graph.get_node(edge.target_id)
+                    relations.append({
+                        "source_id": edge.source_id,
+                        "source_name": source_node.name if source_node else edge.source_id,
+                        "relation": edge.relation,
+                        "target_id": edge.target_id,
+                        "target_name": target_node.name if target_node else edge.target_id,
+                        "target_type": target_node.type if target_node else "",
+                    })
+
+            paths: list[list[dict[str, Any]]] = []
+            for i in range(len(entities)):
+                for j in range(i + 1, len(entities)):
+                    _graph_provider._charge_pair()
+                    found_paths = self._graph.find_path(
+                        entities[i]["id"],
+                        entities[j]["id"],
+                        max_depth=max_depth,
+                        node_limit=_graph_provider._remaining("nodes"),
+                    )
+                    for path in found_paths:
+                        paths.append([
+                            {"id": node.id, "name": node.name, "type": node.type}
+                            for node in path
+                        ])
+
+            return {"entities": entities, "relations": relations, "paths": paths}
+
+    def _extract_entities_bounded(self, text: str) -> list[dict[str, Any]]:
+        text_lower = text.lower().strip()
+        matched: list[dict[str, Any]] = []
+        for node in self._graph.get_all_nodes(
+            scan_limit=_graph_provider._remaining("nodes")
+        ):
+            if (type(getattr(node, "name", None)) is not str or not node.name
+                    or type(getattr(node, "id", None)) is not str or not node.id):
+                continue
+            if node.name.lower() in text_lower or node.id.lower() in text_lower:
+                matched.append({
+                    "id": node.id,
+                    "name": node.name,
+                    "type": node.type,
+                    "attributes": node.attributes,
+                })
+        return matched
 
     # --- Fact sync ---
 

@@ -14,6 +14,7 @@ from memory_server.application.contracts import (
     SemanticSearchCommand,
 )
 from memory_server.application.errors import UnknownDependencyError
+from memory_server.router.embedding_router import NativeSubmitter, SourceOutcome
 
 
 class RetrievalService:
@@ -86,6 +87,34 @@ class RetrievalService:
             score_threshold=score_threshold,
         )
 
+
+    async def gateway_semantic_available(self) -> bool:
+        if self._get_embedding_router is None:
+            return False
+        try:
+            router = await self._get_embedding_router()
+        except (ValueError, UnknownDependencyError):
+            return False
+        return router is not None
+
+    async def gateway_semantic(
+        self, command: SemanticSearchCommand, *, native: NativeSubmitter,
+    ) -> SourceOutcome:
+        if self._get_embedding_router is None:
+            raise UnknownDependencyError("embedding router")
+        try:
+            router = await self._get_embedding_router()
+        except ValueError:
+            raise UnknownDependencyError("embedding router") from None
+        if router is None:
+            raise UnknownDependencyError("embedding router")
+        return await router.search_outcome(
+            command.query,
+            top_k=self._policy.semantic_top_k if command.top_k is None else command.top_k,
+            score_threshold=(self._policy.semantic_score_threshold
+                             if command.score_threshold is None else command.score_threshold),
+            native=native,
+        )
 
     async def route(self, command: RouteCommand) -> dict:
         if self._get_hybrid_router is None:

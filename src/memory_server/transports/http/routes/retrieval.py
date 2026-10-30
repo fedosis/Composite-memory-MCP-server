@@ -31,7 +31,7 @@ def _parse_search(request, body, principal):
     # C4/T2: see ops/CONTRACTS_AMENDMENT_C4_T2.md; these filters remain unsupported.
     if filters.source is not None or filters.tags:
         raise HttpError("E_VALIDATION")
-    if query.trace or query.mode in ("semantic", "graph"):
+    if query.trace:
         raise HttpError("E_CAPABILITY_UNAVAILABLE")
     return d.COMMAND_TYPES["search"](
         operation="search", profile_id=request.path_params["profile"], path_ids={}, payload=query

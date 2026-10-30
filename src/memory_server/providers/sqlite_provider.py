@@ -11,6 +11,7 @@ duplicate inline ORM models.
 import json
 import re
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
@@ -43,6 +44,21 @@ from memory_server.models import (
 )
 
 T = TypeVar("T")
+
+
+RESOLVER_INACTIVE_PER_TRIPLE = 8
+Triple = tuple[str, str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class FactRow:
+    id: str
+    subject: str
+    predicate: str
+    object: str
+    lifecycle_state: str
+    confidence: float
+    created_at: datetime
 
 
 class SQLiteProvider:
@@ -459,6 +475,49 @@ class SQLiteProvider:
             data["timestamp"] = self._utc(data["timestamp"])
             receipts[(row.id, row.memory_type)] = data
         return receipts
+
+    async def resolve_fact_rows(
+        self, session: AsyncSession, triples: tuple[Triple, ...], *, include_inactive: bool,
+    ) -> tuple[FactRow, ...]:
+        if (type(triples) is not tuple or len(triples) > 100 or type(include_inactive) is not bool
+                or any(type(t) is not tuple or len(t) != 3
+                       or any(type(v) is not str or not v for v in t) for t in triples)):
+            raise ValueError("invalid resolver input")
+        triples = tuple(dict.fromkeys(triples))
+        if not triples:
+            return ()
+        params = {f"{name}{i}": value for i, triple in enumerate(triples)
+                  for name, value in zip(("s", "p", "o"), triple, strict=True)}
+
+        def terms(prefix):
+            return " OR ".join(
+                f"({prefix}subject=:s{i} AND {prefix}predicate=:p{i} AND {prefix}object=:o{i})"
+                for i in range(len(triples))
+            )
+
+        columns = "id, subject, predicate, object, lifecycle_state, confidence, created_at"
+        active = "('candidate','validated','active')"
+        a = f"SELECT {columns} FROM facts WHERE ({terms('')}) AND lifecycle_state IN {active}"
+        rows = list((await session.execute(text(a + " ORDER BY created_at DESC, id ASC"), params)).mappings())
+        if include_inactive:
+            b = (
+                f"SELECT {columns} FROM ("
+                "SELECT f.id, f.subject, f.predicate, f.object, f.lifecycle_state, f.confidence, f.created_at, "
+                "ROW_NUMBER() OVER (PARTITION BY f.subject, f.predicate, f.object "
+                "ORDER BY f.created_at DESC, f.id ASC) AS rn "
+                f"FROM facts f WHERE ({terms('f.')}) AND f.lifecycle_state NOT IN {active}"
+                ") WHERE rn <= :k ORDER BY created_at DESC, id ASC"
+            )
+            rows.extend((await session.execute(text(b), {**params, "k": RESOLVER_INACTIVE_PER_TRIPLE})).mappings())
+        result = [FactRow(
+            id=row["id"], subject=row["subject"], predicate=row["predicate"], object=row["object"],
+            lifecycle_state=row["lifecycle_state"], confidence=row["confidence"],
+            created_at=datetime.fromisoformat(self._utc(row["created_at"])),
+        ) for row in rows]
+        # Stable global A union B order; identity and eligibility stay separate.
+        result.sort(key=lambda row: row.id)
+        result.sort(key=lambda row: row.created_at, reverse=True)
+        return tuple(result)
 
     async def read_fact_records(self, session: AsyncSession, ids: tuple[str, ...]):
         """Hydrate a bounded ordered hit list in the caller's existing snapshot."""

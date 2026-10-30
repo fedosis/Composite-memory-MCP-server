@@ -8,7 +8,9 @@ Per ADR-005 routing order:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from memory_server.providers.embedding_provider import (
     EmbeddingProvider,
@@ -32,6 +34,25 @@ if TYPE_CHECKING:
     VectorProvider = QdrantProvider | LanceDBProvider
 else:
     VectorProvider = Any
+
+
+class NativeHandle(Protocol):
+    async def result(self) -> Any: ...
+
+    @property
+    def terminated(self) -> bool: ...
+
+
+class NativeSubmitter(Protocol):
+    async def __call__(self, function: Callable[..., Any], /, *args: Any,
+                       kind: str, **kwargs: Any) -> NativeHandle: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SourceOutcome:
+    state: Literal["ok", "failed"]
+    results: tuple[dict[str, Any], ...]
+    code: Literal["E_VECTOR_BACKEND"] | None
 
 
 class EmbeddingRouter:
@@ -156,3 +177,32 @@ class EmbeddingRouter:
             type(self._vector_provider).__name__,
         )
         return results
+
+    async def search_outcome(
+        self, query: str, *, top_k: int, score_threshold: float | None,
+        native: NativeSubmitter,
+    ) -> SourceOutcome:
+        # Submission is an authority boundary, not a backend failure.
+        handle = await native(self._embedder.embed, query, kind="retrieval-embed")
+        try:
+            vector = await handle.result()
+            results = await self._vector_provider.search(
+                collection=self._collection, vector=vector, limit=top_k,
+                score_threshold=score_threshold,
+            )
+        except Exception as exc:
+            # LanceDB may wrap a submission failure. Authority stays authoritative
+            # even across that public exception chain; never classify it as data.
+            cause = exc
+            seen = set()
+            while cause is not None and id(cause) not in seen:
+                seen.add(id(cause))
+                code = getattr(cause, "code", None)
+                if isinstance(code, str) and (code.startswith("E_RUNTIME_") or code.startswith("E_LOCK_")
+                                              or code in {"E_PROFILE_BUSY", "E_RATE_LIMIT"}):
+                    raise cause
+                cause = cause.__cause__
+            return SourceOutcome("failed", (), "E_VECTOR_BACKEND")
+        if type(results) not in (list, tuple) or len(results) > top_k:
+            return SourceOutcome("failed", (), "E_VECTOR_BACKEND")
+        return SourceOutcome("ok", tuple(item for item in results if type(item) is dict), None)
