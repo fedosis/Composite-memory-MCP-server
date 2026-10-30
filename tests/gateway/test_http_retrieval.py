@@ -725,6 +725,8 @@ async def test_s08b_projection_absence_layout_two_phase(tmp_path, similarity_emb
             assert status == 200 and body["degraded"] == [{"source": "semantic", "code": "E_CAPABILITY_UNAVAILABLE"}], (
                 body
             )
+            # Plan §11.4: a healthy source must still deliver its canonical hit.
+            assert body["results"][0]["memory"]["id"] == "s08b-absence", body
         else:
             assert status == 200 and body["results"][0]["memory"]["id"] == "s08b-absence", body
             status, body = await post(
@@ -743,6 +745,7 @@ async def test_s08b_projection_absence_layout_two_phase(tmp_path, similarity_emb
                 filters={"source": None, "min_confidence": None},
             )
             assert status == 200 and body["degraded"] == [{"source": "graph", "code": "E_CAPABILITY_UNAVAILABLE"}], body
+            assert body["results"][0]["memory"]["id"] == "s08b-absence", body
 
 
 @pytest.mark.asyncio
