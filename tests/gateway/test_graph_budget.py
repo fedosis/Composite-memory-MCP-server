@@ -68,6 +68,8 @@ def test_timeout_cap_independent():
 
     graph = SimpleGraph()
     graph.add_node("root", "entity", "Root")
+    graph.add_node("next", "entity", "Next")
+    graph.add_edge("root", "next", "hidden")
     ticks = iter((0.0, 0.0, 2.0, 2.0, 2.0))
     window = _read_window(
         graph,
@@ -82,7 +84,7 @@ def test_timeout_cap_independent():
 
 
 def test_s08b_budget_context_unchanged():
-    from memory_server.providers.graph_provider import SimpleGraph, _TRAVERSAL_BUDGET
+    from memory_server.providers.graph_provider import _TRAVERSAL_BUDGET, SimpleGraph
 
     graph = SimpleGraph()
     graph.add_node("root", "entity", "Root")

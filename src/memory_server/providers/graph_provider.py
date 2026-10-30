@@ -45,7 +45,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +153,41 @@ class GraphValidation:
     node_digest: str = ""
     edge_digest: str = ""
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class ReadNode:
+    id: str
+    type: str
+    name: str
+
+
+@dataclass(frozen=True)
+class ReadEdge:
+    source_id: str
+    target_id: str
+
+
+@dataclass(frozen=True)
+class ReadWork:
+    nodes: int
+    edges: int
+    pairs: int
+    bucket_probes: int
+
+
+@dataclass(frozen=True)
+class ReadWindow:
+    nodes: tuple[ReadNode, ...]
+    edges: tuple[ReadEdge, ...]
+    work: ReadWork
+    exhausted: bool
+    soft_stopped: bool
+    depth_frontier: tuple[str, ...]
+
+
+class GraphReadDeadlineExceeded(TimeoutError):  # noqa: N818 - frozen S09 ABI
+    """The hard graph-read deadline was reached before an inspect step."""
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +424,168 @@ class SimpleGraph:
                 nodes.append(node)
             return nodes
         return list(self._nodes.values())
+
+    def read_window(
+        self,
+        roots: tuple[str, ...],
+        *,
+        depth: int,
+        direction: Literal["out", "both"],
+        soft_deadline: float,
+        hard_deadline: float,
+        max_nodes: int = 500,
+        max_edges: int = 1000,
+        max_pairs: int = 100,
+        max_depth: int = 4,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> ReadWindow:
+        """Collect a bounded immutable topology window without copying raw data."""
+        if (
+            type(roots) is not tuple
+            or not 1 <= len(roots) <= 6
+            or any(
+                type(root) is not str
+                or not root
+                or len(root) > 8192
+                or len(root.encode("utf-8")) > 8192
+                for root in roots
+            )
+            or direction not in {"out", "both"}
+            or type(depth) is not int
+            or type(max_depth) is not int
+            or not 1 <= depth <= max_depth <= 4
+            or any(
+                type(value) is not int or not 0 <= value <= ceiling
+                for value, ceiling in ((max_nodes, 500), (max_edges, 1000), (max_pairs, 100))
+            )
+            or not callable(clock)
+        ):
+            raise ValueError("invalid graph read window")
+
+        nodes: list[ReadNode] = []
+        edges: list[ReadEdge] = []
+        edge_pairs: set[tuple[str, str]] = set()
+        frontier: list[str] = []
+        queued: deque[tuple[str, int]] = deque()
+        seen: set[str] = set()
+        soft_stopped = False
+        bucket_probes = 0
+
+        def checkpoint() -> bool:
+            nonlocal soft_stopped
+            now = clock()
+            if now >= hard_deadline:
+                raise GraphReadDeadlineExceeded
+            if now >= soft_deadline:
+                soft_stopped = True
+                return False
+            return True
+
+        def admit_node(node_id: str, level: int) -> bool:
+            if node_id in seen:
+                return True
+            if not checkpoint():
+                return False
+            _charge("nodes")
+            node = self._nodes.get(node_id)
+            seen.add(node_id)
+            if (
+                not isinstance(node, GraphNode)
+                or type(node.id) is not str
+                or node.id != node_id
+                or type(node.type) is not str
+                or type(node.name) is not str
+                or not node.id
+                or not node.type
+                or not node.name
+                or len(node.name) > 8192
+            ):
+                return True
+            try:
+                if len(node.name.encode("utf-8")) > 8192:
+                    return True
+            except UnicodeError:
+                return True
+            nodes.append(ReadNode(node.id, node.type, node.name))
+            queued.append((node.id, level))
+            return True
+
+        with _bounded_traversal(max_nodes, max_edges, max_pairs, max_depth) as budget:
+            if len(roots) == 2:
+                if checkpoint():
+                    _charge_pair()
+                else:
+                    return ReadWindow((), (), ReadWork(0, 0, 0, 0), False, True, ())
+            for root in roots:
+                if not admit_node(root, 0):
+                    break
+            while queued and not soft_stopped:
+                current, level = queued.popleft()
+                if level >= depth:
+                    frontier.append(current)
+                    continue
+
+                targets = self._edges.get(current)
+                if targets is not None:
+                    if not checkpoint():
+                        break
+                    _charge("edges")
+                    bucket_probes += 1
+                    for target_id, entries in targets.items():
+                        for entry in entries:
+                            if not checkpoint():
+                                break
+                            _charge("edges")
+                            if (
+                                isinstance(entry, GraphEdge)
+                                and entry.source_id == current
+                                and entry.target_id == target_id
+                                and type(target_id) is str
+                                and target_id
+                            ):
+                                pair = (current, target_id)
+                                if pair not in edge_pairs:
+                                    edge_pairs.add(pair)
+                                    edges.append(ReadEdge(*pair))
+                                if not admit_node(target_id, level + 1):
+                                    break
+                        if soft_stopped:
+                            break
+                if direction == "both" and not soft_stopped:
+                    for source_id, targets in self._edges.items():
+                        if not checkpoint():
+                            break
+                        _charge("edges")
+                        bucket_probes += 1
+                        if source_id == current or current not in targets:
+                            continue
+                        for entry in targets[current]:
+                            if not checkpoint():
+                                break
+                            _charge("edges")
+                            if (
+                                isinstance(entry, GraphEdge)
+                                and entry.source_id == source_id
+                                and entry.target_id == current
+                                and type(source_id) is str
+                                and source_id
+                            ):
+                                pair = (source_id, current)
+                                if pair not in edge_pairs:
+                                    edge_pairs.add(pair)
+                                    edges.append(ReadEdge(*pair))
+                                if not admit_node(source_id, level + 1):
+                                    break
+                        if soft_stopped:
+                            break
+            return ReadWindow(
+                tuple(nodes),
+                tuple(edges),
+                ReadWork(budget.nodes, budget.edges, budget.pairs, bucket_probes),
+                not soft_stopped and not queued and not frontier,
+                soft_stopped,
+                tuple(frontier),
+            )
 
     # --- Edge operations ---
 

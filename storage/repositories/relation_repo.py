@@ -334,3 +334,147 @@ class RelationRepository:
                 upper = RelationKey(**vars(highest[0]))
             rows = await select_page(maximum=upper, after=last, count=limit + 1)
             return RelationPage(rows, upper)
+
+    async def expand_incident(
+        self,
+        memory_id: str,
+        *,
+        direction: Literal["out", "in", "both"],
+        relation_types: tuple[str, ...],
+        memory_types: tuple[str, ...],
+        lifecycle_states: tuple[str, ...],
+        limit: int,
+        last: RelationKey | None,
+        work: RelationReadWork,
+    ) -> RelationPage:
+        if (
+            type(memory_id) is not str
+            or not memory_id
+            or direction not in {"out", "in", "both"}
+            or type(limit) is not int
+            or not 1 <= limit <= 100
+            or any(type(values) is not tuple for values in (relation_types, memory_types, lifecycle_states))
+        ):
+            raise ValueError("invalid incident query")
+        params: dict[str, object] = {"root": memory_id, "n": limit + 1}
+        after = ""
+        if last is not None:
+            names = [f"a{i}" for i in range(4)]
+            params.update(zip(names, _key_values(last)))
+            after = " AND " + _KEY + " > (" + ",".join(":" + name for name in names) + ")"
+
+        allowed_types = tuple(value for value in relation_types if value in _TYPES)
+        type_filter = ""
+        if relation_types:
+            if not allowed_types:
+                return RelationPage((), None)
+            binds = []
+            for index, value in enumerate(allowed_types):
+                name = f"rt{index}"
+                params[name] = value
+                binds.append(":" + name)
+            type_filter = " AND r.relation_type IN (" + ",".join(binds) + ")"
+
+        def metadata_filter(endpoint: str, prefix: str) -> str:
+            clauses = []
+            union = " UNION ALL ".join(
+                f"SELECT '{kind}' AS kind,lifecycle_state FROM {table} WHERE id={endpoint}"
+                for kind, table in _TABLES
+            )
+            if memory_types:
+                names = []
+                for index, value in enumerate(memory_types):
+                    name = f"{prefix}m{index}"
+                    params[name] = value
+                    names.append(":" + name)
+                clauses.append("kind IN (" + ",".join(names) + ")")
+            if lifecycle_states:
+                names = []
+                for index, value in enumerate(lifecycle_states):
+                    name = f"{prefix}l{index}"
+                    params[name] = value
+                    names.append(":" + name)
+                clauses.append("lifecycle_state IN (" + ",".join(names) + ")")
+            if not clauses:
+                return ""
+            return " AND EXISTS(SELECT 1 FROM (" + union + ") WHERE " + " AND ".join(clauses) + ")"
+
+        columns = ",".join("r." + key for key in _ORDER.split(","))
+        order = ",".join("r." + key for key in _ORDER.split(","))
+
+        def branch(index: str, root_clause: str, endpoint: str, extra: str = "") -> str:
+            return (
+                f"SELECT {columns} FROM claim_relations r INDEXED BY {index} WHERE "
+                + _EL
+                + root_clause
+                + extra
+                + after
+                + type_filter
+                + metadata_filter(endpoint, index)
+                + f" ORDER BY {order} LIMIT :n"
+            )
+
+        if direction == "out":
+            sql = branch("s09_source_order", " AND r.source_id=:root", "r.target_id")
+        elif direction == "in":
+            sql = branch("s09_target_order", " AND r.target_id=:root", "r.source_id")
+        else:
+            sql = (
+                "SELECT * FROM ("
+                + branch("s09_source_order", " AND r.source_id=:root", "r.target_id")
+                + ") UNION ALL SELECT * FROM ("
+                + branch(
+                    "s09_target_order",
+                    " AND r.target_id=:root",
+                    "r.source_id",
+                    " AND r.source_id<>:root",
+                )
+                + ") ORDER BY "
+                + _ORDER
+                + " LIMIT :n"
+            )
+        async with self._read_window(work):
+            rows = await self._session.execute(text(sql), params)
+            result = tuple(_row(row) for row in rows)
+        upper = RelationKey(**vars(result[-1])) if result else None
+        return RelationPage(result, upper)
+
+    async def resolve_witnesses(
+        self,
+        names: tuple[str, ...],
+        *,
+        limit: int,
+        work: RelationReadWork,
+    ) -> tuple[tuple[str, Literal["subject", "object"], str, str], ...]:
+        if (
+            type(names) is not tuple
+            or len(names) > 100
+            or type(limit) is not int
+            or not 1 <= limit <= 101
+            or any(
+                type(name) is not str
+                or not name
+                or len(name) > 8192
+                or len(name.encode("utf-8")) > 8192
+                for name in names
+            )
+        ):
+            raise ValueError("invalid witness query")
+        if not names:
+            return ()
+        params: dict[str, object] = {f"name{index}": name for index, name in enumerate(names)}
+        params["n"] = limit
+        binds = ",".join(f":name{index}" for index in range(len(names)))
+        exact_fact = _eligible("f.id")
+        sql = (
+            "SELECT id,slot,value,lifecycle_state FROM ("
+            "SELECT f.id,'subject' AS slot,f.subject AS value,f.lifecycle_state FROM facts f "
+            f"WHERE f.subject IN ({binds}) AND {exact_fact} "
+            "UNION ALL "
+            "SELECT f.id,'object' AS slot,f.object AS value,f.lifecycle_state FROM facts f "
+            f"WHERE f.object IN ({binds}) AND {exact_fact}"
+            ") ORDER BY id,slot LIMIT :n"
+        )
+        async with self._read_window(work):
+            rows = await self._session.execute(text(sql), params)
+            return tuple((row[0], row[1], row[2], row[3]) for row in rows)

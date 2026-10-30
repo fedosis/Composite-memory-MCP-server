@@ -25,6 +25,8 @@ from tests.gateway.test_slice_runtime import seed_fact
 F = "00000000-0000-4000-8000-000000000001"
 G = "00000000-0000-4000-8000-000000000002"
 H = "00000000-0000-4000-8000-000000000003"
+LEFT_FACT = "00000000-0000-4000-8000-000000000004"
+RIGHT_FACT = "00000000-0000-4000-8000-000000000005"
 BASIC = (
     "rel_WyIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEi"
     "LCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJzdXBwb3J0cyJd"
@@ -37,6 +39,12 @@ CANARY = "S09_SECRET_subject_task_query_predicate_canary"
 def rel_id(source, target, kind="supports"):
     return "rel_" + base64.urlsafe_b64encode(
         json.dumps([source, target, kind], ensure_ascii=False, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+
+
+def ent_id(fact, slot="subject"):
+    return "ent_" + base64.urlsafe_b64encode(
+        json.dumps([fact, slot], ensure_ascii=False, separators=(",", ":")).encode()
     ).decode().rstrip("=")
 
 
@@ -82,12 +90,16 @@ async def seed_projection(holder, auth, *, profile="alpha"):
         graph = scope.runtime.dependencies.graph
         subject = "slice01b"
         object_name = CANARY
-        for ident, name in ((subject, subject), (object_name.lower(), object_name)):
-            if graph.get_node(ident) is None:
-                graph.add_node(ident, "entity", name, {"secret": CANARY})
-        if graph.get_edge(subject, object_name.lower()) is None:
-            graph.add_edge(subject, object_name.lower(), CANARY, {"secret": CANARY})
-            graph.add_edge(subject, object_name.lower(), "supports", {"secret": CANARY})
+        graph._suspend_persistence = True
+        try:
+            for ident, name in ((subject, subject), (object_name.lower(), object_name)):
+                if graph.get_node(ident) is None:
+                    graph.add_node(ident, "entity", name, {"secret": CANARY})
+            if graph.get_edge(subject, object_name.lower()) is None:
+                graph.add_edge(subject, object_name.lower(), CANARY, {"secret": CANARY})
+                graph.add_edge(subject, object_name.lower(), "supports", {"secret": CANARY})
+        finally:
+            graph._suspend_persistence = False
         return graph
 
 
@@ -103,7 +115,7 @@ async def test_s09_six_routes_mount_and_permissions(tmp_path):
         await seed(holder, auth)
         for route in ("relations", f"memories/{F}/relations", "relations/" + BASIC):
             status, body = await get(port, auth, route)
-            assert status == 200, body
+            assert status == 200, (route, body)
         denied = await relation_auth(holder, permissions=("graph.read",))
         for route in ("relations", f"memories/{F}/relations", "relations/" + BASIC):
             status, body = await get(port, denied, route)
@@ -128,7 +140,7 @@ async def test_s09_six_routes_mount_and_permissions(tmp_path):
             status, body = await http_request(
                 port, method, "/api/v1/profiles/alpha/" + route, body=payload, headers=request_headers
             )
-            assert status == 200, body
+            assert status == 200, (route, body)
             assert body["graph_consistency"]["projection"] == "unknown"
         for method, route, payload in positives:
             request_headers = dict(auth)
@@ -326,14 +338,32 @@ async def test_graph_read_audit_metrics_canaries(tmp_path, caplog):
         status, body = await get(port, auth, "relations?" + urlencode(dict(cursor=CANARY)))
         assert status == 400
         captured.append(body)
+        graph_auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed_projection(holder, graph_auth)
+        for method, route, payload in (
+            ("GET", f"graph/neighborhood?memory_id={F}", b""),
+            ("POST", "graph/path", json.dumps({"source_id": ENT_SUBJECT, "target_id": ENT_OBJECT}).encode()),
+            ("GET", "graph/entity/" + ENT_SUBJECT, b""),
+        ):
+            headers = dict(graph_auth)
+            if method == "POST":
+                headers["Content-Type"] = "application/json"
+            status, body = await http_request(
+                port, method, "/api/v1/profiles/alpha/" + route, body=payload, headers=headers
+            )
+            assert status == 200, body
+            captured.append(body)
         rows = audit_rows(tmp_path)
-        assert len(rows) == 4
+        assert len(rows) == 7
         with sqlite3.connect(tmp_path / "control/http-access/access.sqlite") as db:
             assert db.execute("SELECT state,result FROM access_audit").fetchall() == [
                 ("terminal", "success"),
                 ("terminal", "success"),
                 ("terminal", "success"),
                 ("terminal", "E_NOT_FOUND"),
+                ("terminal", "success"),
+                ("terminal", "success"),
+                ("terminal", "success"),
             ]
         metrics = holder.app.dependencies.metrics
         from prometheus_client import generate_latest
@@ -354,9 +384,16 @@ async def test_graph_read_audit_metrics_canaries(tmp_path, caplog):
         assert CANARY not in output
         for forbidden in ("query=", "cursor=", "task=", "subject="):
             assert forbidden not in str(exposition)
-        for operation in ("relations.for_memory", "relations.list", "relations.get"):
+        for operation in (
+            "relations.for_memory",
+            "relations.list",
+            "relations.get",
+            "graph.neighborhood",
+            "graph.path",
+            "graph.entity",
+        ):
             assert f'operation="{operation}"' in exposition
-        assert 'stage="graph"' not in exposition
+        assert 'stage="graph"' in exposition
         assert F not in str(rows) and G not in str(rows)
         print("CANARY_SWEEP_OK responses audit metrics captured_logs decoded_relation_ids")
 
@@ -443,6 +480,18 @@ async def test_graph_canonical_vs_projection(tmp_path):
         assert projected[0]["relation_type"] == "[MASKED]"
         assert projected[0]["canonical_relation_id"] is None and projected[0]["revision"] is None
         assert CANARY not in json.dumps(body)
+        status, hidden = await get(
+            port,
+            auth,
+            "graph/neighborhood?" + urlencode({"entity_id": ENT_SUBJECT, "relation_types": CANARY}),
+        )
+        assert status == 200 and hidden["edges"] == [], hidden
+        status, masked = await get(
+            port,
+            auth,
+            "graph/neighborhood?" + urlencode({"entity_id": ENT_SUBJECT, "relation_types": "[MASKED]"}),
+        )
+        assert status == 200 and len(masked["edges"]) == 1, masked
 
 
 @pytest.mark.asyncio
@@ -459,20 +508,48 @@ async def test_entity_unknown_and_masked_namespace(tmp_path):
         assert CANARY not in json.dumps(body)
         status, body = await get(port, auth, "graph/entity/" + ENT_SUBJECT, profile="beta")
         assert (status, body["error"]["code"], body["error"]["details"]) == (404, "E_NOT_FOUND", {})
+        async with await read_scope(holder, auth) as scope:
+            resources = scope.application.read_resources()
+            async with resources.session_factory() as session, session.begin():
+                await session.execute(
+                    text(
+                        "INSERT INTO skills(id,name,version,purpose,steps,constraints,validation,success_rate,"
+                        "creator,created_at,updated_at,confidence,verification_status,lifecycle_state) "
+                        "VALUES (:id,'n','1','p','[]','[]','[]',0,'test',:d,:d,0.5,'candidate','active')"
+                    ),
+                    dict(id=F, d="2026-10-30 00:00:00.000000"),
+                )
+        status, body = await get(port, auth, "graph/entity/" + ENT_SUBJECT)
+        assert (status, body["error"]["code"]) == (404, "E_NOT_FOUND")
 
 
 @pytest.mark.asyncio
 async def test_graph_paths_direction_diamond_and_self(tmp_path):
     async with live_server(tmp_path) as (holder, port, _):
         auth = await relation_auth(holder, permissions=("graph.read",))
-        await seed(holder, auth, ids=(F,), relations=[])
+        resources = await seed(holder, auth, ids=(F,), relations=[])
+        async with resources.session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        "INSERT INTO facts(id,subject,predicate,object,dedup_key,confidence,creator,"
+                        "created_at,updated_at,verification_status,lifecycle_state,version) VALUES "
+                        "(:id,:subject,'hidden','unused',:id,0.8,'test','2026-10-30 00:00:00.000000',"
+                        "'2026-10-30 00:00:00.000000','candidate','active','1')"
+                    ),
+                    [dict(id=LEFT_FACT, subject="Left"), dict(id=RIGHT_FACT, subject="Right")],
+                )
         graph = await seed_projection(holder, auth)
-        for ident, name in (("left", "Left"), ("right", "Right")):
-            graph.add_node(ident, "entity", name)
-        graph.add_edge("slice01b", "left", "hidden")
-        graph.add_edge("slice01b", "right", "hidden")
-        graph.add_edge("left", CANARY.lower(), "hidden")
-        graph.add_edge("right", CANARY.lower(), "hidden")
+        graph._suspend_persistence = True
+        try:
+            for ident, name in (("left", "Left"), ("right", "Right")):
+                graph.add_node(ident, "entity", name)
+            graph.add_edge("slice01b", "left", "hidden")
+            graph.add_edge("slice01b", "right", "hidden")
+            graph.add_edge("left", CANARY.lower(), "hidden")
+            graph.add_edge("right", CANARY.lower(), "hidden")
+        finally:
+            graph._suspend_persistence = False
 
         async def path(source, target):
             payload = json.dumps({"source_id": source, "target_id": target}).encode()
@@ -483,6 +560,10 @@ async def test_graph_paths_direction_diamond_and_self(tmp_path):
         assert status == 200, body
         assert len(body["paths"]) == 3
         assert body["paths"][0] == [ENT_SUBJECT, ENT_OBJECT]
+        assert {tuple(path) for path in body["paths"][1:]} == {
+            (ENT_SUBJECT, ent_id(LEFT_FACT), ENT_OBJECT),
+            (ENT_SUBJECT, ent_id(RIGHT_FACT), ENT_OBJECT),
+        }
         status, reverse = await path(ENT_OBJECT, ENT_SUBJECT)
         assert status == 200 and reverse["paths"] == []
         status, same = await path(ENT_SUBJECT, ENT_SUBJECT)

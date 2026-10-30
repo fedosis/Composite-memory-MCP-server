@@ -18,7 +18,12 @@ from pydantic import ValidationError
 from starlette.requests import Request
 from storage.repositories.relation_repo import RelationKey
 
-from memory_server.application.graph_read_service import decode_relation_id, validate_memory_id, wire_json
+from memory_server.application.graph_read_service import (
+    decode_entity_id,
+    decode_relation_id,
+    validate_memory_id,
+    wire_json,
+)
 from memory_server.application.memory_read_service import b64, unb64, utc
 from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.catalog import CATALOG
@@ -262,6 +267,16 @@ def _parse(operation, request, body, principal):
             decode_relation_id(paths["id"])
         elif operation == "relations.for_memory":
             validate_memory_id(paths["id"])
+        elif operation == "graph.neighborhood":
+            if payload.entity_id is not None:
+                decode_entity_id(payload.entity_id)
+            else:
+                validate_memory_id(payload.memory_id)
+        elif operation == "graph.path":
+            for value in (payload.source_id, payload.target_id):
+                decode_entity_id(value) if value.startswith("ent_") else validate_memory_id(value)
+        elif operation == "graph.entity":
+            decode_entity_id(paths["entity_id"])
         command = d.COMMAND_TYPES[operation](
             operation=operation, profile_id=request.path_params["profile"], path_ids=paths, payload=payload
         )
@@ -358,7 +373,6 @@ GRAPH_READ_ROUTE_SPECS: Final = MappingProxyType(
 
 def create_graph_read_routes(*, cursor_codec: RelationCursorCodec) -> tuple[GraphReadRouteSpec, ...]:
     return tuple(
-        replace(spec, cursor_codec=cursor_codec) if op != "relations.get" else spec
+        replace(spec, cursor_codec=cursor_codec) if op in {"relations.list", "relations.for_memory"} else spec
         for op, spec in GRAPH_READ_ROUTE_SPECS.items()
-        if op.startswith("relations.")
     )

@@ -71,9 +71,9 @@ def compose_read_ports(deps, config):
     ports["context"] = gateway
     relation_codec = RelationCursorCodec.from_path(
         config.control_path.parent / 'http-relation-cursor.key', config.cursor_ttl_seconds)
-    relation_reader = create_graph_read_port(deps.leases, bind_graph_read, native=bind_native,
-                                             cursor_codec=relation_codec, metrics=deps.metrics)
-    relation_specs = create_graph_read_routes(cursor_codec=relation_codec)
-    ports.update({spec.operation: relation_reader for spec in relation_specs})
-    specs += relation_specs
+    graph_reader = create_graph_read_port(deps.leases, bind_graph_read, native=bind_native,
+                                          cursor_codec=relation_codec, metrics=deps.metrics)
+    graph_specs = create_graph_read_routes(cursor_codec=relation_codec)
+    ports.update({spec.operation: graph_reader for spec in graph_specs})
+    specs += graph_specs
     return replace(deps, ports=ports), specs
