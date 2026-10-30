@@ -74,9 +74,8 @@ def classify_diagnostic_error(error: object) -> LastErrorCode | None:
     return error if type(error) is str and error in _DIAGNOSTIC_ERROR_CODES else None
 
 
-def _wire_time(value: datetime | str) -> str:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
-    aware = parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+def _wire_time(value: datetime) -> str:
+    aware = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
     return aware.isoformat(timespec="microseconds")
 
 
@@ -87,11 +86,6 @@ def _storage_time(value: str) -> datetime:
     return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def _dto_time(value: datetime | str | None) -> datetime | None:
-    if value is None:
-        return None
-    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 # ──────────────────────────────────────────────────────────────────────
 # ORM Model
@@ -468,7 +462,7 @@ class OutboxRepository:
                 text(
                     f"SELECT created_at,id FROM outbox_entries WHERE {predicate} "
                     "ORDER BY created_at DESC,id DESC LIMIT 1"
-                ),
+                ).columns(created_at=DateTime),
                 params,
             )
             row = result.first()
@@ -488,23 +482,20 @@ class OutboxRepository:
         page_sql = text(
             "SELECT id,record_id,record_type,operation,status,retry_count,error,created_at,processed_at "
             f"FROM outbox_entries WHERE {page_filter} ORDER BY created_at,id LIMIT :limit"
-        ).bindparams(*date_binds)
+        ).bindparams(*date_binds).columns(created_at=DateTime, processed_at=DateTime)
         result = await self._session.execute(
             page_sql,
             page_params,
         )
-        rows = tuple(
-            OutboxDiagnosticRow(
-                **{
-                    **dict(row),
-                    "created_at": _dto_time(row["created_at"]),
-                    "processed_at": _dto_time(row["processed_at"]),
-                }
-            )
-            for row in result.mappings()
-        )
+        rows = []
+        for row in result.mappings():
+            values = dict(row)
+            for field in ("created_at", "processed_at"):
+                if values[field] is not None:
+                    values[field] = values[field].replace(tzinfo=timezone.utc)
+            rows.append(OutboxDiagnosticRow(**values))
         work.check()
-        return OutboxDiagnosticPage(rows, upper)
+        return OutboxDiagnosticPage(tuple(rows), upper)
 
     async def reset_stale_processing(self, max_age_seconds: int = 600) -> int:
         """Reset entries stuck in ``processing`` back to ``pending``.

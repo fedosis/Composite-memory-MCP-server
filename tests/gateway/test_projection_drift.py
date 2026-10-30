@@ -107,25 +107,29 @@ async def test_foundation_counts_lifecycle_snapshot_and_no_write(tmp_path):
 
 
 async def test_projection_unknown_is_not_invented_zero(tmp_path):
-    """An absent production graph resource yields an unavailable projection."""
-    module = _api()
-    graph = importlib.import_module("memory_server.application.graph_read_service")
-    provider = await _provider(tmp_path)
-    try:
-        async with provider._session_factory() as session:
-            now = asyncio.get_running_loop().time()
-            work = module.DiagnosticsReadWork(soft_deadline=now + 10, hard_deadline=now + 10)
-            async with provider.diagnostics_window(session, work=work):
-                counts = {
-                    table: await provider.diagnostics_count(session, table, work=work)
-                    for table in ("facts", "beliefs", "decisions", "skills")
-                }
-        observation = {
-            "canonical": counts,
-            "vector": None,
-            "graph": graph.map_consistency("unavailable").projection,
-        }
-        assert observation["vector"] is None and observation["graph"] == "unavailable"
-        assert observation["canonical"] == {"facts": 0, "beliefs": 0, "decisions": 0, "skills": 0}
-    finally:
-        await provider.close()
+    """Observe absent composition resources through the real HTTP graph port."""
+    _api()
+    from tests.gateway.test_graph_reads import F, G, get, live_server, read_scope, relation_auth, seed
+
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        status, present = await get(port, auth, f"graph/neighborhood?memory_id={F}")
+        assert status == 200, present
+        assert present["graph_consistency"]["projection"] == "unknown"
+        async with await read_scope(holder, auth) as scope:
+            dependencies = scope.runtime.dependencies
+            previous = dependencies.graph
+            object.__setattr__(dependencies, "graph", None)
+            try:
+                status, absent = await get(port, auth, f"graph/neighborhood?memory_id={F}")
+                assert status == 200, absent
+                consistency = absent["graph_consistency"]
+                assert consistency["projection"] == "unavailable"
+                assert all(consistency[field] is None for field in (
+                    "outbox_lag", "last_sync", "missing_projection", "extra_projection",
+                    "canonical_edges", "projected_edges",
+                ))
+                assert absent["nodes"] and absent["edges"]
+            finally:
+                object.__setattr__(dependencies, "graph", previous)
