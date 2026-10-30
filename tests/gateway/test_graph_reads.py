@@ -29,6 +29,8 @@ BASIC = (
     "rel_WyIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEi"
     "LCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJzdXBwb3J0cyJd"
 )
+ENT_SUBJECT = "ent_WyIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWJqZWN0Il0"
+ENT_OBJECT = "ent_WyIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJvYmplY3QiXQ"
 CANARY = "S09_SECRET_subject_task_query_predicate_canary"
 
 
@@ -75,6 +77,20 @@ async def seed(holder, auth, *, profile="alpha", ids=(F, G, H), relations=None):
     return resources
 
 
+async def seed_projection(holder, auth, *, profile="alpha"):
+    async with await read_scope(holder, auth, profile) as scope:
+        graph = scope.runtime.dependencies.graph
+        subject = "slice01b"
+        object_name = CANARY
+        for ident, name in ((subject, subject), (object_name.lower(), object_name)):
+            if graph.get_node(ident) is None:
+                graph.add_node(ident, "entity", name, {"secret": CANARY})
+        if graph.get_edge(subject, object_name.lower()) is None:
+            graph.add_edge(subject, object_name.lower(), CANARY, {"secret": CANARY})
+            graph.add_edge(subject, object_name.lower(), "supports", {"secret": CANARY})
+        return graph
+
+
 def audit_rows(tmp_path):
     with sqlite3.connect(tmp_path / "control/http-access/access.sqlite") as connection:
         return connection.execute("SELECT * FROM access_audit").fetchall()
@@ -94,13 +110,34 @@ async def test_s09_six_routes_mount_and_permissions(tmp_path):
             assert (status, body["error"]["code"]) == (403, "E_PERMISSION_DENIED")
         status, body = await get(port, {}, "relations")
         assert (status, body["error"]["code"]) == (401, "E_AUTH_REQUIRED")
-        for method, route in (
-            ("GET", "graph/neighborhood"),
-            ("POST", "graph/path"),
-            ("GET", "graph/entity/ent_missing"),
-        ):
-            status, body = await http_request(port, method, "/api/v1/profiles/alpha/" + route, headers=auth)
-            assert (status, body["error"]["code"]) == (404, "E_NOT_FOUND")
+        graph_auth = denied
+        await seed_projection(holder, graph_auth)
+        positives = (
+            ("GET", f"graph/neighborhood?memory_id={F}", b""),
+            (
+                "POST",
+                "graph/path",
+                json.dumps({"source_id": ENT_SUBJECT, "target_id": ENT_OBJECT}).encode(),
+            ),
+            ("GET", "graph/entity/" + ENT_SUBJECT, b""),
+        )
+        for method, route, payload in positives:
+            request_headers = dict(graph_auth)
+            if method == "POST":
+                request_headers["Content-Type"] = "application/json"
+            status, body = await http_request(
+                port, method, "/api/v1/profiles/alpha/" + route, body=payload, headers=request_headers
+            )
+            assert status == 200, body
+            assert body["graph_consistency"]["projection"] == "unknown"
+        for method, route, payload in positives:
+            request_headers = dict(auth)
+            if method == "POST":
+                request_headers["Content-Type"] = "application/json"
+            status, body = await http_request(
+                port, method, "/api/v1/profiles/alpha/" + route, body=payload, headers=request_headers
+            )
+            assert (status, body["error"]["code"]) == (403, "E_PERMISSION_DENIED")
 
 
 @pytest.mark.asyncio
@@ -371,7 +408,7 @@ async def test_graph_mount_closed_descriptors(tmp_path):
         from memory_server.transports.http.guards import ReadRouteSpec
 
         specs = graph.create_graph_read_routes(cursor_codec=graph.RelationCursorCodec(bytes(range(32))))
-        assert len(graph.GRAPH_READ_ROUTE_SPECS) == 6 and len(specs) == 3
+        assert len(graph.GRAPH_READ_ROUTE_SPECS) == 6 and len(specs) == 6
         first = specs[0]
         for bad in (
             replace(first, parse=lambda *_: None),
@@ -388,6 +425,87 @@ async def test_graph_mount_closed_descriptors(tmp_path):
                 HttpApp(holder.app.config, holder.app.dependencies, read_routes=(bad,))
         with pytest.raises(ValueError):
             HttpApp(holder.app.config, holder.app.dependencies, read_routes=(first, first))
+
+
+@pytest.mark.asyncio
+async def test_graph_canonical_vs_projection(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read", "relation.read"))
+        await seed(holder, auth, ids=(F, G), relations=[(F, G, "supports")])
+        await seed_projection(holder, auth)
+        status, body = await get(port, auth, f"graph/neighborhood?memory_id={F}&depth=2")
+        assert status == 200, body
+        assert {node["id"] for node in body["nodes"]} >= {F, G, ENT_SUBJECT, ENT_OBJECT}
+        canonical = [edge for edge in body["edges"] if edge["canonical"]]
+        projected = [edge for edge in body["edges"] if not edge["canonical"]]
+        assert len(canonical) == 1 and canonical[0]["canonical_relation_id"] == BASIC
+        assert len(projected) == 1
+        assert projected[0]["relation_type"] == "[MASKED]"
+        assert projected[0]["canonical_relation_id"] is None and projected[0]["revision"] is None
+        assert CANARY not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+async def test_entity_unknown_and_masked_namespace(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F,), relations=[])
+        await seed_projection(holder, auth)
+        status, body = await get(port, auth, "graph/entity/" + ENT_SUBJECT)
+        assert status == 200, body
+        assert {node["id"] for node in body["nodes"]} == {ENT_SUBJECT, ENT_OBJECT}
+        assert all(node["masked"] and node["label"] == "[MASKED]" for node in body["nodes"])
+        assert len(body["edges"]) == 1 and body["edges"][0]["relation_type"] == "[MASKED]"
+        assert CANARY not in json.dumps(body)
+        status, body = await get(port, auth, "graph/entity/" + ENT_SUBJECT, profile="beta")
+        assert (status, body["error"]["code"], body["error"]["details"]) == (404, "E_NOT_FOUND", {})
+
+
+@pytest.mark.asyncio
+async def test_graph_paths_direction_diamond_and_self(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        await seed(holder, auth, ids=(F,), relations=[])
+        graph = await seed_projection(holder, auth)
+        for ident, name in (("left", "Left"), ("right", "Right")):
+            graph.add_node(ident, "entity", name)
+        graph.add_edge("slice01b", "left", "hidden")
+        graph.add_edge("slice01b", "right", "hidden")
+        graph.add_edge("left", CANARY.lower(), "hidden")
+        graph.add_edge("right", CANARY.lower(), "hidden")
+
+        async def path(source, target):
+            payload = json.dumps({"source_id": source, "target_id": target}).encode()
+            headers = {**auth, "Content-Type": "application/json"}
+            return await http_request(port, "POST", "/api/v1/profiles/alpha/graph/path", payload, headers)
+
+        status, body = await path(ENT_SUBJECT, ENT_OBJECT)
+        assert status == 200, body
+        assert len(body["paths"]) == 3
+        assert body["paths"][0] == [ENT_SUBJECT, ENT_OBJECT]
+        status, reverse = await path(ENT_OBJECT, ENT_SUBJECT)
+        assert status == 200 and reverse["paths"] == []
+        status, same = await path(ENT_SUBJECT, ENT_SUBJECT)
+        assert status == 200 and same["paths"] == [[ENT_SUBJECT]]
+
+
+@pytest.mark.asyncio
+async def test_graph_strict_validation_and_missing_witness(tmp_path):
+    async with live_server(tmp_path) as (holder, port, _):
+        auth = await relation_auth(holder, permissions=("graph.read",))
+        before = audit_rows(tmp_path)
+        for route in (
+            "graph/neighborhood",
+            "graph/neighborhood?memory_id=x&entity_id=" + ENT_SUBJECT,
+            "graph/neighborhood?memory_id=x&depth=0",
+            "graph/entity/ent_@@",
+        ):
+            status, body = await get(port, auth, route)
+            assert (status, body["error"]["code"]) == (422, "E_VALIDATION")
+        assert audit_rows(tmp_path) == before
+        await seed(holder, auth, ids=(F,), relations=[])
+        status, body = await get(port, auth, "graph/entity/" + ENT_SUBJECT)
+        assert (status, body["error"]["code"]) == (404, "E_NOT_FOUND")
 
 
 @pytest.mark.asyncio

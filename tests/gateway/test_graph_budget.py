@@ -16,6 +16,82 @@ from tests.gateway.test_graph_reads import F, G, get, relation_auth, seed
 from tests.gateway.test_http_retrieval import live_server, read_scope
 
 
+def _read_window(graph, roots, **kwargs):
+    read_window = getattr(graph, "read_window", None)
+    assert read_window is not None, "S09 bounded graph read window is absent"
+    return read_window(
+        roots,
+        depth=kwargs.pop("depth", 2),
+        direction=kwargs.pop("direction", "both"),
+        soft_deadline=kwargs.pop("soft_deadline", monotonic() + 10),
+        hard_deadline=kwargs.pop("hard_deadline", monotonic() + 20),
+        **kwargs,
+    )
+
+
+def test_cyclic_wide_graph_stops_before_materialization():
+    from memory_server.providers.graph_provider import GraphBudgetExceeded, SimpleGraph
+
+    graph = SimpleGraph()
+    graph.add_node("root", "entity", "Root")
+    for index in range(1100):
+        ident = f"n-{index}"
+        graph.add_node(ident, "entity", ident)
+        graph.add_edge(ident, ident, "hidden")
+    with pytest.raises(GraphBudgetExceeded) as error:
+        _read_window(graph, ("root",), max_nodes=500, max_edges=1000, max_pairs=100)
+    assert error.value.dimension == "edges" and error.value.attempted == 1001
+
+
+def test_no_full_materialization_or_hidden_scan(monkeypatch):
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    graph = SimpleGraph()
+    graph.add_node("root", "entity", "Root")
+    graph.add_node("hit", "entity", "Hit")
+    graph.add_edge("root", "hit", "SECRET")
+    for index in range(7):
+        ident = f"unrelated-{index}"
+        graph.add_node(ident, "entity", ident)
+        graph.add_edge(ident, ident, "SECRET")
+    for legacy in ("get_all_nodes", "get_neighbors", "find_path"):
+        monkeypatch.setattr(graph, legacy, lambda *a, _legacy=legacy, **k: pytest.fail(_legacy))
+    window = _read_window(graph, ("root",), max_nodes=20, max_edges=100, max_pairs=10)
+    assert {node.id for node in window.nodes} == {"root", "hit"}
+    assert len(window.edges) == 1
+    assert window.work.bucket_probes >= 8
+    assert not hasattr(window.edges[0], "relation")
+
+
+def test_timeout_cap_independent():
+    from memory_server.providers.graph_provider import GraphReadDeadlineExceeded, SimpleGraph
+
+    graph = SimpleGraph()
+    graph.add_node("root", "entity", "Root")
+    ticks = iter((0.0, 0.0, 2.0, 2.0, 2.0))
+    window = _read_window(
+        graph,
+        ("root",),
+        soft_deadline=1.0,
+        hard_deadline=3.0,
+        clock=lambda: next(ticks, 2.0),
+    )
+    assert window.soft_stopped is True
+    with pytest.raises(GraphReadDeadlineExceeded):
+        _read_window(graph, ("root",), soft_deadline=1.0, hard_deadline=1.0, clock=lambda: 1.0)
+
+
+def test_s08b_budget_context_unchanged():
+    from memory_server.providers.graph_provider import SimpleGraph, _TRAVERSAL_BUDGET
+
+    graph = SimpleGraph()
+    graph.add_node("root", "entity", "Root")
+    assert _TRAVERSAL_BUDGET.get() is None
+    _read_window(graph, ("root",), max_nodes=5, max_edges=5, max_pairs=5)
+    assert _TRAVERSAL_BUDGET.get() is None
+    assert graph.get_all_nodes() == [graph.get_node("root")]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count", [1000, 10000, 50000])
 async def test_sql_fetch_and_work_bound(tmp_path, count):
