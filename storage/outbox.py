@@ -10,15 +10,80 @@ as failed.
 """
 
 import json
-from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Optional
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Integer, String, Text, select, update
+from sqlalchemy import DateTime, Integer, String, Text, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from storage.base import Base, utcnow
+
+if TYPE_CHECKING:
+    from memory_server.providers.sqlite_provider import DiagnosticsReadWork
+
+
+LastErrorCode = Literal[
+    "E_TIMEOUT",
+    "E_STORAGE",
+    "E_VECTOR_BACKEND",
+    "E_GRAPH_BACKEND",
+    "E_PROJECTION_UNAVAILABLE",
+    "E_CAPABILITY_UNAVAILABLE",
+]
+_DIAGNOSTIC_ERROR_CODES = frozenset(
+    {
+        "E_TIMEOUT",
+        "E_STORAGE",
+        "E_VECTOR_BACKEND",
+        "E_GRAPH_BACKEND",
+        "E_PROJECTION_UNAVAILABLE",
+        "E_CAPABILITY_UNAVAILABLE",
+    }
+)
+
+
+@dataclass(frozen=True, order=True)
+class OutboxKey:
+    created_at: str
+    id: str
+
+
+@dataclass(frozen=True)
+class OutboxDiagnosticRow:
+    id: str
+    record_id: str
+    record_type: str
+    operation: str
+    status: str
+    retry_count: int
+    error: str | None
+    created_at: datetime
+    processed_at: datetime | None
+
+
+@dataclass(frozen=True)
+class OutboxDiagnosticPage:
+    rows: tuple[OutboxDiagnosticRow, ...]
+    upper: OutboxKey | None
+
+
+def classify_diagnostic_error(error: object) -> LastErrorCode | None:
+    return error if type(error) is str and error in _DIAGNOSTIC_ERROR_CODES else None
+
+
+def _wire_time(value: datetime) -> str:
+    aware = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return aware.isoformat(timespec="microseconds")
+
+
+def _storage_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("cursor timestamp must be aware")
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 # ──────────────────────────────────────────────────────────────────────
 # ORM Model
@@ -328,6 +393,97 @@ class OutboxRepository:
         )
         result = await self._session.execute(stmt)
         return len(result.scalars().all())
+
+    @staticmethod
+    def _diagnostic_require(work: "DiagnosticsReadWork", session: AsyncSession) -> None:
+        if session.info.get("s10_diagnostics_work") is not work:
+            raise ValueError("outbox diagnostics require the active borrowed window")
+        work.check()
+
+    async def diagnostic_count(
+        self,
+        *,
+        status: Literal["pending", "processing", "completed", "failed"],
+        work: "DiagnosticsReadWork",
+    ) -> int:
+        self._diagnostic_require(work, self._session)
+        stored = "completed" if status == "applied" else status
+        if stored not in {"pending", "processing", "completed", "failed"}:
+            raise ValueError("invalid outbox status")
+        result = await self._session.execute(
+            text("SELECT COUNT(*) FROM outbox_entries WHERE status=:status"), {"status": stored}
+        )
+        work.check()
+        return int(result.scalar_one())
+
+    async def diagnostic_status_counts(self, *, work: "DiagnosticsReadWork") -> dict[str, int]:
+        self._diagnostic_require(work, self._session)
+        result = await self._session.execute(
+            text(
+                "SELECT CASE WHEN status IN ('pending','processing','completed','failed') "
+                "THEN status ELSE 'unknown' END AS state,COUNT(*) AS count "
+                "FROM outbox_entries GROUP BY state"
+            )
+        )
+        work.check()
+        counts = {key: 0 for key in ("pending", "processing", "completed", "failed")}
+        for row in result:
+            counts[str(row.state)] = int(row.count)
+        return counts
+
+    async def diagnostic_page(
+        self,
+        *,
+        limit: int,
+        last: OutboxKey | None,
+        upper: OutboxKey | None,
+        status: str | None,
+        record_id: str | None,
+        work: "DiagnosticsReadWork",
+    ) -> OutboxDiagnosticPage:
+        self._diagnostic_require(work, self._session)
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("invalid outbox page limit")
+        stored = "completed" if status == "applied" else status
+        if stored is not None and stored not in {"pending", "processing", "completed", "failed"}:
+            raise ValueError("invalid outbox status")
+        filters, params = [], {}
+        if stored is not None:
+            filters.append("status=:status")
+            params["status"] = stored
+        if record_id is not None:
+            filters.append("record_id=:record_id")
+            params["record_id"] = record_id
+        predicate = " AND ".join(filters) if filters else "1=1"
+        if upper is None:
+            result = await self._session.execute(
+                text(
+                    f"SELECT created_at,id FROM outbox_entries WHERE {predicate} "
+                    "ORDER BY created_at DESC,id DESC LIMIT 1"
+                ),
+                params,
+            )
+            row = result.first()
+            if row is None:
+                work.check()
+                return OutboxDiagnosticPage((), None)
+            upper = OutboxKey(_wire_time(row.created_at), str(row.id))
+        page_filter = predicate + " AND (created_at,id)<=(:upper_date,:upper_id)"
+        page_params = {**params, "upper_date": _storage_time(upper.created_at), "upper_id": upper.id}
+        if last is not None:
+            page_filter += " AND (created_at,id)>(:last_date,:last_id)"
+            page_params.update(last_date=_storage_time(last.created_at), last_id=last.id)
+        page_params["limit"] = limit + 1
+        result = await self._session.execute(
+            text(
+                "SELECT id,record_id,record_type,operation,status,retry_count,error,created_at,processed_at "
+                f"FROM outbox_entries WHERE {page_filter} ORDER BY created_at,id LIMIT :limit"
+            ),
+            page_params,
+        )
+        rows = tuple(OutboxDiagnosticRow(**dict(row)) for row in result.mappings())
+        work.check()
+        return OutboxDiagnosticPage(rows, upper)
 
     async def reset_stale_processing(self, max_age_seconds: int = 600) -> int:
         """Reset entries stuck in ``processing`` back to ``pending``.

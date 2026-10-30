@@ -8,14 +8,17 @@ v0.6: Refactored to delegate to the new storage layer
 duplicate inline ORM models.
 """
 
+import asyncio
 import json
 import re
 import sqlite3
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional, TypeVar
+from time import monotonic
+from typing import Any, Awaitable, Callable, Literal, Optional, TypeVar
 
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from storage.base import Base
 from storage.models.decision import DecisionORM
@@ -59,6 +62,111 @@ class FactRow:
     lifecycle_state: str
     confidence: float
     created_at: datetime
+
+
+DiagnosticTable = Literal["facts", "beliefs", "decisions", "skills", "receipts"]
+DiagnosticCheck = Literal[
+    "invalid_lifecycle",
+    "receipt_state",
+    "confidence",
+    "confidence_low",
+    "consistency",
+    "receipt_missing",
+    "receipt_type",
+    "receipt_orphan",
+    "relation_endpoints",
+    "relation_type",
+]
+_DIAGNOSTIC_TABLES = {"facts", "beliefs", "decisions", "skills", "receipts"}
+_CANONICAL_TABLES = {"facts": "fact", "beliefs": "belief", "decisions": "decision", "skills": "skill"}
+_LIFECYCLE = (
+    "candidate",
+    "validated",
+    "active",
+    "stale",
+    "archived",
+    "forgotten",
+    "superseded",
+    "contradicted",
+    "discarded",
+)
+_VERIFICATION = ("unverified", "candidate", "validated", "trusted", "deprecated", "archived")
+_DIAGNOSTICS_PROGRESS_INTERVAL = 1000
+
+
+class DiagnosticsWorkExceeded(RuntimeError):  # noqa: N818 - frozen S10 ABI
+    pass
+
+
+class DiagnosticsDeadlineExceeded(TimeoutError):  # noqa: N818 - paired S10 ABI
+    pass
+
+
+@dataclass
+class DiagnosticsReadWork:
+    statement_vm_limit: int = 8_000_000
+    operation_vm_limit: int = 40_000_000
+    statements_max: int = 256
+    soft_deadline: float = 0.0
+    hard_deadline: float = 0.0
+    statements: int = 0
+    statement_vm: int = 0
+    operation_vm: int = 0
+    stop: str | None = None
+
+    def _fail(self, cause: str) -> None:
+        self.stop = self.stop or cause
+        if self.stop == "timeout":
+            raise DiagnosticsDeadlineExceeded
+        raise DiagnosticsWorkExceeded(self.stop)
+
+    def check(self, *, statement: bool = False, vm_steps: int = 0) -> None:
+        if self.stop is not None:
+            self._fail(self.stop)
+        if (self.soft_deadline and monotonic() >= self.soft_deadline) or (
+            self.hard_deadline and monotonic() >= self.hard_deadline
+        ):
+            self._fail("timeout")
+        if statement:
+            self.statements += 1
+            self.statement_vm = 0
+            vm_steps += _DIAGNOSTICS_PROGRESS_INTERVAL
+        self.statement_vm += vm_steps
+        self.operation_vm += vm_steps
+        if self.statements > self.statements_max:
+            self._fail("statements")
+        if self.statement_vm > self.statement_vm_limit:
+            self._fail("statement_vm")
+        if self.operation_vm > self.operation_vm_limit:
+            self._fail("operation_vm")
+
+    def raise_stopped(self) -> None:
+        if self.stop is not None:
+            self._fail(self.stop)
+
+
+@dataclass(frozen=True)
+class AuditRecord:
+    fact_id: str
+    memory_type: str
+    status: str | None
+    confidence: float | None
+    lifecycle_state: str | None
+    verification_status: str | None
+    has_receipt: bool
+    receipt_id: str | None
+
+
+@dataclass(frozen=True)
+class AuditSnapshot:
+    records: tuple[AuditRecord, ...]
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class BeliefWindow:
+    rows: tuple[Belief, ...]
+    truncated: bool
 
 
 class SQLiteProvider:
@@ -673,6 +781,281 @@ class SQLiteProvider:
         return await LifecycleRepository(session).get_events_page(
             memory_id, memory_type, limit=limit, after=after, upper=upper
         )
+
+    @asynccontextmanager
+    async def diagnostics_window(self, session: AsyncSession, *, work: DiagnosticsReadWork):
+        """Apply operation-local statement, VM, and deadline limits."""
+        active = session.info.get("s10_diagnostics_work")
+        if active is not None:
+            if active is not work:
+                raise ValueError("diagnostics window mismatch")
+            yield
+            return
+        connection = await session.connection()
+        sync = connection.sync_connection
+
+        async def bridge(function):
+            return await connection.run_sync(lambda conn: conn.connection.dbapi_connection.run_async(function))
+
+        def before(*_args):
+            work.check(statement=True)
+
+        def progress():
+            try:
+                work.check(vm_steps=_DIAGNOSTICS_PROGRESS_INTERVAL)
+                return 0
+            except (DiagnosticsWorkExceeded, DiagnosticsDeadlineExceeded):
+                return 1
+
+        session.info["s10_diagnostics_work"] = work
+        event.listen(sync, "before_cursor_execute", before)
+        try:
+            await bridge(lambda driver: driver.set_progress_handler(progress, _DIAGNOSTICS_PROGRESS_INTERVAL))
+            try:
+                yield
+                work.check()
+            except Exception:
+                work.raise_stopped()
+                raise
+        finally:
+            event.remove(sync, "before_cursor_execute", before)
+
+            async def reset():
+                try:
+                    await bridge(lambda driver: driver.set_progress_handler(None, 0))
+                except BaseException:
+                    await connection.invalidate()
+                    raise
+
+            cleanup = asyncio.create_task(reset())
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    work.stop = work.stop or "timeout"
+            session.info.pop("s10_diagnostics_work", None)
+            cleanup.result()
+
+    @staticmethod
+    def _diagnostics_require(session: AsyncSession, work: DiagnosticsReadWork) -> None:
+        if session.info.get("s10_diagnostics_work") is not work:
+            raise ValueError("diagnostics operation requires its active borrowed window")
+        work.check()
+
+    async def diagnostics_count(
+        self, session: AsyncSession, table: DiagnosticTable, *, work: DiagnosticsReadWork
+    ) -> int:
+        self._diagnostics_require(session, work)
+        if table not in _DIAGNOSTIC_TABLES:
+            raise ValueError("invalid diagnostics table")
+        result = await session.execute(text(f"SELECT COUNT(*) FROM {table}"))
+        work.check()
+        return int(result.scalar_one())
+
+    async def diagnostics_lifecycle_counts(
+        self, session: AsyncSession, table: DiagnosticTable, *, work: DiagnosticsReadWork
+    ) -> dict[str, int]:
+        self._diagnostics_require(session, work)
+        if table not in _DIAGNOSTIC_TABLES:
+            raise ValueError("invalid diagnostics table")
+        known = ",".join(repr(value) for value in _LIFECYCLE)
+        result = await session.execute(
+            text(
+                f"SELECT CASE WHEN lifecycle_state IN ({known}) THEN lifecycle_state ELSE 'unknown' END AS state,"
+                f"COUNT(*) AS count FROM {table} GROUP BY state"
+            )
+        )
+        work.check()
+        return {str(row.state): int(row.count) for row in result}
+
+    async def diagnostics_check_count(
+        self,
+        session: AsyncSession,
+        check: DiagnosticCheck,
+        *,
+        table: DiagnosticTable | None,
+        work: DiagnosticsReadWork,
+    ) -> int:
+        self._diagnostics_require(session, work)
+        known_lc = ",".join(repr(value) for value in _LIFECYCLE)
+        known_vs = ",".join(repr(value) for value in _VERIFICATION)
+        if check in {
+            "invalid_lifecycle",
+            "confidence",
+            "confidence_low",
+            "consistency",
+            "receipt_state",
+            "receipt_missing",
+            "receipt_type",
+        }:
+            if table not in _DIAGNOSTIC_TABLES:
+                raise ValueError("invalid diagnostics table")
+        if check == "invalid_lifecycle":
+            sql = (
+                f"SELECT COUNT(*) FROM {table} WHERE lifecycle_state IS NULL OR lifecycle_state NOT IN ({known_lc}) "
+                f"OR verification_status IS NULL OR verification_status NOT IN ({known_vs})"
+            )
+            params = {}
+        elif check == "confidence":
+            sql, params = f"SELECT COUNT(*) FROM {table} WHERE confidence IS NULL OR confidence<0 OR confidence>1", {}
+        elif check == "confidence_low":
+            sql, params = f"SELECT COUNT(*) FROM {table} WHERE confidence>=0 AND confidence<0.3", {}
+        elif check == "consistency" and table in _CANONICAL_TABLES:
+            sql = (
+                f"SELECT COUNT(*) FROM {table} WHERE "
+                "(confidence=0 AND lifecycle_state NOT IN ('stale','archived','forgotten')) "
+                "OR (lifecycle_state='stale' AND confidence>=0.5)"
+            )
+            params = {}
+        elif check in {"receipt_state", "receipt_missing", "receipt_type"} and table in _CANONICAL_TABLES:
+            kind = _CANONICAL_TABLES[table]
+            if check == "receipt_state":
+                sql = (
+                    f"SELECT COUNT(*) FROM {table} c JOIN receipts r ON r.id=c.id AND r.memory_type=:kind "
+                    "WHERE c.lifecycle_state IS NOT r.lifecycle_state "
+                    "OR c.verification_status IS NOT r.verification_status"
+                )
+            elif check == "receipt_missing":
+                sql = (
+                    f"SELECT COUNT(*) FROM {table} c WHERE NOT EXISTS "
+                    "(SELECT 1 FROM receipts r WHERE r.id=c.id AND r.memory_type=:kind)"
+                )
+            else:
+                sql = f"SELECT COUNT(*) FROM {table} c JOIN receipts r ON r.id=c.id WHERE r.memory_type<>:kind"
+            params = {"kind": kind}
+        elif check == "receipt_orphan" and table is None:
+            sql = """SELECT COUNT(*) FROM receipts r WHERE NOT (
+                (r.memory_type='fact' AND EXISTS(SELECT 1 FROM facts c WHERE c.id=r.id)) OR
+                (r.memory_type='belief' AND EXISTS(SELECT 1 FROM beliefs c WHERE c.id=r.id)) OR
+                (r.memory_type='decision' AND EXISTS(SELECT 1 FROM decisions c WHERE c.id=r.id)) OR
+                (r.memory_type='skill' AND EXISTS(SELECT 1 FROM skills c WHERE c.id=r.id)))"""
+            params = {}
+        elif check == "relation_endpoints" and table is None:
+            def hits(column):
+                return " + ".join(
+                    f"(SELECT COUNT(*) FROM {name} WHERE id=cr.{column})" for name in _CANONICAL_TABLES
+                )
+
+            sql = f"SELECT COUNT(*) FROM claim_relations cr WHERE ({hits('source_id')})<>1 OR ({hits('target_id')})<>1"
+            params = {}
+        elif check == "relation_type" and table is None:
+            sql = (
+                "SELECT COUNT(*) FROM claim_relations WHERE relation_type NOT IN "
+                "('supports','contradicts','derives','derived_from')"
+            )
+            params = {}
+        else:
+            raise ValueError("invalid diagnostics check")
+        result = await session.execute(text(sql), params)
+        work.check()
+        return int(result.scalar_one())
+
+    async def diagnostics_audit_snapshot(
+        self, session: AsyncSession, *, per_type_limit: int, work: DiagnosticsReadWork
+    ) -> AuditSnapshot:
+        self._diagnostics_require(session, work)
+        if type(per_type_limit) is not int or not 1 <= per_type_limit <= 200:
+            raise ValueError("invalid snapshot limit")
+        records, truncated = [], False
+        for table, kind in _CANONICAL_TABLES.items():
+            result = await session.execute(
+                text(
+                    f"SELECT c.id,c.confidence,c.lifecycle_state,c.verification_status,"
+                    f"EXISTS(SELECT 1 FROM receipts r WHERE r.id=c.id AND r.memory_type=:kind) AS has_receipt "
+                    f"FROM {table} c ORDER BY c.id LIMIT :limit"
+                ),
+                {"kind": kind, "limit": per_type_limit + 1},
+            )
+            rows = result.all()
+            truncated = truncated or len(rows) > per_type_limit
+            records.extend(
+                AuditRecord(
+                    fact_id=row.id,
+                    memory_type=kind,
+                    status=row.lifecycle_state,
+                    confidence=row.confidence,
+                    lifecycle_state=row.lifecycle_state,
+                    verification_status=row.verification_status,
+                    has_receipt=bool(row.has_receipt),
+                    receipt_id=row.id if row.has_receipt else None,
+                )
+                for row in rows[:per_type_limit]
+            )
+        work.check()
+        return AuditSnapshot(tuple(records), truncated)
+
+    async def diagnostics_unresolved_conflict_count(
+        self, session: AsyncSession, *, work: DiagnosticsReadWork
+    ) -> int:
+        self._diagnostics_require(session, work)
+        result = await session.execute(
+            text(
+                """SELECT COUNT(*) FROM (
+                SELECT MIN(cr.source_id,cr.target_id),MAX(cr.source_id,cr.target_id)
+                FROM claim_relations cr JOIN beliefs a ON a.id=cr.source_id
+                JOIN beliefs b ON b.id=cr.target_id
+                WHERE cr.relation_type='contradicts' AND cr.source_id<>cr.target_id
+                AND a.lifecycle_state='contradicted' AND b.lifecycle_state='contradicted'
+                AND NOT EXISTS(SELECT 1 FROM facts WHERE id=a.id)
+                AND NOT EXISTS(SELECT 1 FROM decisions WHERE id=a.id)
+                AND NOT EXISTS(SELECT 1 FROM skills WHERE id=a.id)
+                AND NOT EXISTS(SELECT 1 FROM facts WHERE id=b.id)
+                AND NOT EXISTS(SELECT 1 FROM decisions WHERE id=b.id)
+                AND NOT EXISTS(SELECT 1 FROM skills WHERE id=b.id)
+                GROUP BY MIN(cr.source_id,cr.target_id),MAX(cr.source_id,cr.target_id))"""
+            )
+        )
+        work.check()
+        return int(result.scalar_one())
+
+    async def diagnostics_reflect_beliefs(
+        self,
+        session: AsyncSession,
+        *,
+        topic: str | None,
+        min_confidence: float,
+        limit: int,
+        work: DiagnosticsReadWork,
+    ) -> BeliefWindow:
+        self._diagnostics_require(session, work)
+        if type(limit) is not int or not 1 <= limit <= 100 or not isinstance(min_confidence, (int, float)):
+            raise ValueError("invalid reflection bounds")
+        result = await session.execute(
+            text(
+                """SELECT id,proposition,confidence,source,creator,source_ids,tags,created_at,updated_at,
+                last_reinforced_at,version,verification_status,lifecycle_state FROM beliefs
+                WHERE confidence>=:confidence AND (:topic IS NULL OR EXISTS(
+                SELECT 1 FROM json_each(CASE WHEN json_valid(tags) THEN tags ELSE '[]' END) j
+                WHERE j.type='text' AND j.value=:topic)) ORDER BY id LIMIT :limit"""
+            ),
+            {"confidence": float(min_confidence), "topic": topic or None, "limit": limit + 1},
+        )
+        rows = result.mappings().all()
+        beliefs = []
+        for row in rows[:limit]:
+            values = dict(row)
+            values["source_ids"] = json.loads(values["source_ids"] or "[]")
+            values["tags"] = json.loads(values["tags"] or "[]")
+            beliefs.append(Belief.model_validate(values))
+        work.check()
+        return BeliefWindow(tuple(beliefs), len(rows) > limit)
+
+    async def diagnostics_schema_revision(
+        self, session: AsyncSession, *, work: DiagnosticsReadWork
+    ) -> str | None:
+        self._diagnostics_require(session, work)
+        exists = await session.execute(
+            text("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='alembic_version'")
+        )
+        if int(exists.scalar_one()) == 0:
+            work.check()
+            return None
+        result = await session.execute(text("SELECT version_num FROM alembic_version LIMIT 2"))
+        rows = result.scalars().all()
+        work.check()
+        if len(rows) > 1:
+            raise ValueError("ambiguous schema revision")
+        return str(rows[0]) if rows else None
 
     # --- Fact CRUD ---
 
