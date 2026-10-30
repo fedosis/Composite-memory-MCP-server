@@ -103,6 +103,8 @@ class RelationCursorCodec:
         expires_at: datetime | None = None,
     ) -> str:
         expiry = min(now + timedelta(seconds=self.ttl), expires_at) if expires_at else now + timedelta(seconds=self.ttl)
+        if now >= expiry:
+            raise HttpError("E_CURSOR_EXPIRED")
         payload = dict(
             v=1,
             profile_id=command.profile_id,
@@ -176,8 +178,16 @@ class RelationCursorCodec:
                 or not timedelta(0) < expiry - issued <= timedelta(seconds=self.ttl)
             ):
                 raise ValueError
-        except (ValueError, TypeError, KeyError, AttributeError, UnicodeError,
-                RecursionError, OverflowError, HttpError):
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+            AttributeError,
+            UnicodeError,
+            RecursionError,
+            OverflowError,
+            HttpError,
+        ):
             raise HttpError("E_CURSOR_INVALID") from None
         if now >= expiry:
             raise HttpError("E_CURSOR_EXPIRED")

@@ -453,6 +453,9 @@ async def test_relation_cursor_golden_schema_and_key_custody(tmp_path):
             return part + "." + signature
 
         assert sign(payload) == token
+        with pytest.raises(Exception) as expired_issue:
+            codec.issue(ctx, command, last=last, upper=upper, limit=50, now=now, expires_at=now)
+        assert getattr(expired_issue.value, "code", None) == "E_CURSOR_EXPIRED"
         for bad in (
             token + "a",
             token.split(".")[0] + ".AA",

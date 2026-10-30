@@ -92,10 +92,24 @@ async def test_sql_fetch_and_work_bound(tmp_path, count):
 
 
 @pytest.mark.asyncio
-async def test_missing_index_is_storage_not_budget(tmp_path):
+async def test_missing_index_is_storage_not_budget(tmp_path, monkeypatch):
     async with live_server(tmp_path) as (holder, port, _):
         auth = await relation_auth(holder)
         resources = await seed(holder, auth)
+        import aiosqlite
+
+        original = aiosqlite.Connection.set_progress_handler
+
+        async def faulty_reset(driver, handler, interval):
+            await original(driver, handler, interval)
+            if handler is None:
+                raise OSError("S09_RESET_CANARY")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(aiosqlite.Connection, "set_progress_handler", faulty_reset)
+            status, body = await get(port, auth, "relations")
+        assert (status, body["error"]["code"]) == (503, "E_STORAGE")
+        assert "S09_RESET_CANARY" not in str(body)
         async with resources.session_factory() as session:
             await session.execute(text("DROP INDEX s09_order"))
             await session.commit()

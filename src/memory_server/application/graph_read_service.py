@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from dataclasses import dataclass
 from time import monotonic
 from typing import TYPE_CHECKING, Callable, Literal
@@ -188,7 +189,7 @@ class GraphReadService:
                 raise HttpError("E_TIMEOUT") from None
             except GraphBudgetExceeded:
                 raise HttpError("E_GRAPH_BACKEND") from None
-            except SQLAlchemyError:
+            except (SQLAlchemyError, sqlite3.Error, OSError):
                 raise HttpError("E_STORAGE") from None
             finally:
                 # The lease owns the producer, queued reset, rollback and close.
