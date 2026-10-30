@@ -4,14 +4,12 @@ import asyncio
 from dataclasses import replace
 
 from memory_server.admission import MemoryAdmissionGate
-from memory_server.application.diagnostics_service import DiagnosticsResources, create_diagnostics_port
 from memory_server.application.errors import UnknownDependencyError
 from memory_server.application.gateway_retrieval import GatewayRetrievalPort, NativeCustody
 from memory_server.application.graph_read_service import GraphReadResources, create_graph_read_port
 from memory_server.application.memory_read_service import MemoryReadService
 from memory_server.gateway_contracts.ports import ProfileSession
 from memory_server.transports.http.errors import HttpError
-from memory_server.transports.http.routes.diagnostics import OutboxCursorCodec, create_diagnostics_routes
 from memory_server.transports.http.routes.graph import RelationCursorCodec, create_graph_read_routes
 from memory_server.transports.http.routes.memories_read import CursorCodec, create_memory_read_routes
 from memory_server.transports.http.routes.retrieval import create_context_routes, create_search_routes
@@ -26,27 +24,6 @@ def bind_read(scope):
 
 def bind_graph_read(scope: ProfileSession) -> GraphReadResources:
     return GraphReadResources(bind_read(scope), scope.runtime.dependencies.graph)
-
-
-def bind_diagnostics(scope: ProfileSession) -> DiagnosticsResources:
-    dependencies = scope.runtime.dependencies
-
-    def optional(name):
-        try:
-            return getattr(dependencies, name)
-        except UnknownDependencyError:
-            return None
-
-    return DiagnosticsResources(
-        canonical=bind_read(scope),
-        profile=scope.binding.profile.model_copy(update={"storage_root": None}),
-        vector=optional("vector"),
-        graph=optional("graph"),
-        validator=scope.application.audit._validator,
-        confidence=scope.application.audit._confidence_engine,
-        reflection=scope.application.reflection,
-        writer_owned=None,
-    )
 
 
 class _BoundNativeCustody:
@@ -99,11 +76,4 @@ def compose_read_ports(deps, config):
     graph_specs = create_graph_read_routes(cursor_codec=relation_codec)
     ports.update({spec.operation: graph_reader for spec in graph_specs})
     specs += graph_specs
-    outbox_codec = OutboxCursorCodec.from_path(
-        config.control_path.parent / "http-outbox-cursor.key", config.cursor_ttl_seconds)
-    diagnostics = create_diagnostics_port(deps.leases, bind_diagnostics, native=bind_native,
-                                          cursor_codec=outbox_codec, metrics=deps.metrics)
-    diagnostics_specs = create_diagnostics_routes(cursor_codec=outbox_codec)
-    ports.update({spec.operation: diagnostics for spec in diagnostics_specs})
-    specs += diagnostics_specs
     return replace(deps, ports=ports), specs

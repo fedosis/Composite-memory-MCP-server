@@ -641,7 +641,6 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
             "lookup", "memories.reveal", "search", "context",
             "relations.for_memory", "relations.list", "relations.get",
             "graph.neighborhood", "graph.path", "graph.entity",
-            "audit", "indexes.status", "outbox.list", "overview", "reflect",
         }
         assert set(deps.ports) == expected
         assert {spec.operation for spec in read_routes} == expected
