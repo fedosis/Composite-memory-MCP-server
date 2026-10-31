@@ -11,7 +11,15 @@ scores to 0.0-1.0 and deduplicates by content.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
+
+
+class _RankTap(Protocol):
+    def raw(self, source: str, items: list[tuple[str | None, float, int]]) -> None: ...
+    def order(self, items: list[tuple[str | None, str, float, int]]) -> None: ...
+    def dedup(
+        self, kept: list[tuple[str | None, str]], dropped: list[tuple[str | None, str, str | None, str]]
+    ) -> None: ...
 
 
 @dataclass
@@ -41,8 +49,9 @@ class RankMerger:
     and returns a unified sorted result list.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tap: _RankTap | None = None) -> None:
         self._seen: set[str] = set()
+        self._tap = tap
 
     @staticmethod
     def _normalize_score(
@@ -97,6 +106,13 @@ class RankMerger:
         semantic_scores = [r.score for r in semantic_results]
         graph_scores = [r.score for r in graph_results]
 
+        if self._tap is not None:
+            for source, batch in (("fts", fts_results), ("semantic", semantic_results), ("graph", graph_results)):
+                try:
+                    self._tap.raw(source, [(r.metadata.get("id"), float(r.score), i) for i, r in enumerate(batch, 1)])
+                except Exception:
+                    pass
+
         all_results: list[RankResult] = []
 
         for r in fts_results:
@@ -111,16 +127,42 @@ class RankMerger:
             r.score = self._normalize_score(r.score, "graph", graph_scores)
             all_results.append(r)
 
+        ordered = sorted(all_results, key=lambda x: x.score, reverse=True)
+        if self._tap is not None:
+            try:
+                self._tap.order([(r.metadata.get("id"), r.source, float(r.score), i) for i, r in enumerate(ordered, 1)])
+            except Exception:
+                pass
+
         # Deduplicate by content
         seen: set[str] = set()
         deduped: list[RankResult] = []
-        for r in sorted(all_results, key=lambda x: x.score, reverse=True):
+        kept, dropped, winners = [], [], {}
+        for r in ordered:
             content_key = r.content.lower().strip()
+            keep = not content_key or content_key not in seen
             if content_key and content_key not in seen:
                 seen.add(content_key)
                 deduped.append(r)
             elif not content_key:
                 deduped.append(r)  # Keep empty-content entries
+            if self._tap is not None:
+                try:
+                    pair = (r.metadata.get("id"), r.source)
+                    if keep:
+                        kept.append(pair)
+                        if content_key:
+                            winners[content_key] = pair
+                    else:
+                        dropped.append((*winners[content_key], *pair))
+                except Exception:
+                    pass
+
+        if self._tap is not None:
+            try:
+                self._tap.dedup(kept, dropped)
+            except Exception:
+                pass
 
         return deduped
 
@@ -142,18 +184,20 @@ class RankMerger:
             # Use position as a rough proxy when FTS5 rank not available;
             # FTS results are ordered by rank, so earlier = better.
             score = 1.0 - (i / max(len(facts), 1) * 0.5)
-            results.append(RankResult(
-                content=content,
-                score=score,
-                source="fts",
-                confidence=fact.confidence,
-                metadata={
-                    "id": fact.id,
-                    "subject": fact.subject,
-                    "predicate": fact.predicate,
-                    "object": fact.object,
-                },
-            ))
+            results.append(
+                RankResult(
+                    content=content,
+                    score=score,
+                    source="fts",
+                    confidence=fact.confidence,
+                    metadata={
+                        "id": fact.id,
+                        "subject": fact.subject,
+                        "predicate": fact.predicate,
+                        "object": fact.object,
+                    },
+                )
+            )
         return results
 
     @staticmethod
@@ -181,27 +225,25 @@ class RankMerger:
         for r in qdrant_results:
             payload = r.get("payload", {})
             raw_content = payload.get("content")
-            content = (
-                raw_content.strip()
-                if isinstance(raw_content, str)
-                else ""
-            )
+            content = raw_content.strip() if isinstance(raw_content, str) else ""
             if not content:
                 subj = payload.get("subject", "")
                 pred = payload.get("predicate", "")
                 obj = payload.get("object", "")
                 content = f"{subj} {pred} {obj}".strip()
             score = r.get("score", 0.0)
-            results.append(RankResult(
-                content=content or "No content",
-                score=score,
-                source="semantic",
-                confidence=payload.get("confidence", 1.0),
-                metadata={
-                    "id": r.get("id", ""),
-                    **payload,
-                },
-            ))
+            results.append(
+                RankResult(
+                    content=content or "No content",
+                    score=score,
+                    source="semantic",
+                    confidence=payload.get("confidence", 1.0),
+                    metadata={
+                        "id": r.get("id", ""),
+                        **payload,
+                    },
+                )
+            )
         return results
 
     @staticmethod
@@ -227,27 +269,30 @@ class RankMerger:
             # Score based on relation count relative to total
             total_rels = len(relations) if relations else 1
             score = min(1.0, count / total_rels) if total_rels > 0 else 1.0
-            results.append(RankResult(
-                content=name,
-                score=score,
-                source="graph",
-                confidence=1.0,
-                metadata=entity,
-            ))
+            results.append(
+                RankResult(
+                    content=name,
+                    score=score,
+                    source="graph",
+                    confidence=1.0,
+                    metadata=entity,
+                )
+            )
 
         # Add relation-based results
         for rel in relations:
             rel_content = (
-                f"{rel.get('source_name', '')} {rel.get('relation', '')} "
-                f"{rel.get('target_name', '')}"
+                f"{rel.get('source_name', '')} {rel.get('relation', '')} {rel.get('target_name', '')}"
             ).strip()
             if rel_content:
-                results.append(RankResult(
-                    content=rel_content,
-                    score=0.8,  # Relations are informative but secondary to entities
-                    source="graph",
-                    confidence=1.0,
-                    metadata=rel,
-                ))
+                results.append(
+                    RankResult(
+                        content=rel_content,
+                        score=0.8,  # Relations are informative but secondary to entities
+                        source="graph",
+                        confidence=1.0,
+                        metadata=rel,
+                    )
+                )
 
         return results

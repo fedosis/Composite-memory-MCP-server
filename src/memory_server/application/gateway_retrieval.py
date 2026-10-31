@@ -9,6 +9,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Protocol
@@ -20,8 +21,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from memory_server.application.contracts import ContextCommand, GraphSearchCommand, SemanticSearchCommand
 from memory_server.application.errors import UnknownDependencyError
 from memory_server.application.memory_read_service import project_for_caller
+from memory_server.application.retrieval_trace import _contribution, _ObserverTap, _safe_id
 from memory_server.gateway_contracts import dto as d
-from memory_server.gateway_contracts.ports import ProfileSession, RetrievalPort
+from memory_server.gateway_contracts.ports import ProfileSession, RetrievalPort, TracePort
 from memory_server.router.embedding_router import NativeSubmitter
 from memory_server.router.hybrid_router import StrictSourceFailed, collect_strict
 from memory_server.router.ranking import RankMerger, RankResult
@@ -56,6 +58,27 @@ def _mask_version(value):
     if len(value) <= 128 and _SAFE_VERSION.fullmatch(value):
         return value
     return "[MASKED]"
+
+
+def _search_contribution(hit):
+    try:
+        return _contribution(hit.memory.id, hit.source, before=hit.rank, after=hit.rank)
+    except Exception:
+        return None
+
+
+def _rank_contribution(item, before, after):
+    try:
+        return _contribution(item.metadata.get("id"), item.source, item.score, item.score, before, after)
+    except Exception:
+        return None
+
+
+def _notify(observer, method, *args):
+    try:
+        getattr(observer, method)(*deepcopy(args))
+    except Exception:
+        pass
 
 
 def mask_context_package(package: dict) -> dict:
@@ -112,9 +135,6 @@ def _preflight(operation, query):
         if not query.query.isprintable() or query.filters.source is not None or query.filters.tags:
             raise HttpError("E_VALIDATION")
 
-    if query.trace:
-        raise HttpError("E_CAPABILITY_UNAVAILABLE")
-
 
 class NativeCustody(NativeSubmitter, Protocol):
     async def drain(self) -> None: ...
@@ -124,9 +144,11 @@ NativeBinder = Callable[[ProfileSession], NativeCustody]
 
 
 class GatewayRetrievalPort(RetrievalPort):
-    def __init__(self, leases, bind_read, metrics, *, native: NativeBinder | None = None):
+    def __init__(
+        self, leases, bind_read, metrics, *, native: NativeBinder | None = None, traces: TracePort | None = None
+    ):
         self.leases, self.bind_read, self.metrics = leases, bind_read, metrics
-        self.native = native
+        self.native, self.traces = native, traces
 
     @asynccontextmanager
     async def _stage(self, ctx, stage):
@@ -156,33 +178,88 @@ class GatewayRetrievalPort(RetrievalPort):
         if command.profile_id != ctx.profile_id or command.operation not in ("search", "context"):
             raise HttpError("E_VALIDATION")
         _preflight(command.operation, command.payload)
+        trace_requested = bool(command.payload.trace)
+        if trace_requested and self.traces is None:
+            raise HttpError("E_CAPABILITY_UNAVAILABLE")
         async with self.leases.acquire(ctx) as scope:
-            if command.operation == "search" and command.payload.mode != "keyword":
+            if trace_requested and command.operation == "search" and command.payload.mode in ("semantic", "graph"):
                 try:
                     resources = self.bind_read(scope)
                     retrieval = scope.application.retrieval
                 except UnknownDependencyError:
                     raise HttpError("E_RUNTIME_NOT_READY") from None
-                if (self.native is None or resources.provider is None
-                        or resources.session_factory is None or retrieval is None):
+                if (
+                    self.native is None
+                    or resources.provider is None
+                    or resources.session_factory is None
+                    or retrieval is None
+                ):
                     raise HttpError("E_RUNTIME_NOT_READY")
                 custody = self.native(scope)
-                return await self._run_before_deadline(
-                    ctx, self._search_sources(ctx, command.payload, resources, retrieval, scope, custody), custody,
+                self._deadline(ctx)
+                outcomes = await self._run_before_deadline(
+                    ctx, self._collect_native(ctx, command.payload, retrieval, scope, custody), custody
                 )
-            async with self._stage(ctx, "context" if command.operation == "context" else "fts"):
+                await custody.drain()
+                outcome = outcomes[command.payload.mode]
+                if outcome is None:
+                    raise HttpError("E_CAPABILITY_UNAVAILABLE")
+                if outcome.state == "failed":
+                    raise HttpError(outcome.code)
+                async with self.traces.observe(ctx, command.operation) as observer:
+                    result = await self._run_before_deadline(
+                        ctx,
+                        self._search_sources(
+                            ctx, command.payload, resources, retrieval, scope, custody, observer, outcomes
+                        ),
+                        custody,
+                    )
                 try:
-                    resources = self.bind_read(scope)
-                    retrieval = scope.application.retrieval
-                except UnknownDependencyError:
-                    raise HttpError("E_RUNTIME_NOT_READY") from None
-                if resources.provider is None or resources.session_factory is None or retrieval is None:
-                    raise HttpError("E_RUNTIME_NOT_READY")
-                if command.operation == "search":
-                    return await self._search(ctx, command.payload, resources)
-                return await self._context(ctx, command.payload, retrieval, resources)
+                    return result.model_copy(update={"trace_id": observer.trace_id})
+                except Exception:
+                    return result
+            if trace_requested:
+                async with self.traces.observe(ctx, command.operation) as observer:
+                    result = await self._execute_in_lease(ctx, command, scope, observer)
+                try:
+                    return result.model_copy(update={"trace_id": observer.trace_id})
+                except Exception:
+                    return result
+            return await self._execute_in_lease(ctx, command, scope, None)
 
-    async def _search(self, ctx, query, resources):
+    async def _execute_in_lease(self, ctx, command, scope, observer):
+        if command.operation == "search" and command.payload.mode != "keyword":
+            try:
+                resources = self.bind_read(scope)
+                retrieval = scope.application.retrieval
+            except UnknownDependencyError:
+                raise HttpError("E_RUNTIME_NOT_READY") from None
+            if (
+                self.native is None
+                or resources.provider is None
+                or resources.session_factory is None
+                or retrieval is None
+            ):
+                raise HttpError("E_RUNTIME_NOT_READY")
+            custody = self.native(scope)
+            return await self._run_before_deadline(
+                ctx,
+                self._search_sources(ctx, command.payload, resources, retrieval, scope, custody, observer),
+                custody,
+            )
+        async with self._stage(ctx, "context" if command.operation == "context" else "fts"):
+            try:
+                resources = self.bind_read(scope)
+                retrieval = scope.application.retrieval
+            except UnknownDependencyError:
+                raise HttpError("E_RUNTIME_NOT_READY") from None
+            if resources.provider is None or resources.session_factory is None or retrieval is None:
+                raise HttpError("E_RUNTIME_NOT_READY")
+            if command.operation == "search":
+                return await self._search(ctx, command.payload, resources, observer)
+            return await self._context(ctx, command.payload, retrieval, resources, observer)
+
+    async def _search(self, ctx, query, resources, observer=None):
         if query.filters.memory_types and "fact" not in query.filters.memory_types:
             hits = []
         else:
@@ -216,9 +293,17 @@ class GatewayRetrievalPort(RetrievalPort):
                     )
                     for i, record in enumerate(records, 1)
                 ]
-        return d.SearchResult(
-            request_id=ctx.request_id, results=hits, total=len(hits), trace_id=None, degraded=[]
-        )
+        result = d.SearchResult(request_id=ctx.request_id, results=hits, total=len(hits), trace_id=None, degraded=[])
+        if observer is not None:
+            try:
+                items = [_search_contribution(hit) for hit in hits]
+                items = [x for x in items if x is not None]
+                _notify(observer, "stage", "fts", items, "ran")
+                _notify(observer, "merged", items, items)
+                _notify(observer, "final", items)
+            except Exception:
+                pass
+        return result
 
     async def _run_before_deadline(self, ctx, work, custody):
         operation = asyncio.create_task(work)
@@ -258,7 +343,8 @@ class GatewayRetrievalPort(RetrievalPort):
                 return None
             async with self._stage(ctx, "semantic") as state:
                 outcome = await retrieval.gateway_semantic(
-                    SemanticSearchCommand(query=query.query, top_k=query.limit, score_threshold=None), native=custody,
+                    SemanticSearchCommand(query=query.query, top_k=query.limit, score_threshold=None),
+                    native=custody,
                 )
                 state["code"] = outcome.code
                 return outcome
@@ -318,9 +404,14 @@ class GatewayRetrievalPort(RetrievalPort):
         seen, groups = set(), {triple: [] for triple in triples}
         for row in rows:
             triple = (row.subject, row.predicate, row.object)
-            if (triple not in groups or type(row.id) is not str or not row.id or row.id in seen
-                    or not _finite_number(row.confidence)
-                    or not isinstance(row.created_at, datetime)):
+            if (
+                triple not in groups
+                or type(row.id) is not str
+                or not row.id
+                or row.id in seen
+                or not _finite_number(row.confidence)
+                or not isinstance(row.created_at, datetime)
+            ):
                 raise HttpError("E_INTERNAL")
             seen.add(row.id)
             prior = expected.get(row.id)
@@ -340,9 +431,13 @@ class GatewayRetrievalPort(RetrievalPort):
                 continue
             payload, ident, score = hit["payload"], hit.get("id"), hit.get("score")
             triple = tuple(payload.get(field) for field in ("subject", "predicate", "object"))
-            if (payload.get("memory_type") != "fact" or type(ident) is not str or not ident
-                    or any(type(value) is not str or not value for value in triple)
-                    or not _finite_number(score)):
+            if (
+                payload.get("memory_type") != "fact"
+                or type(ident) is not str
+                or not ident
+                or any(type(value) is not str or not value for value in triple)
+                or not _finite_number(score)
+            ):
                 continue
             valid.append((ident, float(score), triple))
         triples = tuple(dict.fromkeys(item[2] for item in valid))
@@ -356,7 +451,7 @@ class GatewayRetrievalPort(RetrievalPort):
                 row = matched[0]
                 if self._eligible_fact(query, row.lifecycle_state, row.confidence):
                     candidates[row.id] = max(score, candidates.get(row.id, -math.inf))
-        return list(candidates.items())[:query.limit]
+        return list(candidates.items())[: query.limit]
 
     async def _resolve_graph(self, query, provider, session, outcome, expected):
         if outcome is None or outcome.state != "ok":
@@ -378,7 +473,7 @@ class GatewayRetrievalPort(RetrievalPort):
             for row in groups[triple]:
                 if self._eligible_fact(query, row.lifecycle_state, row.confidence):
                     candidates.setdefault(row.id, 0.8)
-        return list(candidates.items())[:query.limit]
+        return list(candidates.items())[: query.limit]
 
     async def _hydrate_candidates(self, query, provider, session, batches, expected):
         ids = tuple(dict.fromkeys(ident for batch in batches.values() for ident, _ in batch))
@@ -386,24 +481,27 @@ class GatewayRetrievalPort(RetrievalPort):
             raise HttpError("E_INTERNAL")
         records = {}
         for start in range(0, len(ids), 100):
-            chunk = ids[start:start + 100]
+            chunk = ids[start : start + 100]
             hydrated = await provider.read_fact_records(session, chunk)
             for record in hydrated:
                 key = (record.memory_type, record.memory["id"])
                 if key[0] != "fact" or key[1] not in chunk or key[1] in records:
                     raise HttpError("E_INTERNAL")
                 row = expected[key[1]]
-                if any(record.memory[field] != getattr(row, field)
-                       for field in ("subject", "predicate", "object", "lifecycle_state", "confidence")):
+                if any(
+                    record.memory[field] != getattr(row, field)
+                    for field in ("subject", "predicate", "object", "lifecycle_state", "confidence")
+                ):
                     raise HttpError("E_INTERNAL")
                 records[key[1]] = record
             if any(ident not in records for ident in chunk):
                 raise HttpError("E_STORAGE")
         return records
 
-    async def _search_sources(self, ctx, query, resources, retrieval, scope, custody):
+    async def _search_sources(self, ctx, query, resources, retrieval, scope, custody, observer=None, outcomes=None):
         self._deadline(ctx)
-        outcomes = await self._collect_native(ctx, query, retrieval, scope, custody)
+        if outcomes is None:
+            outcomes = await self._collect_native(ctx, query, retrieval, scope, custody)
         # Projection threads must be terminated before opening the SQL snapshot.
         await custody.drain()
         self._deadline(ctx)
@@ -422,39 +520,59 @@ class GatewayRetrievalPort(RetrievalPort):
                 if query.mode == "hybrid":
                     async with self._stage(ctx, "fts"):
                         facts = await resources.provider.search_facts_in_session(
-                            session, text=query.query, limit=query.limit, include_inactive=query.include_inactive,
+                            session,
+                            text=query.query,
+                            limit=query.limit,
+                            include_inactive=query.include_inactive,
                             memory_types=tuple(query.filters.memory_types),
                             lifecycle_states=tuple(query.filters.lifecycle_states),
                             min_confidence=query.filters.min_confidence,
                         )
-                        if (type(facts) is not list or len(facts) > query.limit
-                                or any(type(f.id) is not str or not f.id or not _finite_number(f.confidence)
-                                       for f in facts)
-                                or len({f.id for f in facts}) != len(facts)):
+                        if (
+                            type(facts) is not list
+                            or len(facts) > query.limit
+                            or any(type(f.id) is not str or not f.id or not _finite_number(f.confidence) for f in facts)
+                            or len({f.id for f in facts}) != len(facts)
+                        ):
                             raise HttpError("E_INTERNAL")
                         batches["fts"] = [(fact.id, 0.0) for fact in facts]
                         expected.update((fact.id, fact) for fact in facts)
                 self._deadline(ctx)
                 merge_started = monotonic()
                 batches["semantic"] = await self._resolve_semantic(
-                    query, resources.provider, session, outcomes.get("semantic"), expected,
+                    query,
+                    resources.provider,
+                    session,
+                    outcomes.get("semantic"),
+                    expected,
                 )
                 batches["graph"] = await self._resolve_graph(
-                    query, resources.provider, session, outcomes.get("graph"), expected,
+                    query,
+                    resources.provider,
+                    session,
+                    outcomes.get("graph"),
+                    expected,
                 )
                 records = await self._hydrate_candidates(query, resources.provider, session, batches, expected)
                 self._deadline(ctx)
                 ranked_batches = {}
                 for source, batch in batches.items():
                     ranked_batches[source] = [
-                        RankResult(content=f"fact:{ident}", score=score, source=source,
-                                   confidence=records[ident].memory["confidence"], metadata={"id": ident})
+                        RankResult(
+                            content=f"fact:{ident}",
+                            score=score,
+                            source=source,
+                            confidence=records[ident].memory["confidence"],
+                            metadata={"id": ident},
+                        )
                         for ident, score in batch
-                        if self._eligible_fact(query, records[ident].memory["lifecycle_state"],
-                                               records[ident].memory["confidence"])
+                        if self._eligible_fact(
+                            query, records[ident].memory["lifecycle_state"], records[ident].memory["confidence"]
+                        )
                     ]
                 failures = {}
                 if query.mode == "hybrid":
+
                     def callback(source):
                         outcome = outcomes.get(source)
                         if source != "fts" and outcome is None:
@@ -464,20 +582,80 @@ class GatewayRetrievalPort(RetrievalPort):
                             if source != "fts" and outcome.state == "failed":
                                 raise StrictSourceFailed(outcome.code)
                             return ranked_batches[source]
+
                         return collect
 
-                    merged = await collect_strict(fts=callback("fts"), semantic=callback("semantic"),
-                                                  graph=callback("graph"), merger=RankMerger(), limit=query.limit)
+                    tap = None
+                    try:
+                        tap = _ObserverTap(observer) if observer is not None else None
+                    except Exception:
+                        pass
+                    merged = await collect_strict(
+                        fts=callback("fts"),
+                        semantic=callback("semantic"),
+                        graph=callback("graph"),
+                        merger=RankMerger(tap=tap),
+                        limit=query.limit,
+                    )
                     ranked, failures = merged.ranked, merged.failures
+                    if observer is not None and tap is not None:
+                        try:
+                            items, dedup = tap.emit()
+                            by_key = {(item.memory_id, item.source): item for item in items}
+                            final_items = []
+                            for item in ranked:
+                                ident = item.metadata.get("id") if isinstance(item.metadata, dict) else None
+                                contribution = by_key.get((_safe_id(ident), item.source))
+                                if contribution is not None:
+                                    final_items.append(contribution)
+                            for source in ("fts", "semantic", "graph"):
+                                status = (
+                                    "ran"
+                                    if source in merged.executed
+                                    else "skipped"
+                                    if failures.get(source) == "E_CAPABILITY_UNAVAILABLE"
+                                    else "failed"
+                                )
+                                _notify(observer, "stage", source, [x for x in items if x.source == source], status)
+                            _notify(observer, "merged", items, dedup)
+                            _notify(observer, "final", final_items)
+                        except Exception:
+                            pass
                 else:
-                    ranked = sorted(ranked_batches[query.mode], key=lambda item: item.score, reverse=True)[:query.limit]
-                hits = [d.SearchHit(memory=project_for_caller(ctx, "search", records[item.metadata["id"]], "unknown"),
-                                    score=item.score, rank=index, source=item.source)
-                        for index, item in enumerate(ranked, 1)]
+                    ranked_full = sorted(ranked_batches[query.mode], key=lambda item: item.score, reverse=True)
+                    ranked = ranked_full[: query.limit]
+                    if observer is not None:
+                        try:
+                            items = [
+                                contribution
+                                for index, item in enumerate(ranked_full, 1)
+                                for contribution in [_rank_contribution(item, index, index)]
+                                if contribution is not None
+                            ]
+                            _notify(observer, "stage", query.mode, items, "ran")
+                            _notify(observer, "merged", items, items)
+                            _notify(observer, "final", items[: query.limit])
+                        except Exception:
+                            pass
+                hits = [
+                    d.SearchHit(
+                        memory=project_for_caller(ctx, "search", records[item.metadata["id"]], "unknown"),
+                        score=item.score,
+                        rank=index,
+                        source=item.source,
+                    )
+                    for index, item in enumerate(ranked, 1)
+                ]
             result = d.SearchResult(
-                request_id=ctx.request_id, results=hits, total=len(hits), trace_id=None,
-                degraded=[d.SourceFailure(source=source, code=failures[source])
-                          for source in ("fts", "semantic", "graph") if source in failures],
+                request_id=ctx.request_id,
+                results=hits,
+                total=len(hits),
+                trace_id=None,
+                degraded=[
+                    d.SourceFailure(source=source, code=failures[source])
+                    for source in ("fts", "semantic", "graph")
+                    if source in failures
+                ],
             )
             merge_code = None
             return result
@@ -494,7 +672,7 @@ class GatewayRetrievalPort(RetrievalPort):
             if merge_started is not None:
                 self.metrics.retrieval_completed(ctx, "merge", monotonic() - merge_started, merge_code)
 
-    async def _context(self, ctx, query, retrieval, resources):
+    async def _context(self, ctx, query, retrieval, resources, observer=None):
         raw = await retrieval.get_context(
             ContextCommand(
                 task=query.task,
@@ -536,7 +714,7 @@ class GatewayRetrievalPort(RetrievalPort):
                     ):
                         raise HttpError("E_STORAGE")
                     memories.append(memory)
-            return d.ContextResult(
+            result = d.ContextResult(
                 request_id=ctx.request_id,
                 package=d.ContextPackage.model_validate_json(json.dumps(mask_context_package(value))),
                 memories=memories,
@@ -545,6 +723,11 @@ class GatewayRetrievalPort(RetrievalPort):
                 tokenizer=None,
                 token_count_is_estimate=True,
             )
+            if observer is not None:
+                _notify(observer, "stage", "context", [], "ran")
+                _notify(observer, "merged", [], [])
+                _notify(observer, "final", [])
+            return result
         except HttpError:
             raise
         except (ValueError, TypeError, KeyError, AttributeError):
