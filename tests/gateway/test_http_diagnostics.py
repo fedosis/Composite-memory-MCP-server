@@ -376,6 +376,24 @@ def test_audit_coalescing_is_deterministic_and_closed_validators():
         )
 
 
+def test_s10b2_route_specs_include_metrics_surface():
+    from memory_server.transports.http.routes.diagnostics import DIAGNOSTICS_ROUTE_SPECS
+
+    assert set(DIAGNOSTICS_ROUTE_SPECS) == {"audit", "indexes.status", "outbox.list", "overview", "reflect"}
+
+
+@pytest.mark.asyncio
+async def test_s10b2_service_accepts_indexes_operation():
+    service, _, _ = _foundation()
+    from memory_server.gateway_contracts import dto as d
+
+    command = d.COMMAND_TYPES["indexes.status"](
+        operation="indexes.status", profile_id="alpha", path_ids={}, payload=d.Empty()
+    )
+    assert command.operation == "indexes.status"
+    assert hasattr(service.DiagnosticsService, "indexes_status")
+
+
 @pytest.mark.asyncio
 async def test_outbox_service_codec_wire_enum_and_no_writes(shell, tmp_path, monkeypatch):
     service, _, _ = _foundation()
@@ -763,3 +781,589 @@ async def test_lifecycle_audit_does_not_spend_statements_on_discarded_groups(dat
     assert result.sections == {"lifecycle": "ok"}
     assert result.complete is True and result.findings.items == []
     assert statements and not any("GROUP BY" in sql.upper() for sql in statements)
+
+
+def test_indexes_status_honest_unknown():
+    service, _, _ = _foundation(require_b1=False)
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    from memory_server.application.diagnostics_service import map_index_status
+
+    result = map_index_status(
+        {"facts": 2, "beliefs": 3, "decisions": 5, "skills": 7},
+        vector_count=None,
+        outbox_pending=4,
+        outbox_failed=1,
+        graph_available=True,
+        sampled_at=AT,
+    )
+    assert result.sqlite_records == 17
+    assert result.vector_records is None
+    assert result.graph_relations is None and result.graph_lag is None
+    assert result.vector_lag is None and result.last_success is None
+    assert result.graph_consistency.projection == "unknown"
+    assert service.map_index_status is map_index_status
+
+
+def test_overview_profile_redacted_and_counts():
+    service, _, _ = _foundation(require_b1=False)
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    from memory_server.application.diagnostics_service import DiagnosticsResources, map_index_status, map_overview
+    from memory_server.gateway_contracts import dto as d
+
+    profile = d.Profile(
+        id="alpha",
+        display_name="Alpha",
+        description=None,
+        enabled=True,
+        generation=1,
+        runtime_state="ready",
+        capabilities=(),
+        storage_root="/secret/root",
+    )
+    resources = DiagnosticsResources(
+        canonical=SimpleNamespace(),
+        profile=profile,
+        vector=None,
+        graph=None,
+        validator=None,
+        confidence=None,
+        reflection=None,
+        writer_owned=True,
+    )
+    indexes = map_index_status(
+        {"facts": 1, "beliefs": 2, "decisions": 3, "skills": 4},
+        vector_count=None,
+        outbox_pending=0,
+        outbox_failed=0,
+        graph_available=False,
+        sampled_at=AT,
+    )
+    result = map_overview(
+        resources,
+        {"facts": 1, "beliefs": 2, "decisions": 3, "skills": 4},
+        lifecycle_counts={key: 0 for key in (*service._LIFECYCLE, "unknown")},
+        unresolved_conflicts=0,
+        indexes=indexes,
+        schema_revision=None,
+    )
+    assert result.profile.storage_root is None
+    assert result.facts == 1 and result.beliefs == 2 and result.decisions == 3 and result.skills == 4
+    assert result.lifecycle_counts["unknown"] == 0 and result.audit_warnings is None
+
+
+@pytest.mark.parametrize(
+    "mode", ["overview", "contradictions", "decay", "topics", "evidence_audit", "confidence", "relations"]
+)
+def test_reflect_modes_and_masking(mode):
+    service, _, _ = _foundation(require_b1=False)
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    from memory_server.application.diagnostics_service import map_reflect_result
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.transports.http.errors import HttpError
+    from memory_server.transports.http.routes.diagnostics import validate_reflect_result
+
+    ids = frozenset(IDS[:2])
+    common = {"_selected_ids": tuple(ids)}
+    raw = {
+        "overview": {
+            "total_beliefs": 2,
+            "by_lifecycle_state": {"active": 2},
+            "confidence": {"high_0.8_1.0": 1, "medium_0.5_0.8": 1, "low_0.0_0.5": 0, "average": 0.75},
+            "contradiction_count": 0,
+            "stale_count": 0,
+            "decaying_next_7d": 0,
+            "no_evidence_count": 2,
+        },
+        "contradictions": {"total": 0, "contradictions": []},
+        "decay": {"stale_now": 0, "stale_7d": 0, "archived_7d": 0, "forgotten_7d": 0},
+        "topics": {"topics": [], "untagged_count": 2},
+        "evidence_audit": {
+            "total": 2,
+            "with_evidence": 0,
+            "without_evidence": 2,
+            "avg_evidence_per_belief": 0.0,
+            "zero_weight_entries": 0,
+        },
+        "confidence": {
+            "histogram": {"0.9_1.0": 0, "0.7_0.9": 1, "0.5_0.7": 1, "0.3_0.5": 0, "0.0_0.3": 0},
+            "lowest_count": 1,
+            "beliefs": [{"id": IDS[0], "confidence": 0.8, "lifecycle_state": "active"}],
+        },
+        "relations": {"total": 0, "contradictions": 0, "entailments": 0, "neutral_pairs": 0, "relations": []},
+    }[mode]
+    result = map_reflect_result(
+        SimpleNamespace(request_id="r"),
+        d.ReflectRequest(mode=mode, topic=None, min_confidence=None, limit=1, context=None, strict_same_context=True),
+        raw | common,
+        sampled_at=AT,
+        selected_count=2,
+        truncated=False,
+        evidence_unavailable=False,
+    )
+    assert validate_reflect_result(result) == result
+    tampered = result.model_copy(update={"sections": {**result.sections, "nested_canary": {"forbidden": 1}}})
+    with pytest.raises(HttpError, match="E_INTERNAL"):
+        validate_reflect_result(tampered)
+
+
+@pytest.mark.asyncio
+async def test_reflect_borrowed_evidence_and_limits(database):
+    service, _, _ = _foundation(require_b1=False)
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    from storage.models.belief import BeliefORM
+
+    from memory_server.application.contracts import ReflectionPolicy
+    from memory_server.application.diagnostics_service import run_borrowed_diagnostics
+    from memory_server.gateway_contracts import dto as d
+
+    ident = IDS[0]
+    async with database._session_factory() as session, session.begin():
+        session.add(
+            BeliefORM(
+                id=ident,
+                proposition="Docker is better",
+                confidence=0.8,
+                source="test",
+                creator="test",
+                source_ids=[],
+                tags=["masked-topic"],
+                lifecycle_state="active",
+                verification_status="validated",
+            )
+        )
+    resources = _resources(database)
+    resources.reflection = SimpleNamespace(policy=ReflectionPolicy.capture())
+    resources.profile = d.Profile(
+        id="alpha",
+        display_name="Alpha",
+        description=None,
+        enabled=True,
+        generation=1,
+        runtime_state="ready",
+        capabilities=(),
+        storage_root=None,
+    )
+    resources.writer_owned = True
+    request = d.ReflectRequest(
+        mode="evidence_audit", topic="masked-topic", min_confidence=0.0, limit=1, context=None, strict_same_context=True
+    )
+    result = await run_borrowed_diagnostics(
+        _ctx(),
+        resources,
+        lambda session, work, sampled: service.DiagnosticsService(None, None)._operation(
+            _ctx(),
+            d.COMMAND_TYPES["reflect"](operation="reflect", profile_id="alpha", path_ids={}, payload=request),
+            resources,
+            session,
+            work,
+            sampled,
+        ),
+    )
+    assert result.sections["selected_count"] == 1
+    assert result.sections["evidence_stats_status"] == "ok"
+    assert "masked-topic" not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["overview", "contradictions", "decay", "topics", "evidence_audit", "confidence", "relations"]
+)
+async def test_b2_real_reflection_single_snapshot(database, mode):
+    service, _, _ = _foundation(require_b1=False)
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 reflect API missing"
+    from storage.models.belief import BeliefORM
+
+    from memory_server.application.contracts import ReflectionPolicy
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.transports.http.routes.diagnostics import validate_reflect_result
+
+    async with database._session_factory() as session, session.begin():
+        for i in range(3):
+            session.add(
+                BeliefORM(
+                    id=IDS[i],
+                    proposition="B2_PROPOSITION_CANARY",
+                    confidence=0.8,
+                    source="B2_SOURCE_CANARY",
+                    creator="test",
+                    source_ids=[],
+                    tags=["B2_TAG_CANARY"],
+                    lifecycle_state="active",
+                    verification_status="validated",
+                )
+            )
+    resources = _resources(database)
+    resources.reflection = SimpleNamespace(policy=ReflectionPolicy.capture())
+    statements = []
+
+    def trace(_conn, _cursor, sql, _params, _context, _many):
+        if sql.lstrip().upper().startswith("SELECT"):
+            statements.append(sql)
+
+    event.listen(database._engine.sync_engine, "before_cursor_execute", trace)
+    try:
+        command = d.COMMAND_TYPES["reflect"](
+            operation="reflect",
+            profile_id="alpha",
+            path_ids={},
+            payload=d.ReflectRequest(
+                mode=mode,
+                topic="B2_TAG_CANARY",
+                min_confidence=0.0,
+                context="B2_CONTEXT_CANARY",
+                strict_same_context=False,
+                limit=2,
+            ),
+        )
+        result = await service.run_borrowed_diagnostics(
+            _ctx(),
+            resources,
+            lambda session, work, sampled: service.DiagnosticsService(None, None)._operation(
+                _ctx(), command, resources, session, work, sampled
+            ),
+        )
+        assert result.sections["selected_count"] == 2
+        assert not result.complete
+        assert validate_reflect_result(result) == result
+        assert len([sql for sql in statements if "FROM beliefs" in sql]) == 1
+        assert all(
+            secret not in result.model_dump_json()
+            for secret in ("B2_PROPOSITION_CANARY", "B2_TAG_CANARY", "B2_CONTEXT_CANARY", "B2_SOURCE_CANARY")
+        )
+    finally:
+        event.remove(database._engine.sync_engine, "before_cursor_execute", trace)
+
+
+@pytest.mark.parametrize("nested", [True, "CANARY", {"arbitrary": 1}, [1]])
+def test_b2_reflect_nested_numeric_closed(nested):
+    service, _, _ = _foundation(require_b1=False)
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 reflect API missing"
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.transports.http.errors import HttpError
+    from memory_server.transports.http.routes.diagnostics import validate_reflect_result
+
+    result = d.ReflectResult(
+        mode="confidence",
+        request_id="r",
+        complete=True,
+        sections={
+            "sampled_at": AT.isoformat(),
+            "selected_count": 1,
+            "lowest_count": 0,
+            "beliefs": [],
+            "histogram": {"0.9_1.0": nested, "0.7_0.9": 0, "0.5_0.7": 0, "0.3_0.5": 0, "0.0_0.3": 0},
+        },
+    )
+    with pytest.raises(HttpError, match="E_INTERNAL"):
+        validate_reflect_result(result)
+
+
+@pytest.mark.asyncio
+async def test_b2_indexes_uses_exact_status_counts(database):
+    service, _, _ = _foundation(require_b1=False)
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    assert hasattr(service.DiagnosticsService, "indexes_status"), "B2 indexes API missing"
+    await _seed_outbox(database, count=8)
+    statements = []
+
+    def trace(_conn, _cursor, sql, _params, _context, _many):
+        if sql.lstrip().upper().startswith("SELECT"):
+            statements.append(sql)
+
+    event.listen(database._engine.sync_engine, "before_cursor_execute", trace)
+    resources = _resources(database)
+    resources.vector, resources.graph = None, None
+    try:
+        result = await service.run_borrowed_diagnostics(
+            _ctx(),
+            resources,
+            lambda session, work, sampled: service.DiagnosticsService(None, None)._indexes(
+                resources, session, work, sampled
+            ),
+        )
+        assert result.outbox_pending == result.outbox_failed == 2
+        assert len(statements) == 6
+        assert all("GROUP BY" not in sql.upper() for sql in statements)
+    finally:
+        event.remove(database._engine.sync_engine, "before_cursor_execute", trace)
+
+
+@pytest.mark.asyncio
+async def test_b2_real_lease_native_and_overview(shell, monkeypatch):
+    service, _, _ = _foundation()
+    assert hasattr(service.DiagnosticsService, "overview"), "B2 API missing"
+    from memory_server.gateway_contracts.ports import RequestContext
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+    from memory_server.runtime import runtime_factory
+    from memory_server.runtime.read_composition import bind_native
+    from memory_server.transports.http.routes.diagnostics import validate_index_status, validate_overview
+
+    monkeypatch.setitem(runtime_factory._DEFAULT_RECIPES, "embedder", lambda runtime: MockEmbeddingProvider())
+    vector = LanceDBProvider(db_path=str(shell.bindings[0].layout.data_root / "lancedb"))
+    await vector.create_collection("memories")
+    await vector.close()
+    principal = await shell.tokens.authenticate(shell.bearer, now=datetime.now(UTC))
+    ctx = RequestContext("b2-native", principal, "alpha", None, asyncio.get_running_loop().time() + 30)
+
+    def bind(scope):
+        return service.DiagnosticsResources(
+            scope.application.read_resources(),
+            scope.binding.profile,
+            scope.runtime.dependencies.vector,
+            scope.runtime.dependencies.graph,
+            None,
+            None,
+            scope.application.reflection,
+            None,
+        )
+
+    obj = service.DiagnosticsService(shell.leases, bind, native=bind_native)
+    status = await obj.indexes_status(ctx)
+    assert validate_index_status(status) == status and status.vector_records == 0
+    overview = await obj.overview(ctx)
+    assert validate_overview(overview) == overview
+    assert overview.profile.storage_root is None and overview.writer_owned is True
+    assert overview.indexes.sampled_at.tzinfo is not None
+    assert overview.indexes.sqlite_records == sum(
+        (overview.facts, overview.beliefs, overview.decisions, overview.skills)
+    )
+
+
+@pytest.mark.asyncio
+async def test_b2_topic_minimum_and_bounded_evidence(database):
+    service, _, _ = _foundation()
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    from dataclasses import replace
+
+    from storage.models.belief import BeliefORM, EvidenceORM
+
+    from memory_server.application.contracts import ReflectionPolicy
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.transports.http.errors import HttpError
+
+    async with database._session_factory() as session, session.begin():
+        for i in range(102):
+            session.add(
+                BeliefORM(
+                    id=IDS[i],
+                    proposition="B2_PROPOSITION_CANARY",
+                    confidence=(0.0 if i == 0 else 1.0),
+                    source="test",
+                    creator="test",
+                    source_ids=[],
+                    tags=[] if i == 0 else ["B2_TOPIC_CANARY"],
+                    lifecycle_state="active",
+                    verification_status="validated",
+                )
+            )
+        await session.flush()
+        for i in range(30):
+            session.add(
+                EvidenceORM(
+                    id=IDS[i], belief_id=IDS[1], source_type=f"B2_SOURCE_CANARY_{i}", source_id=IDS[i], weight=0.0
+                )
+            )
+    resources = _resources(database)
+    resources.reflection = SimpleNamespace(policy=replace(ReflectionPolicy.capture(), reflect_min_confidence=1.0))
+
+    async def run(request, inspect=None):
+        async def operation(session, work, sampled):
+            adapter = await service.build_borrowed_reflection(resources, session, request, work)
+            if inspect is not None:
+                await inspect(adapter)
+            return adapter
+
+        return await service.run_borrowed_diagnostics(_ctx(), resources, operation)
+
+    for minimum, expected in ((None, IDS[1]), (0.0, IDS[0]), (1.0, IDS[1])):
+        adapter = await run(d.ReflectRequest(topic=None, min_confidence=minimum, context=None, limit=1))
+        assert [belief.id for belief in adapter.beliefs] == [expected]
+    adapter = await run(d.ReflectRequest(topic="B2_TOPIC_CANARY", min_confidence=0.0, context=None, limit=1))
+    assert adapter.beliefs[0].id == IDS[1]
+    adapter = await run(d.ReflectRequest(topic=None, min_confidence=0.0, context=None, limit=100))
+    assert len(adapter.beliefs) == 100 and adapter.window.truncated
+
+    async def inspect(adapter):
+        from storage.repositories.evidence_repo import EvidenceRepository
+
+        stats = await EvidenceRepository(adapter).aggregate_stats([IDS[1]])
+        assert stats[IDS[1]]["by_source_type"] == {"[MASKED]": 30}
+        assert stats[IDS[1]]["count"] == 30
+        assert await adapter.search_beliefs(limit=9999) == adapter.beliefs
+        with pytest.raises(HttpError, match="E_INTERNAL"):
+            await adapter.execute(text("DELETE FROM evidence"), {"bid_0": IDS[1]})
+        assert adapter.evidence_error is not None
+
+    await run(d.ReflectRequest(topic="B2_TOPIC_CANARY", min_confidence=0.0, context=None, limit=1), inspect)
+
+
+@pytest.mark.parametrize("limit", [0, 101, True, False])
+def test_b2_reflect_parser_rejects_limits(limit):
+    service, _, _ = _foundation()
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    from starlette.requests import Request
+
+    from memory_server.transports.http.errors import HttpError
+    from memory_server.transports.http.routes.diagnostics import parse_reflect
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/reflect",
+            "path_params": {"profile": "alpha"},
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    with pytest.raises(HttpError, match="E_VALIDATION"):
+        parse_reflect(
+            request,
+            json.dumps({"topic": None, "min_confidence": None, "context": None, "limit": limit}).encode(),
+            _principal(),
+        )
+
+
+def test_b2_reflect_pair_cap_drop_timestamp_and_numeric():
+    service, _, _ = _foundation()
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.transports.http.errors import HttpError
+
+    pair = {
+        "belief_a_id": IDS[0],
+        "belief_b_id": IDS[1],
+        "confidence_a": 0.8,
+        "confidence_b": 0.8,
+        "overlap_score": 0.8,
+        "detection_score": 0.8,
+        "detected_at": "invalid",
+        "proposition": "B2_TEXT_CANARY",
+    }
+    request = d.ReflectRequest(mode="contradictions", topic=None, min_confidence=0.0, context=None, limit=1)
+
+    def mapped(rows):
+        return service.map_reflect_result(
+            SimpleNamespace(request_id="r"),
+            request,
+            {"total": len(rows), "contradictions": rows, "_selected_ids": IDS[:2]},
+            sampled_at=AT,
+            selected_count=2,
+            truncated=False,
+            evidence_unavailable=False,
+        )
+
+    for rows in ([pair], [pair, pair], [dict(pair, belief_a_id="B2_TEXT_CANARY"), pair]):
+        result = mapped(rows)
+        assert not result.complete and len(result.sections["pairs"]) == 1
+        assert result.sections["pairs"][0]["detected_at"] is None
+        assert "B2_TEXT_CANARY" not in result.model_dump_json()
+    with pytest.raises(HttpError, match="E_INTERNAL"):
+        mapped([dict(pair, confidence_a=True)])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["overview", "evidence_audit", "confidence"])
+async def test_b2_swallowed_evidence_storage_failure_is_sticky(database, mode):
+    service, _, _ = _foundation()
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    from storage.models.belief import BeliefORM
+
+    from memory_server.application.contracts import ReflectionPolicy
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.transports.http.errors import HttpError
+
+    async with database._session_factory() as session, session.begin():
+        session.add(
+            BeliefORM(
+                id=IDS[0],
+                proposition="CANARY",
+                confidence=0.8,
+                source="test",
+                creator="test",
+                source_ids=[],
+                tags=[],
+                lifecycle_state="active",
+                verification_status="validated",
+            )
+        )
+        await session.execute(text("DROP TABLE evidence"))
+    resources = _resources(database)
+    resources.reflection = SimpleNamespace(policy=ReflectionPolicy.capture())
+    command = d.COMMAND_TYPES["reflect"](
+        operation="reflect",
+        profile_id="alpha",
+        path_ids={},
+        payload=d.ReflectRequest(mode=mode, topic=None, min_confidence=0.0, context=None),
+    )
+    with pytest.raises(HttpError, match="E_STORAGE"):
+        await service.run_borrowed_diagnostics(
+            _ctx(),
+            resources,
+            lambda session, work, sampled: service.DiagnosticsService(None, None)._operation(
+                _ctx(), command, resources, session, work, sampled
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_b2_vector_fault_masking_and_absent_capability(database, caplog):
+    service, _, _ = _foundation()
+    assert hasattr(service.DiagnosticsService, "indexes_status"), "B2 API missing"
+    from memory_server.transports.http.errors import HttpError
+
+    resources = _resources(database)
+    resources.vector, resources.graph = object(), None
+
+    async def run():
+        return await service.run_borrowed_diagnostics(
+            _ctx(),
+            resources,
+            lambda session, work, sampled: service.DiagnosticsService(None, None)._indexes(
+                resources, session, work, sampled
+            ),
+        )
+
+    assert (await run()).vector_records is None
+
+    class BrokenClient:
+        async def count_points(self):
+            try:
+                raise RuntimeError("B2_VECTOR_EXCEPTION_CANARY")
+            except RuntimeError:
+                logging.getLogger("memory_server.providers.lancedb_provider").exception("B2_VECTOR_EXCEPTION_CANARY")
+                raise
+
+    resources.vector = BrokenClient()
+    with pytest.raises(HttpError, match="E_VECTOR_BACKEND"):
+        await run()
+    assert "B2_VECTOR_EXCEPTION_CANARY" not in caplog.text
+
+
+@pytest.mark.parametrize("change", ["topic", "min_confidence", "context", "mode", "media"])
+def test_b2_reflect_required_fields_and_media(change):
+    service, _, _ = _foundation()
+    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    from starlette.requests import Request
+
+    from memory_server.transports.http.errors import HttpError
+    from memory_server.transports.http.routes.diagnostics import parse_reflect
+
+    values = {"topic": None, "min_confidence": None, "context": None}
+    if change in values:
+        del values[change]
+    elif change == "mode":
+        values[change] = "invalid"
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/reflect",
+            "path_params": {"profile": "alpha"},
+            "query_string": b"",
+            "headers": [(b"content-type", b"text/plain" if change == "media" else b"application/json")],
+        }
+    )
+    with pytest.raises(HttpError, match="E_UNSUPPORTED_MEDIA_TYPE" if change == "media" else "E_VALIDATION"):
+        parse_reflect(request, json.dumps(values).encode(), _principal())

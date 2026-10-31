@@ -53,6 +53,38 @@ async def test_drift_audit_indexes_unavailable_without_fake_graph_zero(database)
         ("OUTBOX_FAILED", True, None)
     ]
     assert statements and all(sql.lstrip().split()[0].upper() in {"SELECT", "BEGIN"} for sql in statements)
+    assert hasattr(service.DiagnosticsService, "indexes_status"), "B2 API missing"
+
+    class VectorClient:
+        rows = [1, 2]
+
+        async def count_points(self):
+            return len(self.rows)
+
+    resources.vector, resources.graph = VectorClient(), object()
+    for size in (2, 1, 3):
+        resources.vector.rows = list(range(size))
+        status = await service.run_borrowed_diagnostics(
+            _ctx(),
+            resources,
+            lambda session, work, sampled: service.DiagnosticsService(None, None)._indexes(
+                resources, session, work, sampled
+            ),
+        )
+        assert status.vector_records == size
+        assert status.graph_consistency.projection == "unknown"
+        assert status.vector_lag is None and status.graph_lag is None
+        assert status.graph_relations is None and status.last_success is None
+    resources.vector, resources.graph = None, None
+    status = await service.run_borrowed_diagnostics(
+        _ctx(),
+        resources,
+        lambda session, work, sampled: service.DiagnosticsService(None, None)._indexes(
+            resources, session, work, sampled
+        ),
+    )
+    assert status.vector_records is None and status.graph_consistency.projection == "unavailable"
+    assert await _hash_tables(database) == before
 
 
 @pytest.mark.asyncio
