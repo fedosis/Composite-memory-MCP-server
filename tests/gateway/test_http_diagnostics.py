@@ -35,12 +35,10 @@ def _ctx(profile="alpha"):
     return RequestContext("req-b1", _principal(), profile, None, asyncio.get_running_loop().time() + 30)
 
 
-def _foundation(*, require_b1=True):
+def _foundation():
     import importlib
 
     service = importlib.import_module("memory_server.application.diagnostics_service")
-    if require_b1:
-        assert hasattr(service, "DiagnosticsService"), "B1 service not implemented"
     provider = importlib.import_module("memory_server.providers.sqlite_provider")
     outbox = importlib.import_module("storage.outbox")
     return service, provider, outbox
@@ -169,7 +167,7 @@ async def test_audit_dispatcher_truncation_unavailable_and_coalescing(database):
 
 @pytest.mark.asyncio
 async def test_outbox_real_page_tie_filters_and_six_known_unknown_codes(database):
-    _, provider_module, outbox_module = _foundation(require_b1=False)
+    _, provider_module, outbox_module = _foundation()
     await _seed_outbox(database)
     statements = []
 
@@ -235,7 +233,7 @@ async def test_outbox_real_page_tie_filters_and_six_known_unknown_codes(database
 )
 @pytest.mark.asyncio
 async def test_b1_canary_provider_logs(database, caplog, provider_logger):
-    service, provider_module, _ = _foundation(require_b1=False)
+    service, provider_module, _ = _foundation()
     before = []
     async with database._session_factory() as session:
         before = (await session.execute(text("SELECT COUNT(*) FROM outbox_entries"))).scalar_one()
@@ -594,7 +592,7 @@ def test_outbox_cursor_golden_binding_tamper_expiry_and_from_path(tmp_path):
     from memory_server.gateway_contracts.ports import RequestContext
     from memory_server.transports.http.errors import HttpError
 
-    _, _, outbox = _foundation(require_b1=False)
+    _, _, outbox = _foundation()
     routes = importlib.import_module("memory_server.transports.http.routes.diagnostics")
     codec = routes.OutboxCursorCodec(b"k" * 32, ttl_seconds=300, clock=lambda: AT)
     ctx = RequestContext("request", _principal("diagnostic-reader"), "alpha", None, 1.0)
@@ -675,7 +673,7 @@ def test_outbox_cursor_golden_binding_tamper_expiry_and_from_path(tmp_path):
 
 @pytest.mark.asyncio
 async def test_work_window_statement_vm_sticky_cleanup_and_deadline(database):
-    service, provider_module, _ = _foundation(require_b1=False)
+    service, provider_module, _ = _foundation()
     now = asyncio.get_running_loop().time()
     async with database._session_factory() as session:
         work = provider_module.DiagnosticsReadWork(
@@ -783,31 +781,13 @@ async def test_lifecycle_audit_does_not_spend_statements_on_discarded_groups(dat
     assert statements and not any("GROUP BY" in sql.upper() for sql in statements)
 
 
-def test_indexes_status_honest_unknown():
-    service, _, _ = _foundation(require_b1=False)
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
-    from memory_server.application.diagnostics_service import map_index_status
+@pytest.fixture
+async def diagnostics(database):
+    from contextlib import asynccontextmanager
 
-    result = map_index_status(
-        {"facts": 2, "beliefs": 3, "decisions": 5, "skills": 7},
-        vector_count=None,
-        outbox_pending=4,
-        outbox_failed=1,
-        graph_available=True,
-        sampled_at=AT,
-    )
-    assert result.sqlite_records == 17
-    assert result.vector_records is None
-    assert result.graph_relations is None and result.graph_lag is None
-    assert result.vector_lag is None and result.last_success is None
-    assert result.graph_consistency.projection == "unknown"
-    assert service.map_index_status is map_index_status
-
-
-def test_overview_profile_redacted_and_counts():
-    service, _, _ = _foundation(require_b1=False)
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
-    from memory_server.application.diagnostics_service import DiagnosticsResources, map_index_status, map_overview
+    from memory_server.application.contracts import ReflectionPolicy
+    from memory_server.application.diagnostics_service import DiagnosticsResources, DiagnosticsService
+    from memory_server.application.memory_read_service import ReadResources
     from memory_server.gateway_contracts import dto as d
 
     profile = d.Profile(
@@ -821,95 +801,339 @@ def test_overview_profile_redacted_and_counts():
         storage_root="/secret/root",
     )
     resources = DiagnosticsResources(
-        canonical=SimpleNamespace(),
+        canonical=ReadResources(database, database._session_factory),
         profile=profile,
         vector=None,
         graph=None,
         validator=None,
         confidence=None,
-        reflection=None,
+        reflection=SimpleNamespace(policy=ReflectionPolicy.capture()),
         writer_owned=True,
     )
-    indexes = map_index_status(
-        {"facts": 1, "beliefs": 2, "decisions": 3, "skills": 4},
-        vector_count=None,
-        outbox_pending=0,
-        outbox_failed=0,
-        graph_available=False,
-        sampled_at=AT,
-    )
-    result = map_overview(
-        resources,
-        {"facts": 1, "beliefs": 2, "decisions": 3, "skills": 4},
-        lifecycle_counts={key: 0 for key in (*service._LIFECYCLE, "unknown")},
-        unresolved_conflicts=0,
-        indexes=indexes,
-        schema_revision=None,
-    )
+
+    class Lease:
+        acquired = 0
+        snapshots = 0
+
+        @asynccontextmanager
+        async def acquire(self, _ctx):
+            self.acquired += 1
+            yield SimpleNamespace()
+
+        def snapshot(self):
+            self.snapshots += 1
+            return {"alpha": SimpleNamespace(owned=True)}
+
+    lease = Lease()
+    service = DiagnosticsService(lease, lambda _scope: resources)
+    service._test_resources = resources
+    service._test_lease = lease
+    yield service
+
+
+@pytest.mark.asyncio
+async def test_indexes_status_honest_unknown(diagnostics):
+    from dataclasses import replace
+
+    diagnostics.bind = lambda _scope: replace(diagnostics._test_resources, graph=object())
+    result = await diagnostics.indexes_status(_ctx())
+    assert result.sqlite_records == 0
+    assert result.vector_records is None
+    assert result.graph_relations is None and result.graph_lag is None
+    assert result.vector_lag is None and result.last_success is None
+    assert result.graph_consistency.projection == "unknown"
+    assert diagnostics._test_lease.acquired == 1 and diagnostics._test_lease.snapshots == 1
+
+
+@pytest.mark.asyncio
+async def test_overview_profile_redacted_and_counts(diagnostics, database):
+    from storage.models.belief import BeliefORM
+    from storage.models.decision import DecisionORM
+    from storage.models.fact import FactORM
+    from storage.models.receipt import MemoryReceiptORM
+    from storage.models.relation import ClaimRelationORM
+    from storage.models.skill import SkillORM
+
+    a, b = IDS[0], IDS[1]
+    async with database._session_factory() as session, session.begin():
+        session.add_all(
+            [
+                FactORM(
+                    id=IDS[2],
+                    subject="f",
+                    predicate="p",
+                    object="o",
+                    dedup_key=IDS[2],
+                    confidence=0.8,
+                    lifecycle_state="active",
+                    verification_status="validated",
+                ),
+                BeliefORM(
+                    id=a,
+                    proposition="a",
+                    confidence=0.8,
+                    source="test",
+                    creator="test",
+                    source_ids=[],
+                    tags=[],
+                    lifecycle_state="contradicted",
+                    verification_status="validated",
+                ),
+                BeliefORM(
+                    id=b,
+                    proposition="b",
+                    confidence=0.8,
+                    source="test",
+                    creator="test",
+                    source_ids=[],
+                    tags=[],
+                    lifecycle_state="contradicted",
+                    verification_status="validated",
+                ),
+                DecisionORM(
+                    id=IDS[3],
+                    context="",
+                    choice="d",
+                    rejected_alternatives="[]",
+                    reason="test",
+                    confidence=0.8,
+                    lifecycle_state="active",
+                    verification_status="validated",
+                ),
+                SkillORM(
+                    id=IDS[4],
+                    name="s",
+                    purpose="test",
+                    confidence=0.8,
+                    lifecycle_state="active",
+                    verification_status="validated",
+                ),
+                MemoryReceiptORM(
+                    id=a,
+                    memory_type="belief",
+                    source="test",
+                    created_by="test",
+                    timestamp=AT.replace(tzinfo=None),
+                    confidence=0.8,
+                    verification_status="validated",
+                    lifecycle_state="contradicted",
+                ),
+            ]
+        )
+        session.add_all(
+            [
+                ClaimRelationORM(source_id=a, target_id=b, relation_type="contradicts"),
+                ClaimRelationORM(source_id=b, target_id=a, relation_type="contradicts"),
+                ClaimRelationORM(source_id=a, target_id=a, relation_type="contradicts"),
+                ClaimRelationORM(source_id=a, target_id=IDS[2], relation_type="contradicts"),
+                ClaimRelationORM(source_id=a, target_id=b, relation_type="entails"),
+            ]
+        )
+    result = await diagnostics.overview(_ctx())
     assert result.profile.storage_root is None
-    assert result.facts == 1 and result.beliefs == 2 and result.decisions == 3 and result.skills == 4
-    assert result.lifecycle_counts["unknown"] == 0 and result.audit_warnings is None
+    assert (result.facts, result.beliefs, result.decisions, result.skills) == (1, 2, 1, 1)
+    assert result.unresolved_conflicts == 1
+    assert set(result.lifecycle_counts) == {
+        "candidate",
+        "validated",
+        "active",
+        "stale",
+        "archived",
+        "forgotten",
+        "superseded",
+        "contradicted",
+        "discarded",
+        "unknown",
+    }
+    assert result.lifecycle_counts == {
+        "candidate": 0,
+        "validated": 0,
+        "active": 3,
+        "stale": 0,
+        "archived": 0,
+        "forgotten": 0,
+        "superseded": 0,
+        "contradicted": 2,
+        "discarded": 0,
+        "unknown": 0,
+    }
+    assert result.indexes.sqlite_records == 5
+    assert result.indexes.vector_records is None
+    assert result.indexes.graph_relations is None
+    assert result.indexes.vector_lag is None and result.indexes.graph_lag is None
+    assert result.indexes.last_success is None
+    assert result.audit_warnings is None
+    assert result.last_migration is None
+    assert result.schema_revision is None
+    assert diagnostics._test_lease.acquired == 1 and diagnostics._test_lease.snapshots == 1
 
 
+@pytest.mark.asyncio
+async def test_overview_unresolved_conflicts_deduplicates_and_rejects_ambiguous_endpoints(diagnostics, database):
+    from storage.models.belief import BeliefORM
+    from storage.models.fact import FactORM
+    from storage.models.relation import ClaimRelationORM
+
+    async with database._session_factory() as session, session.begin():
+        for i in range(4):
+            session.add(
+                BeliefORM(
+                    id=IDS[i],
+                    proposition="conflict",
+                    confidence=0.8,
+                    source="test",
+                    creator="test",
+                    source_ids=[],
+                    tags=[],
+                    lifecycle_state="contradicted",
+                    verification_status="validated",
+                )
+            )
+        # This untyped ID resolves in two canonical domains and must not form a pair.
+        session.add(
+            FactORM(
+                id=IDS[2],
+                subject="ambiguous",
+                predicate="p",
+                object="o",
+                dedup_key=IDS[2],
+                confidence=0.8,
+                lifecycle_state="contradicted",
+                verification_status="validated",
+            )
+        )
+        for source, target in (
+            (IDS[0], IDS[1]),
+            (IDS[1], IDS[0]),
+            (IDS[0], IDS[0]),
+            (IDS[0], IDS[2]),
+            (IDS[0], IDS[20]),
+            (IDS[0], "invalid"),
+        ):
+            session.add(ClaimRelationORM(source_id=source, target_id=target, relation_type="contradicts"))
+    result = await diagnostics.overview(_ctx())
+    assert result.unresolved_conflicts == 1
+    assert (result.facts, result.beliefs) == (1, 4)
+
+
+@pytest.mark.asyncio
+async def test_overview_schema_revision_states(diagnostics, database):
+    async def read():
+        return (await diagnostics.overview(_ctx())).schema_revision
+
+    assert await read() is None
+    async with database._session_factory() as session, session.begin():
+        await session.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+    assert await read() is None
+    async with database._session_factory() as session, session.begin():
+        await session.execute(text("INSERT INTO alembic_version(version_num) VALUES ('one')"))
+        await session.execute(text("INSERT INTO alembic_version(version_num) VALUES ('two')"))
+    assert await read() is None
+    async with database._session_factory() as session, session.begin():
+        await session.execute(text("DELETE FROM alembic_version WHERE version_num='two'"))
+    assert await read() == "one"
+
+
+@pytest.mark.asyncio
+async def test_overview_schema_revision_storage_failures_are_e_storage(diagnostics, database, monkeypatch):
+    async def fail(_session, *, work):
+        raise ValueError("unrelated schema SQL failure")
+
+    monkeypatch.setattr(database, "diagnostics_schema_revision", fail)
+    from memory_server.transports.http.errors import HttpError
+
+    with pytest.raises(HttpError, match="E_STORAGE"):
+        await diagnostics.overview(_ctx())
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mode", ["overview", "contradictions", "decay", "topics", "evidence_audit", "confidence", "relations"]
 )
-def test_reflect_modes_and_masking(mode):
-    service, _, _ = _foundation(require_b1=False)
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
-    from memory_server.application.diagnostics_service import map_reflect_result
+async def test_reflect_modes_and_masking(diagnostics, database, mode):
+    from storage.models.belief import BeliefORM
+
     from memory_server.gateway_contracts import dto as d
-    from memory_server.transports.http.errors import HttpError
     from memory_server.transports.http.routes.diagnostics import validate_reflect_result
 
-    ids = frozenset(IDS[:2])
-    common = {"_selected_ids": tuple(ids)}
-    raw = {
-        "overview": {
-            "total_beliefs": 2,
-            "by_lifecycle_state": {"active": 2},
-            "confidence": {"high_0.8_1.0": 1, "medium_0.5_0.8": 1, "low_0.0_0.5": 0, "average": 0.75},
+    async with database._session_factory() as session, session.begin():
+        session.add(
+            BeliefORM(
+                id=IDS[0],
+                proposition="REFLECT_SECRET",
+                confidence=0.8,
+                source="secret-source",
+                creator="test",
+                source_ids=[],
+                tags=["secret-topic"],
+                lifecycle_state="active",
+                verification_status="validated",
+            )
+        )
+    request = d.ReflectRequest(
+        mode=mode, topic=None, min_confidence=0.0, limit=1, context=None, strict_same_context=True
+    )
+    result = await diagnostics.reflect(_ctx(), request)
+    assert result.mode == mode
+    assert validate_reflect_result(result) == result
+    common = {"sampled_at": result.sections["sampled_at"], "selected_count": 1}
+    lifecycle = {
+        key: 0
+        for key in (
+            "candidate",
+            "validated",
+            "active",
+            "stale",
+            "archived",
+            "forgotten",
+            "superseded",
+            "contradicted",
+            "discarded",
+            "unknown",
+        )
+    }
+    lifecycle["active"] = 1
+    expected = {
+        "overview": common
+        | {
+            "total_beliefs": 1,
+            "lifecycle_counts": lifecycle,
+            "confidence": {"high_0.8_1.0": 1, "medium_0.5_0.8": 0, "low_0.0_0.5": 0, "average": 0.8},
             "contradiction_count": 0,
             "stale_count": 0,
             "decaying_next_7d": 0,
-            "no_evidence_count": 2,
+            "no_evidence_count": 1,
+            "evidence_stats_status": "ok",
         },
-        "contradictions": {"total": 0, "contradictions": []},
-        "decay": {"stale_now": 0, "stale_7d": 0, "archived_7d": 0, "forgotten_7d": 0},
-        "topics": {"topics": [], "untagged_count": 2},
-        "evidence_audit": {
-            "total": 2,
+        "contradictions": common | {"total": 0, "pairs": []},
+        "decay": common | {"stale_now": 0, "stale_7d": 0, "archived_7d": 0, "forgotten_7d": 0},
+        "topics": common | {"topic_count": 1, "untagged_count": 0},
+        "evidence_audit": common
+        | {
+            "total": 1,
             "with_evidence": 0,
-            "without_evidence": 2,
-            "avg_evidence_per_belief": 0.0,
+            "without_evidence": 1,
+            "avg_evidence_per_belief": 0,
             "zero_weight_entries": 0,
+            "evidence_stats_status": "ok",
         },
-        "confidence": {
-            "histogram": {"0.9_1.0": 0, "0.7_0.9": 1, "0.5_0.7": 1, "0.3_0.5": 0, "0.0_0.3": 0},
+        "confidence": common
+        | {
+            "histogram": {"0.9_1.0": 0, "0.7_0.9": 1, "0.5_0.7": 0, "0.3_0.5": 0, "0.0_0.3": 0},
             "lowest_count": 1,
             "beliefs": [{"id": IDS[0], "confidence": 0.8, "lifecycle_state": "active"}],
         },
-        "relations": {"total": 0, "contradictions": 0, "entailments": 0, "neutral_pairs": 0, "relations": []},
+        "relations": common | {"total": 0, "contradictions": 0, "entailments": 0, "neutral_pairs": 0, "pairs": []},
     }[mode]
-    result = map_reflect_result(
-        SimpleNamespace(request_id="r"),
-        d.ReflectRequest(mode=mode, topic=None, min_confidence=None, limit=1, context=None, strict_same_context=True),
-        raw | common,
-        sampled_at=AT,
-        selected_count=2,
-        truncated=False,
-        evidence_unavailable=False,
-    )
-    assert validate_reflect_result(result) == result
-    tampered = result.model_copy(update={"sections": {**result.sections, "nested_canary": {"forbidden": 1}}})
-    with pytest.raises(HttpError, match="E_INTERNAL"):
-        validate_reflect_result(tampered)
+    assert result.sections == expected
+    assert "REFLECT_SECRET" not in result.model_dump_json()
+    assert "secret-source" not in result.model_dump_json()
+    assert "secret-topic" not in result.model_dump_json()
 
 
 @pytest.mark.asyncio
 async def test_reflect_borrowed_evidence_and_limits(database):
-    service, _, _ = _foundation(require_b1=False)
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
+    service, _, _ = _foundation()
     from storage.models.belief import BeliefORM
 
     from memory_server.application.contracts import ReflectionPolicy
@@ -968,12 +1192,9 @@ async def test_reflect_borrowed_evidence_and_limits(database):
 @pytest.mark.parametrize(
     "mode", ["overview", "contradictions", "decay", "topics", "evidence_audit", "confidence", "relations"]
 )
-async def test_b2_real_reflection_single_snapshot(database, mode):
-    service, _, _ = _foundation(require_b1=False)
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 reflect API missing"
+async def test_b2_real_reflection_single_snapshot(diagnostics, database, mode):
     from storage.models.belief import BeliefORM
 
-    from memory_server.application.contracts import ReflectionPolicy
     from memory_server.gateway_contracts import dto as d
     from memory_server.transports.http.routes.diagnostics import validate_reflect_result
 
@@ -992,36 +1213,23 @@ async def test_b2_real_reflection_single_snapshot(database, mode):
                     verification_status="validated",
                 )
             )
-    resources = _resources(database)
-    resources.reflection = SimpleNamespace(policy=ReflectionPolicy.capture())
     statements = []
 
     def trace(_conn, _cursor, sql, _params, _context, _many):
         if sql.lstrip().upper().startswith("SELECT"):
             statements.append(sql)
 
-    event.listen(database._engine.sync_engine, "before_cursor_execute", trace)
+    event.listen(database.engine.sync_engine, "before_cursor_execute", trace)
     try:
-        command = d.COMMAND_TYPES["reflect"](
-            operation="reflect",
-            profile_id="alpha",
-            path_ids={},
-            payload=d.ReflectRequest(
-                mode=mode,
-                topic="B2_TAG_CANARY",
-                min_confidence=0.0,
-                context="B2_CONTEXT_CANARY",
-                strict_same_context=False,
-                limit=2,
-            ),
+        request = d.ReflectRequest(
+            mode=mode,
+            topic="B2_TAG_CANARY",
+            min_confidence=0.0,
+            context="B2_CONTEXT_CANARY",
+            strict_same_context=False,
+            limit=2,
         )
-        result = await service.run_borrowed_diagnostics(
-            _ctx(),
-            resources,
-            lambda session, work, sampled: service.DiagnosticsService(None, None)._operation(
-                _ctx(), command, resources, session, work, sampled
-            ),
-        )
+        result = await diagnostics.reflect(_ctx(), request)
         assert result.sections["selected_count"] == 2
         assert not result.complete
         assert validate_reflect_result(result) == result
@@ -1031,13 +1239,12 @@ async def test_b2_real_reflection_single_snapshot(database, mode):
             for secret in ("B2_PROPOSITION_CANARY", "B2_TAG_CANARY", "B2_CONTEXT_CANARY", "B2_SOURCE_CANARY")
         )
     finally:
-        event.remove(database._engine.sync_engine, "before_cursor_execute", trace)
+        event.remove(database.engine.sync_engine, "before_cursor_execute", trace)
 
 
 @pytest.mark.parametrize("nested", [True, "CANARY", {"arbitrary": 1}, [1]])
 def test_b2_reflect_nested_numeric_closed(nested):
-    service, _, _ = _foundation(require_b1=False)
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 reflect API missing"
+    service, _, _ = _foundation()
     from memory_server.gateway_contracts import dto as d
     from memory_server.transports.http.errors import HttpError
     from memory_server.transports.http.routes.diagnostics import validate_reflect_result
@@ -1060,9 +1267,7 @@ def test_b2_reflect_nested_numeric_closed(nested):
 
 @pytest.mark.asyncio
 async def test_b2_indexes_uses_exact_status_counts(database):
-    service, _, _ = _foundation(require_b1=False)
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
-    assert hasattr(service.DiagnosticsService, "indexes_status"), "B2 indexes API missing"
+    service, _, _ = _foundation()
     await _seed_outbox(database, count=8)
     statements = []
 
@@ -1091,7 +1296,6 @@ async def test_b2_indexes_uses_exact_status_counts(database):
 @pytest.mark.asyncio
 async def test_b2_real_lease_native_and_overview(shell, monkeypatch):
     service, _, _ = _foundation()
-    assert hasattr(service.DiagnosticsService, "overview"), "B2 API missing"
     from memory_server.gateway_contracts.ports import RequestContext
     from memory_server.providers.embedding_provider import MockEmbeddingProvider
     from memory_server.providers.lancedb_provider import LanceDBProvider
@@ -1133,7 +1337,6 @@ async def test_b2_real_lease_native_and_overview(shell, monkeypatch):
 @pytest.mark.asyncio
 async def test_b2_topic_minimum_and_bounded_evidence(database):
     service, _, _ = _foundation()
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
     from dataclasses import replace
 
     from storage.models.belief import BeliefORM, EvidenceORM
@@ -1201,7 +1404,6 @@ async def test_b2_topic_minimum_and_bounded_evidence(database):
 @pytest.mark.parametrize("limit", [0, 101, True, False])
 def test_b2_reflect_parser_rejects_limits(limit):
     service, _, _ = _foundation()
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
     from starlette.requests import Request
 
     from memory_server.transports.http.errors import HttpError
@@ -1227,7 +1429,6 @@ def test_b2_reflect_parser_rejects_limits(limit):
 
 def test_b2_reflect_pair_cap_drop_timestamp_and_numeric():
     service, _, _ = _foundation()
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
     from memory_server.gateway_contracts import dto as d
     from memory_server.transports.http.errors import HttpError
 
@@ -1267,7 +1468,6 @@ def test_b2_reflect_pair_cap_drop_timestamp_and_numeric():
 @pytest.mark.parametrize("mode", ["overview", "evidence_audit", "confidence"])
 async def test_b2_swallowed_evidence_storage_failure_is_sticky(database, mode):
     service, _, _ = _foundation()
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
     from storage.models.belief import BeliefORM
 
     from memory_server.application.contracts import ReflectionPolicy
@@ -1308,43 +1508,212 @@ async def test_b2_swallowed_evidence_storage_failure_is_sticky(database, mode):
 
 
 @pytest.mark.asyncio
-async def test_b2_vector_fault_masking_and_absent_capability(database, caplog):
-    service, _, _ = _foundation()
-    assert hasattr(service.DiagnosticsService, "indexes_status"), "B2 API missing"
+async def test_b2_reflect_absent_capability_is_503(diagnostics):
+    from dataclasses import replace
+
+    from memory_server.gateway_contracts import dto as d
     from memory_server.transports.http.errors import HttpError
 
-    resources = _resources(database)
-    resources.vector, resources.graph = object(), None
-
-    async def run():
-        return await service.run_borrowed_diagnostics(
-            _ctx(),
-            resources,
-            lambda session, work, sampled: service.DiagnosticsService(None, None)._indexes(
-                resources, session, work, sampled
-            ),
+    diagnostics.bind = lambda _scope: replace(diagnostics._test_resources, reflection=None)
+    with pytest.raises(HttpError, match="E_CAPABILITY_UNAVAILABLE"):
+        await diagnostics.reflect(
+            _ctx(), d.ReflectRequest(mode="overview", topic=None, min_confidence=0.0, limit=1, context=None)
         )
 
-    assert (await run()).vector_records is None
 
-    class BrokenClient:
+@pytest.mark.asyncio
+async def test_b2_execute_validates_malformed_reflect_commands(diagnostics):
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.transports.http.errors import HttpError
+
+    commands = (
+        d.COMMAND_TYPES["reflect"].model_construct(
+            operation="reflect",
+            profile_id="alpha",
+            path_ids={},
+            payload={
+                "mode": "invalid",
+                "topic": None,
+                "min_confidence": 0.0,
+                "limit": 1,
+                "context": None,
+                "strict_same_context": True,
+            },
+        ),
+        d.COMMAND_TYPES["reflect"].model_construct(
+            operation="reflect",
+            profile_id="alpha",
+            path_ids={},
+            payload={
+                "mode": "overview",
+                "topic": None,
+                "min_confidence": 0.0,
+                "limit": 1,
+                "context": None,
+                "strict_same_context": True,
+                "extra": "forbidden",
+            },
+        ),
+    )
+    for command in commands:
+        with pytest.raises(HttpError, match="E_VALIDATION"):
+            await diagnostics.execute(_ctx(), command)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 100])
+async def test_b2_reflect_public_limits(diagnostics, database, limit):
+    from storage.models.belief import BeliefORM
+
+    from memory_server.gateway_contracts import dto as d
+
+    async with database._session_factory() as session, session.begin():
+        for ident in IDS[:101]:
+            session.add(
+                BeliefORM(
+                    id=ident,
+                    proposition="limit",
+                    confidence=0.8,
+                    source="test",
+                    creator="test",
+                    source_ids=[],
+                    tags=[],
+                    lifecycle_state="active",
+                    verification_status="validated",
+                )
+            )
+    result = await diagnostics.reflect(
+        _ctx(), d.ReflectRequest(mode="overview", topic=None, min_confidence=0.0, limit=limit, context=None)
+    )
+    assert result.sections["selected_count"] == limit
+    assert result.sections["total_beliefs"] == limit
+    assert result.complete is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["overview", "indexes.status", "reflect"])
+async def test_b2_base_public_execute_regression_probes(diagnostics, operation):
+    from dataclasses import replace
+
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.transports.http.errors import HttpError
+
+    diagnostics.bind = lambda _scope: replace(diagnostics._test_resources, vector=object())
+    payload = (
+        d.ReflectRequest(mode="topics", topic=None, min_confidence=0.0, limit=1, context=None)
+        if operation == "reflect"
+        else d.Empty()
+    )
+    command = d.COMMAND_TYPES[operation](operation=operation, profile_id="alpha", path_ids={}, payload=payload)
+    try:
+        result = await diagnostics.execute(_ctx(), command)
+        observed = result.sections["topic_count"] if operation == "reflect" else result.model_dump()
+    except HttpError as error:
+        observed = error.code
+    assert observed == (0 if operation == "reflect" else "E_VECTOR_BACKEND")
+
+
+@pytest.mark.asyncio
+async def test_b2_reflect_empty_selection_does_not_scan_evidence(diagnostics, database):
+    from storage.models.belief import BeliefORM, EvidenceORM
+
+    from memory_server.gateway_contracts import dto as d
+
+    statements = []
+
+    async with database._session_factory() as session, session.begin():
+        session.add(
+            BeliefORM(
+                id=IDS[10],
+                proposition="NONSELECTED",
+                confidence=0.8,
+                source="test",
+                creator="test",
+                source_ids=[],
+                tags=["present"],
+                lifecycle_state="active",
+                verification_status="validated",
+            )
+        )
+        await session.flush()
+        session.add(
+            EvidenceORM(id=IDS[10], belief_id=IDS[10], source_type="nonselected", source_id=IDS[10], weight=1.0)
+        )
+
+    def trace(_conn, _cursor, sql, _params, _context, _many):
+        if sql.lstrip().upper().startswith("SELECT"):
+            statements.append(sql)
+
+    event.listen(database.engine.sync_engine, "before_cursor_execute", trace)
+    try:
+        result = await diagnostics.reflect(
+            _ctx(), d.ReflectRequest(mode="evidence_audit", topic="absent", min_confidence=0.0, limit=1, context=None)
+        )
+    finally:
+        event.remove(database.engine.sync_engine, "before_cursor_execute", trace)
+    assert result.sections["selected_count"] == 0
+    assert statements
+    assert not any("FROM EVIDENCE" in sql.upper() for sql in statements)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vector", [object(), SimpleNamespace(count_points=object())])
+async def test_b2_vector_present_without_callable_is_backend_error(diagnostics, vector):
+    from memory_server.transports.http.errors import HttpError
+
+    diagnostics.bind = lambda scope: diagnostics._test_resources
+    # Rebind the borrowed resource through the fixture's lease closure.
+    original = diagnostics.bind
+    resources = original(None)
+    diagnostics.bind = lambda _scope: resources.__class__(
+        canonical=resources.canonical,
+        profile=resources.profile,
+        vector=vector,
+        graph=resources.graph,
+        validator=resources.validator,
+        confidence=resources.confidence,
+        reflection=resources.reflection,
+        writer_owned=resources.writer_owned,
+    )
+    with pytest.raises(HttpError, match="E_VECTOR_BACKEND"):
+        await diagnostics.indexes_status(_ctx())
+
+
+@pytest.mark.asyncio
+async def test_b2_vector_throw_is_backend_error_and_absent_is_unknown(diagnostics, caplog):
+    from memory_server.transports.http.errors import HttpError
+
+    resources = diagnostics.bind(None)
+
+    class Broken:
         async def count_points(self):
             try:
-                raise RuntimeError("B2_VECTOR_EXCEPTION_CANARY")
+                raise RuntimeError("VECTOR_LOG_CANARY")
             except RuntimeError:
-                logging.getLogger("memory_server.providers.lancedb_provider").exception("B2_VECTOR_EXCEPTION_CANARY")
+                logging.getLogger("memory_server.providers.lancedb_provider").exception("VECTOR_LOG_CANARY")
                 raise
 
-    resources.vector = BrokenClient()
-    with pytest.raises(HttpError, match="E_VECTOR_BACKEND"):
-        await run()
-    assert "B2_VECTOR_EXCEPTION_CANARY" not in caplog.text
+    diagnostics.bind = lambda _scope: resources.__class__(
+        canonical=resources.canonical,
+        profile=resources.profile,
+        vector=Broken(),
+        graph=resources.graph,
+        validator=resources.validator,
+        confidence=resources.confidence,
+        reflection=resources.reflection,
+        writer_owned=resources.writer_owned,
+    )
+    with caplog.at_level(logging.ERROR, logger="memory_server.providers.lancedb_provider"):
+        with pytest.raises(HttpError, match="E_VECTOR_BACKEND"):
+            await diagnostics.indexes_status(_ctx())
+    assert "VECTOR_LOG_CANARY" not in caplog.text
+    diagnostics.bind = lambda _scope: resources
+    assert (await diagnostics.indexes_status(_ctx())).vector_records is None
 
 
 @pytest.mark.parametrize("change", ["topic", "min_confidence", "context", "mode", "media"])
 def test_b2_reflect_required_fields_and_media(change):
     service, _, _ = _foundation()
-    assert hasattr(service.DiagnosticsService, "reflect"), "B2 API missing"
     from starlette.requests import Request
 
     from memory_server.transports.http.errors import HttpError

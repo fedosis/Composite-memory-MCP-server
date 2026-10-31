@@ -10,6 +10,7 @@ from sqlalchemy import event, text
 
 from tests.gateway.test_http_diagnostics import _ctx, _foundation, _resources, _seed_outbox
 from tests.gateway.test_http_diagnostics import database as database
+from tests.gateway.test_http_diagnostics import diagnostics as diagnostics
 
 
 async def _hash_tables(provider):
@@ -22,7 +23,7 @@ async def _hash_tables(provider):
 
 
 @pytest.mark.asyncio
-async def test_drift_audit_indexes_unavailable_without_fake_graph_zero(database):
+async def test_drift_audit_indexes_unavailable_without_fake_graph_zero(database, diagnostics):
     service, _, _ = _foundation()
     from memory_server.gateway_contracts import dto as d
 
@@ -53,7 +54,7 @@ async def test_drift_audit_indexes_unavailable_without_fake_graph_zero(database)
         ("OUTBOX_FAILED", True, None)
     ]
     assert statements and all(sql.lstrip().split()[0].upper() in {"SELECT", "BEGIN"} for sql in statements)
-    assert hasattr(service.DiagnosticsService, "indexes_status"), "B2 API missing"
+    from dataclasses import replace
 
     class VectorClient:
         rows = [1, 2]
@@ -64,32 +65,24 @@ async def test_drift_audit_indexes_unavailable_without_fake_graph_zero(database)
     resources.vector, resources.graph = VectorClient(), object()
     for size in (2, 1, 3):
         resources.vector.rows = list(range(size))
-        status = await service.run_borrowed_diagnostics(
-            _ctx(),
-            resources,
-            lambda session, work, sampled: service.DiagnosticsService(None, None)._indexes(
-                resources, session, work, sampled
-            ),
+        diagnostics.bind = lambda _scope: replace(
+            diagnostics._test_resources, vector=resources.vector, graph=resources.graph
         )
+        status = await diagnostics.indexes_status(_ctx())
         assert status.vector_records == size
         assert status.graph_consistency.projection == "unknown"
         assert status.vector_lag is None and status.graph_lag is None
         assert status.graph_relations is None and status.last_success is None
     resources.vector, resources.graph = None, None
-    status = await service.run_borrowed_diagnostics(
-        _ctx(),
-        resources,
-        lambda session, work, sampled: service.DiagnosticsService(None, None)._indexes(
-            resources, session, work, sampled
-        ),
-    )
+    status = await diagnostics.indexes_status(_ctx())
+    assert diagnostics._test_lease.acquired == diagnostics._test_lease.snapshots == 4
     assert status.vector_records is None and status.graph_consistency.projection == "unavailable"
     assert await _hash_tables(database) == before
 
 
 @pytest.mark.asyncio
 async def test_runner_statement_overflow_is_storage_and_hooks_reset(database):
-    service, _, _ = _foundation(require_b1=False)
+    service, _, _ = _foundation()
     from memory_server.transports.http.errors import HttpError
 
     observed = []
@@ -109,7 +102,7 @@ async def test_runner_statement_overflow_is_storage_and_hooks_reset(database):
 
 @pytest.mark.asyncio
 async def test_runner_cancellation_drains_before_return(database):
-    service, _, _ = _foundation(require_b1=False)
+    service, _, _ = _foundation()
     from memory_server.transports.http.errors import HttpError
 
     started, finished = asyncio.Event(), asyncio.Event()
