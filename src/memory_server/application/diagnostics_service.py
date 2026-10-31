@@ -51,6 +51,8 @@ _diagnostics_active: ContextVar[bool] = ContextVar("diagnostics_active", default
 _PROVIDER_LOGGERS = (
     "memory_server.providers.lancedb_provider",
     "memory_server.providers.qdrant_provider",
+    # HTTP reflect logs raw evidence failures; mask only inside diagnostics scope.
+    "memory_server.api.reflect",
 )
 
 
@@ -69,7 +71,7 @@ _provider_filter = _DiagnosticsProviderFilter()
 
 
 def install_diagnostics_logging_filter() -> None:
-    """Install one task-aware filter on the two reviewed provider loggers."""
+    """Install one task-aware filter on the reviewed diagnostics backend loggers."""
     for name in _PROVIDER_LOGGERS:
         logger = logging.getLogger(name)
         if _provider_filter not in logger.filters:

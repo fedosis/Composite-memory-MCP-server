@@ -600,6 +600,62 @@ async def test_s10_provider_log_scope_isolation(diagnostic_http, monkeypatch, ca
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["overview", "evidence_audit"])
+async def test_s10_reflect_evidence_failure_log_scope(diagnostic_http, caplog, mode):
+    import sqlite3
+
+    from tests.gateway.test_http_shell import code, rows
+
+    shell = diagnostic_http
+    scope = await _seed_diag(shell)
+    engine = scope.runtime.dependencies.sqlite.engine.sync_engine
+    canary = "S10B3_REFLECT_EVIDENCE_EXCEPTION_CANARY"
+    faults = []
+
+    def evidence_fault(_conn, _cursor, statement, _params, _context, _many):
+        # Fault the real borrowed SQL execution, not the engine, mapper or filter.
+        if "FROM EVIDENCE" in " ".join(statement.upper().split()):
+            faults.append(statement)
+            raise sqlite3.OperationalError(canary)
+
+    logger = logging.getLogger("memory_server.api.reflect")
+    event.listen(engine, "before_cursor_execute", evidence_fault)
+    try:
+        with caplog.at_level(logging.ERROR, logger=logger.name):
+            response = await _http(shell, "reflect", body={**REFLECT, "mode": mode})
+    finally:
+        event.remove(engine, "before_cursor_execute", evidence_fault)
+    assert faults, "HTTP reflect did not execute the borrowed evidence query"
+    code(response, "E_STORAGE", 503)
+    for key in ("message", "details", "request_id"):
+        assert canary not in json.dumps(response.json["error"][key])
+    assert canary not in response.body.decode()
+    assert rows(shell)[-1]["operation"] == "reflect"
+    assert rows(shell)[-1]["state"] == "terminal"
+    assert shell.leases.snapshot()["alpha"].admissions == 0
+    records = [record for record in caplog.records if record.name == logger.name]
+    assert records, "real ReflectEngine evidence failure was not logged"
+    assert canary not in caplog.text
+    for record in records:
+        assert record.msg == "diagnostics backend failure"
+        assert record.args == ()
+        assert record.exc_info is None
+        assert record.exc_text is None
+        assert record.stack_info is None
+        assert canary not in record.getMessage()
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        logger.error("outside diagnostics %s", canary)
+    record = caplog.records[-1]
+    assert record.name == logger.name
+    assert record.msg == "outside diagnostics %s"
+    assert record.args == (canary,)
+    assert record.getMessage() == "outside diagnostics " + canary
+    assert canary in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_s10_http_canary_modes_and_identifiers(diagnostic_http, caplog):
     from tests.gateway.test_http_shell import code, rows
 
