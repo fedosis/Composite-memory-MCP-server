@@ -8,9 +8,12 @@ import hashlib
 import pytest
 from sqlalchemy import event, text
 
-from tests.gateway.test_http_diagnostics import _ctx, _foundation, _resources, _seed_outbox
+from tests.gateway.test_http_diagnostics import _ctx, _foundation, _http, _resources, _seed_diag, _seed_outbox
 from tests.gateway.test_http_diagnostics import database as database
+from tests.gateway.test_http_diagnostics import diagnostic_http as diagnostic_http
 from tests.gateway.test_http_diagnostics import diagnostics as diagnostics
+from tests.gateway.test_http_diagnostics import offline_embedder as offline_embedder
+from tests.gateway.test_http_diagnostics import shell as shell
 
 
 async def _hash_tables(provider):
@@ -78,6 +81,34 @@ async def test_drift_audit_indexes_unavailable_without_fake_graph_zero(database,
     assert diagnostics._test_lease.acquired == diagnostics._test_lease.snapshots == 4
     assert status.vector_records is None and status.graph_consistency.projection == "unavailable"
     assert await _hash_tables(database) == before
+
+
+@pytest.mark.asyncio
+async def test_s10_http_drift_does_not_write(diagnostic_http):
+    from tests.gateway.test_http_shell import rows
+
+    shell = diagnostic_http
+    scope = await _seed_diag(shell)
+    provider, vector = scope.runtime.dependencies.sqlite, scope.runtime.dependencies.vector
+    before = await _hash_tables(provider)
+    counts = []
+    for n in range(3):
+        assert await vector.upsert(point_id=f"vector-{n}", vector=[1.0] + [0.0] * 383)
+        response = await _http(shell, "indexes/status")
+        assert response.status == 200, response.body
+        counts.append(response.json["vector_records"])
+        for key in ("vector_lag", "graph_lag", "graph_relations", "last_success"):
+            assert response.json[key] is None
+        assert response.json["graph_consistency"]["projection"] == "unknown"
+    assert counts == [1, 2, 3]
+    table = await vector._get_table()
+    await vector._blocking(table.delete, "id = 'vector-1'")
+    status = await _http(shell, "indexes/status")
+    assert status.json["vector_records"] == 2
+    for _, suffix in (("audit", "audit"), ("outbox", "outbox"), ("overview", "overview"), ("reflect", "reflect")):
+        assert (await _http(shell, suffix)).status == 200
+    assert await _hash_tables(provider) == before
+    assert len(rows(shell)) == 8 and all(row["state"] == "terminal" for row in rows(shell))
 
 
 @pytest.mark.asyncio

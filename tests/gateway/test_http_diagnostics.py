@@ -7,6 +7,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import event, text
@@ -42,6 +43,14 @@ def _foundation():
     provider = importlib.import_module("memory_server.providers.sqlite_provider")
     outbox = importlib.import_module("storage.outbox")
     return service, provider, outbox
+
+
+@pytest.fixture(autouse=True)
+def offline_embedder(monkeypatch):
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
+    from memory_server.runtime import runtime_factory
+
+    monkeypatch.setitem(runtime_factory._DEFAULT_RECIPES, "embedder", lambda runtime: MockEmbeddingProvider())
 
 
 @pytest.fixture
@@ -82,49 +91,600 @@ async def shell(tmp_path):
     import importlib
 
     module = importlib.import_module("tests.gateway.test_http_shell")
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    for profile in ("alpha", "beta", "gamma"):
+        root = tmp_path / module.CANARY / profile
+        root.mkdir(parents=True)
+        vector = LanceDBProvider(db_path=str(root / "lancedb"))
+        await vector.create_collection("memories")
+        await vector.close()
     async for value in module.shell.__wrapped__(tmp_path):
         yield value
 
 
-@pytest.mark.asyncio
-async def test_b1_http_routes_are_unmounted_until_b3(shell, caplog):
+@pytest.fixture
+async def diagnostic_http(shell):
     from memory_server.runtime.read_composition import compose_read_ports
     from memory_server.transports.http.app import create_http_app
-    from tests.gateway.test_http_shell import request, rows
 
     deps, specs = compose_read_ports(shell.deps, shell.config)
-    assert {spec.operation for spec in specs}.isdisjoint(
-        {"audit", "indexes.status", "outbox.list", "overview", "reflect"}
+    shell.app = create_http_app(shell.config, deps, read_routes=specs)
+    shell.bearer, _ = shell.mint(permissions=("profile.read", "audit.read"))
+    shell.specs = specs
+    try:
+        yield shell
+    finally:
+        await shell.app.close()
+
+
+REFLECT = {"topic": None, "min_confidence": None, "context": None}
+S10 = (
+    ("audit", "audit"),
+    ("indexes.status", "indexes/status"),
+    ("outbox.list", "outbox"),
+    ("overview", "overview"),
+    ("reflect", "reflect"),
+)
+SECRETS = tuple(
+    "S10_" + name + "_CANARY"
+    for name in ("FACT", "PROPOSITION", "TAG", "SOURCE", "ERROR", "QUERY", "TOPIC", "CONTEXT", "CURSOR", "FOREIGN_ID")
+)
+
+
+async def _http(shell, suffix, *, profile="alpha", bearer=None, body=None, query=b"", receive=None):
+    from tests.gateway.test_http_shell import request
+
+    return await request(
+        shell.app,
+        f"/api/v1/profiles/{profile}/{suffix}",
+        method="POST" if suffix == "reflect" else "GET",
+        bearer=bearer or shell.bearer,
+        body=body if body is not None else REFLECT if suffix == "reflect" else b"",
+        query=query,
+        receive=receive,
     )
-    app = create_http_app(shell.config, deps, read_routes=specs)
-    before = rows(shell)
-    for method, suffix, body in (
-        ("GET", "audit", b""),
-        ("GET", "indexes/status", b""),
-        ("GET", "outbox", b""),
-        ("GET", "overview", b""),
-        ("POST", "reflect", b'{"topic":null,"min_confidence":null,"context":null}'),
-    ):
-        response = await request(
-            app,
-            f"/api/v1/profiles/alpha/{suffix}",
-            method=method,
-            bearer=shell.bearer,
-            body=body,
-            headers=[("Content-Type", "application/json")] if method == "POST" else [],
-            query=b"cursor=B1_CURSOR_CANARY",
-        )
-        assert response.status == 404, (method, suffix, response.json)
-        assert response.json["error"]["code"] == "E_NOT_FOUND"
-        assert "B1_PAYLOAD_CANARY" not in response.body.decode()
-    assert rows(shell) == before
+
+
+async def _seed_diag(shell, profile="alpha", foreign=False):
+    from storage.models.belief import BeliefORM
+    from storage.models.fact import FactORM
+    from storage.models.receipt import MemoryReceiptORM
+    from storage.models.relation import ClaimRelationORM
+    from storage.outbox import OutboxEntryORM
+
+    from memory_server.gateway_contracts.ports import RequestContext
+
+    principal = await shell.tokens.authenticate(shell.bearer, now=datetime.now(UTC))
+    ctx = RequestContext("seed", principal, profile, None, asyncio.get_running_loop().time() + 30)
+    async with shell.leases.acquire(ctx) as scope:
+        provider = scope.runtime.dependencies.sqlite
+        async with provider._session_factory() as session, session.begin():
+            session.add(
+                FactORM(
+                    id=IDS[0],
+                    subject=SECRETS[0],
+                    predicate="is",
+                    object="safe",
+                    dedup_key=IDS[0],
+                    creator="test",
+                    confidence=0.8,
+                    source=SECRETS[3],
+                    lifecycle_state="active",
+                    verification_status="validated",
+                )
+            )
+            session.add(
+                BeliefORM(
+                    id=IDS[1],
+                    proposition=SECRETS[1],
+                    confidence=0.8,
+                    source=SECRETS[3],
+                    creator="test",
+                    source_ids=[],
+                    tags=[SECRETS[2], SECRETS[6] if foreign else "safe-topic"],
+                    lifecycle_state="active",
+                    verification_status="validated",
+                )
+            )
+            session.add(
+                MemoryReceiptORM(
+                    id=IDS[0],
+                    memory_type="fact",
+                    source=SECRETS[3],
+                    created_by="test",
+                    timestamp=AT.replace(tzinfo=None),
+                    lifecycle_state="active",
+                    verification_status="validated",
+                    confidence=0.8,
+                )
+            )
+            for n in range(3, 6) if foreign else range(3, 5):
+                session.add(
+                    OutboxEntryORM(
+                        id=IDS[n],
+                        record_id=IDS[1],
+                        record_type="belief",
+                        operation="index_belief",
+                        payload_json=json.dumps({"secret": SECRETS[1]}),
+                        status="failed",
+                        retry_count=1,
+                        error=SECRETS[4],
+                        created_at=AT.replace(tzinfo=None),
+                    )
+                )
+            if foreign:
+                session.add(
+                    MemoryReceiptORM(
+                        id=IDS[7],
+                        memory_type="belief",
+                        source=SECRETS[3],
+                        created_by="test",
+                        timestamp=AT.replace(tzinfo=None),
+                        lifecycle_state="active",
+                        verification_status="validated",
+                        confidence=0.8,
+                    )
+                )
+                session.add(ClaimRelationORM(source_id=IDS[0], target_id=IDS[1], relation_type="supports"))
+        return scope
+
+
+def _sweep(shell, caplog, responses):
+    import base64
+
     from prometheus_client import generate_latest
 
-    surfaces = repr(rows(shell)) + caplog.text + generate_latest(shell.metrics._registry).decode()
-    assert all(secret not in surfaces for secret in ("B1_CURSOR_CANARY", "B1_PAYLOAD_CANARY"))
+    from tests.gateway.test_http_shell import rows
 
-    assert shell.leases.snapshot() == {}
-    await app.close()
+    surfaces = repr(rows(shell)) + generate_latest(shell.metrics._registry).decode()
+    for response in responses:
+        surfaces += response.body.decode()
+        cursor = response.json.get("next_cursor")
+        if cursor:
+            surfaces += base64.urlsafe_b64decode(cursor.split(".")[0] + "==").decode()
+    surfaces += repr([(r.msg, r.args, r.exc_text, r.exc_info, r.stack_info) for r in caplog.records])
+    assert all(secret not in surfaces for secret in SECRETS), surfaces
+    allowed = {"profile", "operation", "status_class", "le", "projection", "kind", "state"}
+    for metric in shell.metrics._registry.collect():
+        for sample in metric.samples:
+            assert set(sample.labels) <= allowed, sample
+            if "profile" in sample.labels:
+                assert sample.labels["profile"] in {"alpha", "beta", "gamma", "_unknown"}
+            if "operation" in sample.labels:
+                from memory_server.gateway_contracts.catalog import CATALOG
+
+                assert sample.labels["operation"] in CATALOG.by_operation
+            if "status_class" in sample.labels:
+                assert sample.labels["status_class"] in {"2xx", "4xx", "5xx"}
+
+
+@pytest.mark.asyncio
+async def test_s10_five_routes_mount_and_permissions(diagnostic_http, monkeypatch):
+    from dataclasses import replace
+
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.transports.http.app import create_http_app
+    from tests.gateway.test_http_shell import code, rows
+
+    shell = diagnostic_http
+    await _seed_diag(shell)
+    models = (d.AuditResult, d.IndexStatus, d.Page[d.OutboxItem], d.Overview, d.ReflectResult)
+    for (op, suffix), model in zip(S10, models, strict=True):
+        permission = "profile.read" if op in {"indexes.status", "overview"} else "audit.read"
+        bearer, _ = shell.mint(permissions=(permission,))
+        response = await _http(shell, suffix, bearer=bearer)
+        assert response.status == 200, response.body
+        assert set(response.json) == set(model.model_fields)
+        model.model_validate_json(response.body)
+        wrong, _ = shell.mint(permissions=("audit.read" if permission == "profile.read" else "profile.read",))
+        before = rows(shell)
+        code(await _http(shell, suffix, bearer=wrong), "E_PERMISSION_DENIED", 403)
+        assert rows(shell) == before
+        ports = dict(shell.app.dependencies.ports)
+        del ports[op]
+        missing = create_http_app(shell.config, replace(shell.app.dependencies, ports=ports), read_routes=shell.specs)
+        with monkeypatch.context() as m:
+
+            async def forbidden(*a, **k):
+                pytest.fail("missing port reached intent/lease")
+
+            m.setattr(shell.access, "begin", forbidden)
+            m.setattr(shell.leases, "acquire", forbidden)
+            from tests.gateway.test_http_shell import request
+
+            result = await request(
+                missing,
+                f"/api/v1/profiles/alpha/{suffix}",
+                bearer=bearer,
+                method="POST" if op == "reflect" else "GET",
+                body=REFLECT if op == "reflect" else b"",
+            )
+            code(result, "E_CAPABILITY_UNAVAILABLE", 503)
+        await missing.close()
+    assert len(shell.specs) == 19
+    code(await _http(shell, "unknown"), "E_NOT_FOUND", 404)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "owner",
+        "parser",
+        "validator",
+        "subclass",
+        "codec",
+        "nonoutbox-codec",
+        "codec-subclass",
+        "duplicate",
+        "method",
+        "path",
+        "permission",
+    ],
+)
+def test_s10_mount_rejections(shell, kind):
+    from dataclasses import replace
+
+    from memory_server.transports.http.app import create_http_app
+    from memory_server.transports.http.routes.diagnostics import (
+        DiagnosticsRouteSpec,
+        OutboxCursorCodec,
+        create_diagnostics_routes,
+    )
+
+    codec = OutboxCursorCodec(b"s" * 32, 300)
+    spec, indexes, outbox, _, _ = create_diagnostics_routes(cursor_codec=codec)
+
+    class Subspec(DiagnosticsRouteSpec):
+        pass
+
+    class Subcodec(OutboxCursorCodec):
+        pass
+
+    def forbidden(*a, **k):
+        pytest.fail("substituted callable executed")
+
+    cases = {
+        "owner": (replace(spec, operation="profiles.list", path="/api/v1/profiles", permission="profile.read"),),
+        "parser": (replace(spec, parse=forbidden),),
+        "validator": (replace(spec, validate_result=forbidden),),
+        "subclass": (Subspec(**vars(spec)),),
+        "codec": (replace(outbox, cursor_codec=object()),),
+        "codec-subclass": (replace(outbox, cursor_codec=Subcodec(b"s" * 32, 300)),),
+        "nonoutbox-codec": (replace(indexes, cursor_codec=codec),),
+        "duplicate": (spec, spec),
+        "method": (replace(spec, method="POST"),),
+        "path": (replace(spec, path="/wrong"),),
+        "permission": (replace(spec, permission="profile.read"),),
+    }
+    with pytest.raises(ValueError):
+        create_http_app(shell.config, shell.deps, read_routes=cases[kind])
+    create_http_app(shell.config, shell.deps, read_routes=(replace(spec), outbox))
+
+
+@pytest.mark.asyncio
+async def test_s10_audit_metrics_canaries(diagnostic_http, monkeypatch, caplog):
+    from tests.gateway.test_http_shell import code, rows
+
+    shell = diagnostic_http
+    scope = await _seed_diag(shell)
+    provider = scope.runtime.dependencies.sqlite
+    sql = []
+    event.listen(provider.engine.sync_engine, "before_cursor_execute", lambda c, u, s, p, x, m: sql.append(s))
+
+    async def snapshot():
+        async with provider._session_factory() as session:
+            names = (
+                await session.execute(text("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"))
+            ).scalars()
+            return {name: (await session.execute(text(f'SELECT * FROM "{name}"'))).all() for name in names}
+
+    before = await snapshot()
+    graph_before = scope.runtime.dependencies.graph.to_dict()
+    original_begin, original_finish = shell.access.begin, shell.access.finish
+    calls = []
+
+    async def begin(ctx, op):
+        ticket = await original_begin(ctx, op)
+        assert rows(shell)[-1]["state"] == "intent"
+        calls.append(("begin", op))
+        return ticket
+
+    async def finish(ticket, outcome):
+        calls.append(("finish", ticket.request_id))
+        await original_finish(ticket, outcome)
+
+    monkeypatch.setattr(shell.access, "begin", begin)
+    monkeypatch.setattr(shell.access, "finish", finish)
+    responses = []
+    for op, suffix in S10:
+        response = await _http(shell, suffix, query=b"limit=1" if op == "outbox.list" else b"")
+        assert response.status == 200, response.body
+        responses.append(response)
+        assert rows(shell)[-1]["operation"] == op and rows(shell)[-1]["state"] == "terminal"
+        assert rows(shell)[-1]["result"] == "success"
+    assert len(rows(shell)) == 5 and len(calls) == 10
+    assert responses[2].json["items"][0]["memory_id"] == IDS[1]
+    assert responses[3].json["profile"]["storage_root"] is None
+    assert responses[3].json["writer_owned"] == shell.leases.snapshot()["alpha"].owned
+    assert before == await snapshot()
+    assert scope.runtime.dependencies.graph.to_dict() == graph_before
+    assert not any(
+        s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP")) for s in sql
+    )
+    _sweep(shell, caplog, responses)
+    calls.clear()
+
+    async def fault(*a, **k):
+        raise OSError(SECRETS[4])
+
+    with monkeypatch.context() as m:
+        m.setattr(shell.access, "begin", fault)
+        m.setattr(shell.leases, "acquire", lambda *a: pytest.fail("begin failure acquired lease"))
+        code(await _http(shell, "audit"), "E_AUDIT_UNAVAILABLE", 503)
+    assert calls == [] and len(rows(shell)) == 5
+    with monkeypatch.context() as m:
+        m.setattr(shell.access, "finish", fault)
+        response = await _http(shell, "audit")
+        code(response, "E_AUDIT_UNAVAILABLE", 503)
+    pending = rows(shell)[-1]
+    assert len(rows(shell)) == 6 and pending["state"] == "intent"
+    assert [r["request_id"] for r in rows(shell)].count(pending["request_id"]) == 1
+    import sqlite3
+
+    filename = shell.access._db.execute("PRAGMA database_list").fetchone()[2]
+    with sqlite3.connect(filename) as durable:
+        assert (
+            durable.execute("SELECT state FROM access_audit WHERE request_id=?", (pending["request_id"],)).fetchone()[0]
+            == "intent"
+        )
+    _sweep(shell, caplog, [response])
+    assert shell.leases.snapshot()["alpha"].admissions == 0
+
+
+@pytest.mark.asyncio
+async def test_s10_cross_profile_and_missing(diagnostic_http, monkeypatch, caplog):
+    from tests.gateway.test_http_shell import code, request, rows
+
+    shell = diagnostic_http
+    a = await _seed_diag(shell)
+    await _seed_diag(shell, "beta", foreign=True)
+    alpha, _ = shell.mint(profiles=("alpha",), permissions=("profile.read", "audit.read"))
+    before = rows(shell)
+    with monkeypatch.context() as m:
+
+        async def forbidden(*a, **k):
+            pytest.fail("wrong scope reached registry")
+
+        m.setattr(shell.registry, "resolve", forbidden)
+        for _, suffix in S10:
+            code(await _http(shell, suffix, profile="beta", bearer=alpha), "E_PERMISSION_DENIED", 403)
+    assert rows(shell) == before
+    out_a, out_b = await _http(shell, "outbox"), await _http(shell, "outbox", profile="beta")
+    assert [i["event_id"] for i in out_a.json["items"]] == list(IDS[3:5])
+    assert [i["event_id"] for i in out_b.json["items"]] == list(IDS[3:6])
+    topic = {**REFLECT, "mode": "confidence", "topic": SECRETS[6]}
+    reflected = await _http(shell, "reflect", body=topic)
+    other = await _http(shell, "reflect", profile="beta", body=topic)
+    assert reflected.status == other.status == 200
+    assert reflected.json["sections"] != other.json["sections"]
+    audit_a = await _http(shell, "audit", query=b"audit_type=receipts")
+    audit_b = await _http(shell, "audit", profile="beta", query=b"audit_type=receipts")
+    assert audit_a.status == audit_b.status == 200
+    assert not any(i["code"] == "RECEIPT_ORPHAN" for i in audit_a.json["findings"]["items"])
+    assert any(i["code"] == "RECEIPT_ORPHAN" for i in audit_b.json["findings"]["items"])
+    relation_a = await _http(shell, "reflect", body={**REFLECT, "mode": "relations"})
+    relation_b = await _http(shell, "reflect", profile="beta", body={**REFLECT, "mode": "relations"})
+    assert relation_a.status == relation_b.status == 200
+    assert relation_a.json["sections"] != relation_b.json["sections"]
+    assert IDS[5] not in out_a.body.decode() and IDS[7] not in audit_a.body.decode()
+    ov_a, ov_b = await _http(shell, "overview"), await _http(shell, "overview", profile="beta")
+    assert ov_a.json["facts"] == ov_b.json["facts"] == 1
+    assert ov_a.json["beliefs"] == ov_b.json["beliefs"] == 1
+    unknown, _ = shell.mint(profiles=("missing",), permissions=("profile.read",))
+    code(await _http(shell, "overview", profile="missing", bearer=unknown), "E_PROFILE_NOT_FOUND", 404)
+    from memory_server.transports.http.app import with_profile_ports
+    from memory_server.transports.http.routes.profiles import bind_control_pending
+
+    with_profile_ports(shell.app, pending_control=bind_control_pending(shell.registry, shell.store))
+    disabled = await request(
+        shell.app,
+        "/api/v1/profiles/beta/disable",
+        method="POST",
+        bearer=shell.mint()[0],
+        body={"reason": "test", "confirmation": True, "expected_generation": 1},
+        headers=[("Idempotency-Key", str(uuid4()))],
+    )
+    assert disabled.status == 200, disabled.body
+    code(await _http(shell, "overview", profile="beta"), "E_PROFILE_DISABLED", 409)
+    with monkeypatch.context() as m:
+
+        async def broken(*a, **k):
+            raise OSError(SECRETS[4])
+
+        m.setattr(a.runtime.dependencies.sqlite, "diagnostics_count", broken)
+        code(await _http(shell, "overview"), "E_STORAGE", 503)
+    shell.app.guard.profiles[("alpha", "profile.read")] = shell.config.retrieval_concurrency
+    code(await _http(shell, "overview"), "E_RATE_LIMIT", 429)
+    shell.app.guard.profiles.clear()
+    with monkeypatch.context() as m:
+
+        async def slow(*a, **k):
+            await asyncio.sleep(10)
+
+        m.setattr(a.runtime.dependencies.sqlite, "diagnostics_count", slow)
+        shell.app.config = __import__("dataclasses").replace(
+            shell.config, request_timeout_seconds=0.05, header_timeout_seconds=0.05
+        )
+        code(await _http(shell, "overview"), "E_TIMEOUT", 504)
+    _sweep(shell, caplog, [out_a, out_b, reflected, other, audit_a, audit_b, ov_a, ov_b])
+
+
+@pytest.mark.asyncio
+async def test_s10_request_size_and_audit_cursor(diagnostic_http):
+    from tests.gateway.test_http_shell import code, rows
+
+    shell = diagnostic_http
+    chunks = iter([b"x" * (shell.config.max_body_bytes // 2)] * 3)
+
+    async def streamed():
+        return {"type": "http.request", "body": next(chunks), "more_body": True}
+
+    code(await _http(shell, "reflect", receive=streamed), "E_REQUEST_TOO_LARGE", 413)
+    assert rows(shell) == []
+    for cursor in (b"", b"random", SECRETS[8].encode(), b"foreign", b"expired"):
+        code(await _http(shell, "audit", query=b"cursor=" + cursor), "E_CURSOR_INVALID", 400)
+        assert rows(shell) == []
+    for suffix in ("indexes/status", "overview"):
+        code(await _http(shell, suffix, query=b"unknown=1"), "E_VALIDATION", 422)
+        code(await _http(shell, suffix, body=b"{}"), "E_VALIDATION", 422)
+        assert rows(shell) == []
+    result = await _http(shell, "audit")
+    assert result.status == 200 and len(rows(shell)) == 1
+
+
+@pytest.mark.asyncio
+async def test_s10_provider_log_scope_isolation(diagnostic_http, monkeypatch, caplog):
+    from tests.gateway.test_http_shell import code
+
+    shell = diagnostic_http
+    scope = await _seed_diag(shell)
+    vector = scope.runtime.dependencies.vector
+    assert vector is not None
+    client = await vector._get_table()
+    assert client is not None
+
+    def broken(*a, **k):
+        raise RuntimeError(SECRETS[4])
+
+    logger = logging.getLogger("memory_server.providers.lancedb_provider")
+    with monkeypatch.context() as m, caplog.at_level(logging.ERROR):
+        m.setattr(type(client), "count_rows", broken)
+        response = await _http(shell, "indexes/status")
+        code(response, "E_VECTOR_BACKEND", 503)
+        records = [r for r in caplog.records if r.name == logger.name]
+        assert records and all(r.args == () and r.exc_info is None and r.exc_text is None for r in records)
+        assert all(SECRETS[4] not in repr(vars(r)) for r in records)
+        logger.error("outside %s", SECRETS[4])
+        assert caplog.records[-1].args == (SECRETS[4],)
+    assert shell.leases.snapshot()["alpha"].admissions == 0
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+
+    def blocked(*a, **k):
+        started.set()
+        assert release.wait(5)
+        logger.error("native %s", SECRETS[4], exc_info=True)
+        return 0
+
+    with monkeypatch.context() as m, caplog.at_level(logging.ERROR):
+        m.setattr(type(client), "count_rows", blocked)
+        task = asyncio.create_task(_http(shell, "indexes/status"))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            caplog.clear()
+            logger.error("concurrent %s", "ordinary")
+            assert caplog.records[-1].args == ("ordinary",)
+            task.cancel()
+            await asyncio.sleep(0.02)
+            assert not task.done() and shell.leases.snapshot()["alpha"].admissions == 1
+        finally:
+            release.set()
+        code(await asyncio.wait_for(task, 5), "E_TIMEOUT", 504)
+        assert any(r.msg == "diagnostics backend failure" and r.args == () for r in caplog.records)
+        assert all(SECRETS[4] not in repr(vars(r)) for r in caplog.records)
+        logger.error("after cancel %s", "ordinary-after")
+        assert caplog.records[-1].args == ("ordinary-after",)
+    assert shell.leases.snapshot()["alpha"].admissions == 0
+
+
+@pytest.mark.asyncio
+async def test_s10_http_canary_modes_and_identifiers(diagnostic_http, caplog):
+    from tests.gateway.test_http_shell import code, rows
+
+    shell = diagnostic_http
+    scope = await _seed_diag(shell)
+    responses = []
+    for mode in ("overview", "topics", "contradictions", "confidence", "decay", "evidence_audit", "relations"):
+        response = await _http(shell, "reflect", body={**REFLECT, "mode": mode, "context": SECRETS[7]})
+        assert response.status == 200, response.body
+        responses.append(response)
+    for suffix, query in (("audit", b"query=" + SECRETS[5].encode()), ("outbox", b"cursor=" + SECRETS[8].encode())):
+        before = rows(shell)
+        response = await _http(shell, suffix, query=query)
+        assert response.status in (400, 422)
+        assert rows(shell) == before
+        responses.append(response)
+    provider = scope.runtime.dependencies.sqlite
+    async with provider._session_factory() as session, session.begin():
+        assert SECRETS[0] in repr((await session.execute(text("SELECT * FROM facts"))).all())
+        assert SECRETS[1] in repr((await session.execute(text("SELECT * FROM beliefs"))).all())
+        assert SECRETS[4] in repr((await session.execute(text("SELECT * FROM outbox_entries"))).all())
+        await session.execute(
+            text("UPDATE outbox_entries SET record_id=:unsafe WHERE id=:id"), {"unsafe": SECRETS[9], "id": IDS[3]}
+        )
+    response = await _http(shell, "outbox")
+    code(response, "E_STORAGE", 503)
+    responses.append(response)
+    safe = await _http(shell, "outbox", query=("memory_id=" + IDS[1]).encode())
+    assert safe.status == 200 and [r["event_id"] for r in safe.json["items"]] == [IDS[4]]
+    responses.append(safe)
+    _sweep(shell, caplog, responses)
+
+
+@pytest.mark.asyncio
+async def test_s10_tcp_publication(diagnostic_http):
+    from tests.gateway.test_http_security import wire
+    from tests.gateway.test_slice_runtime import http_request
+
+    shell = diagnostic_http
+    await _seed_diag(shell)
+    async with wire(shell.app, shell.config) as port:
+        for _, suffix in S10:
+            status, payload = await http_request(
+                port,
+                "POST" if suffix == "reflect" else "GET",
+                f"/api/v1/profiles/alpha/{suffix}",
+                body=json.dumps(REFLECT).encode() if suffix == "reflect" else b"",
+                headers={"Authorization": "Bearer " + shell.bearer, "Content-Type": "application/json"},
+            )
+            assert status == 200 and "error" not in payload, payload
+
+
+@pytest.mark.asyncio
+async def test_s10_binder_optional_errors_are_narrow(diagnostic_http, monkeypatch):
+    from memory_server.application.errors import UnknownDependencyError
+    from memory_server.runtime.read_composition import bind_diagnostics
+
+    scope = await _seed_diag(diagnostic_http)
+    bound = bind_diagnostics(scope)
+    assert bound.canonical.provider is scope.runtime.dependencies.sqlite
+    assert bound.vector is scope.runtime.dependencies.vector and bound.graph is scope.runtime.dependencies.graph
+    assert bound.reflection is scope.application.reflection
+    assert bound.validator is scope.application.audit._validator
+    assert bound.confidence is scope.application.audit._confidence_engine
+    assert bound.writer_owned == diagnostic_http.leases.snapshot()["alpha"].owned
+    for owner, attr, field in (
+        (scope.runtime.dependencies, "vector", "vector"),
+        (scope.runtime.dependencies, "graph", "graph"),
+        (scope.application, "reflection", "reflection"),
+        (scope.application.audit, "_validator", "validator"),
+        (scope.application.audit, "_confidence_engine", "confidence"),
+        (scope.application, "audit", "validator"),
+    ):
+        for exception in (UnknownDependencyError, RuntimeError):
+
+            def fail(_self):
+                raise exception("optional fault")
+
+            with monkeypatch.context() as m:
+                m.setattr(type(owner), attr, property(fail), raising=False)
+                if exception is UnknownDependencyError:
+                    assert getattr(bind_diagnostics(scope), field) is None
+                else:
+                    with pytest.raises(RuntimeError, match="optional fault"):
+                        bind_diagnostics(scope)
 
 
 @pytest.mark.asyncio
