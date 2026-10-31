@@ -266,6 +266,8 @@ def _get(operation: str, model: type[d.DTO], request: Request, body: bytes, prin
                 values[key] = int(value)
             else:
                 values[key] = value
+        if model is d.Empty and values:
+            raise ValueError
         if model is d.AuditQuery:
             values.setdefault("cursor", None)
         if model is d.OutboxQuery:
@@ -293,8 +295,41 @@ def parse_audit(request, body, principal):
     return _get("audit", d.AuditQuery, request, body, principal)
 
 
+def parse_indexes_status(request, body, principal):
+    return _get("indexes.status", d.Empty, request, body, principal)
+
+
 def parse_outbox_list(request, body, principal):
     return _get("outbox.list", d.OutboxQuery, request, body, principal)
+
+
+def parse_overview(request, body, principal):
+    return _get("overview", d.Empty, request, body, principal)
+
+
+def parse_reflect(request: Request, body: bytes, principal: Principal):
+    del principal
+    if request.query_params:
+        raise HttpError("E_VALIDATION")
+    if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
+        raise HttpError("E_UNSUPPORTED_MEDIA_TYPE")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    try:
+        values = json.loads(body, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        if not {"topic", "min_confidence", "context"} <= set(values):
+            raise ValueError
+        payload = d.ReflectRequest.model_validate(values, strict=True)
+        return _command("reflect", request, payload)
+    except (ValidationError, ValueError, TypeError, UnicodeError, RecursionError):
+        raise HttpError("E_VALIDATION") from None
 
 
 _ERROR_CODES = {
@@ -410,6 +445,119 @@ def validate_outbox_page(value):
     return result
 
 
+def validate_index_status(value):
+    try:
+        result = d.IndexStatus.model_validate(value.model_dump(), strict=True)
+    except ValidationError:
+        raise HttpError("E_INTERNAL") from None
+    raw = value.model_dump()
+    if set(raw) != {
+        "sqlite_records",
+        "vector_records",
+        "graph_relations",
+        "vector_lag",
+        "graph_lag",
+        "outbox_pending",
+        "outbox_failed",
+        "graph_consistency",
+        "last_success",
+        "sampled_at",
+    }:
+        raise HttpError("E_INTERNAL")
+    graph = raw["graph_consistency"]
+    if type(graph) is not dict or set(graph) != set(d.GraphConsistency.model_fields):
+        raise HttpError("E_INTERNAL")
+    if (
+        graph["projection"] not in {"unknown", "unavailable"}
+        or any(graph[key] is not None for key in set(graph) - {"canonical_store", "projection"})
+        or any(raw[key] is not None for key in ("graph_relations", "graph_lag", "vector_lag", "last_success"))
+    ):
+        raise HttpError("E_INTERNAL")
+    for key in ("sqlite_records", "vector_records", "outbox_pending", "outbox_failed"):
+        if raw[key] is not None and (type(raw[key]) is not int or raw[key] < 0):
+            raise HttpError("E_INTERNAL")
+    return result
+
+
+def validate_overview(value):
+    try:
+        result = d.Overview.model_validate(value.model_dump(), strict=True)
+    except ValidationError:
+        raise HttpError("E_INTERNAL") from None
+    raw = value.model_dump()
+    if set(raw) != {
+        "profile",
+        "facts",
+        "beliefs",
+        "decisions",
+        "skills",
+        "lifecycle_counts",
+        "unresolved_conflicts",
+        "audit_warnings",
+        "indexes",
+        "schema_revision",
+        "last_migration",
+        "writer_owned",
+    }:
+        raise HttpError("E_INTERNAL")
+    if set(raw["lifecycle_counts"]) != {
+        "candidate",
+        "validated",
+        "active",
+        "stale",
+        "archived",
+        "forgotten",
+        "superseded",
+        "contradicted",
+        "discarded",
+        "unknown",
+    }:
+        raise HttpError("E_INTERNAL")
+    profile = raw["profile"]
+    if set(profile) != set(d.Profile.model_fields):
+        raise HttpError("E_INTERNAL")
+    if profile.get("storage_root") is not None:
+        raise HttpError("E_INTERNAL")
+    index_raw = raw["indexes"]
+    if (
+        type(index_raw) is not dict
+        or set(index_raw) != set(d.IndexStatus.model_fields)
+        or type(index_raw["graph_consistency"]) is not dict
+        or set(index_raw["graph_consistency"]) != set(d.GraphConsistency.model_fields)
+    ):
+        raise HttpError("E_INTERNAL")
+    validate_index_status(result.indexes)
+    if result.audit_warnings is not None or result.last_migration is not None:
+        raise HttpError("E_INTERNAL")
+    if any(
+        type(count) is not int or count < 0
+        for count in (
+            result.facts,
+            result.beliefs,
+            result.decisions,
+            result.skills,
+            result.unresolved_conflicts,
+            *raw["lifecycle_counts"].values(),
+        )
+    ):
+        raise HttpError("E_INTERNAL")
+    return result
+
+
+def validate_reflect_result(value):
+    from memory_server.application.diagnostics_service import validate_reflect_sections
+
+    try:
+        raw = value.model_dump()
+        if set(raw) != set(d.ReflectResult.model_fields):
+            raise HttpError("E_INTERNAL")
+        result = d.ReflectResult.model_validate(raw, strict=True)
+        validate_reflect_sections(result.mode, result.sections)
+        return result
+    except (ValidationError, ValueError, TypeError, AttributeError, KeyError):
+        raise HttpError("E_INTERNAL") from None
+
+
 DIAGNOSTICS_ROUTE_SPECS: Final = MappingProxyType(
     {
         operation: DiagnosticsRouteSpec(
@@ -422,7 +570,10 @@ DIAGNOSTICS_ROUTE_SPECS: Final = MappingProxyType(
         )
         for operation, parser, validator in (
             ("audit", parse_audit, validate_audit_result),
+            ("indexes.status", parse_indexes_status, validate_index_status),
             ("outbox.list", parse_outbox_list, validate_outbox_page),
+            ("overview", parse_overview, validate_overview),
+            ("reflect", parse_reflect, validate_reflect_result),
         )
     }
 )
