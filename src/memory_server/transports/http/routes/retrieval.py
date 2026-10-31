@@ -31,8 +31,6 @@ def _parse_search(request, body, principal):
     # C4/T2: see ops/CONTRACTS_AMENDMENT_C4_T2.md; these filters remain unsupported.
     if filters.source is not None or filters.tags:
         raise HttpError("E_VALIDATION")
-    if query.trace:
-        raise HttpError("E_CAPABILITY_UNAVAILABLE")
     return d.COMMAND_TYPES["search"](
         operation="search", profile_id=request.path_params["profile"], path_ids={}, payload=query
     )
@@ -49,8 +47,6 @@ def _parse_context(request, body, principal):
         raise HttpError("E_VALIDATION") from None
     if not query.task.isprintable() or (query.subject is not None and not query.subject.isprintable()):
         raise HttpError("E_VALIDATION")
-    if query.trace:
-        raise HttpError("E_CAPABILITY_UNAVAILABLE")
     return d.COMMAND_TYPES["context"](
         operation="context", profile_id=request.path_params["profile"], path_ids={}, payload=query
     )

@@ -137,10 +137,12 @@ class RankMerger:
         # Deduplicate by content
         seen: set[str] = set()
         deduped: list[RankResult] = []
-        kept, dropped, winners = [], [], {}
+        if self._tap is not None:
+            kept, dropped, winners = [], [], {}
         for r in ordered:
             content_key = r.content.lower().strip()
-            keep = not content_key or content_key not in seen
+            if self._tap is not None:
+                keep = not content_key or content_key not in seen
             if content_key and content_key not in seen:
                 seen.add(content_key)
                 deduped.append(r)
