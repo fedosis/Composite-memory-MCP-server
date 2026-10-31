@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from storage.models.http_request import HttpRequestJournalORM
 from storage.models.receipt import MemoryReceiptORM
 from storage.outbox import OutboxEntryORM
@@ -218,6 +219,50 @@ async def test_concurrent_ten_single_effect(provider):
     assert await counts(provider) == (1, 1, 1, 1)
     await uow.run(context, cmd, _RememberHandler(provider, context))
     assert MUTATION_REPLY.get().replayed is True
+
+
+async def test_journal_unique_scope_backstop(provider):
+    # Backstop control: writer serialization + re-read are the primary protection
+    # (test_concurrent_ten_single_effect above), so exercise the repo/constraint, not HTTP.
+    first = provider._session_factory()
+    second = provider._session_factory()
+    try:
+        first_repo = HttpRequestRepository(first)
+        second_repo = HttpRequestRepository(second)
+        assert await first_repo.find("subject", "p1", "memories.create", "k") is None
+        assert await second_repo.find("subject", "p1", "memories.create", "k") is None
+        now = datetime(2026, 1, 1)
+        fields = {
+            "subject": "subject",
+            "profile_id": "p1",
+            "operation": "memories.create",
+            "idem_key": "k",
+            "digest": "a" * 64,
+            "response_snapshot": "{}",
+            "result_refs": "[]",
+            "audit_ticket_id": None,
+            "pending_publication": 0,
+            "created_at": now,
+            "expires_at": now + timedelta(days=1),
+        }
+        await first_repo.add(**fields, request_id="r-1")
+        await first.commit()
+        await second_repo.add(**fields, request_id="r-2")
+        with pytest.raises(IntegrityError) as caught:
+            await second.flush()
+        assert "http_request_journal" in str(caught.value.orig)
+        assert "UNIQUE constraint failed" in str(caught.value.orig)
+    finally:
+        try:
+            await first.rollback()
+        finally:
+            try:
+                await first.close()
+            finally:
+                try:
+                    await second.rollback()
+                finally:
+                    await second.close()
 
 
 async def test_same_key_different_payload_conflict(provider):
