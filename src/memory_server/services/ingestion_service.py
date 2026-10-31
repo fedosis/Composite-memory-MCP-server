@@ -272,6 +272,17 @@ async def reinforce_belief_item(
     return fresh_belief, fresh_receipt
 
 
+def _validate_remember_inputs(subject, predicate, object, confidence) -> None:
+    if not subject:
+        raise ValueError("'subject' is required and cannot be empty")
+    if not predicate:
+        raise ValueError("'predicate' is required and cannot be empty")
+    if not object:
+        raise ValueError("'object' is required and cannot be empty")
+    if confidence < 0.0 or confidence > 1.0:
+        raise ValueError(f"'confidence' must be between 0.0 and 1.0, got {confidence}")
+
+
 class MemoryIngestionService:
     """Transactional service for memory ingestion (remember + learn).
 
@@ -329,123 +340,128 @@ class MemoryIngestionService:
             ValueError: If subject, predicate, or object are empty, or
                         confidence is outside [0, 1].
         """
-        if not subject:
-            raise ValueError("'subject' is required and cannot be empty")
-        if not predicate:
-            raise ValueError("'predicate' is required and cannot be empty")
-        if not object:
-            raise ValueError("'object' is required and cannot be empty")
-        if confidence < 0.0 or confidence > 1.0:
-            raise ValueError(
-                f"'confidence' must be between 0.0 and 1.0, got {confidence}"
-            )
-
+        _validate_remember_inputs(subject, predicate, object, confidence)
         async with self._session_factory() as session:
             async with session.begin():
-                now = datetime.now(timezone.utc)
-                fact_id = str(uuid4())
-
-                fact_repo = FactRepository(session)
-                existing = await fact_repo.find_existing(subject, predicate, object)
-                if existing is not None:
-                    stored_fact, stored_receipt = await reinforce_memory_item(
-                        session,
-                        memory_type="fact",
-                        item_id=existing.id,
-                        new_confidence=confidence,
-                        source=source,
-                        previous_confidence=existing.confidence,
-                    )
-                    return {"receipt": stored_receipt, "fact": stored_fact}
-
-                # Create fact. The savepoint makes a concurrent duplicate
-                # recoverable without aborting the caller's outer UoW.
-                fact = Fact(
-                    id=fact_id,
+                return await self.remember_in_session(
+                    session,
                     subject=subject,
                     predicate=predicate,
                     object=object,
-                    dedup_key=fact_dedup_key(subject, predicate, object),
                     confidence=confidence,
                     source=source,
-                    created_at=now,
-                )
-                try:
-                    async with session.begin_nested():
-                        stored_fact = await fact_repo.create(fact)
-                except IntegrityError:
-                    keeper = await fact_repo.find_existing(subject, predicate, object)
-                    if keeper is None:
-                        raise
-                    stored_fact, stored_receipt = await reinforce_memory_item(
-                        session,
-                        memory_type="fact",
-                        item_id=keeper.id,
-                        new_confidence=confidence,
-                        source=source,
-                        previous_confidence=keeper.confidence,
-                    )
-                    return {"receipt": stored_receipt, "fact": stored_fact}
-
-                # Create receipt
-                receipt_history: list[dict[str, Any]] = []
-                if metadata:
-                    receipt_history.append(
-                        {"metadata": metadata, "timestamp": now.isoformat()}
-                    )
-                receipt = MemoryReceipt(
-                    id=fact_id,
-                    memory_type="fact",
-                    source=source,
-                    created_by="user",
-                    timestamp=now,
-                    confidence=confidence,
-                    verification_status=VerificationStatus.CANDIDATE,
-                    history=receipt_history,
-                )
-                receipt_repo = ReceiptRepository(session)
-                stored_receipt = await receipt_repo.create(receipt)
-
-                relation_entries: list[dict[str, Any]] = []
-                evidence_metadata = metadata.get("evidence") if metadata else None
-                derived_from = (
-                    evidence_metadata.get("derived_from")
-                    if isinstance(evidence_metadata, dict)
-                    else None
-                )
-                if derived_from:
-                    relation_entries = [
-                        {
-                            "source_id": fact_id,
-                            "target_id": parent_id,
-                            "relation_type": "derived_from",
-                        }
-                        for parent_id in derived_from
-                    ]
-                    relation_repo = RelationRepository(session)
-                    for entry in relation_entries:
-                        await relation_repo.create(
-                            source_id=entry["source_id"],
-                            target_id=entry["target_id"],
-                            relation_type=entry["relation_type"],
-                        )
-
-                # Write outbox entry (same transaction!)
-                outbox_repo = OutboxRepository(session)
-                await outbox_repo.add_entry(
-                    record_type="fact",
-                    record_id=fact_id,
-                    operation="index_fact",
-                    payload={
-                        "subject": subject,
-                        "predicate": predicate,
-                        "object": object,
-                        "source": source,
-                    },
+                    metadata=metadata,
                 )
 
-            # Transaction committed here by session.begin() context manager
+    async def remember_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        subject: str,
+        predicate: str,
+        object: str,
+        confidence: float = 1.0,
+        source: str = "user",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict:
+        """Write using only the caller's session, without commit or external effects."""
+        _validate_remember_inputs(subject, predicate, object, confidence)
+        now = datetime.now(timezone.utc)
+        fact_id = str(uuid4())
+
+        fact_repo = FactRepository(session)
+        existing = await fact_repo.find_existing(subject, predicate, object)
+        if existing is not None:
+            stored_fact, stored_receipt = await reinforce_memory_item(
+                session,
+                memory_type="fact",
+                item_id=existing.id,
+                new_confidence=confidence,
+                source=source,
+                previous_confidence=existing.confidence,
+            )
             return {"receipt": stored_receipt, "fact": stored_fact}
+
+        # Create fact. The savepoint makes a concurrent duplicate
+        # recoverable without aborting the caller's outer UoW.
+        fact = Fact(
+            id=fact_id,
+            subject=subject,
+            predicate=predicate,
+            object=object,
+            dedup_key=fact_dedup_key(subject, predicate, object),
+            confidence=confidence,
+            source=source,
+            created_at=now,
+        )
+        try:
+            async with session.begin_nested():
+                stored_fact = await fact_repo.create(fact)
+        except IntegrityError:
+            keeper = await fact_repo.find_existing(subject, predicate, object)
+            if keeper is None:
+                raise
+            stored_fact, stored_receipt = await reinforce_memory_item(
+                session,
+                memory_type="fact",
+                item_id=keeper.id,
+                new_confidence=confidence,
+                source=source,
+                previous_confidence=keeper.confidence,
+            )
+            return {"receipt": stored_receipt, "fact": stored_fact}
+
+        # Create receipt
+        receipt_history: list[dict[str, Any]] = []
+        if metadata:
+            receipt_history.append({"metadata": metadata, "timestamp": now.isoformat()})
+        receipt = MemoryReceipt(
+            id=fact_id,
+            memory_type="fact",
+            source=source,
+            created_by="user",
+            timestamp=now,
+            confidence=confidence,
+            verification_status=VerificationStatus.CANDIDATE,
+            history=receipt_history,
+        )
+        receipt_repo = ReceiptRepository(session)
+        stored_receipt = await receipt_repo.create(receipt)
+
+        relation_entries: list[dict[str, Any]] = []
+        evidence_metadata = metadata.get("evidence") if metadata else None
+        derived_from = evidence_metadata.get("derived_from") if isinstance(evidence_metadata, dict) else None
+        if derived_from:
+            relation_entries = [
+                {
+                    "source_id": fact_id,
+                    "target_id": parent_id,
+                    "relation_type": "derived_from",
+                }
+                for parent_id in derived_from
+            ]
+            relation_repo = RelationRepository(session)
+            for entry in relation_entries:
+                await relation_repo.create(
+                    source_id=entry["source_id"],
+                    target_id=entry["target_id"],
+                    relation_type=entry["relation_type"],
+                )
+
+        # Write outbox entry (same transaction!)
+        outbox_repo = OutboxRepository(session)
+        await outbox_repo.add_entry(
+            record_type="fact",
+            record_id=fact_id,
+            operation="index_fact",
+            payload={
+                "subject": subject,
+                "predicate": predicate,
+                "object": object,
+                "source": source,
+            },
+        )
+        return {"receipt": stored_receipt, "fact": stored_fact}
 
     async def learn(
         self,

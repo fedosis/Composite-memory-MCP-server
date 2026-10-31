@@ -230,6 +230,27 @@ class MemoryService:
 
         return result
 
+    async def remember_in_session(self, session: Any, command: RememberCommand) -> dict[str, Any]:
+        """Use only the supplied session; caller owns commit and post-commit graph work."""
+        validate_remember_command(command)
+        receipt_metadata: dict[str, Any] = dict(command.metadata or {})
+        receipt_metadata = _normalize_evidence(receipt_metadata)
+        if command.admission is not None:
+            receipt_metadata["admission"] = command.admission.to_metadata()
+        service = MemoryIngestionService(
+            self._session_factory,
+            max_active_beliefs=self._policy.max_active_beliefs,
+        )
+        return await service.remember_in_session(
+            session,
+            subject=command.subject,
+            predicate=command.predicate,
+            object=command.object,
+            confidence=command.confidence,
+            source=command.source,
+            metadata=receipt_metadata or None,
+        )
+
     async def learn(self, command: LearnCommand) -> dict:
         """Extract and store facts/decisions/skills (+ beliefs) for one text.
 
