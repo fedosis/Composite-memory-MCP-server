@@ -14,6 +14,7 @@ from time import monotonic
 from typing import Awaitable, Callable, Mapping, Sequence, TypeVar
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from storage.outbox import OutboxDiagnosticRow, OutboxKey, OutboxRepository, classify_diagnostic_error
@@ -765,6 +766,14 @@ class DiagnosticsService:
             raise HttpError("E_PERMISSION_DENIED")
         permission = "profile.read" if command.operation in {"indexes.status", "overview"} else "audit.read"
         require_permission(ctx.principal, permission, profile_id=command.profile_id)
+        if command.operation == "reflect":
+            payload = command.payload
+            raw = payload.model_dump() if isinstance(payload, d.ReflectRequest) else payload
+            try:
+                request = d.ReflectRequest.model_validate(raw, strict=True)
+            except ValidationError:
+                raise HttpError("E_VALIDATION") from None
+            command = command.model_copy(update={"payload": request})
         if command.operation == "audit" and command.payload.cursor is not None:
             raise HttpError("E_CURSOR_INVALID")
         if command.operation == "outbox.list" and command.payload.cursor is not None:
@@ -803,12 +812,13 @@ class DiagnosticsService:
         pending = await repo.diagnostic_count(status="pending", work=work)
         failed = await repo.diagnostic_count(status="failed", work=work)
         vector_count = None
-        if resources.vector is not None and callable(getattr(resources.vector, "count_points", None)):
+        if resources.vector is not None:
             try:
-                vector_count = await resources.vector.count_points()
+                count_points = getattr(resources.vector, "count_points", None)
+                if not callable(count_points):
+                    raise HttpError("E_VECTOR_BACKEND")
+                vector_count = await count_points()
             except (DiagnosticsWorkExceeded, DiagnosticsDeadlineExceeded):
-                raise
-            except HttpError:
                 raise
             except Exception:
                 raise HttpError("E_VECTOR_BACKEND") from None
@@ -948,7 +958,12 @@ class DiagnosticsService:
                 ).items():
                     lifecycle[key] += value
             indexes = await self._indexes(resources, session, work, sampled, counts=counts)
-            revision = await resources.canonical.provider.diagnostics_schema_revision(session, work=work)
+            try:
+                revision = await resources.canonical.provider.diagnostics_schema_revision(session, work=work)
+            except ValueError as error:
+                if str(error) != "ambiguous schema revision":
+                    raise
+                revision = None
             unresolved = await resources.canonical.provider.diagnostics_unresolved_conflict_count(session, work=work)
             return map_overview(
                 resources,
