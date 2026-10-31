@@ -111,6 +111,8 @@ def _command(mode="hybrid", trace=True):
 
 
 def _identity(result):
+    if isinstance(result, Exception):
+        return ("error", type(result).__name__)
     return [(h.memory.id, h.source, h.score, h.rank) for h in result.results], result.degraded
 
 
@@ -148,8 +150,13 @@ async def test_observer_on_off_identity_keyword_and_hybrid(gateway):
     for mode in ("keyword", "hybrid"):
         plain = await base.execute(ctx, _command(mode, False))
         assert plain.results
-        for store in (module.InMemoryTracePort(), HostilePort()):
-            traced = await _port(base, store).execute(ctx, _command(mode))
+        for store in (HostilePort(), module.InMemoryTracePort()):
+            try:
+                traced = await _port(base, store).execute(ctx, _command(mode))
+            except Exception as exc:
+                # Success vs observer-induced failure is an identity violation,
+                # not an unrelated failure before the comparison is reached.
+                traced = exc
             assert _identity(traced) == _identity(plain)
             observer = store.observers[-1]
             assert observer.final_items and observer.merge
@@ -283,6 +290,5 @@ async def test_trace_id_only_when_requested(gateway, tmp_path):
     assert after == before
     for path, dump in after.items():
         print("NO_WRITE_AFTER", path, hashlib.sha256("\n".join(dump).encode()).hexdigest())
-    with pytest.raises(HttpError) as error:
-        await base.execute(ctx, _command())
-    assert error.value.code == "E_CAPABILITY_UNAVAILABLE"
+    result = await base.execute(ctx, _command())
+    assert result.trace_id is not None

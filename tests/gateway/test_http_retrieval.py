@@ -1,4 +1,4 @@
-"""S08a TCP regression tests added before implementation."""
+"""S08a TCP regression tests plus S11B trace preflight coverage."""
 
 from __future__ import annotations
 
@@ -1205,12 +1205,6 @@ async def test_s08b_filter_and_trace_rejections_remain_prelease(tmp_path, simila
             {
                 "query": "alpha owns beta",
                 "mode": "semantic",
-                "trace": True,
-                "filters": {"source": None, "min_confidence": None},
-            },
-            {
-                "query": "alpha owns beta",
-                "mode": "semantic",
                 "filters": {"source": "forbidden", "min_confidence": None},
             },
             {
@@ -1220,9 +1214,19 @@ async def test_s08b_filter_and_trace_rejections_remain_prelease(tmp_path, simila
             },
         ):
             status, body = await post(port, auth, **payload)
-            assert status in {422, 503}
-            assert body["error"]["code"] in {"E_VALIDATION", "E_CAPABILITY_UNAVAILABLE"}
-        assert calls == []
+            assert status == 422 and body["error"]["code"] == "E_VALIDATION"
+            assert calls == []
+        status, body = await post(
+            port,
+            auth,
+            query="alpha owns beta",
+            mode="semantic",
+            trace=True,
+            filters={"source": None, "min_confidence": None},
+        )
+        assert status == 200, body
+        assert body["trace_id"] is not None
+        assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1655,15 +1659,11 @@ async def test_preflight_audit_modes_and_canaries(tmp_path, caplog, monkeypatch)
                 ("context", {"trace": True}),
             ):
                 status, body = await post(port, auth, operation=operation, profile=profile, **change)
-                if change.get("trace"):
-                    assert status == 503 and body["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
-                else:
-                    assert status == 200, body
-        assert len(calls) == 4
-        # Validation and trace rejection still precede audit and lease.
+                assert status == 200, body
+        assert len(calls) == 8
         with sqlite3.connect(tmp_path / "control" / "http-access" / "access.sqlite") as db:
             rows = db.execute("SELECT operation,state FROM access_audit ORDER BY rowid").fetchall()
-        assert len(rows) == 4 and all(state == "terminal" for _, state in rows)
+        assert len(rows) == 8 and all(state == "terminal" for _, state in rows)
         status, keyword = await post(port, auth, query="alpha")
         status2, hybrid = await post(port, auth, query="alpha", mode="hybrid")
         assert status == status2 == 200

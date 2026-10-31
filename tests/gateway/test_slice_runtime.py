@@ -331,8 +331,7 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
 
         async def search(profile, payload):
             eligible = not (
-                payload.get("trace")
-                or any(payload.get("filters", {}).get(f) for f in ("tags",))
+                any(payload.get("filters", {}).get(f) for f in ("tags",))
                 or payload.get("filters", {}).get("source") is not None
             )
             return await checked(
@@ -367,7 +366,7 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
             status, result = await search("alpha", {**base, "mode": mode})
             assert status == 200 and result["degraded"] == [], result
         status, result = await search("alpha", {**base, "trace": True})
-        assert status == 503 and result["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
+        assert status == 200 and result["trace_id"] is not None
         status, result = await search("alpha", {**base, "filters": {**base["filters"], "memory_types": ["fact"]}})
         assert status == 200 and result["total"] == 1
         status, result = await search("alpha", {**base, "filters": {**base["filters"], "lifecycle_states": ["active"]}})
@@ -485,9 +484,7 @@ async def test_slice_search_mode_filter_trace_and_profile_isolation(tmp_path, mo
             payload={**base, "query": "common-marker", "mode": "keyword"},
         )
         assert status == 200 and all(h["memory"]["masked"] for h in result["results"])
-        status, result = await checked(
-            "GET", "/api/v1/profiles/alpha/lookup?kind=trace&id=absent-trace", "lookup"
-        )
+        status, result = await checked("GET", "/api/v1/profiles/alpha/lookup?kind=trace&id=absent-trace", "lookup")
         assert status == 503 and result["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
         status, result = await search("alpha", {**base, "query": "SLICE_CANARY_QUERY", "mode": "keyword"})
         assert status == 200 and result["total"] == 0
@@ -637,11 +634,27 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
         from memory_server.transports.http.app import create_http_app
 
         expected = {
-            "memories.list", "memories.get", "receipts.get", "history.list",
-            "lookup", "memories.reveal", "search", "context",
-            "relations.for_memory", "relations.list", "relations.get",
-            "graph.neighborhood", "graph.path", "graph.entity",
-            "audit", "indexes.status", "outbox.list", "overview", "reflect",
+            "memories.list",
+            "memories.get",
+            "receipts.get",
+            "history.list",
+            "lookup",
+            "memories.reveal",
+            "search",
+            "context",
+            "relations.for_memory",
+            "relations.list",
+            "relations.get",
+            "graph.neighborhood",
+            "graph.path",
+            "graph.entity",
+            "audit",
+            "indexes.status",
+            "outbox.list",
+            "overview",
+            "reflect",
+            "traces.get",
+            "traces.list",
         }
         assert set(deps.ports) == expected
         assert {spec.operation for spec in read_routes} == expected
@@ -728,8 +741,23 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
 
 @pytest.mark.parametrize(
     "kind",
-    ["plain-search", "search-as-read", "context", "method", "path", "permission", "duplicate", "foreign", "object",
-     "context-parser", "search-parser", "context-result", "search-result", "plain-context", "context-as-search"],
+    [
+        "plain-search",
+        "search-as-read",
+        "context",
+        "method",
+        "path",
+        "permission",
+        "duplicate",
+        "foreign",
+        "object",
+        "context-parser",
+        "search-parser",
+        "context-result",
+        "search-result",
+        "plain-context",
+        "context-as-search",
+    ],
 )
 def test_slice_mount_catalogue_rejects_substitution(shell, kind):
     from memory_server.transports.http.app import create_http_app
