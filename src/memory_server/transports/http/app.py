@@ -21,6 +21,7 @@ from .limits import read_body, validate_config
 from .routes import S06_ROUTE_SPECS, ProfilePort
 from .routes.diagnostics import DIAGNOSTICS_ROUTE_SPECS, DiagnosticsRouteSpec, OutboxCursorCodec
 from .routes.graph import GRAPH_READ_ROUTE_SPECS, GraphReadRouteSpec, RelationCursorCodec
+from .routes.ingestion import INGESTION_ROUTE_SPECS, MutationRouteSpec
 from .routes.profiles import validate_profile_id
 from .routes.retrieval import RETRIEVAL_ROUTE_SPECS, RetrievalRouteSpec
 from .routes.traces import TRACE_ROUTE_SPECS, TraceCursorCodec, TraceRouteSpec
@@ -36,6 +37,7 @@ class HttpApp:
         publish=None,
         saturation=None,
         read_routes: tuple[ReadRouteSpec, ...] = (),
+        mutation_routes: tuple[MutationRouteSpec, ...] = (),
     ):
         validate_config(config)  # F4: exactly once on the received object.
         self.config = config
@@ -47,6 +49,7 @@ class HttpApp:
         self._idle = asyncio.Event()
         self._idle.set()
         self.read_routes = tuple(read_routes)
+        self.mutation_routes = tuple(mutation_routes)
         self.routes = []
         # Check the projection against the frozen executable catalogue.
         for spec in S06_ROUTE_SPECS:
@@ -122,10 +125,34 @@ class HttpApp:
             if (
                 row is None
                 or not owner_matches
-                or any(route.name == spec.operation or route.path == spec.path for route in self.routes)
+                or any(
+                    route.name == spec.operation
+                    or (route.path == spec.path and route.spec.method == spec.method)
+                    for route in self.routes
+                )
                 or (spec.method, spec.path, spec.permission) != (row.method, row.route, row.permission)
             ):
                 raise ValueError("read route specification does not match catalogue")
+            route = Route(row.route, self.endpoint, methods=[row.method], name=row.operation)
+            route.permission, route.spec = row.permission, spec
+            self.routes.append(route)
+        for spec in self.mutation_routes:
+            row = CATALOG.by_operation.get(spec.operation)
+            canonical = INGESTION_ROUTE_SPECS.get(spec.operation)
+            if (
+                not isinstance(spec, MutationRouteSpec)
+                or row is None
+                or row.owner != "S13"
+                or row.mutation is not True
+                or spec is not canonical
+                or (spec.method, spec.path, spec.permission) != (row.method, row.route, row.permission)
+                or any(
+                    route.name == spec.operation
+                    or (route.path == spec.path and route.spec.method == spec.method)
+                    for route in self.routes
+                )
+            ):
+                raise ValueError("mutation route specification does not match catalogue")
             route = Route(row.route, self.endpoint, methods=[row.method], name=row.operation)
             route.permission, route.spec = row.permission, spec
             self.routes.append(route)
@@ -135,6 +162,10 @@ class HttpApp:
         state = request.scope["s06"]
         if isinstance(state["spec"], ReadRouteSpec):
             return await self.guard.execute_read(
+                request, state["spec"], state["body"], state["request_id"], state["deadline"]
+            )
+        if isinstance(state["spec"], MutationRouteSpec):
+            return await self.guard.execute(
                 request, state["spec"], state["body"], state["request_id"], state["deadline"]
             )
         return await self.guard.execute(request, state["spec"], state["body"], state["request_id"], state["deadline"])
@@ -230,24 +261,31 @@ class HttpApp:
             raw = scope.get("raw_path", scope["path"].encode()).split(b"?", 1)[0]
             if raw.startswith(b"/api/v1/profiles/") and (b"%" in raw or b"\x00" in raw):
                 raise HttpError("E_VALIDATION")
-            selected = None
+            matches = []
             for route in self.routes:
                 match = route.path_regex.fullmatch(scope["path"])
                 if match:
-                    selected = route
-                    scope["path_params"] = match.groupdict()
-                    break
-            if selected is None:
+                    matches.append((route, match.groupdict()))
+            if not matches:
                 raise HttpError("E_NOT_FOUND")
+            method = scope["method"]
+            selected, path_params = matches[0]
+            wanted = "GET" if method == "HEAD" else method
+            if method != "OPTIONS":
+                selected, path_params = next(
+                    ((route, params) for route, params in matches if route.spec.method == wanted),
+                    matches[0],
+                )
+            scope["path_params"] = path_params
             spec = selected.spec
             profile = scope.get("path_params", {}).get("profile")
             if profile is not None:
                 validate_profile_id(profile)
-            method = scope["method"]
             if method == "OPTIONS":
                 response = Response(status_code=204)
                 if origin in self.config.allowed_origins:
-                    response.headers["Access-Control-Allow-Methods"] = spec.method + ", HEAD, OPTIONS"
+                    methods = list(dict.fromkeys(route.spec.method for route, _ in matches))
+                    response.headers["Access-Control-Allow-Methods"] = ", ".join([*methods, "HEAD", "OPTIONS"])
                     response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Idempotency-Key"
             elif method != spec.method and not (method == "HEAD" and spec.method == "GET"):
                 raise HttpError("E_METHOD_NOT_ALLOWED")
@@ -305,10 +343,25 @@ class HttpApp:
 
 
 def create_http_app(
-    config, dependencies, *, denial=None, publish=None, saturation=None, read_routes: tuple[ReadRouteSpec, ...] = ()
+    config,
+    dependencies,
+    *,
+    denial=None,
+    publish=None,
+    saturation=None,
+    read_routes: tuple[ReadRouteSpec, ...] = (),
+    mutation_routes: tuple[MutationRouteSpec, ...] = (),
 ):
     """Build without opening profiles; missing operation ports stay unavailable."""
-    return HttpApp(config, dependencies, denial=denial, publish=publish, saturation=saturation, read_routes=read_routes)
+    return HttpApp(
+        config,
+        dependencies,
+        denial=denial,
+        publish=publish,
+        saturation=saturation,
+        read_routes=read_routes,
+        mutation_routes=mutation_routes,
+    )
 
 
 def with_profile_ports(app, *, pending_control=None):

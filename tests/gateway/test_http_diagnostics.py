@@ -105,13 +105,15 @@ async def shell(tmp_path):
 
 @pytest.fixture
 async def diagnostic_http(shell):
-    from memory_server.runtime.read_composition import compose_read_ports
+    from memory_server.runtime.read_composition import compose_ingestion_ports, compose_read_ports
     from memory_server.transports.http.app import create_http_app
 
     deps, specs = compose_read_ports(shell.deps, shell.config)
-    shell.app = create_http_app(shell.config, deps, read_routes=specs)
+    deps, mutation_specs = compose_ingestion_ports(deps, shell.config)
+    shell.app = create_http_app(shell.config, deps, read_routes=specs, mutation_routes=mutation_specs)
     shell.bearer, _ = shell.mint(permissions=("profile.read", "audit.read"))
     shell.specs = specs
+    shell.mutation_specs = mutation_specs
     try:
         yield shell
     finally:
@@ -283,7 +285,12 @@ async def test_s10_five_routes_mount_and_permissions(diagnostic_http, monkeypatc
         assert rows(shell) == before
         ports = dict(shell.app.dependencies.ports)
         del ports[op]
-        missing = create_http_app(shell.config, replace(shell.app.dependencies, ports=ports), read_routes=shell.specs)
+        missing = create_http_app(
+            shell.config,
+            replace(shell.app.dependencies, ports=ports),
+            read_routes=shell.specs,
+            mutation_routes=shell.mutation_specs,
+        )
         with monkeypatch.context() as m:
 
             async def forbidden(*a, **k):
@@ -303,6 +310,8 @@ async def test_s10_five_routes_mount_and_permissions(diagnostic_http, monkeypatc
             code(result, "E_CAPABILITY_UNAVAILABLE", 503)
         await missing.close()
     assert len(shell.specs) == 21
+    assert len(shell.mutation_specs) == 1
+    assert len(shell.specs) + len(shell.mutation_specs) == 22
     code(await _http(shell, "unknown"), "E_NOT_FOUND", 404)
 
 

@@ -630,10 +630,10 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
     )
     holder = SimpleNamespace(server=None, app=None)
 
-    def app_factory(config, deps, *, read_routes):
+    def app_factory(config, deps, *, read_routes, mutation_routes=()):
         from memory_server.transports.http.app import create_http_app
 
-        expected = {
+        read_operations = {
             "memories.list",
             "memories.get",
             "receipts.get",
@@ -656,11 +656,17 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
             "traces.get",
             "traces.list",
         }
-        assert set(deps.ports) == expected
-        assert {spec.operation for spec in read_routes} == expected
+        assert set(deps.ports) == read_operations | {"memories.create"}
+        assert {spec.operation for spec in read_routes} == read_operations
+        assert {spec.operation for spec in mutation_routes} == {"memories.create"}
         missing = dict(deps.ports)
         del missing[operation]
-        return create_http_app(config, replace(deps, ports=missing), read_routes=read_routes)
+        return create_http_app(
+            config,
+            replace(deps, ports=missing),
+            read_routes=read_routes,
+            mutation_routes=mutation_routes,
+        )
 
     def factory(server_config):
         holder.server = SocketServer(server_config)

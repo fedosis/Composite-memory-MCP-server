@@ -14,11 +14,13 @@ from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from memory_server.application.mutation_uow import MUTATION_REPLY
 from memory_server.control.policy import bearer_from_headers, require_permission
 from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.ports import AuditOutcome, Principal, RequestContext
 
 from .errors import HttpError, error_code, error_response
+from .routes.ingestion import MutationRouteSpec
 from .routes.profiles import audit_ticket, control_pending, control_reply, validate_profile_id, validate_query
 
 
@@ -113,6 +115,21 @@ class Guard:
             if body or request.query_params:
                 raise HttpError('E_VALIDATION')
             payload = d.Empty()
+        elif isinstance(spec, MutationRouteSpec):
+            if request.query_params:
+                raise HttpError('E_VALIDATION')
+            if request.headers.get('content-type', '').split(';')[0].strip().lower() != 'application/json':
+                raise HttpError('E_UNSUPPORTED_MEDIA_TYPE')
+            keys = request.headers.getlist('idempotency-key')
+            if not keys:
+                raise HttpError('E_IDEMPOTENCY_REQUIRED')
+            if len(keys) != 1:
+                raise HttpError('E_VALIDATION')
+            try:
+                idem = UUID(keys[0])
+            except ValueError:
+                raise HttpError('E_VALIDATION') from None
+            command = spec.parse(body, profile)
         else:
             if request.query_params:
                 raise HttpError('E_VALIDATION')
@@ -134,7 +151,7 @@ class Guard:
                        for item in exc.errors()):
                     raise HttpError('E_PRECONDITION_REQUIRED') from None
                 raise HttpError('E_VALIDATION') from None
-        if not isinstance(spec, ReadRouteSpec):
+        if not isinstance(spec, (ReadRouteSpec, MutationRouteSpec)):
             command = d.COMMAND_TYPES[spec.operation](
                 operation=spec.operation, profile_id=profile, path_ids={}, payload=payload)
         port = self.dependencies.ports.get(spec.operation)
@@ -154,6 +171,7 @@ class Guard:
         bound = audit_ticket.set(ticket)
         reply_token = control_reply.set(None)
         pending_token = control_pending.set(False)
+        mutation_token = MUTATION_REPLY.set(None)
         started = monotonic()
         response, code = None, None
         cancelled = False
@@ -162,17 +180,26 @@ class Guard:
             # Validate injected DTOs as well; only closed typed success shapes.
             if isinstance(spec, ReadRouteSpec):
                 result = spec.validate_result(result)
+                response = JSONResponse(result.model_dump(mode='json'))
+            elif isinstance(spec, MutationRouteSpec):
+                response = JSONResponse(result.model_dump(mode='json'), status_code=spec.status(result))
+                mutation = MUTATION_REPLY.get()
+                if mutation is not None and mutation.replayed:
+                    response.headers['Idempotency-Replayed'] = 'true'
+                    response.headers['X-Original-Request-ID'] = mutation.original_request_id
             elif spec.operation == 'profiles.list':
                 result = d.Page[d.Profile].model_validate(result.model_dump())
                 result = result.model_copy(update={'items': [p.model_copy(update={'storage_root': None})
                                                             for p in result.items]})
+                response = JSONResponse(result.model_dump(mode='json'))
             else:
                 result = d.Profile.model_validate(result.model_dump()).model_copy(update={'storage_root': None})
-            response = JSONResponse(result.model_dump(mode='json'))
-            reply = control_reply.get()
-            if reply is not None and reply.replayed:
-                response.headers['Idempotency-Replayed'] = 'true'
-                response.headers['X-Original-Request-ID'] = reply.original_request_id
+                response = JSONResponse(result.model_dump(mode='json'))
+            if not isinstance(spec, (ReadRouteSpec, MutationRouteSpec)):
+                reply = control_reply.get()
+                if reply is not None and reply.replayed:
+                    response.headers['Idempotency-Replayed'] = 'true'
+                    response.headers['X-Original-Request-ID'] = reply.original_request_id
         except asyncio.CancelledError:
             code, cancelled = 'E_TIMEOUT', True
             response = error_response(code, request_id)
@@ -183,7 +210,12 @@ class Guard:
             # Registry.control owns publication of the original durable ticket.
             # A replay still terminates this request's independently admitted intent.
             reply = control_reply.get()
-            journal_owned = control_pending.get() or (reply is not None and not reply.replayed)
+            mutation_owned = (
+                isinstance(spec, MutationRouteSpec)
+                and response is not None
+                and 200 <= response.status_code < 300
+            )
+            journal_owned = control_pending.get() or (reply is not None and not reply.replayed) or mutation_owned
             try:
                 if not journal_owned:
                     await asyncio.shield(self.dependencies.access.finish(
@@ -196,6 +228,7 @@ class Guard:
                 audit_ticket.reset(bound)
                 control_reply.reset(reply_token)
                 control_pending.reset(pending_token)
+                MUTATION_REPLY.reset(mutation_token)
         self.dependencies.metrics.http_completed(ctx, spec.operation, response.status_code, monotonic() - started)
         if cancelled:
             raise asyncio.CancelledError

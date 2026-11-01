@@ -130,10 +130,11 @@ async def run_daemon(config, registry_path, profiles_root=None, *, factory=None,
 
             deps = GatewayDependencies(registry, tokens, access, BoundedMetricsSink(observer.profiles), {},
                                        leases=daemon_owner, readiness=readiness)
-            from memory_server.runtime.read_composition import compose_read_ports
+            from memory_server.runtime.read_composition import compose_ingestion_ports, compose_read_ports
 
             deps, specs = compose_read_ports(deps, config)
-            app = with_profile_ports(factory(config, deps, read_routes=specs),
+            deps, mutation_specs = compose_ingestion_ports(deps, config)
+            app = with_profile_ports(factory(config, deps, read_routes=specs, mutation_routes=mutation_specs),
                                      pending_control=bind_control_pending(registry, store))
             managed_signals = server_factory is None
             if managed_signals:
