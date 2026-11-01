@@ -79,7 +79,9 @@ async def _cas_transition(
         raise LifecycleConflictError(
             f"expected_version mismatch for {memory_id}: expected {expected_version}",
             memory_id=memory_id, expected=expected_version,
-            actual=normalize_version(observed.version) if observed is not None else None,
+            actual=normalize_version(observed.version) if observed is not None and (
+                observed.version != row.version or observed.lifecycle_state != row.lifecycle_state
+            ) else None,
         )
     orm = await session.get(model, memory_id, populate_existing=True)
     return orm.to_pydantic()

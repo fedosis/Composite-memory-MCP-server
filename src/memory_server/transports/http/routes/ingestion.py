@@ -1,5 +1,5 @@
-# ruff: noqa: E501
-"""Canonical S14 lifecycle mutation route descriptors."""
+"""Canonical S13 mutation route descriptors."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
@@ -27,17 +27,20 @@ class MutationRouteSpec:
 
 
 def _parse_remember(request: Request, body: bytes, profile_id: str) -> d.Command:
-    del request
     entry = CATALOG.by_operation["memories.create"]
     try:
         payload = entry.request_type.model_validate_json(body)
     except ValidationError:
         raise HttpError("E_VALIDATION") from None
-    return d.COMMAND_TYPES["memories.create"](operation="memories.create", profile_id=profile_id, path_ids={}, payload=payload)
+    return d.COMMAND_TYPES["memories.create"](
+        operation="memories.create",
+        profile_id=profile_id,
+        path_ids={},
+        payload=payload,
+    )
 
 
 def _parse_learn(request: Request, body: bytes, profile_id: str) -> d.Command:
-    del request
     entry = CATALOG.by_operation["learn"]
     try:
         payload = entry.request_type.model_validate_json(body)
@@ -46,10 +49,21 @@ def _parse_learn(request: Request, body: bytes, profile_id: str) -> d.Command:
     return d.COMMAND_TYPES["learn"](operation="learn", profile_id=profile_id, path_ids={}, payload=payload)
 
 
-INGESTION_ROUTE_SPECS: Mapping[str, MutationRouteSpec] = MappingProxyType({
-    "memories.create": MutationRouteSpec("memories.create", "POST", "/api/v1/profiles/{profile}/memories", "memory.write", _parse_remember, write_status),
-    "learn": MutationRouteSpec("learn", "POST", "/api/v1/profiles/{profile}/learn", "memory.write", _parse_learn, write_status),
-})
+INGESTION_ROUTE_SPECS: Mapping[str, MutationRouteSpec] = MappingProxyType(
+    {
+        "memories.create": MutationRouteSpec(
+            "memories.create",
+            "POST",
+            "/api/v1/profiles/{profile}/memories",
+            "memory.write",
+            _parse_remember,
+            write_status,
+        ),
+        "learn": MutationRouteSpec(
+            "learn", "POST", "/api/v1/profiles/{profile}/learn", "memory.write", _parse_learn, write_status,
+        ),
+    }
+)
 
 
 def create_ingestion_routes() -> tuple[MutationRouteSpec, ...]:

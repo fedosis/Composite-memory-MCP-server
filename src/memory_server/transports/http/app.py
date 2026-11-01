@@ -1,4 +1,3 @@
-# ruff: noqa: E501
 """Six-route ASGI shell; all requests cross the same closed guard stack."""
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ from .routes.diagnostics import DIAGNOSTICS_ROUTE_SPECS, DiagnosticsRouteSpec, O
 from .routes.graph import GRAPH_READ_ROUTE_SPECS, GraphReadRouteSpec, RelationCursorCodec
 from .routes.ingestion import INGESTION_ROUTE_SPECS, MutationRouteSpec
 from .routes.lifecycle import LIFECYCLE_ROUTE_SPECS
-from .routes.lifecycle import MutationRouteSpec as LifecycleMutationRouteSpec
 from .routes.profiles import validate_profile_id
 from .routes.retrieval import RETRIEVAL_ROUTE_SPECS, RetrievalRouteSpec
 from .routes.traces import TRACE_ROUTE_SPECS, TraceCursorCodec, TraceRouteSpec
@@ -141,23 +139,20 @@ class HttpApp:
             self.routes.append(route)
         for spec in self.mutation_routes:
             row = CATALOG.by_operation.get(spec.operation)
-            canonical = INGESTION_ROUTE_SPECS.get(spec.operation)
-            if isinstance(spec, LifecycleMutationRouteSpec):
-                canonical = LIFECYCLE_ROUTE_SPECS.get(spec.operation)
-                valid = (
-                    row is not None and row.owner == "S14" and row.mutation is True
-                    and spec is canonical
-                    and (spec.method, spec.path, spec.permission) == (row.method, row.route, row.permission)
-                )
+            if spec.operation in INGESTION_ROUTE_SPECS:
+                canonical, owner = INGESTION_ROUTE_SPECS[spec.operation], "S13"
+            elif spec.operation in LIFECYCLE_ROUTE_SPECS:
+                canonical, owner = LIFECYCLE_ROUTE_SPECS[spec.operation], "S14"
             else:
-                valid = (
-                    isinstance(spec, MutationRouteSpec)
-                    and row is not None and row.owner == "S13" and row.mutation is True
-                    and spec is canonical
-                    and (spec.method, spec.path, spec.permission) == (row.method, row.route, row.permission)
-                )
+                canonical, owner = None, None
             if (
-                not valid
+                not isinstance(spec, MutationRouteSpec)
+                or row is None
+                or owner is None
+                or row.owner != owner
+                or row.mutation is not True
+                or spec is not canonical
+                or (spec.method, spec.path, spec.permission) != (row.method, row.route, row.permission)
                 or any(
                     route.name == spec.operation
                     or (route.path == spec.path and route.spec.method == spec.method)
@@ -176,7 +171,7 @@ class HttpApp:
             return await self.guard.execute_read(
                 request, state["spec"], state["body"], state["request_id"], state["deadline"]
             )
-        if isinstance(state["spec"], (MutationRouteSpec, LifecycleMutationRouteSpec)):
+        if isinstance(state["spec"], MutationRouteSpec):
             return await self.guard.execute(
                 request, state["spec"], state["body"], state["request_id"], state["deadline"]
             )
@@ -298,7 +293,9 @@ class HttpApp:
                 if origin in self.config.allowed_origins:
                     methods = list(dict.fromkeys(route.spec.method for route, _ in matches))
                     response.headers["Access-Control-Allow-Methods"] = ", ".join([*methods, "HEAD", "OPTIONS"])
-                    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Idempotency-Key, If-Match"
+                    response.headers["Access-Control-Allow-Headers"] = (
+                        "Authorization, Content-Type, Idempotency-Key, If-Match"
+                    )
             elif method != spec.method and not (method == "HEAD" and spec.method == "GET"):
                 raise HttpError("E_METHOD_NOT_ALLOWED")
             elif spec.permission == "PUBLIC":
