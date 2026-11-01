@@ -164,15 +164,30 @@ async def test_query_and_non_json_rejected_before_audit(harness):
     assert harness.access.intents == []
 
 
+def test_remember_handler_has_no_unused_clock_dependency():
+    import inspect
+
+    from memory_server.application.remote_ingestion import RememberHandler
+
+    assert "clock" not in inspect.signature(RememberHandler).parameters
+
+
 def test_no_s04_implementation_imports():
     import ast
     from pathlib import Path
 
-    for name in ("test_http_ingestion.py", "test_remote_admission.py"):
-        tree = ast.parse((Path(__file__).with_name(name)).read_text())
+    root = Path(__file__).resolve().parents[2]
+    for name in (
+        "src/memory_server/application/remote_ingestion.py",
+        "src/memory_server/transports/http/routes/ingestion.py",
+    ):
+        tree = ast.parse((root / name).read_text())
         modules = {
             node.module
             for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom) and node.module is not None
         }
-        assert not any(module.startswith("memory_server.runtime.daemon") for module in modules)
+        modules.update(
+            alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+        )
+        assert not any(module.startswith("memory_server.runtime.daemon") for module in modules), name

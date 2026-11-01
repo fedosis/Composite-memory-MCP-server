@@ -207,13 +207,15 @@ class Guard:
             code = error_code(exc)
             response = error_response(exc if isinstance(exc, HttpError) else code, request_id)
         finally:
-            # Registry.control owns publication of the original durable ticket.
-            # A replay still terminates this request's independently admitted intent.
+            # Fresh mutation/control success owns durable-ticket publication.
+            # Guard finishes the current intent on replay or non-2xx/exception.
             reply = control_reply.get()
+            mutation = MUTATION_REPLY.get()
             mutation_owned = (
                 isinstance(spec, MutationRouteSpec)
                 and response is not None
                 and 200 <= response.status_code < 300
+                and not (mutation is not None and mutation.replayed)
             )
             journal_owned = control_pending.get() or (reply is not None and not reply.replayed) or mutation_owned
             try:

@@ -137,11 +137,10 @@ def _admission_dto(decision: AdmissionDecision) -> d.AdmissionResult:
 class RememberHandler:
     """Mutation handler that uses only the session supplied by ``MutationUoW``."""
 
-    def __init__(self, scope, ctx: RequestContext, decision: AdmissionDecision, *, clock: Callable[[], datetime]):
+    def __init__(self, scope, ctx: RequestContext, decision: AdmissionDecision):
         self._memory = scope.application.memory
         self._ctx = ctx
         self._decision = decision
-        self._clock = clock
 
     async def apply(self, session: AsyncSession, command: d.ProfileMutationCommand) -> d.WriteResult:
         if command.operation != "memories.create" or not isinstance(command, d.COMMAND_TYPES["memories.create"]):
@@ -265,7 +264,7 @@ class RemoteIngestionPort:
             result = await uow.run(
                 ctx,
                 command,
-                RememberHandler(scope, ctx, decision, clock=self._clock),
+                RememberHandler(scope, ctx, decision),
             )
             outcome = AuditOutcome(
                 write_status(result),
@@ -273,17 +272,19 @@ class RemoteIngestionPort:
                 tuple(receipt.id for receipt in result.receipts),
                 (monotonic() - started) * 1000,
             )
-            try:
-                published = await self._publish_outcome(AuditTicket(ticket, ctx.request_id), outcome)
-            except Exception:
-                published = False
-            if published is True:
-                try:
-                    await uow.mark_published(ctx.request_id)
-                except Exception:
-                    pass
             reply = MUTATION_REPLY.get()
-            if reply is not None and reply.replayed:
+            replayed = reply is not None and reply.replayed
+            if not replayed:
+                try:
+                    published = await self._publish_outcome(AuditTicket(ticket, ctx.request_id), outcome)
+                except Exception:
+                    published = False
+                if published is True:
+                    try:
+                        await uow.mark_published(ctx.request_id)
+                    except Exception:
+                        pass
+            else:
                 try:
                     await self._reconcile(factory, ctx, command, result, self._publish_outcome)
                 except Exception:

@@ -278,6 +278,7 @@ async def test_create_201_masked_real_effects_and_publication(harness):
     result = d.WriteResult.model_validate_json(response.body)
     assert result.request_id.startswith("req_")
     assert len(result.memories) == len(result.receipts) == len(result.outbox_ids) == 1
+    assert len(result.admission) == 1 and result.admission[0].admitted is True
     assert result.memories[0].masked is True
     assert result.memories[0].content is result.memories[0].payload is None
     assert result.memories[0].projection.outbox == "pending"
@@ -304,7 +305,66 @@ async def test_replay_twice_byte_equal_headers_and_single_effect(harness):
         assert response.headers["idempotency-replayed"] == "true"
         assert response.headers["x-original-request-id"] == original
     assert await counts(harness.providers["alpha"]) == (1, 1, 1, 1)
-    assert len(harness.access.published) == 3
+    assert len(harness.access.published) == 1
+    assert len(harness.access.finished) == 2
+
+
+async def test_replay_2xx_finishes_current_intent(harness):
+    idem = key()
+    assert (await post(harness, remember_body(), idem=idem)).status == 201
+    harness.access.publish_result = False
+    replay = await post(harness, remember_body(), idem=idem)
+    assert replay.status == 201 and replay.headers["idempotency-replayed"] == "true"
+    current = harness.access.intents[-1][0]
+    assert [(ticket, outcome.status) for ticket, outcome in harness.access.finished] == [(current, 201)]
+
+
+@pytest.mark.parametrize("pending", [False, True])
+async def test_replay_never_publishes_current_ticket(harness, monkeypatch, pending):
+    idem = key()
+    harness.access.publish_result = not pending
+    assert (await post(harness, remember_body(), idem=idem)).status == 201
+    original = harness.access.intents[0][0]
+    harness.access.published.clear()
+    marked = []
+    mark = MutationUoW.mark_published
+
+    async def track_mark(self, request_id):
+        marked.append(request_id)
+        await mark(self, request_id)
+
+    monkeypatch.setattr(MutationUoW, "mark_published", track_mark)
+    harness.access.publish_result = True
+    replay = await post(harness, remember_body(), idem=idem)
+    assert replay.status == 201 and replay.headers["idempotency-replayed"] == "true"
+    current = harness.access.intents[-1][0]
+    assert current != original
+    assert all(ticket.request_id != current.request_id for ticket, _ in harness.access.published)
+    assert [ticket for ticket, _ in harness.access.published] == ([original] if pending else [])
+    assert current.request_id not in marked
+    assert (await journal_rows(harness.providers["alpha"]))[0].pending_publication == 0
+
+
+@pytest.mark.parametrize("failure", ["false", "exception"])
+async def test_replay_2xx_survives_publish_failure(harness, failure):
+    harness.access.publish_result = False
+    idem = key()
+    first = await post(harness, remember_body(), idem=idem)
+    assert first.status == 201
+    attempts = []
+
+    async def fail_publish(ticket, outcome):
+        attempts.append(ticket)
+        if failure == "exception":
+            raise RuntimeError("synthetic publisher failure")
+        return False
+
+    harness.deps.ports["memories.create"]._publish_outcome = fail_publish
+    replay = await post(harness, remember_body(), idem=idem)
+    assert replay.status == 201 and replay.body == first.body
+    assert replay.headers["idempotency-replayed"] == "true"
+    assert attempts
+    assert (await journal_rows(harness.providers["alpha"]))[0].pending_publication == 1
 
 
 async def test_key_conflict_missing_malformed_duplicate_and_media_validation(harness):
@@ -380,6 +440,48 @@ async def test_dedup_requires_version_then_reinforces_once(harness):
     async with harness.providers["alpha"]._session_factory() as session:
         assert (await FactRepository(session).get(memory_id)).version == 2
     assert await counts(harness.providers["alpha"]) == (1, 1, 1, 2)
+
+
+async def test_silent_reinforce_race_rolls_back_request(harness, monkeypatch):
+    created = await post(harness, remember_body())
+    assert created.status == 201
+    memory_id = created.json["memories"][0]["id"]
+    before_counts = await counts(harness.providers["alpha"])
+    before_receipt = await stored_receipt(harness.providers["alpha"], memory_id)
+    assert before_receipt is not None
+    before_history = list(before_receipt.history)
+    find = FactRepository.find_existing
+    calls = []
+
+    async def hide_first(self, *args, **kwargs):
+        calls.append(None)
+        if len(calls) == 1:
+            return None
+        return await find(self, *args, **kwargs)
+
+    memory = harness.applications["alpha"].memory
+    remember = memory.remember_in_session
+    observed = []
+
+    async def observe_reinforce(session, command):
+        result = await remember(session, command)
+        observed.append(result["receipt"].history[-1]["kind"])
+        return result
+
+    monkeypatch.setattr(FactRepository, "find_existing", hide_first)
+    monkeypatch.setattr(memory, "remember_in_session", observe_reinforce)
+    response = await post(harness, remember_body())
+    assert observed == ["reinforce"] and len(calls) >= 2
+    assert response.status == 409 and response.json["error"]["code"] == "E_VERSION_CONFLICT"
+    assert await counts(harness.providers["alpha"]) == before_counts
+    async with harness.providers["alpha"]._session_factory() as session:
+        assert (await FactRepository(session).get(memory_id)).version == 1
+    after_receipt = await stored_receipt(harness.providers["alpha"], memory_id)
+    assert after_receipt is not None
+    assert after_receipt.version == before_receipt.version
+    assert after_receipt.history == before_history
+    assert len(harness.access.published) == 1
+    assert len(harness.access.finished) == 1 and harness.access.finished[0][1].status == 409
 
 
 async def test_publish_pending_blocks_fresh_and_replay_self_heals(harness):
@@ -510,3 +612,17 @@ async def test_legacy_remember_characterization_unchanged(harness):
     assert result["fact"].version == 1
     assert result["receipt"].history == []
     assert await counts(harness.providers["alpha"]) == (1, 1, 1, 0)
+    reinforced = await harness.applications["alpha"].memory.remember(
+        RememberCommand(subject="Legacy", predicate="keeps", object="existing behavior", source="user")
+    )
+    assert reinforced["fact"].id == result["fact"].id
+    assert reinforced["fact"].version == 2
+    assert reinforced["receipt"].history[-1]["kind"] == "reinforce"
+    before = await counts(harness.providers["alpha"])
+    remote = await post(harness, remember_body("Legacy", "keeps", "existing behavior"))
+    assert remote.status == 428
+    assert remote.json["error"]["code"] == "E_PRECONDITION_REQUIRED"
+    assert remote.json["error"]["details"] == {"id": result["fact"].id}
+    assert await counts(harness.providers["alpha"]) == before
+    async with harness.providers["alpha"]._session_factory() as session:
+        assert (await FactRepository(session).get(result["fact"].id)).version == 2
