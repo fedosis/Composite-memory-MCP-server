@@ -187,8 +187,16 @@ def test_no_s04_implementation_imports():
         )
         assert not any(module.startswith("memory_server.runtime.daemon") for module in modules), name
 
-@pytest.mark.parametrize("case,code", [("rejected", "E_ADMISSION_REJECTED"), ("permission", "E_PERMISSION_DENIED"),
-                                      ("profile", "E_VALIDATION"), ("key", "E_IDEMPOTENCY_REQUIRED"), ("deadline", "E_TIMEOUT")])
+@pytest.mark.parametrize(
+    "case,code",
+    [
+        ("rejected", "E_ADMISSION_REJECTED"),
+        ("permission", "E_PERMISSION_DENIED"),
+        ("profile", "E_VALIDATION"),
+        ("key", "E_IDEMPOTENCY_REQUIRED"),
+        ("deadline", "E_TIMEOUT"),
+    ],
+)
 async def test_learn_15_preflight_before_classify_and_lease(harness, case, code):
     principal = harness.tokens._principals[harness.bearer]
     ctx = RequestContext("req-learn-preflight", principal, "alpha", uuid4(), asyncio.get_running_loop().time() + 30)
@@ -200,10 +208,10 @@ async def test_learn_15_preflight_before_classify_and_lease(harness, case, code)
         ctx = replace(ctx, idempotency_key=None)
     elif case == "deadline":
         ctx = replace(ctx, deadline=0)
-    command = d.COMMAND_TYPES["learn"](operation="learn", profile_id="alpha", path_ids={},
-                                     payload=d.LearnRequest(text="temporary is today."))
+    command = d.COMMAND_TYPES["learn"](
+        operation="learn", profile_id="alpha", path_ids={}, payload=d.LearnRequest(text="temporary is today.")
+    )
     with pytest.raises(HttpError) as caught:
         await harness.deps.ports["memories.create"].execute(ctx, command)
     assert caught.value.code == code
     assert harness.leases.acquisitions == []
-

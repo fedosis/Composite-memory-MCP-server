@@ -200,5 +200,5 @@ def compose_ingestion_ports(deps, config):
     )
     specs = create_ingestion_routes()
     ports = dict(deps.ports)
-    ports["memories.create"] = port
+    ports.update({spec.operation: port for spec in specs})
     return replace(deps, ports=ports), specs

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
 from uuid import UUID
@@ -18,8 +19,13 @@ from storage.repositories.lifecycle_repo import normalize_version
 from memory_server.admission import AdmissionDecision, MemoryAdmissionGate
 from memory_server.application.contracts import RememberCommand
 from memory_server.application.mutation_uow import MUTATION_REPLY, MutationUoW
+from memory_server.extractors.decision_extractor import DecisionExtractor
+from memory_server.extractors.fact_extractor import FactExtractor
+from memory_server.extractors.noise_filter import filter_facts
+from memory_server.extractors.skill_extractor import SkillExtractor
 from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.ports import AuditOutcome, AuditTicket, GatewayDependencies, RequestContext
+from memory_server.services.ingestion_service import check_fact_version, remote_learn_in_session
 from memory_server.transports.http.errors import HttpError
 
 
@@ -102,7 +108,7 @@ def _receipt_dto(receipt) -> d.Receipt:
     verification = getattr(receipt.verification_status, "value", receipt.verification_status)
     return d.Receipt(
         id=receipt.id,
-        memory_type="fact",
+        memory_type=receipt.memory_type,
         source=receipt.source,
         created_by=receipt.created_by,
         timestamp=_aware(receipt.timestamp),
@@ -195,6 +201,81 @@ class RememberHandler:
         )
 
 
+@dataclass
+class LearnPlan:
+    """Extractor candidates that survived the remote admission boundary."""
+
+    facts: list[dict]
+    decisions: list[dict]
+    skills: list[dict]
+    admission: list[AdmissionDecision]
+
+
+class LearnHandler:
+    """CAS preflight and masked mapping on the request-wide injected session."""
+
+    def __init__(self, scope, ctx: RequestContext, *, admitted: LearnPlan, payload: d.LearnRequest):
+        self._ctx = ctx
+        self._admitted = admitted
+        self._payload = payload
+
+    async def apply(self, session: AsyncSession, command: d.ProfileMutationCommand) -> d.WriteResult:
+        payload = self._payload
+        for candidate in self._admitted.facts:
+            existing = await FactRepository(session).find_existing(
+                *(candidate.get(k, "") for k in ("subject", "predicate", "object"))
+            )
+            if existing is not None:
+                check_fact_version(existing, payload.expected_versions)
+        result = await remote_learn_in_session(
+            session,
+            text=payload.text,
+            source=payload.source,
+            admitted=self._admitted,
+            extract_beliefs=payload.extract_beliefs,
+            min_belief_confidence=payload.min_belief_confidence,
+            expected_versions=payload.expected_versions,
+        )
+        memories = []
+        for kind, rows in (
+            ("fact", result.facts),
+            ("decision", result.decisions),
+            ("skill", result.skills),
+            ("belief", result.beliefs),
+        ):
+            for row in rows:
+                semantic = kind in {"decision", "skill"}
+                revision = None if semantic else normalize_version(row.version)
+                memories.append(
+                    d.Memory(
+                        id=row.id,
+                        memory_type=kind,
+                        content=None,
+                        payload=None,
+                        confidence=row.confidence,
+                        lifecycle_state=row.lifecycle_state,
+                        revision=revision,
+                        source_version=row.version if semantic else int(row.version),
+                        source=None,
+                        creator=None,
+                        created_at=_aware(row.created_at),
+                        updated_at=_aware(row.updated_at),
+                        risk_tags=[],
+                        receipt_id=row.id if any(r.id == row.id for r in result.receipts) else None,
+                        masked=True,
+                        projection=d.ItemProjection(vector="unknown", graph="unknown", outbox="pending"),
+                    )
+                )
+        return d.WriteResult(
+            request_id=self._ctx.request_id,
+            memories=memories,
+            receipts=[_receipt_dto(receipt) for receipt in result.receipts],
+            admission=[_admission_dto(decision) for decision in self._admitted.admission],
+            outbox_ids=result.outbox_ids,
+            reinforced_ids=result.reinforced_ids,
+        )
+
+
 class RemoteIngestionPort:
     """S13 application port with mandatory server-side admission and audit publication."""
 
@@ -218,8 +299,8 @@ class RemoteIngestionPort:
     async def execute(self, ctx: RequestContext, command: d.IngestionCommand) -> d.WriteResult:
         started = monotonic()
         try:
-            if command.operation != "memories.create" or not isinstance(
-                command, d.COMMAND_TYPES["memories.create"]
+            if command.operation not in {"memories.create", "learn"} or not isinstance(
+                command, d.COMMAND_TYPES[command.operation]
             ):
                 raise ValueError
             type(command).model_validate(command.model_dump())
@@ -237,14 +318,17 @@ class RemoteIngestionPort:
             raise HttpError("E_TIMEOUT")
 
         payload = command.payload
-        decision = self._admission.classify(
-            f"{payload.subject} {payload.predicate} {payload.object}",
-            source_scope="remote",
-            now=self._clock(),
-            force=False,
-        )
-        if not decision.admitted:
-            raise HttpError("E_ADMISSION_REJECTED")
+        if command.operation == "memories.create":
+            decision = self._admission.classify(
+                f"{payload.subject} {payload.predicate} {payload.object}",
+                source_scope="remote", now=self._clock(), force=False,
+            )
+            if not decision.admitted:
+                raise HttpError("E_ADMISSION_REJECTED")
+        else:
+            plan = self._learn_candidates(payload)
+            if not plan.admission:
+                raise HttpError("E_ADMISSION_REJECTED")
         try:
             ticket = self._ticket_provider()
         except Exception:
@@ -264,7 +348,8 @@ class RemoteIngestionPort:
             result = await uow.run(
                 ctx,
                 command,
-                RememberHandler(scope, ctx, decision),
+                RememberHandler(scope, ctx, decision) if command.operation == "memories.create"
+                else LearnHandler(scope, ctx, admitted=plan, payload=payload),
             )
             outcome = AuditOutcome(
                 write_status(result),
@@ -290,6 +375,27 @@ class RemoteIngestionPort:
                 except Exception:
                     pass
             return result
+
+    def _learn_candidates(self, payload: d.LearnRequest) -> LearnPlan:
+        plan = LearnPlan([], [], [], [])
+        candidates = (
+            (plan.facts, filter_facts(FactExtractor().extract(payload.text))),
+            (plan.decisions, DecisionExtractor().extract(payload.text)),
+            (plan.skills, SkillExtractor().extract(payload.text)),
+        )
+        for target, rows in candidates:
+            for candidate in rows:
+                if target is plan.facts:
+                    text = " ".join(candidate.get(k, "") for k in ("subject", "predicate", "object"))
+                elif target is plan.decisions:
+                    text = candidate.get("context") or candidate.get("choice", "")
+                else:
+                    text = candidate.get("purpose", "")
+                decision = self._admission.classify(text, source_scope="remote", force=False, now=self._clock())
+                if decision.admitted:
+                    target.append({**candidate, "_admission": decision.to_metadata()})
+                    plan.admission.append(decision)
+        return plan
 
     async def _reconcile(
         self,

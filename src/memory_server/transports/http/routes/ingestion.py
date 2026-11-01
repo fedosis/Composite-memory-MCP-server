@@ -39,6 +39,15 @@ def _parse_remember(body: bytes, profile_id: str) -> d.Command:
     )
 
 
+def _parse_learn(body: bytes, profile_id: str) -> d.Command:
+    entry = CATALOG.by_operation["learn"]
+    try:
+        payload = entry.request_type.model_validate_json(body)
+    except ValidationError:
+        raise HttpError("E_VALIDATION") from None
+    return d.COMMAND_TYPES["learn"](operation="learn", profile_id=profile_id, path_ids={}, payload=payload)
+
+
 INGESTION_ROUTE_SPECS: Mapping[str, MutationRouteSpec] = MappingProxyType(
     {
         "memories.create": MutationRouteSpec(
@@ -48,10 +57,13 @@ INGESTION_ROUTE_SPECS: Mapping[str, MutationRouteSpec] = MappingProxyType(
             "memory.write",
             _parse_remember,
             write_status,
-        )
+        ),
+        "learn": MutationRouteSpec(
+            "learn", "POST", "/api/v1/profiles/{profile}/learn", "memory.write", _parse_learn, write_status,
+        ),
     }
 )
 
 
 def create_ingestion_routes() -> tuple[MutationRouteSpec, ...]:
-    return (INGESTION_ROUTE_SPECS["memories.create"],)
+    return (INGESTION_ROUTE_SPECS["memories.create"], INGESTION_ROUTE_SPECS["learn"])
