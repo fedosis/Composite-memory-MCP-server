@@ -28,12 +28,83 @@ pytestmark = pytest.mark.asyncio
 
 
 async def retry(h, key, **kwargs):
-    for _ in range(20):
-        r = await post(h, key=key, **kwargs)
-        if r.status != 409 or r.json["error"]["code"] != "E_REQUEST_IN_PROGRESS":
-            return r
-        await asyncio.sleep(0.01)
-    pytest.fail("transient busy did not settle to a semantic outcome")
+    last, attempts = None, 0
+    try:
+        async with asyncio.timeout(2):
+            for attempts in range(1, 41):
+                last = await post(h, key=key, **kwargs)
+                error = last.json.get("error", {}).get("code")
+                if (last.status, error) not in {
+                    (409, "E_REQUEST_IN_PROGRESS"),
+                    (503, "E_AUDIT_UNAVAILABLE"),
+                }:
+                    return last
+                if attempts < 40:
+                    await asyncio.sleep(0.01)
+    except TimeoutError:
+        pass
+    pytest.fail(
+        f"retry exhausted after {attempts} attempts (limit 40 / 2s); "
+        f"last status={None if last is None else last.status} "
+        f"code={None if last is None else last.json.get('error', {}).get('code')} "
+        f"body={None if last is None else last.body!r}"
+    )
+
+
+@pytest.mark.parametrize("terminal", [(409, "E_VERSION_CONFLICT"), (503, "E_STORAGE"), (503, "E_OUTBOX")])
+async def test_retry_only_retries_named_transient_responses(monkeypatch, terminal):
+    from types import SimpleNamespace
+
+    responses = [
+        SimpleNamespace(status=status, json={"error": {"code": error}}, body=error.encode())
+        for status, error in [(503, "E_AUDIT_UNAVAILABLE"), (409, "E_REQUEST_IN_PROGRESS"), terminal]
+    ]
+    calls = []
+
+    async def scripted(h, key, **kwargs):
+        calls.append((h, key, kwargs))
+        return responses[len(calls) - 1]
+
+    monkeypatch.setitem(globals(), "post", scripted)
+    assert await retry("client", "original-key", op="invalidate") is responses[-1]
+    assert calls == [("client", "original-key", {"op": "invalidate"})] * 3
+
+
+async def test_retry_exhaustion_reports_last_status_and_body(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+
+    async def unavailable(*args, **kwargs):
+        calls.append(True)
+        return SimpleNamespace(status=503, json={"error": {"code": "E_AUDIT_UNAVAILABLE"}}, body=b"last-audit-body")
+
+    monkeypatch.setitem(globals(), "post", unavailable)
+    with pytest.raises(pytest.fail.Exception, match="503.*E_AUDIT_UNAVAILABLE.*last-audit-body"):
+        await retry(None, "original-key")
+    assert len(calls) == 40
+
+
+async def test_retry_deadline_reports_last_completed_response(monkeypatch):
+    from types import SimpleNamespace
+
+    calls, cancelled = [], []
+
+    async def stalled(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            return SimpleNamespace(
+                status=503, json={"error": {"code": "E_AUDIT_UNAVAILABLE"}}, body=b"last-before-timeout"
+            )
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    monkeypatch.setitem(globals(), "post", stalled)
+    with pytest.raises(pytest.fail.Exception, match="503.*E_AUDIT_UNAVAILABLE.*last-before-timeout"):
+        await retry(None, "original-key")
+    assert len(calls) == 2 and cancelled == [True]
 
 
 async def test_two_clients_barrier_same_observed_version(lifecycle):
@@ -59,7 +130,16 @@ async def test_two_clients_barrier_same_observed_version(lifecycle):
     s = await snapshot(h)
     assert len(s["lifecycle_events"]) == len(s["outbox_entries"]) == 2
     assert len(s["http_request_journal"]) == 1
+    assert s["http_request_journal"][0]["pending_publication"] == 0
     assert {f["version"] for f in s["facts"]} == {"2"}
+    assert sorted(row["memory_id"] for row in s["lifecycle_events"]) == [ROOT, CHILD]
+    assert sorted(row["record_id"] for row in s["outbox_entries"]) == [ROOT, CHILD]
+    assert len(s["lifecycle_states"]) == 2
+    import json
+
+    assert all(row["version"] == "2" and len(json.loads(row["history"])) == 2 for row in s["receipts"])
+    beta = await snapshot(h, "beta")
+    assert len(beta["lifecycle_events"]) == len(beta["outbox_entries"]) == len(beta["http_request_journal"]) == 1
 
 
 async def test_writer_busy_at_journal_purge_retries_to_typed_conflict(lifecycle, monkeypatch):
@@ -130,6 +210,9 @@ async def test_inflight_audit_publication_is_not_a_sqlite_busy_error(lifecycle, 
             return await attempt(uow, *args, **kwargs)
         except HttpError as exc:
             failures.append((exc.code, traceback.format_exc()))
+            # Release only after retry has itself observed the real pending 503.
+            if len(failures) == 2:
+                release.set()
             raise
 
     with monkeypatch.context() as m:
@@ -146,10 +229,19 @@ async def test_inflight_audit_publication_is_not_a_sqlite_busy_error(lifecycle, 
             assert len(failures) == 1 and failures[0][0] == "E_AUDIT_UNAVAILABLE"
             assert 'mutation_uow.py", line 214' in failures[0][1]
             print("S14_PENDING_AUDIT_ORIGIN", failures[0][1])
+            converged = await retry(h, str(uuid4()))
+            code(converged, "E_VERSION_CONFLICT", 409)
+            assert converged.json["error"]["details"] == dict(expected=1, actual=2, id=ROOT)
+            assert len(failures) >= 2 and failures[1][0] == "E_AUDIT_UNAVAILABLE"
         finally:
             release.set()
             response = await winner
         assert response.status == 200, response.body
+    settled = await snapshot(h)
+    # Only the original publication marker may change after the losing retries.
+    committed["http_request_journal"][0]["pending_publication"] = 0
+    assert settled == committed
+    assert len(settled["lifecycle_events"]) == len(settled["outbox_entries"]) == 1
     code(await post(h), "E_VERSION_CONFLICT", 409)
 
 
