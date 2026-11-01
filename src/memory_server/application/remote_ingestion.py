@@ -25,7 +25,7 @@ from memory_server.extractors.noise_filter import filter_facts
 from memory_server.extractors.skill_extractor import SkillExtractor
 from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.ports import AuditOutcome, AuditTicket, GatewayDependencies, RequestContext
-from memory_server.services.ingestion_service import check_fact_version, remote_learn_in_session
+from memory_server.services.ingestion_service import FactVersionError, check_fact_version, remote_learn_in_session
 from memory_server.transports.http.errors import HttpError
 
 
@@ -221,21 +221,24 @@ class LearnHandler:
 
     async def apply(self, session: AsyncSession, command: d.ProfileMutationCommand) -> d.WriteResult:
         payload = self._payload
-        for candidate in self._admitted.facts:
-            existing = await FactRepository(session).find_existing(
-                *(candidate.get(k, "") for k in ("subject", "predicate", "object"))
+        try:
+            for candidate in self._admitted.facts:
+                existing = await FactRepository(session).find_existing(
+                    *(candidate.get(k, "") for k in ("subject", "predicate", "object"))
+                )
+                if existing is not None:
+                    check_fact_version(existing, payload.expected_versions)
+            result = await remote_learn_in_session(
+                session,
+                text=payload.text,
+                source=payload.source,
+                admitted=self._admitted,
+                extract_beliefs=payload.extract_beliefs,
+                min_belief_confidence=payload.min_belief_confidence,
+                expected_versions=payload.expected_versions,
             )
-            if existing is not None:
-                check_fact_version(existing, payload.expected_versions)
-        result = await remote_learn_in_session(
-            session,
-            text=payload.text,
-            source=payload.source,
-            admitted=self._admitted,
-            extract_beliefs=payload.extract_beliefs,
-            min_belief_confidence=payload.min_belief_confidence,
-            expected_versions=payload.expected_versions,
-        )
+        except FactVersionError as exc:
+            raise HttpError(exc.code, details=exc.details) from None
         memories = []
         for kind, rows in (
             ("fact", result.facts),

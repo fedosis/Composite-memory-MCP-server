@@ -1141,17 +1141,27 @@ async def _outbox(
     ids.append(str(entry.id))
 
 
+class FactVersionError(Exception):
+    """A fact CAS failure independent of the remote error adapter."""
+
+    code: str
+    details: dict[str, Any]
+
+    def __init__(self, code: str, *, details: dict[str, Any]) -> None:
+        self.code = code
+        self.details = details
+        super().__init__(code)
+
+
 def check_fact_version(row: Fact, expected_versions: Mapping[str, int]) -> None:
     """Reject missing or stale remote preconditions before a write."""
-    from memory_server.transports.http.errors import HttpError
-
     item_id = str(row.id)
     if item_id not in expected_versions:
-        raise HttpError("E_PRECONDITION_REQUIRED", details={"id": item_id})
+        raise FactVersionError("E_PRECONDITION_REQUIRED", details={"id": item_id})
     actual = normalize_version(row.version)
     expected = expected_versions[item_id]
     if actual != expected:
-        raise HttpError("E_VERSION_CONFLICT", details={"expected": expected, "actual": actual})
+        raise FactVersionError("E_VERSION_CONFLICT", details={"expected": expected, "actual": actual})
 
 
 async def _checked_fact(session: AsyncSession, s: str, p: str, o: str, expected: Mapping[str, int]) -> Fact | None:

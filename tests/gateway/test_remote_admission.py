@@ -202,8 +202,6 @@ async def test_learn_15_preflight_before_classify_and_lease(harness, case, code)
     ctx = RequestContext("req-learn-preflight", principal, "alpha", uuid4(), asyncio.get_running_loop().time() + 30)
     if case == "permission":
         ctx = replace(ctx, principal=replace(principal, permissions=frozenset()))
-    elif case == "profile":
-        ctx = replace(ctx, profile_id="beta")
     elif case == "key":
         ctx = replace(ctx, idempotency_key=None)
     elif case == "deadline":
@@ -211,7 +209,23 @@ async def test_learn_15_preflight_before_classify_and_lease(harness, case, code)
     command = d.COMMAND_TYPES["learn"](
         operation="learn", profile_id="alpha", path_ids={}, payload=d.LearnRequest(text="temporary is today.")
     )
+    if case == "profile":
+        # The same text reaches admission with matching profiles: learn is supported.
+        with pytest.raises(HttpError) as supported:
+            await harness.deps.ports["memories.create"].execute(ctx, command)
+        assert supported.value.code == "E_ADMISSION_REJECTED"
+        command = command.model_copy(update={"profile_id": "beta"})
+        assert command.profile_id != ctx.profile_id
+        assert command.profile_id in principal.profiles
     with pytest.raises(HttpError) as caught:
         await harness.deps.ports["memories.create"].execute(ctx, command)
     assert caught.value.code == code
     assert harness.leases.acquisitions == []
+
+
+def test_ingestion_service_has_no_transport_dependency():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "src/memory_server/services/ingestion_service.py").read_text()
+    assert "transports" not in source
