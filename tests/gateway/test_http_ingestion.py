@@ -553,7 +553,7 @@ async def test_profile_isolation_same_key_and_cross_profile_denied(harness):
 
 
 async def test_mount_missing_port_and_shared_path_method_dispatch(harness):
-    assert len(harness.mutation_specs) == 1
+    assert len(harness.mutation_specs) == 2
     assert len(harness.read_specs) == 6
     get = await request(
         harness.app,
@@ -626,3 +626,207 @@ async def test_legacy_remember_characterization_unchanged(harness):
     assert await counts(harness.providers["alpha"]) == before
     async with harness.providers["alpha"]._session_factory() as session:
         assert (await FactRepository(session).get(result["fact"].id)).version == 2
+
+LEARN_TEXT = "Postgres is a reliable relational database."
+MIXED_TEXT = LEARN_TEXT + "\nWe decided to prefer durable database storage because reliability matters.\nTo preserve durable database backups, do: 1) snapshot, 2) verify."
+
+
+async def learn_post(h, *, value=LEARN_TEXT, profile="alpha", idem=None, **updates):
+    return await request(h.app, f"/api/v1/profiles/{profile}/learn", bearer=h.bearer,
+                         body={"text": value, "extract_beliefs": False, **updates},
+                         headers=(("Idempotency-Key", idem or key()),))
+
+
+async def learn_counts(h):
+    async with h.providers["alpha"]._session_factory() as session:
+        return tuple([(await session.execute(text(f"SELECT count(*) FROM {table}"))).scalar_one()
+                      for table in ("facts", "decisions", "skills", "beliefs", "receipts", "outbox_entries", "http_request_journal")])
+
+
+def belief_stub(monkeypatch):
+    from memory_server.extractors.belief_extractor import BeliefExtractor, ExtractedBelief
+
+    async def extract(self, text):
+        return [ExtractedBelief(proposition="Durable database storage improves reliability", confidence=0.9,
+                               source_refs=["Postgres is a reliable relational database"], tags=["database"])]
+
+    monkeypatch.setattr(BeliefExtractor, "extract", extract)
+
+
+async def test_learn_01_fact(harness):
+    r = await learn_post(harness)
+    assert r.status == 201
+    result = d.WriteResult.model_validate_json(r.body)
+    assert len(result.memories) == len(result.receipts) == len(result.outbox_ids) == 1
+    m = result.memories[0]
+    assert m.memory_type == "fact" and m.revision == m.source_version == 1
+    assert m.masked and m.content is m.payload is m.source is m.creator is None
+    assert m.projection.outbox == "pending" and result.admission[0].admitted
+    assert await learn_counts(harness) == (1, 0, 0, 0, 1, 1, 1)
+    assert (await journal_rows(harness.providers["alpha"]))[0].pending_publication == 0
+    assert len(harness.access.published) == 1 and harness.access.finished == []
+
+
+async def test_learn_02_mixed(harness):
+    r = await learn_post(harness, value=MIXED_TEXT)
+    assert r.status == 201
+    items = {m["memory_type"]: m for m in r.json["memories"]}
+    assert set(items) == {"fact", "decision", "skill"}
+    for kind, version in (("decision", "0.1.0"), ("skill", "1.0.0")):
+        assert items[kind]["revision"] is None and items[kind]["source_version"] == version
+    assert await learn_counts(harness) == (1, 1, 1, 0, 3, 3, 1)
+    assert len(r.json["admission"]) == 3
+
+
+async def test_learn_03_rejected(harness):
+    r = await learn_post(harness, value="temporary is today.", extract_beliefs=True)
+    assert r.status == 422 and r.json["error"]["code"] == "E_ADMISSION_REJECTED"
+    assert await learn_counts(harness) == (0,) * 7 and harness.leases.acquisitions == []
+
+
+async def test_learn_04_partial(harness):
+    r = await learn_post(harness, value=LEARN_TEXT + "\ntemporary is today.")
+    assert r.status == 201
+    assert len(r.json["memories"]) == len(r.json["admission"]) == 1
+    assert all(a["admitted"] for a in r.json["admission"])
+    assert await learn_counts(harness) == (1, 0, 0, 0, 1, 1, 1)
+
+
+@pytest.mark.parametrize("expected,status", [(None, 428), (99, 409), (1, 200)])
+async def test_learn_05_cas(harness, expected, status):
+    created = await post(harness, remember_body("Postgres", "is", "a reliable relational database"))
+    assert created.status == 201
+    mid = created.json["memories"][0]["id"]
+    r = await learn_post(harness, expected_versions={} if expected is None else {mid: expected})
+    assert r.status == status
+    if status == 428:
+        assert r.json["error"]["details"] == {"id": mid}
+    elif status == 409:
+        assert r.json["error"]["code"] == "E_VERSION_CONFLICT"
+    else:
+        assert r.json["reinforced_ids"] == [mid] and r.json["memories"][0]["revision"] == 2
+    assert await counts(harness.providers["alpha"]) == (1, 1, 1, 2 if status == 200 else 1)
+
+
+async def test_learn_06_cas_before_writes(harness, monkeypatch):
+    created = await post(harness, remember_body("Postgres", "is", "a reliable relational database"))
+    mid = created.json["memories"][0]["id"]
+    before = await learn_counts(harness)
+    writes = []
+    create = FactRepository.create
+
+    async def observe(self, fact):
+        writes.append(fact.id)
+        return await create(self, fact)
+
+    monkeypatch.setattr(FactRepository, "create", observe)
+    r = await learn_post(harness, value="SQLite is a durable embedded database.\n" + MIXED_TEXT, expected_versions={mid: 99})
+    assert r.status == 409
+    assert writes == [] and await learn_counts(harness) == before
+
+
+async def test_learn_07_belief_rollback(harness, monkeypatch):
+    from storage.repositories import BeliefRepository
+
+    belief_stub(monkeypatch)
+    calls = []
+
+    async def fail(self, belief):
+        calls.append(belief.id)
+        raise RuntimeError("synthetic belief failure")
+
+    monkeypatch.setattr(BeliefRepository, "create", fail)
+    r = await learn_post(harness, value=MIXED_TEXT, extract_beliefs=True)
+    assert r.status == 500
+    assert len(calls) == 1 and await learn_counts(harness) == (0,) * 7
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_learn_08_belief_flag(harness, monkeypatch, enabled):
+    belief_stub(monkeypatch)
+    r = await learn_post(harness, extract_beliefs=enabled)
+    assert r.status == 201
+    assert {m["memory_type"] for m in r.json["memories"]} == ({"fact", "belief"} if enabled else {"fact"})
+    assert await learn_counts(harness) == (1, 0, 0, int(enabled), 1 + int(enabled), 1 + int(enabled), 1)
+    if enabled:
+        belief = next(m for m in r.json["memories"] if m["memory_type"] == "belief")
+        assert belief["revision"] == belief["source_version"] == 1
+        async with harness.providers["alpha"]._session_factory() as session:
+            assert (await session.execute(text("SELECT count(*) FROM evidence"))).scalar_one() == 1
+
+
+async def test_learn_09_replay(harness):
+    idem = key()
+    first = await learn_post(harness, value=MIXED_TEXT, idem=idem)
+    replay = await learn_post(harness, value=MIXED_TEXT, idem=idem)
+    assert first.status == replay.status == 201
+    assert replay.body == first.body and replay.headers["idempotency-replayed"] == "true"
+    assert await learn_counts(harness) == (1, 1, 1, 0, 3, 3, 1)
+    assert len(harness.access.published) == len(harness.access.finished) == 1
+
+
+async def test_learn_10_profile(harness):
+    idem = key()
+    a = await learn_post(harness, idem=idem)
+    b = await learn_post(harness, profile="beta", idem=idem)
+    assert a.status == b.status == 201
+    assert a.json["memories"][0]["id"] != b.json["memories"][0]["id"]
+    assert await counts(harness.providers["beta"]) == (1, 1, 1, 1)
+    denied = await request(harness.app, "/api/v1/profiles/beta/learn", bearer=harness.alpha_only,
+                           body={"text": LEARN_TEXT}, headers=(("Idempotency-Key", key()),))
+    assert denied.status == 403
+
+
+async def test_learn_11_http_guards(harness):
+    path = "/api/v1/profiles/alpha/learn"
+    missing = await request(harness.app, path, bearer=harness.bearer, body={"text": LEARN_TEXT})
+    assert missing.status == 400
+    media = await request(harness.app, path, bearer=harness.bearer, body=b"{}",
+                          headers=(("Idempotency-Key", key()), ("Content-Type", "text/plain")))
+    assert media.status == 415
+    assert (await request(harness.app, path, method="GET", bearer=harness.bearer)).status == 405
+    ports = {k: v for k, v in harness.deps.ports.items() if k != "learn"}
+    app = create_http_app(harness.config, replace(harness.deps, ports=ports), mutation_routes=harness.mutation_specs)
+    try:
+        r = await request(app, path, bearer=harness.bearer, body={"text": LEARN_TEXT}, headers=(("Idempotency-Key", key()),))
+        assert r.status == 503 and r.json["error"]["code"] == "E_CAPABILITY_UNAVAILABLE"
+        assert harness.leases.acquisitions == []
+    finally:
+        await app.close()
+
+
+async def test_learn_12_mount(harness):
+    from memory_server.transports.http.routes.ingestion import INGESTION_ROUTE_SPECS, create_ingestion_routes
+
+    specs = create_ingestion_routes()
+    assert len(specs) == 2 and {s.operation for s in specs} == {"memories.create", "learn"}
+    assert all(s is INGESTION_ROUTE_SPECS[s.operation] for s in specs)
+    assert harness.deps.ports["memories.create"] is harness.deps.ports["learn"]
+
+
+async def test_learn_13_legacy_parity(harness):
+    from memory_server.application.contracts import LearnCommand
+
+    memory = harness.applications["alpha"].memory
+    first = await memory.learn(LearnCommand(text=LEARN_TEXT, source="user", extract_beliefs=False))
+    second = await memory.learn(LearnCommand(text=LEARN_TEXT, source="user", extract_beliefs=False))
+    assert first["facts"][0]["item"]["id"] == second["facts"][0]["item"]["id"]
+    assert second["facts"][0]["item"]["version"] == 2
+    assert second["facts"][0]["receipt"]["history"][-1]["kind"] == "reinforce"
+    r = await learn_post(harness)
+    assert r.status == 428
+    assert await counts(harness.providers["alpha"]) == (1, 1, 1, 0)
+
+
+async def test_learn_14_soft_limit(harness, monkeypatch):
+    from storage.repositories import BeliefRepository
+    from memory_server.models import Belief
+
+    belief_stub(monkeypatch)
+    async with harness.providers["alpha"]._session_factory() as session, session.begin():
+        await BeliefRepository(session).create(Belief(proposition="Existing active durable belief", confidence=0.9))
+    monkeypatch.setattr("memory_server.settings.get_settings", lambda: SimpleNamespace(max_active_beliefs=1))
+    r = await learn_post(harness, extract_beliefs=True)
+    assert r.status == 201 and [m["memory_type"] for m in r.json["memories"]] == ["fact"]
+    assert await learn_counts(harness) == (1, 0, 0, 1, 1, 1, 1)
+

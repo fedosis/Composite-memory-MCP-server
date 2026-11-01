@@ -109,12 +109,7 @@ async def test_direct_preflight_negatives_do_not_lease(harness, case, code):
     elif case == "deadline":
         ctx = replace(ctx, deadline=asyncio.get_running_loop().time() - 1)
     elif case == "operation":
-        command = d.COMMAND_TYPES["learn"](
-            operation="learn",
-            profile_id="alpha",
-            path_ids={},
-            payload=d.LearnRequest(text="durable content"),
-        )
+        command = command.model_copy(update={"operation": "unknown.operation"})
     elif case == "forged":
         command = command.model_copy(update={"payload": {"subject": "not-a-dto"}})
     with pytest.raises(HttpError) as caught:
@@ -191,3 +186,24 @@ def test_no_s04_implementation_imports():
             alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
         )
         assert not any(module.startswith("memory_server.runtime.daemon") for module in modules), name
+
+@pytest.mark.parametrize("case,code", [("rejected", "E_ADMISSION_REJECTED"), ("permission", "E_PERMISSION_DENIED"),
+                                      ("profile", "E_VALIDATION"), ("key", "E_IDEMPOTENCY_REQUIRED"), ("deadline", "E_TIMEOUT")])
+async def test_learn_15_preflight_before_classify_and_lease(harness, case, code):
+    principal = harness.tokens._principals[harness.bearer]
+    ctx = RequestContext("req-learn-preflight", principal, "alpha", uuid4(), asyncio.get_running_loop().time() + 30)
+    if case == "permission":
+        ctx = replace(ctx, principal=replace(principal, permissions=frozenset()))
+    elif case == "profile":
+        ctx = replace(ctx, profile_id="beta")
+    elif case == "key":
+        ctx = replace(ctx, idempotency_key=None)
+    elif case == "deadline":
+        ctx = replace(ctx, deadline=0)
+    command = d.COMMAND_TYPES["learn"](operation="learn", profile_id="alpha", path_ids={},
+                                     payload=d.LearnRequest(text="temporary is today."))
+    with pytest.raises(HttpError) as caught:
+        await harness.deps.ports["memories.create"].execute(ctx, command)
+    assert caught.value.code == code
+    assert harness.leases.acquisitions == []
+
