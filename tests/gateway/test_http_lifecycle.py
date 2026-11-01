@@ -114,6 +114,13 @@ async def lifecycle(tmp_path, monkeypatch):
 
 
 async def seed(h, ident=ROOT, kind="fact", profile="alpha", state="active", version=1, confidence=0.8, receipt=True):
+    """Synthetic storage characterization, not the application-ingestion fixture.
+
+    Residual: fixed cross-profile IDs, arbitrary persisted state/version, missing
+    receipts, and a 0.1 belief confidence cannot all be requested via remember /
+    set_belief. Keep those exact fixtures for legacy/CAS/corruption tests. The
+    fact happy path below separately seeds via the real application API/lease.
+    """
     async with h.factories[profile]() as session, session.begin():
         common = dict(id=ident, lifecycle_state=state, confidence=confidence, source="S14_SOURCE_CANARY")
         if kind == "fact":
@@ -145,6 +152,17 @@ async def seed(h, ident=ROOT, kind="fact", profile="alpha", state="active", vers
                     history=json.dumps([{"kind": "seed"}]),
                 )
             )
+
+
+async def seed_application_fact(h):
+    from memory_server.application.contracts import RememberCommand
+
+    ctx = RequestContext("seed-remember", h.principal, "alpha", None, asyncio.get_running_loop().time() + 30)
+    async with h.deps.leases.acquire(ctx) as scope:
+        result = await scope.application.memory.remember(
+            RememberCommand("S14_CONTENT_CANARY", "p", "o", confidence=0.8, source="S14_SOURCE_CANARY")
+        )
+        return result["fact"].id
 
 
 async def edges(h, pairs, profile="alpha"):
@@ -195,11 +213,22 @@ def delta(before, after, table, count):
     assert len(after[table]) - len(before[table]) == count, (table, before[table], after[table])
 
 
-async def test_transition_fact_persists_result_and_one_atomic_effect(lifecycle):
+async def test_transition_fact_persists_result_and_one_atomic_effect(lifecycle, monkeypatch):
+    from memory_server.application.memory_service import MemoryService
+
     h = lifecycle
-    await seed(h)
+    remembered, remember = [], MemoryService.remember
+
+    async def observe(service, command, **kwargs):
+        result = await remember(service, command, **kwargs)
+        remembered.append(result["fact"].id)
+        return result
+
+    monkeypatch.setattr(MemoryService, "remember", observe)
+    ident = await seed_application_fact(h)
+    assert remembered == [ident], "happy-path seed bypassed application remember"
     before = await snapshot(h)
-    response = await post(h)
+    response = await post(h, ident=ident)
     assert response.status == 200, response.body
     result, after = response.json, await snapshot(h)
     assert result["from_state"] == "active" and result["to_state"] == "stale"
@@ -208,8 +237,10 @@ async def test_transition_fact_persists_result_and_one_atomic_effect(lifecycle):
     for table in ("lifecycle_states", "lifecycle_events", "outbox_entries", "http_request_journal"):
         delta(before, after, table, 1)
     receipt = after["receipts"][0]
-    assert receipt["version"] == "2" and len(json.loads(receipt["history"])) == 2
-    assert result["receipt_id"] == ROOT and result["audit_id"]
+    assert receipt["version"] == "2"
+    assert json.loads(receipt["history"])[:-1] == json.loads(before["receipts"][0]["history"])
+    assert len(json.loads(receipt["history"])) == len(json.loads(before["receipts"][0]["history"])) + 1
+    assert result["receipt_id"] == ident and result["audit_id"]
     memory = result["memory"]
     assert memory["masked"] and all(memory[field] is None for field in ("source", "creator", "content", "payload"))
     assert memory["projection"] == dict(vector="unknown", graph="unknown", outbox="pending")
@@ -444,25 +475,96 @@ async def test_all_invalidating_targets_propagate(lifecycle, target):
     assert len(r.json["propagated"]) == (0 if target == "stale" else 1)
 
 
-async def test_strict_sql_lookup_failure_is_not_success(lifecycle, monkeypatch):
+@pytest.fixture
+def prepared_graph_registry(monkeypatch):
+    """Publish a real graph before RuntimeManager captures file identity."""
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    original = build_registry
+
+    async def prepare(tmp_path):
+        registry, roots = await original(tmp_path)
+        graph = SimpleGraph(snapshot_path=roots["alpha"] / "graph.json")
+        for ident, kind in ((ROOT, "fact"), (CHILD, "fact"), (OTHER, "belief")):
+            graph.add_node(id=ident, type=kind, name=ident, attributes={})
+        graph.add_edge(source_id=CHILD, target_id=ROOT, relation="derived_from")
+        graph.add_edge(source_id=ROOT, target_id=OTHER, relation="derived_from")
+        return registry, roots
+
+    monkeypatch.setitem(globals(), "build_registry", prepare)
+
+
+@pytest.fixture
+async def graph_lifecycle(prepared_graph_registry, lifecycle):
+    return lifecycle
+
+
+async def graph_only_dependents(h):
+    """Read the lease's real graph, with no canonical SQL relations."""
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    await seed(h)
+    await seed(h, CHILD)
+    await seed(h, OTHER, "belief")
+    ctx = RequestContext("graph-parity", h.principal, "alpha", None, asyncio.get_running_loop().time() + 30)
+    async with h.deps.leases.acquire(ctx) as scope:
+        graph = await scope.application.lifecycle._graph()
+        assert isinstance(graph, SimpleGraph)
+        # Native compatibility includes legacy reversed graph edges.
+        assert {(edge.source_id, edge.target_id) for edge in graph.search_by_relation("derived_from")} == {
+            (CHILD, ROOT), (ROOT, OTHER)
+        }
+    async with h.factories["alpha"]() as session:
+        assert (await session.execute(text("SELECT count(*) FROM claim_relations"))).scalar_one() == 0
+    return graph
+
+
+@pytest.mark.parametrize("lookup", ["error", "empty"])
+async def test_strict_sql_lookup_failure_is_not_success(graph_lifecycle, monkeypatch, lookup):
+    lifecycle = graph_lifecycle
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    await seed(lifecycle)
+    from memory_server.application.lifecycle_service import LifecycleService as ApplicationLifecycleService
+
+    graph = await graph_only_dependents(lifecycle)
     before = await snapshot(lifecycle)
     original, calls = AsyncSession.execute, []
+    graph_calls = []
+
+    def forbidden_graph(*args, **kwargs):
+        graph_calls.append((args, kwargs))
+        pytest.fail("strict remote lifecycle touched graph authority")
+
+    async def forbidden_acquire(*args, **kwargs):
+        forbidden_graph(*args, **kwargs)
 
     async def fault(session, statement, *args, **kwargs):
         if "SELECT source_id FROM claim_relations" in str(statement):
             calls.append(str(statement))
-            raise OperationalError("S14_CANARY_SQL", {}, Exception("failed"))
+            if lookup == "error":
+                raise OperationalError("S14_CANARY_SQL", {}, Exception("failed"))
         return await original(session, statement, *args, **kwargs)
 
     with monkeypatch.context() as m:
         m.setattr(AsyncSession, "execute", fault)
-        code(await post(lifecycle, op="invalidate"), "E_STORAGE", 503)
-    assert len(calls) == 1
-    assert await snapshot(lifecycle) == before
+        m.setattr(ApplicationLifecycleService, "_graph", forbidden_acquire)
+        m.setattr(graph, "search_by_relation", forbidden_graph)
+        response = await post(lifecycle, op="invalidate")
+    assert len(calls) == 1 and graph_calls == []
+    after = await snapshot(lifecycle)
+    if lookup == "error":
+        code(response, "E_STORAGE", 503)
+        assert after == before
+    else:
+        assert response.status == 200, response.body
+        assert response.json["propagated"] == []
+        assert next(row for row in after["facts"] if row["id"] == CHILD) == next(
+            row for row in before["facts"] if row["id"] == CHILD
+        )
+        assert after["beliefs"] == before["beliefs"]
+        assert {row["memory_id"] for row in after["lifecycle_events"]} == {ROOT}
+        assert {row["record_id"] for row in after["outbox_entries"]} == {ROOT}
 
 
 @pytest.mark.parametrize("parent_receipt", [True, False])
@@ -581,9 +683,12 @@ async def test_auth_revoke_expiry_and_wrong_profile(lifecycle):
     await seed(h)
     key = str(uuid4())
     assert (await post(h, key=key)).status == 200
-    for bearer in ("malformed", h.mint(expired=True)[0], h.mint(profiles=("beta",))[0]):
-        r = await post(h, bearer=bearer)
-        code(r, "E_PERMISSION_DENIED" if r.status == 403 else "E_AUTH_REQUIRED", 403 if r.status == 403 else 401)
+    for bearer, expected_code, expected_status in (
+        ("malformed", "E_AUTH_REQUIRED", 401),
+        (h.mint(expired=True)[0], "E_AUTH_REQUIRED", 401),
+        (h.mint(profiles=("beta",))[0], "E_PERMISSION_DENIED", 403),
+    ):
+        code(await post(h, bearer=bearer), expected_code, expected_status)
     h.deps.tokens._unchecked_revoke(
         h.deps.tokens._local_context(datetime.now(UTC)),
         h.token_id,
@@ -949,6 +1054,88 @@ async def test_limits_headers_and_canary_redaction(lifecycle, caplog):
     rate = await request(app, path, method="POST", bearer=h.bearer, body=payload())
     code(rate, "E_RATE_LIMIT", 429)
     assert rate.headers["retry-after"] == "1"
+
+
+@pytest.mark.parametrize("lookup", ["error", "empty"])
+@pytest.mark.parametrize(
+    "entrypoint", ["transition", "transition_many", "default", "false", "batch_default", "batch_false"]
+)
+async def test_native_graph_fallback_default_false_parity(graph_lifecycle, monkeypatch, lookup, entrypoint):
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from memory_server.application.contracts import LifecycleCommand
+    from memory_server.services.lifecycle_service import LifecycleService, LifecycleTransitionRequest
+
+    h = graph_lifecycle
+    graph = await graph_only_dependents(h)
+    original, queries, searches = AsyncSession.execute, [], []
+    search = graph.search_by_relation
+
+    async def observe_sql(session, statement, *args, **kwargs):
+        sql = str(statement)
+        if sql.lstrip().startswith("SELECT") and "FROM claim_relations" in sql:
+            queries.append(sql)
+            if lookup == "error":
+                raise OperationalError("S14_NATIVE_SQL", {}, Exception("failed"))
+            result = await original(session, statement, *args, **kwargs)
+            frozen = result.freeze()
+            assert frozen().all() == []
+            return frozen()
+        return await original(session, statement, *args, **kwargs)
+
+    def observe_graph(relation):
+        searches.append(relation)
+        return search(relation)
+
+    command = LifecycleCommand(memory_id=ROOT, memory_type="fact", to_state="discarded")
+    ctx = RequestContext("native-graph", h.principal, "alpha", None, asyncio.get_running_loop().time() + 30)
+    with monkeypatch.context() as m:
+        m.setattr(AsyncSession, "execute", observe_sql)
+        m.setattr(graph, "search_by_relation", observe_graph)
+        async with h.deps.leases.acquire(ctx) as scope:
+            application = scope.application.lifecycle
+            assert await application._graph() is graph
+            if entrypoint == "transition":
+                result = await application.transition(command)
+            elif entrypoint == "transition_many":
+                result = (await application.transition_many([command]))[0]
+            else:
+                kwargs = {"strict_remote": False} if entrypoint in ("false", "batch_false") else {}
+                async with scope.application.memory.session_factory() as session, session.begin():
+                    if entrypoint.startswith("batch_"):
+                        domain = LifecycleService(application._provider)
+                        native_request = LifecycleTransitionRequest(ROOT, "fact", "discarded")
+                        outcome = (await domain.transition_many_in_session(
+                            session, [native_request], graph=graph, **kwargs
+                        ))[0]
+                    else:
+                        outcome = await application.transition_in_session(session, command, **kwargs)
+                    result = application._payload(outcome)
+    assert len(queries) == 1 and searches == ["derived_from"]
+    assert result["memory"]["lifecycle_state"] == "discarded"
+    assert int(result["memory"]["version"]) == 2
+    assert result["event"] == dict(
+        memory_id=ROOT, memory_type="fact", from_state="active", to_state="discarded",
+        reason="lifecycle transition", triggered_by="system",
+    )
+    assert {item["memory_id"] for item in result["propagated"]} == {CHILD, OTHER}
+    for item in result["propagated"]:
+        assert item == dict(
+            memory_id=item["memory_id"], memory_type="fact" if item["memory_id"] == CHILD else "belief",
+            confidence=0.64, version=2, reason="parent_invalidated",
+        )
+    after = await snapshot(h)
+    facts = {row["id"]: row for row in after["facts"]}
+    assert (facts[ROOT]["lifecycle_state"], facts[ROOT]["version"]) == ("discarded", "2")
+    assert (facts[CHILD]["lifecycle_state"], facts[CHILD]["version"], facts[CHILD]["confidence"]) == (
+        "active", "2", 0.64
+    )
+    belief = after["beliefs"][0]
+    assert (belief["lifecycle_state"], belief["version"], belief["confidence"]) == ("active", 2, 0.64)
+    assert {row["memory_id"] for row in after["lifecycle_events"]} == {ROOT, CHILD, OTHER}
+    assert len(after["lifecycle_events"]) == 3
+    assert after["outbox_entries"] == after["http_request_journal"] == []
 
 
 async def test_legacy_lifecycle_observable_parity(lifecycle):

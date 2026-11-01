@@ -9,11 +9,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
+from typing import Literal
 from uuid import UUID
 
 from pydantic import ValidationError
 from sqlalchemy import event, select
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from storage.models.belief import BeliefORM
 from storage.models.fact import FactORM
@@ -84,7 +85,7 @@ def _memory(row, kind, receipt_id):
 
 @dataclass(frozen=True)
 class _EffectEvent:
-    memory_type: str
+    memory_type: Literal["fact", "belief"]
     event: d.Event
 
 
@@ -103,6 +104,29 @@ async def _settle(awaitable):
         except asyncio.CancelledError:
             continue
     return task.result()
+
+
+def _sqlite_busy(exc: Exception) -> bool:
+    original = getattr(exc, "orig", exc)
+    if not isinstance(original, sqlite3.OperationalError):
+        return False
+    code = getattr(original, "sqlite_errorcode", None)
+    # Extended codes (e.g. SQLITE_BUSY_SNAPSHOT) share the primary low byte.
+    if type(code) is int:
+        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    return _is_busy(exc)
+
+
+class _LifecycleMutationUoW(MutationUoW):
+    async def _attempt(self, ctx, command, handler, digest):
+        # Journal purge/read and COMMIT are outside the handler's SQL mapper.
+        # Classify before MutationUoW.run sanitizes the exception to E_STORAGE.
+        try:
+            return await super()._attempt(ctx, command, handler, digest)
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            if _sqlite_busy(exc):
+                raise HttpError("E_REQUEST_IN_PROGRESS") from None
+            raise
 
 
 class LifecycleHandler:
@@ -150,8 +174,7 @@ class LifecycleHandler:
         except LifecyclePropagationLimitError:
             raise HttpError("E_STORAGE") from None
         except (SQLAlchemyError, sqlite3.Error) as exc:
-            busy = isinstance(exc, (OperationalError, sqlite3.OperationalError)) and _is_busy(exc)
-            raise HttpError("E_REQUEST_IN_PROGRESS" if busy else "E_STORAGE") from None
+            raise HttpError("E_REQUEST_IN_PROGRESS" if _sqlite_busy(exc) else "E_STORAGE") from None
         except (HttpError, asyncio.CancelledError):
             raise
         except Exception:
@@ -352,7 +375,7 @@ class RemoteLifecyclePort:
         started = monotonic()
         async with self._deps.leases.acquire(ctx) as scope:
             factory = scope.application.memory.session_factory
-            uow = MutationUoW(
+            uow = _LifecycleMutationUoW(
                 factory,
                 verify_principal=lambda p: self._deps.tokens.verify_principal(p, now=datetime.now(UTC)),
                 ticket_provider=lambda: ticket,

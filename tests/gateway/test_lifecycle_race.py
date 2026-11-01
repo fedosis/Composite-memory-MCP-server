@@ -52,7 +52,7 @@ async def test_two_clients_barrier_same_observed_version(lifecycle):
 
     first, second, independent = await asyncio.gather(client(), client(), post(h, profile="beta"))
     assert independent.status == 200, independent.body
-    assert sorted([first.status, second.status]) == [200, 409]
+    assert sorted([first.status, second.status]) == [200, 409], [first.body, second.body]
     loser = first if first.status == 409 else second
     code(loser, "E_VERSION_CONFLICT", 409)
     assert loser.json["error"]["details"] == dict(expected=1, actual=2, id=ROOT)
@@ -60,6 +60,92 @@ async def test_two_clients_barrier_same_observed_version(lifecycle):
     assert len(s["lifecycle_events"]) == len(s["outbox_entries"]) == 2
     assert len(s["http_request_journal"]) == 1
     assert {f["version"] for f in s["facts"]} == {"2"}
+
+
+async def test_writer_busy_at_journal_purge_retries_to_typed_conflict(lifecycle, monkeypatch):
+    """Real second writer, not an injected exception or a probabilistic race."""
+    import sqlite3
+    import traceback
+
+    from sqlalchemy.exc import OperationalError
+
+    h = lifecycle
+    await seed(h)
+    before = await snapshot(h)
+    original, failures = AsyncSession.execute, []
+
+    async def no_wait(session, statement, *args, **kwargs):
+        if str(statement).startswith("DELETE FROM http_request_journal"):
+            await original(session, text("PRAGMA busy_timeout=0"))
+            try:
+                return await original(session, statement, *args, **kwargs)
+            except OperationalError as exc:
+                failures.append(exc)
+                print("S14_WRITER_ORIGIN", type(exc).__name__, type(exc.orig).__name__,
+                      str(exc.orig), exc.orig.sqlite_errorcode, exc.orig.sqlite_errorname)
+                traceback.print_exc()
+                raise
+        return await original(session, statement, *args, **kwargs)
+
+    key = str(uuid4())
+    with monkeypatch.context() as m:
+        m.setattr(AsyncSession, "execute", no_wait)
+        async with h.factories["alpha"]() as writer, writer.begin():
+            await writer.execute(text("UPDATE facts SET version=version WHERE id=:id"), {"id": ROOT})
+            response = await post(h, key=key)
+            assert len(failures) == 1
+            assert isinstance(failures[0].orig, sqlite3.OperationalError)
+            assert failures[0].orig.sqlite_errorcode == sqlite3.SQLITE_BUSY
+            code(response, "E_REQUEST_IN_PROGRESS", 409)
+    assert await snapshot(h) == before
+    winner = await post(h)
+    assert winner.status == 200, winner.body
+    loser = await retry(h, key)
+    code(loser, "E_VERSION_CONFLICT", 409)
+    assert loser.json["error"]["details"] == dict(expected=1, actual=2, id=ROOT)
+    after = await snapshot(h)
+    assert len(after["http_request_journal"]) == len(after["lifecycle_events"]) == 1
+
+
+@pytest.mark.parametrize("boundary", ["journal", "handler"])
+@pytest.mark.parametrize("failure", ["readonly", "missing_table"])
+async def test_non_busy_sqlite_fault_is_storage_not_transient(lifecycle, monkeypatch, boundary, failure):
+    import sqlite3
+
+    from sqlalchemy.exc import OperationalError
+
+    h = lifecycle
+    await seed(h)
+    before = await snapshot(h)
+    original, failures = AsyncSession.execute, []
+
+    async def fault(session, statement, *args, **kwargs):
+        sql = str(statement)
+        matches = (
+            sql.startswith("DELETE FROM http_request_journal")
+            if boundary == "journal"
+            else sql.startswith("UPDATE facts SET")
+        )
+        if matches:
+            if failure == "readonly":
+                await original(session, text("PRAGMA query_only=ON"))
+            else:
+                statement = text("UPDATE s14_missing_table SET value=1")
+            try:
+                return await original(session, statement, *args, **kwargs)
+            except OperationalError as exc:
+                failures.append(exc.orig)
+                raise
+            finally:
+                await original(session, text("PRAGMA query_only=OFF"))
+        return await original(session, statement, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(AsyncSession, "execute", fault)
+        code(await post(h), "E_STORAGE", 503)
+    assert len(failures) == 1
+    assert failures[0].sqlite_errorcode == (sqlite3.SQLITE_READONLY if failure == "readonly" else sqlite3.SQLITE_ERROR)
+    assert await snapshot(h) == before
 
 
 @pytest.mark.parametrize("schedule", ["first_select", "conditional_update"])
