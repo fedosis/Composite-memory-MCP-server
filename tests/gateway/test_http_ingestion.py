@@ -904,3 +904,14 @@ async def test_learn_belief_reinforce_and_outbox_scope(harness, monkeypatch):
     assert len(second.json["outbox_ids"]) == 1
     assert not set(second.json["outbox_ids"]) & set(first.json["outbox_ids"])
     assert await learn_counts(harness) == (1, 0, 0, 1, 2, 3, 2)
+
+
+def test_learn_service_import_order_in_fresh_interpreter():
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", "from memory_server.application import MemoryApplication"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr

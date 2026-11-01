@@ -48,7 +48,6 @@ from memory_server.models import (
     Skill,
     VerificationStatus,
 )
-from memory_server.transports.http.errors import HttpError
 
 if TYPE_CHECKING:
     from memory_server.application.remote_ingestion import LearnPlan
@@ -1144,6 +1143,8 @@ async def _outbox(
 
 def check_fact_version(row: Fact, expected_versions: Mapping[str, int]) -> None:
     """Reject missing or stale remote preconditions before a write."""
+    from memory_server.transports.http.errors import HttpError
+
     item_id = str(row.id)
     if item_id not in expected_versions:
         raise HttpError("E_PRECONDITION_REQUIRED", details={"id": item_id})
