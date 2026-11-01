@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """S14 lifecycle HTTP acceptance tests."""
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from storage.models.fact import FactORM
 
 from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.ports import HttpConfig
@@ -43,8 +45,14 @@ async def test_transition_fact_persists_result_and_one_atomic_effect(tmp_path):
             ), now=now,
         )
         bearer = f"cmms_{created.token.id}.{created.secret}"
+        principal = await holder.app.dependencies.tokens.authenticate(bearer, now=now)
+        ctx = __import__("memory_server.gateway_contracts.ports", fromlist=["RequestContext"]).RequestContext("seed-s14", principal, "alpha", None, 9999999999.0)
+        async with holder.app.dependencies.leases.acquire(ctx) as scope:
+            async with scope.application.memory.session_factory() as session:
+                async with session.begin():
+                    session.add(FactORM(id="00000000-0000-0000-0000-000000000001", subject="s14", predicate="p", object="o", dedup_key="s14", confidence=0.8, source="test", creator="test", lifecycle_state="active", version="1"))
         status, body = await http_request(
-            port, "POST", f"/api/v1/profiles/alpha/memories/{uuid4()}/transition",
+            port, "POST", "/api/v1/profiles/alpha/memories/00000000-0000-0000-0000-000000000001/transition",
             body=json.dumps({"memory_type": "fact", "to_state": "stale", "reason": "s14", "expected_version": 1, "confirmation": True}).encode(),
             headers={"Authorization": "Bearer " + bearer, "Content-Type": "application/json", "Idempotency-Key": str(uuid4())},
         )

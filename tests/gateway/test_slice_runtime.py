@@ -656,9 +656,10 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
             "traces.get",
             "traces.list",
         }
-        assert set(deps.ports) == read_operations | {"memories.create", "learn"}
+        mutation_operations = {"memories.create", "learn", "memories.transition", "memories.invalidate"}
+        assert set(deps.ports) == read_operations | mutation_operations
         assert {spec.operation for spec in read_routes} == read_operations
-        assert {spec.operation for spec in mutation_routes} == {"memories.create", "learn"}
+        assert {spec.operation for spec in mutation_routes} == mutation_operations
         missing = dict(deps.ports)
         del missing[operation]
         return create_http_app(

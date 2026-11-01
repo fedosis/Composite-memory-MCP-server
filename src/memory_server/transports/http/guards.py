@@ -21,6 +21,7 @@ from memory_server.gateway_contracts.ports import AuditOutcome, Principal, Reque
 
 from .errors import HttpError, error_code, error_response
 from .routes.ingestion import MutationRouteSpec
+from .routes.lifecycle import MutationRouteSpec as LifecycleMutationRouteSpec
 from .routes.profiles import audit_ticket, control_pending, control_reply, validate_profile_id, validate_query
 
 
@@ -115,7 +116,7 @@ class Guard:
             if body or request.query_params:
                 raise HttpError('E_VALIDATION')
             payload = d.Empty()
-        elif isinstance(spec, MutationRouteSpec):
+        elif isinstance(spec, (MutationRouteSpec, LifecycleMutationRouteSpec)):
             if request.query_params:
                 raise HttpError('E_VALIDATION')
             if request.headers.get('content-type', '').split(';')[0].strip().lower() != 'application/json':
@@ -129,7 +130,7 @@ class Guard:
                 idem = UUID(keys[0])
             except ValueError:
                 raise HttpError('E_VALIDATION') from None
-            command = spec.parse(body, profile)
+            command = spec.parse(request, body, profile)
         else:
             if request.query_params:
                 raise HttpError('E_VALIDATION')
@@ -151,7 +152,7 @@ class Guard:
                        for item in exc.errors()):
                     raise HttpError('E_PRECONDITION_REQUIRED') from None
                 raise HttpError('E_VALIDATION') from None
-        if not isinstance(spec, (ReadRouteSpec, MutationRouteSpec)):
+        if not isinstance(spec, (ReadRouteSpec, MutationRouteSpec, LifecycleMutationRouteSpec)):
             command = d.COMMAND_TYPES[spec.operation](
                 operation=spec.operation, profile_id=profile, path_ids={}, payload=payload)
         port = self.dependencies.ports.get(spec.operation)
@@ -181,7 +182,7 @@ class Guard:
             if isinstance(spec, ReadRouteSpec):
                 result = spec.validate_result(result)
                 response = JSONResponse(result.model_dump(mode='json'))
-            elif isinstance(spec, MutationRouteSpec):
+            elif isinstance(spec, (MutationRouteSpec, LifecycleMutationRouteSpec)):
                 response = JSONResponse(result.model_dump(mode='json'), status_code=spec.status(result))
                 mutation = MUTATION_REPLY.get()
                 if mutation is not None and mutation.replayed:
@@ -195,7 +196,7 @@ class Guard:
             else:
                 result = d.Profile.model_validate(result.model_dump()).model_copy(update={'storage_root': None})
                 response = JSONResponse(result.model_dump(mode='json'))
-            if not isinstance(spec, (ReadRouteSpec, MutationRouteSpec)):
+            if not isinstance(spec, (ReadRouteSpec, MutationRouteSpec, LifecycleMutationRouteSpec)):
                 reply = control_reply.get()
                 if reply is not None and reply.replayed:
                     response.headers['Idempotency-Replayed'] = 'true'
@@ -212,7 +213,7 @@ class Guard:
             reply = control_reply.get()
             mutation = MUTATION_REPLY.get()
             mutation_owned = (
-                isinstance(spec, MutationRouteSpec)
+                isinstance(spec, (MutationRouteSpec, LifecycleMutationRouteSpec))
                 and response is not None
                 and 200 <= response.status_code < 300
                 and not (mutation is not None and mutation.replayed)

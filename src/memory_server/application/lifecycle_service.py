@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, Sequence
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from memory_server.application.contracts import LifecycleCommand
 from memory_server.services.lifecycle_service import (
     LifecycleService as DomainLifecycleService,
 )
-from memory_server.services.lifecycle_service import LifecycleTransitionRequest
+from memory_server.services.lifecycle_service import LifecycleTransitionRequest, LifecycleTransitionResult
 
 
 class LifecycleService:
@@ -37,6 +39,21 @@ class LifecycleService:
             "event": result.event,
             "propagated": result.propagated,
         }
+
+    async def transition_in_session(
+        self, session: AsyncSession, command: LifecycleCommand, *, strict_remote: bool = False
+    ) -> LifecycleTransitionResult:
+        request = LifecycleTransitionRequest(
+            memory_id=command.memory_id,
+            memory_type=command.memory_type,
+            to_state=command.to_state,
+            reason=command.reason,
+            triggered_by=command.triggered_by,
+            expected_version=self._expected_version(command.expected_version),
+        )
+        return await DomainLifecycleService(self._provider).transition_in_session(
+            session, request, graph=None if strict_remote else await self._graph(), strict_remote=strict_remote
+        )
 
     async def transition(self, command: LifecycleCommand) -> dict[str, Any]:
         result = await DomainLifecycleService(self._provider).transition(

@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Lifecycle repository — lifecycle state and event tracking."""
 
 import json
@@ -14,6 +15,12 @@ from storage.models.lifecycle import LifecycleEventORM, LifecycleStateORM
 
 class LifecycleConflictError(ValueError):
     """The requested revision/state no longer matches; roll back the whole UOW."""
+
+    def __init__(self, message, *, memory_id=None, expected=None, actual=None):
+        super().__init__(message)
+        self.memory_id = memory_id
+        self.expected = expected
+        self.actual = actual
 
 
 def normalize_version(version: Any) -> int:
@@ -49,7 +56,11 @@ async def _cas_transition(
         select(model.version, model.lifecycle_state).where(model.id == memory_id)
     )).one_or_none()
     if row is None or normalize_version(row.version) != expected_version or row.lifecycle_state != expected_state:
-        raise LifecycleConflictError(f"expected_version mismatch for {memory_id}: expected {expected_version}")
+        raise LifecycleConflictError(
+            f"expected_version mismatch for {memory_id}: expected {expected_version}",
+            memory_id=memory_id, expected=expected_version,
+            actual=normalize_version(row.version) if row is not None else None,
+        )
     values = {
         "lifecycle_state": new_state,
         "version": str(expected_version + 1) if model.__tablename__ == "facts" else expected_version + 1,
@@ -64,7 +75,12 @@ async def _cas_transition(
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
-        raise LifecycleConflictError(f"expected_version mismatch for {memory_id}: expected {expected_version}")
+        observed = (await session.execute(select(model.version, model.lifecycle_state).where(model.id == memory_id))).one_or_none()
+        raise LifecycleConflictError(
+            f"expected_version mismatch for {memory_id}: expected {expected_version}",
+            memory_id=memory_id, expected=expected_version,
+            actual=normalize_version(observed.version) if observed is not None else None,
+        )
     orm = await session.get(model, memory_id, populate_existing=True)
     return orm.to_pydantic()
 
