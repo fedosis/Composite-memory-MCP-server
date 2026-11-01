@@ -353,9 +353,21 @@ async def test_if_match_optional_and_agreement(lifecycle):
 
 @pytest.mark.parametrize("op", ["transition", "invalidate"])
 async def test_decision_skill_rejected_before_lookup(lifecycle, monkeypatch, op):
+    from memory_server.transports.http.errors import HttpError
+
     await forbid_lease(lifecycle, monkeypatch)
+    operation = "memories." + op
+    payload_class = d.TransitionRequest if op == "transition" else d.InvalidateRequest
+    valid = d.COMMAND_TYPES[operation](
+        operation=operation, profile_id="alpha", path_ids={"id": ROOT},
+        payload=payload_class(**payload(op)),
+    )
+    ctx = RequestContext("forged-type", lifecycle.principal, "alpha", uuid4(), asyncio.get_running_loop().time() + 30)
     for kind in ("decision", "skill"):
         code(await post(lifecycle, op=op, kind=kind), "E_VALIDATION", 422)
+        forged = valid.model_copy(update={"payload": valid.payload.model_copy(update={"memory_type": kind})})
+        with pytest.raises(HttpError, match="E_VALIDATION"):
+            await port(lifecycle).execute(ctx, forged)
 
 
 async def test_scoped_missing_and_foreign_id_are_404(lifecycle):
@@ -437,7 +449,7 @@ async def test_idempotency_header_and_content_type(lifecycle):
 async def test_direct_derived_from_propagation_only(lifecycle):
     h = lifecycle
     await seed(h)
-    await seed(h, CHILD)
+    await seed(h, CHILD, confidence=0.81234567)
     await seed(h, OTHER, "belief", confidence=0.1)
     extra = [str(uuid4()) for _ in range(4)]
     for ident in extra:
@@ -460,7 +472,7 @@ async def test_direct_derived_from_propagation_only(lifecycle):
         assert (p["action"], p["reason"], p["revision"]) == ("confidence_demoted", "parent_invalidated", 2)
     s = await snapshot(h)
     facts = {f["id"]: f for f in s["facts"]}
-    assert facts[CHILD]["confidence"] == 0.64 and facts[CHILD]["lifecycle_state"] == "active"
+    assert facts[CHILD]["confidence"] == 0.649877 and facts[CHILD]["lifecycle_state"] == "active"
     assert s["beliefs"][0]["confidence"] == 0.1
     assert all(facts[i]["version"] == "1" for i in extra)
 

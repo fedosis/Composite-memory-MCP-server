@@ -107,6 +107,52 @@ async def test_writer_busy_at_journal_purge_retries_to_typed_conflict(lifecycle,
     assert len(after["http_request_journal"]) == len(after["lifecycle_events"]) == 1
 
 
+async def test_inflight_audit_publication_is_not_a_sqlite_busy_error(lifecycle, monkeypatch):
+    """Characterize the distinct 503 path; do not relabel an audit outage busy."""
+    import traceback
+
+    from memory_server.application.mutation_uow import MutationUoW
+    from memory_server.application.remote_lifecycle import RemoteLifecyclePort
+    from memory_server.transports.http.errors import HttpError
+
+    h = lifecycle
+    await seed(h)
+    reached, release = asyncio.Event(), asyncio.Event()
+    tail, attempt, failures = RemoteLifecyclePort._tail, MutationUoW._attempt, []
+
+    async def pause(port, *args, **kwargs):
+        reached.set()
+        await release.wait()
+        return await tail(port, *args, **kwargs)
+
+    async def observe(uow, *args, **kwargs):
+        try:
+            return await attempt(uow, *args, **kwargs)
+        except HttpError as exc:
+            failures.append((exc.code, traceback.format_exc()))
+            raise
+
+    with monkeypatch.context() as m:
+        m.setattr(RemoteLifecyclePort, "_tail", pause)
+        m.setattr(MutationUoW, "_attempt", observe)
+        winner = asyncio.create_task(post(h))
+        try:
+            await asyncio.wait_for(reached.wait(), 5)
+            committed = await snapshot(h)
+            assert committed["http_request_journal"][0]["pending_publication"] == 1
+            loser = await post(h)
+            code(loser, "E_AUDIT_UNAVAILABLE", 503)
+            assert await snapshot(h) == committed
+            assert len(failures) == 1 and failures[0][0] == "E_AUDIT_UNAVAILABLE"
+            assert 'mutation_uow.py", line 214' in failures[0][1]
+            print("S14_PENDING_AUDIT_ORIGIN", failures[0][1])
+        finally:
+            release.set()
+            response = await winner
+        assert response.status == 200, response.body
+    code(await post(h), "E_VERSION_CONFLICT", 409)
+
+
 @pytest.mark.parametrize("boundary", ["journal", "handler"])
 @pytest.mark.parametrize("failure", ["readonly", "missing_table"])
 async def test_non_busy_sqlite_fault_is_storage_not_transient(lifecycle, monkeypatch, boundary, failure):
