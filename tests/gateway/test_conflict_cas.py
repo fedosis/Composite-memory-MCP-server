@@ -814,3 +814,42 @@ async def test_defer_different_keys_and_ttl_are_not_once_ever(resolve_http):
     for rid in fourth.json["receipt_ids"]:
         raw = json.loads((await sql(state, "SELECT history FROM receipts WHERE id=:id", dict(id=rid)))[0][0])
         assert raw[0]["reason"] == "  RESOLVE_REASON_CANARY  "
+
+
+async def test_merge_readback_checks_database_not_identity_map(resolve_http):
+    from sqlalchemy import event, text
+    from storage.models.belief import EvidenceORM
+
+    state = resolve_http
+    await seed_evidence(state, 1)
+    before, crossed = await set_snapshot(state), []
+
+    def corrupt(mapper, connection, row):
+        if row.belief_id not in (ident(1), ident(2)):
+            crossed.append(row.id)
+            connection.execute(text("UPDATE evidence SET note='CORRUPTED' WHERE id=:id"), dict(id=row.id))
+
+    event.listen(EvidenceORM, "after_insert", corrupt)
+    try:
+        response = await resolve(state, resolve_payload("merge"))
+    finally:
+        event.remove(EvidenceORM, "after_insert", corrupt)
+    error_code(response, "E_STORAGE", 503)
+    assert len(crossed) == 1 and await set_snapshot(state) == before
+
+
+async def test_merge_final_indexing_follows_effect_frontier(resolve_http, monkeypatch):
+    from storage.outbox import OutboxRepository
+
+    state, recorded = resolve_http, []
+    original = OutboxRepository.add_entry
+
+    async def tracked(self, kind, ident, *a, **kw):
+        result = await original(self, kind, ident, *a, **kw)
+        recorded.append((kind, ident))
+        return result
+
+    monkeypatch.setattr(OutboxRepository, "add_entry", tracked)
+    response = await resolve(state, resolve_payload("merge"))
+    assert response.status == 200, response.body
+    assert recorded == [("belief", m["id"]) for m in response.json["memories"]]

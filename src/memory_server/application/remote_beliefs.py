@@ -1452,7 +1452,12 @@ class BeliefsMutationHandler:
                 copied.append((copy.id, *(getattr(copy, f) for f in fields)))
             await session.flush()
             actual = (
-                await session.scalars(select(EvidenceORM).where(EvidenceORM.belief_id == new.id).limit(1025))
+                await session.scalars(
+                    select(EvidenceORM)
+                    .where(EvidenceORM.belief_id == new.id)
+                    .limit(1025)
+                    .execution_options(populate_existing=True)
+                )
             ).all()
             if {r.id: tuple(getattr(r, f) for f in fields) for r in actual} != {r[0]: r[1:] for r in copied}:
                 raise HttpError("E_STORAGE")
@@ -1462,13 +1467,14 @@ class BeliefsMutationHandler:
             await self._persist_receipt(
                 session, fresh, "belief", [new_entry], source="conflict_resolution", actor=actor, required=True
             )
-            await self._index(session, "belief", fresh)
         if requests:
             final = await self._transitions(session, requests, plan, frontier)
             pair = [final.get(("belief", r.id), r) for r in pair]
             entry["effects"] = [
                 self._event_entry(e, record[0], record[-1]) for e, record in zip(plan, self.effects, strict=True)
             ]
+        if new is not None:
+            await self._index(session, "belief", fresh)
         receipt = MemoryReceipt(
             id=action_id,
             memory_type="belief",
