@@ -328,6 +328,66 @@ def parse_beliefs_set(request: Request, body: bytes, profile_id: str) -> d.Belie
     return validate_belief_mutation_command(command)
 
 
+def parse_conflicts_resolve(request: Request, body: bytes, profile_id: str) -> d.ConflictsResolveCommand:
+    if request.headers.getlist("if-match"):
+        raise HttpError("E_VALIDATION")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    def nonfinite(value):
+        raise ValueError
+
+    try:
+        conflict_id = request.path_params["id"]
+        path_pair = decode_conflict_id(conflict_id)
+        raw = json.loads(body.decode("utf-8"), object_pairs_hook=pairs, parse_constant=nonfinite)
+        if type(raw) is not dict or set(raw) - set(d.ResolveRequest.model_fields):
+            raise ValueError
+        for name, field in d.ResolveRequest.model_fields.items():
+            if name in raw:
+                TypeAdapter(
+                    field.rebuild_annotation(), config=ConfigDict(strict=True, allow_inf_nan=False)
+                ).validate_python(raw[name])
+            elif field.is_required() and name != "expected_versions":
+                raise ValueError
+        a, b = validate_belief_id(raw["belief_a_id"]), validate_belief_id(raw["belief_b_id"])
+        if a == b or path_pair != tuple(sorted((a, b))) or not raw["reason"].strip():
+            raise ValueError
+        if raw["resolution"] == "merge":
+            if (
+                type(raw["new_proposition"]) is not str
+                or not 1 <= len(raw["new_proposition"]) <= 2048
+                or not raw["new_proposition"].strip()
+            ):
+                raise ValueError
+        elif raw["new_proposition"] is not None:
+            raise ValueError
+        versions = raw.get("expected_versions", {})
+        for ident in versions:
+            validate_belief_id(ident)
+        if set(versions) - {a, b}:
+            raise ValueError
+        if set(versions) != {a, b}:
+            raise HttpError("E_PRECONDITION_REQUIRED")
+        payload = d.ResolveRequest.model_validate(raw, strict=True)
+        command = d.ConflictsResolveCommand(
+            operation="conflicts.resolve", profile_id=profile_id, path_ids={"id": conflict_id}, payload=payload
+        )
+    except (ValidationError, ValueError, TypeError, KeyError, RecursionError):
+        raise HttpError("E_VALIDATION") from None
+    return validate_belief_mutation_command(command)
+
+
+def _resolve_status(result):
+    return 200
+
+
 BELIEF_MUTATION_ROUTE_SPECS = MappingProxyType(
     {
         "beliefs.set": MutationRouteSpec(
@@ -338,9 +398,17 @@ BELIEF_MUTATION_ROUTE_SPECS = MappingProxyType(
             parse_beliefs_set,
             write_status,
         ),
+        "conflicts.resolve": MutationRouteSpec(
+            "conflicts.resolve",
+            CATALOG.by_operation["conflicts.resolve"].method,
+            CATALOG.by_operation["conflicts.resolve"].route,
+            CATALOG.by_operation["conflicts.resolve"].permission,
+            parse_conflicts_resolve,
+            _resolve_status,
+        ),
     }
 )
 
 
 def create_belief_mutation_routes() -> tuple[MutationRouteSpec, ...]:
-    return (BELIEF_MUTATION_ROUTE_SPECS["beliefs.set"],)
+    return (BELIEF_MUTATION_ROUTE_SPECS["beliefs.set"], BELIEF_MUTATION_ROUTE_SPECS["conflicts.resolve"])

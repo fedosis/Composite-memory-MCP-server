@@ -488,6 +488,8 @@ class BeliefsReadHandler:
 
 
 def validate_belief_mutation_command(command):
+    if type(command) is d.ConflictsResolveCommand:
+        return _validate_resolve_command(command)
     try:
         if type(command) is not d.BeliefsSetCommand or command.operation != "beliefs.set":
             raise ValueError
@@ -505,6 +507,39 @@ def validate_belief_mutation_command(command):
         for summary in payload.sources:
             for ident in summary.derived_from:
                 validate_belief_id(ident)
+        return command
+    except (ValidationError, ValueError, TypeError, AttributeError, KeyError):
+        raise HttpError("E_VALIDATION") from None
+
+
+def _validate_resolve_command(command):
+    try:
+        if command.operation != "conflicts.resolve":
+            raise ValueError
+        for model in (command, command.payload):
+            if set(model.__dict__) - set(type(model).model_fields) or model.model_extra:
+                raise ValueError
+        command = d.ConflictsResolveCommand.model_validate(command.model_dump(), strict=True)
+        payload = command.payload
+        a, b = validate_belief_id(payload.belief_a_id), validate_belief_id(payload.belief_b_id)
+        if (
+            a == b
+            or set(command.path_ids) != {"id"}
+            or decode_conflict_id(command.path_ids["id"]) != tuple(sorted((a, b)))
+            or not payload.reason.strip()
+        ):
+            raise ValueError
+        for ident in payload.expected_versions:
+            validate_belief_id(ident)
+        if payload.resolution == "merge":
+            if (
+                type(payload.new_proposition) is not str
+                or not 1 <= len(payload.new_proposition) <= 2048
+                or not payload.new_proposition.strip()
+            ):
+                raise ValueError
+        elif payload.new_proposition is not None:
+            raise ValueError
         return command
     except (ValidationError, ValueError, TypeError, AttributeError, KeyError):
         raise HttpError("E_VALIDATION") from None
@@ -723,6 +758,15 @@ class BeliefsMutationHandler:
         try:
             async with asyncio.timeout_at(self.ctx.deadline):
                 await conn.run_sync(lambda c: c.connection.dbapi_connection.run_async(install))
+                if type(command) is d.ConflictsResolveCommand:
+                    return await self.resolve_in_session(
+                        session,
+                        command.payload,
+                        conflict_id=command.path_ids["id"],
+                        expected_versions=dict(command.payload.expected_versions),
+                        reason=command.payload.reason,
+                        actor=self.ctx.principal.subject,
+                    )
                 return await self.set_in_session(
                     session,
                     command.payload,
@@ -1242,6 +1286,239 @@ class BeliefsMutationHandler:
             raise HttpError("E_STORAGE", details={"limit": 1048576})
         return d.WriteResult.model_validate(result.model_dump(), strict=True)
 
+    async def resolve_in_session(self, session, payload, *, conflict_id, expected_versions, reason, actor):
+        payload = validate_belief_mutation_command(
+            d.ConflictsResolveCommand(
+                operation="conflicts.resolve",
+                profile_id=self.ctx.profile_id,
+                path_ids={"id": conflict_id},
+                payload=payload,
+            )
+        ).payload
+        if (
+            type(expected_versions) is not dict
+            or any(type(v) is not int or v < 1 for v in expected_versions.values())
+            or expected_versions != payload.expected_versions
+            or actor != self.ctx.principal.subject
+            or reason != payload.reason
+        ):
+            raise HttpError("E_VALIDATION")
+        expected_versions = dict(expected_versions)
+        pair = [await self._load(session, "belief", ident) for ident in (payload.belief_a_id, payload.belief_b_id)]
+        if any(row is None for row in pair):
+            raise HttpError("E_NOT_FOUND")
+        for row in pair:
+            _write_cas(row, {row.id: expected_versions[row.id]})
+        before = [dict(id=r.id, version=r.version, state=r.lifecycle_state) for r in pair]
+        action = payload.resolution
+        parents = (
+            pair[1:] if action == "keep_a" else pair[:1] if action == "keep_b" else pair if action != "defer" else []
+        )
+        target_state = (
+            "superseded" if action == "merge" else "contradicted" if action == "mark_contradicted" else "discarded"
+        )
+        requests = [
+            LifecycleTransitionRequest(r.id, "belief", target_state, reason, actor, expected_versions[r.id])
+            for r in parents
+        ]
+        # Inspect raw direct refs before hydration: pair overlap is not a native demotion.
+        for request in requests:
+            if not is_valid_transition(
+                next(r.lifecycle_state for r in pair if r.id == request.memory_id), target_state
+            ):
+                raise HttpError("E_VALIDATION")
+        for request in requests:
+            refs = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT source_id FROM claim_relations WHERE target_id=:id "
+                            "AND relation_type='derived_from' ORDER BY source_id COLLATE BINARY LIMIT 513"
+                        ),
+                        {"id": request.memory_id},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(refs) > 512:
+                raise HttpError("E_STORAGE", details={"limit": 512})
+            if set(refs) & set(expected_versions):
+                raise HttpError("E_VERSION_CONFLICT")
+        plan, frontier = await self._plan_transitions(session, requests)
+        now, action_id = utc(self.clock()), str(uuid4())
+        confidence = (pair[0].confidence + pair[1].confidence) / 2
+        decision, evidence, new = None, [], None
+        fields = ("source_type", "source_id", "weight", "contributor", "note", "created_at")
+        if action == "merge":
+            evidence = (
+                await session.scalars(
+                    select(EvidenceORM)
+                    .where(EvidenceORM.belief_id.in_([r.id for r in pair]))
+                    .order_by(
+                        EvidenceORM.belief_id.collate("BINARY"),
+                        EvidenceORM.created_at,
+                        EvidenceORM.id.collate("BINARY"),
+                    )
+                    .limit(1025)
+                )
+            ).all()
+            if len(evidence) > 1024:
+                raise HttpError("E_STORAGE", details={"limit": 1024})
+            for row in evidence:
+                if (
+                    any(type(getattr(row, f)) is not str for f in ("source_type", "source_id", "contributor"))
+                    or type(row.weight) not in (int, float)
+                    or not math.isfinite(row.weight)
+                    or (row.note is not None and type(row.note) is not str)
+                    or not isinstance(row.created_at, datetime)
+                ):
+                    raise HttpError("E_INTERNAL")
+            if not callable(getattr(self.gate, "classify", None)):
+                raise HttpError("E_CAPABILITY_UNAVAILABLE")
+            decision = self.gate.classify(payload.new_proposition, source_scope="remote", force=False, now=self.clock())
+            if not isinstance(decision, AdmissionDecision):
+                raise HttpError("E_INTERNAL")
+            if not decision.admitted:
+                raise HttpError("E_ADMISSION_REJECTED")
+            new = Belief(
+                id=str(uuid4()),
+                proposition=payload.new_proposition,
+                confidence=min(1.0, confidence),
+                creator=actor,
+                source="conflict_resolution",
+                tags=list(dict.fromkeys([*pair[0].tags, *pair[1].tags])),
+                source_ids=list(
+                    dict.fromkeys(
+                        [*pair[0].source_ids, *pair[1].source_ids, *(r.source_id for r in evidence if r.source_id)]
+                    )
+                ),
+                version=1,
+                created_at=now,
+                updated_at=now,
+                last_reinforced_at=now,
+            )
+        grouped = {}
+        for effect in plan:
+            grouped.setdefault(effect[0], []).append(self._event_entry(effect, "0" * 36, now))
+        for row in pair:
+            await self._receipt(session, row.id, "belief")
+        for (kind, ident), entries in grouped.items():
+            receipt = await self._receipt(session, ident, kind)
+            if receipt is not None:
+                self._history_budget(receipt, entries)
+        new_entry = dict(
+            id=new.id if new else action_id,
+            kind="receipt",
+            timestamp=now.isoformat(timespec="microseconds"),
+            operation="conflicts.resolve",
+            actor=actor,
+            reason=reason,
+            admission=decision.to_metadata() if decision else None,
+        )
+        if new is not None:
+            self._history_budget(None, [new_entry])
+        entry = dict(
+            id=action_id,
+            kind="receipt",
+            timestamp=now.isoformat(timespec="microseconds"),
+            operation="conflicts.resolve",
+            resolution=action,
+            conflict_id=conflict_id,
+            request_id=self.ctx.request_id,
+            actor=actor,
+            reason=reason,
+            pair=[r.id for r in pair],
+            before=before,
+            after=[
+                dict(
+                    id=r.id,
+                    version=frontier.get(("belief", r.id), (r.version, r.lifecycle_state, r.confidence))[0],
+                    state=frontier.get(("belief", r.id), (r.version, r.lifecycle_state, r.confidence))[1],
+                )
+                for r in pair
+            ],
+            effects=[self._event_entry(e, "0" * 36, now) for e in plan],
+            new_id=new.id if new else None,
+            admission=decision.to_metadata() if decision else None,
+        )
+        self._history_budget(None, [entry])
+        if new is not None:
+            await BeliefRepository(session).create(new)
+            copied = []
+            for original in evidence:
+                copy = EvidenceORM(id=str(uuid4()), belief_id=new.id, **{f: getattr(original, f) for f in fields})
+                session.add(copy)
+                copied.append((copy.id, *(getattr(copy, f) for f in fields)))
+            await session.flush()
+            actual = (
+                await session.scalars(select(EvidenceORM).where(EvidenceORM.belief_id == new.id).limit(1025))
+            ).all()
+            if {r.id: tuple(getattr(r, f) for f in fields) for r in actual} != {r[0]: r[1:] for r in copied}:
+                raise HttpError("E_STORAGE")
+            fresh = await self._load(session, "belief", new.id)
+            if fresh.source_ids != new.source_ids:
+                raise HttpError("E_STORAGE")
+            await self._persist_receipt(
+                session, fresh, "belief", [new_entry], source="conflict_resolution", actor=actor, required=True
+            )
+            await self._index(session, "belief", fresh)
+        if requests:
+            final = await self._transitions(session, requests, plan, frontier)
+            pair = [final.get(("belief", r.id), r) for r in pair]
+            entry["effects"] = [
+                self._event_entry(e, record[0], record[-1]) for e, record in zip(plan, self.effects, strict=True)
+            ]
+        receipt = MemoryReceipt(
+            id=action_id,
+            memory_type="belief",
+            source="conflict_resolution",
+            created_by=actor,
+            timestamp=now,
+            confidence=confidence,
+            version="1",
+            history=[entry],
+        )
+        await ReceiptRepository(session).create(receipt)
+        await session.flush()
+        readback = await ReceiptRepository(session).get(action_id)
+        raw = (
+            await session.execute(
+                text("SELECT id,source,created_by,version,history FROM receipts WHERE id=:id LIMIT 1"),
+                {"id": action_id},
+            )
+        ).first()
+        if (
+            readback is None
+            or readback.id != action_id
+            or readback.history != [entry]
+            or raw is None
+            or tuple(raw[:4]) != (action_id, "conflict_resolution", actor, "1")
+            or json.loads(raw[4]) != [entry]
+        ):
+            raise HttpError("E_STORAGE")
+        returned = [*pair, *([fresh] if new is not None else [])]
+        receipt_ids = list(dict.fromkeys([action_id, *(r.id for r in returned if self.receipts.get(r.id))]))
+        result = d.ConflictResult(
+            conflict_id=conflict_id,
+            resolution=action,
+            memories=[
+                _write_memory(
+                    r,
+                    "belief",
+                    r.id if self.receipts.get(r.id) else None,
+                    ("belief", r.id) in frontier or (new is not None and r.id == new.id),
+                )
+                for r in returned
+            ],
+            receipt_ids=receipt_ids,
+            audit_id=self.ticket,
+            request_id=self.ctx.request_id,
+        )
+        if len(result.model_dump_json().encode()) > 1048576:
+            raise HttpError("E_STORAGE", details={"limit": 1048576})
+        return d.ConflictResult.model_validate(result.model_dump(), strict=True)
+
 
 class RemoteBeliefsMutationPort:
     def __init__(
@@ -1262,10 +1539,20 @@ class RemoteBeliefsMutationPort:
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def execute(self, ctx: RequestContext, command: d.BeliefsSetCommand) -> d.WriteResult:
-        if type(command) is not d.BeliefsSetCommand or command.operation != "beliefs.set":
+        if type(command) not in (d.BeliefsSetCommand, d.ConflictsResolveCommand) or (
+            type(command),
+            command.operation,
+        ) not in (
+            (d.BeliefsSetCommand, "beliefs.set"),
+            (d.ConflictsResolveCommand, "conflicts.resolve"),
+        ):
             raise HttpError("E_VALIDATION")
         self._deps.tokens.verify_principal(ctx.principal, now=datetime.now(UTC))
-        require_permission(ctx.principal, "belief.write", profile_id=ctx.profile_id)
+        require_permission(
+            ctx.principal,
+            "belief.resolve" if type(command) is d.ConflictsResolveCommand else "belief.write",
+            profile_id=ctx.profile_id,
+        )
         if ctx.profile_id is None or command.profile_id != ctx.profile_id:
             raise HttpError("E_VALIDATION")
         command = validate_belief_mutation_command(command)
@@ -1326,11 +1613,15 @@ class RemoteBeliefsMutationPort:
             )
             if row is None or row.digest != _digest(command):
                 return None
-            return d.WriteResult.model_validate_json(row.response_snapshot), row.request_id, row.audit_ticket_id
+            return (
+                d.RESULT_TYPES[command.operation].model_validate_json(row.response_snapshot),
+                row.request_id,
+                row.audit_ticket_id,
+            )
 
     @staticmethod
     def _status(result):
-        return 200 if result.reinforced_ids else 201
+        return 200 if type(result) is d.ConflictResult or result.reinforced_ids else 201
 
     async def _reconcile(self, factory, ctx, command):
         async with factory() as session, session.begin():
@@ -1340,15 +1631,23 @@ class RemoteBeliefsMutationPort:
             )
             if row is None or row.digest != _digest(command) or not row.pending_publication or not row.audit_ticket_id:
                 return
-            result = d.WriteResult.model_validate_json(row.response_snapshot)
-            outcome = AuditOutcome(self._status(result), None, tuple(r.id for r in result.receipts), 0.0)
+            result = d.RESULT_TYPES[command.operation].model_validate_json(row.response_snapshot)
+            outcome = AuditOutcome(
+                self._status(result),
+                None,
+                tuple(result.receipt_ids) if type(result) is d.ConflictResult else tuple(r.id for r in result.receipts),
+                0.0,
+            )
             if await self._publish_outcome(AuditTicket(row.audit_ticket_id, row.request_id), outcome) is True:
                 await repo.mark_published(row.request_id)
 
     async def _tail(self, factory, uow, ctx, command, result, ticket, handler, started):
         async def audit():
             outcome = AuditOutcome(
-                self._status(result), None, tuple(r.id for r in result.receipts), (time.monotonic() - started) * 1000
+                self._status(result),
+                None,
+                tuple(result.receipt_ids) if type(result) is d.ConflictResult else tuple(r.id for r in result.receipts),
+                (time.monotonic() - started) * 1000,
             )
             if await self._publish_outcome(AuditTicket(ticket, ctx.request_id), outcome) is True:
                 await uow.mark_published(ctx.request_id)
@@ -1397,7 +1696,12 @@ class RemoteBeliefsMutationPort:
             wire = d.Event(
                 id=eid,
                 type="memory.transitioned"
-                if index == 0 and command.payload.replace_belief_id is not None
+                if (type(command) is d.ConflictsResolveCommand and before != after)
+                or (
+                    type(command) is d.BeliefsSetCommand
+                    and index == 0
+                    and command.payload.replace_belief_id is not None
+                )
                 else "memory.updated",
                 profile_id=ctx.profile_id,
                 timestamp=stamp,

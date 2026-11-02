@@ -18,7 +18,7 @@ from tests.gateway.test_slice_runtime import build_registry
 from tests.gateway.test_slice_runtime import offline_embedder as offline_embedder
 
 READS = {"beliefs.list", "beliefs.get", "conflicts.list"}
-WRITES = {"memories.create", "learn", "memories.transition", "memories.invalidate", "beliefs.set"}
+WRITES = {"memories.create", "learn", "memories.transition", "memories.invalidate", "beliefs.set", "conflicts.resolve"}
 IDENT = "00000000-0000-4000-8000-000000000001"
 
 
@@ -119,9 +119,9 @@ async def test_belief_composition_regression_counts(belief_http):
     assert READS <= reads
     assert {spec.operation for spec in state.mutation_specs} == WRITES
     assert set(state.deps.ports) == reads | WRITES
-    assert "conflicts.resolve" not in state.deps.ports
     port = state.deps.ports["beliefs.set"]
-    assert all(port is not state.deps.ports[op] for op in (READS | WRITES) - {"beliefs.set"})
+    assert port is state.deps.ports["conflicts.resolve"]
+    assert all(port is not state.deps.ports[op] for op in (READS | WRITES) - {"beliefs.set", "conflicts.resolve"})
 
 
 async def orm_seed(state, rows, profile="alpha"):
@@ -204,7 +204,7 @@ async def test_belief_surface_mount_catalog_and_permissions(belief_http):
         )
         assert response.status == 503
     assert (await http(state, method="POST")).status == 403
-    assert (await http(state, "conflicts/conf_x/resolve", method="POST")).status == 404
+    assert (await http(state, "conflicts/conf_x/resolve", method="POST")).status == 403
 
 
 async def test_belief_list_exact_privacy_filter_matrix(belief_http, monkeypatch):
@@ -715,10 +715,9 @@ async def test_belief_read_import_graph_and_no_domain_writes(belief_http, monkey
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 symbols.update({a.asname or a.name.split(".")[0]: node for a in node.names})
             elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-                symbols.update({
-                    n.id: node for n in ast.walk(node)
-                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-                })
+                symbols.update(
+                    {n.id: node for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                )
         roots = [n for n in original.body if isinstance(n, definitions)]
         for node in roots:
             assert ast.get_source_segment(source, symbols[node.name]) == ast.get_source_segment(baseline, node)
@@ -1471,7 +1470,8 @@ async def test_beliefs_set_canonical_descriptor_and_missing_binding(belief_write
 
     state = belief_write
     specs = routes.create_belief_mutation_routes()
-    assert len(specs) == 1 and specs[0] is routes.BELIEF_MUTATION_ROUTE_SPECS["beliefs.set"]
+    assert len(specs) == 2 and specs[0] is routes.BELIEF_MUTATION_ROUTE_SPECS["beliefs.set"]
+    assert specs[1] is routes.BELIEF_MUTATION_ROUTE_SPECS["conflicts.resolve"]
     spec = specs[0]
     for fields in (
         {},
@@ -1601,7 +1601,7 @@ async def test_belief_write_import_graph_and_read_partition():
                 name = getattr(node.func, "attr", getattr(node.func, "id", ""))
                 assert name not in {"commit", "create_async_engine", "AsyncSession"}
     assert hasattr(module, "RemoteBeliefsMutationPort")
-    assert not hasattr(module.BeliefsMutationHandler, "resolve_in_session")
+    assert hasattr(module.BeliefsMutationHandler, "resolve_in_session")
 
 
 async def test_beliefs_set_cancel_cleanup_holds_lease(belief_write, monkeypatch):
@@ -1972,3 +1972,230 @@ async def test_beliefs_set_real_commit_cancel_journal_recovery(belief_write, mon
     assert (await post_set(state, key=key)).json == response.json
     assert len(await sql(state, "SELECT id FROM beliefs")) == 1
     assert state.deps.leases.snapshot()["alpha"].admissions == 0
+
+
+@pytest.fixture
+async def conflict_http(belief_http):
+    from tests.gateway.test_conflict_cas import resolve_http
+
+    return await resolve_http.__wrapped__(belief_http)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        (("If-Match", ""),),
+        (("If-Match", "*"),),
+        (("If-Match", 'W/"x"'),),
+        (("If-Match", '"m:belief:00000000-0000-4000-8000-000000000001:1"'),),
+        (("If-Match", '"a", "b"'),),
+        (("If-Match", '"a"'), ("If-Match", '"b"')),
+    ],
+)
+@pytest.mark.parametrize("mode", ["missing", "stale", "foreign", "replay"])
+async def test_conflicts_resolve_q5_header_matrix_before_lease(conflict_http, monkeypatch, headers, mode):
+    from uuid import uuid4
+
+    from tests.gateway.test_conflict_cas import resolve, resolve_payload
+
+    state, key = conflict_http, uuid4()
+    payload = resolve_payload("defer")
+    if mode == "missing":
+        payload.pop("expected_versions")
+    elif mode == "stale":
+        payload["expected_versions"] = {ident(1): 9, ident(2): 9}
+    elif mode == "foreign":
+        await sql(state, "DELETE FROM beliefs WHERE id=:id", dict(id=ident(2)))
+    else:
+        assert (await resolve(state, payload, key=key)).status == 200
+    before = await set_snapshot(state)
+    calls, original = [], type(state.deps.leases).acquire
+
+    def tracked(self, ctx):
+        calls.append(ctx)
+        return original(self, ctx)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(state.deps.leases), "acquire", tracked)
+        error_code(await resolve(state, payload, key=key, headers=headers), "E_VALIDATION", 422)
+        assert calls == []
+    assert await set_snapshot(state) == before
+
+
+@pytest.mark.parametrize(
+    "changes,status",
+    [
+        ({"expected_versions": {}}, 428),
+        ({"expected_versions": {IDENT: 1}}, 428),
+        ({"expected_versions": None}, 422),
+        ({"expected_versions": {IDENT: True}}, 422),
+        ({"expected_versions": {IDENT: 0}}, 422),
+        ({"expected_versions": {IDENT: "1"}}, 422),
+        ({"expected_versions": {ident(3): 1}}, 422),
+        ({"confirmation": 1, "expected_versions": {}}, 422),
+        ({"confirmation": False, "expected_versions": {}}, 422),
+        ({"reason": "  ", "expected_versions": {}}, 422),
+        ({"resolution": "unknown", "expected_versions": {}}, 422),
+        ({"auto_resolve": True, "expected_versions": {}}, 422),
+        ({"auto_resolve": False, "expected_versions": {}}, 422),
+        ({"new_proposition": "ignored", "expected_versions": {}}, 422),
+        ({"belief_a_id": ident(2), "expected_versions": {}}, 422),
+        ({"belief_a_id": IDENT.replace("-", ""), "expected_versions": {}}, 422),
+        ({"resolution": "merge", "new_proposition": "  ", "expected_versions": {}}, 422),
+        ({"resolution": "merge", "new_proposition": "x" * 2049, "expected_versions": {}}, 422),
+    ],
+)
+async def test_conflicts_resolve_parser_precedence(conflict_http, monkeypatch, changes, status):
+    from tests.gateway.test_conflict_cas import resolve, resolve_payload
+
+    def forbidden(*a, **kw):
+        pytest.fail("malformed request reached lease")
+
+    monkeypatch.setattr(type(conflict_http.deps.leases), "acquire", forbidden)
+    error_code(
+        await resolve(conflict_http, resolve_payload(**changes)),
+        "E_VALIDATION" if status == 422 else "E_PRECONDITION_REQUIRED",
+        status,
+    )
+
+
+async def test_conflicts_resolve_foreign_precedes_stale_and_pair_binding(conflict_http):
+    from tests.gateway.test_conflict_cas import conflict_path, resolve, resolve_payload
+
+    state = conflict_http
+    payload = resolve_payload(expected_versions={ident(1): 9, ident(2): 9})
+    await sql(state, "DELETE FROM beliefs WHERE id=:id", dict(id=ident(2)))
+    assert error_code(await resolve(state, payload), "E_NOT_FOUND", 404) == {}
+    error_code(await resolve(state, payload, conflict=conflict_path(ident(1), ident(3))), "E_VALIDATION", 422)
+    # The read-only token cannot invoke either mutation, irrespective of malformed DTO.
+    for suffix in ("beliefs", f"conflicts/{conflict_path()}/resolve"):
+        error_code(
+            await http(
+                state, suffix, method="POST", body={}, headers=(("Idempotency-Key", str(__import__("uuid").uuid4())),)
+            ),
+            "E_PERMISSION_DENIED",
+            403,
+        )
+
+
+async def test_conflicts_resolve_canonical_descriptor(conflict_http):
+    from dataclasses import replace
+    from uuid import uuid4
+
+    from memory_server.gateway_contracts.catalog import CATALOG
+    from memory_server.transports.http.routes import beliefs as routes
+    from tests.gateway.test_conflict_cas import conflict_path, resolve_payload
+
+    state = conflict_http
+    specs = routes.create_belief_mutation_routes()
+    assert [s.operation for s in specs] == ["beliefs.set", "conflicts.resolve"]
+    for spec in specs:
+        row = CATALOG.by_operation[spec.operation]
+        assert row.owner == "S15" and row.mutation is True
+        assert spec is routes.BELIEF_MUTATION_ROUTE_SPECS[spec.operation]
+        assert (spec.method, spec.path, spec.permission) == (row.method, row.route, row.permission)
+        for fields in (
+            {},
+            {"parse": lambda *a: None},
+            {"status": lambda *a: 200},
+            {"method": "GET"},
+            {"path": "/bad"},
+            {"permission": "memory.write"},
+        ):
+            with pytest.raises(ValueError):
+                create_http_app(state.config, state.deps, mutation_routes=(replace(spec, **fields),))
+    spec = specs[1]
+    ports = dict(state.deps.ports)
+    del ports[spec.operation]
+    app = create_http_app(state.config, replace(state.deps, ports=ports), mutation_routes=specs)
+    response = await request(
+        app,
+        f"/api/v1/profiles/alpha/conflicts/{conflict_path()}/resolve",
+        method="POST",
+        bearer=state.resolve_bearer,
+        body=resolve_payload(),
+        headers=(("Idempotency-Key", str(uuid4())),),
+    )
+    error_code(response, "E_CAPABILITY_UNAVAILABLE", 503)
+
+
+async def test_both_belief_mutations_negative_auth_and_scope(conflict_http):
+    from uuid import uuid4
+
+    from tests.gateway.test_conflict_cas import conflict_path, resolve_payload
+
+    state = conflict_http
+    now = datetime.now(UTC)
+
+    def mint(grants, profiles=("alpha",), *, when=now):
+        token = state.deps.tokens._bootstrap_create(
+            d.TokenCreate(
+                subject="negative",
+                profiles=list(profiles),
+                permissions=list(grants),
+                expires_at=when + timedelta(hours=1),
+            ),
+            now=when,
+        )
+        return f"cmms_{token.token.id}.{token.secret}", token
+
+    for suffix, payload, permission in (
+        ("beliefs", set_payload(), "belief.write"),
+        (f"conflicts/{conflict_path()}/resolve", resolve_payload(), "belief.resolve"),
+    ):
+
+        async def send(bearer, profile="alpha"):
+            return await http(
+                state,
+                suffix,
+                profile=profile,
+                method="POST",
+                body=payload,
+                bearer=bearer,
+                headers=(("Idempotency-Key", str(uuid4())),),
+            )
+
+        error_code(await send(None), "E_AUTH_REQUIRED", 401)
+        for grants in (
+            ("belief.read",),
+            ("memory.write",),
+            ("memory.transition",),
+            (("belief.write",) if permission == "belief.resolve" else ("belief.resolve",)),
+        ):
+            bearer, _ = mint(grants)
+            error_code(await send(bearer), "E_PERMISSION_DENIED", 403)
+        expired, _ = mint((permission,), when=now - timedelta(hours=2))
+        error_code(await send(expired), "E_AUTH_REQUIRED", 401)
+        scoped, _ = mint((permission,))
+        error_code(await send(scoped, "beta"), "E_PERMISSION_DENIED", 403)
+        unknown, _ = mint((permission,), profiles=("unknown",))
+        error_code(await send(unknown, "unknown"), "E_PROFILE_NOT_FOUND", 404)
+        revoked, token = mint((permission,))
+        await state.deps.tokens.authenticate(revoked, now=now)
+        state.deps.tokens._unchecked_revoke(
+            state.deps.tokens._local_context(now),
+            token.token.id,
+            d.ControlMutation(reason="test", confirmation=True, expected_generation=1),
+            now,
+            local=True,
+        )
+        error_code(await send(revoked), "E_AUTH_REQUIRED", 401)
+
+
+async def test_resolve_direct_port_rejects_other_operation_before_lease(conflict_http, monkeypatch):
+    from uuid import uuid4
+
+    from memory_server.transports.http.errors import HttpError
+
+    state = conflict_http
+    principal = await state.deps.tokens.authenticate(state.resolve_bearer, now=datetime.now(UTC))
+    ctx = RequestContext("direct-resolve", principal, "alpha", uuid4(), monotonic() + 10)
+
+    def forbidden(*a, **kw):
+        pytest.fail("nonmutation operation reached lease")
+
+    monkeypatch.setattr(type(state.deps.leases), "acquire", forbidden)
+    for cmd in (command(), object()):
+        with pytest.raises(HttpError) as error:
+            await state.deps.ports["conflicts.resolve"].execute(ctx, cmd)
+        assert error.value.code == "E_VALIDATION"
