@@ -18,7 +18,7 @@ from tests.gateway.test_slice_runtime import build_registry
 from tests.gateway.test_slice_runtime import offline_embedder as offline_embedder
 
 READS = {"beliefs.list", "beliefs.get", "conflicts.list"}
-WRITES = {"memories.create", "learn", "memories.transition", "memories.invalidate"}
+WRITES = {"memories.create", "learn", "memories.transition", "memories.invalidate", "beliefs.set"}
 IDENT = "00000000-0000-4000-8000-000000000001"
 
 
@@ -114,12 +114,14 @@ async def test_beliefs_get_by_id_is_not_text_search(belief_http):
 
 async def test_belief_composition_regression_counts(belief_http):
     state = belief_http
-    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 4, 28)
+    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 5, 29)
     reads = {spec.operation for spec in state.specs}
     assert READS <= reads
     assert {spec.operation for spec in state.mutation_specs} == WRITES
     assert set(state.deps.ports) == reads | WRITES
-    assert "beliefs.set" not in state.deps.ports and "conflicts.resolve" not in state.deps.ports
+    assert "conflicts.resolve" not in state.deps.ports
+    port = state.deps.ports["beliefs.set"]
+    assert all(port is not state.deps.ports[op] for op in (READS | WRITES) - {"beliefs.set"})
 
 
 async def orm_seed(state, rows, profile="alpha"):
@@ -201,7 +203,7 @@ async def test_belief_surface_mount_catalog_and_permissions(belief_http):
             missing, spec.path.replace("{profile}", "alpha").replace("{id}", IDENT), bearer=state.bearer
         )
         assert response.status == 503
-    assert (await http(state, method="POST")).status == 405
+    assert (await http(state, method="POST")).status == 403
     assert (await http(state, "conflicts/conf_x/resolve", method="POST")).status == 404
 
 
@@ -1122,3 +1124,49 @@ async def test_belief_cancel_cleanup_retains_admission(belief_http, monkeypatch)
     monkeypatch.setattr(BeliefsReadHandler, "list_beliefs", original)
     for profile in ("alpha", "beta"):
         assert (await http(state, profile=profile)).status == 200
+
+
+@pytest.fixture
+async def belief_write(belief_http):
+    state = belief_http
+    now = datetime.now(UTC)
+    created = state.deps.tokens._bootstrap_create(
+        d.TokenCreate(subject="s15b1", profiles=["alpha", "beta"], permissions=["belief.write", "belief.read"],
+                      expires_at=now + timedelta(hours=1)), now=now,
+    )
+    state.write_bearer = f"cmms_{created.token.id}.{created.secret}"
+    state.write_principal = await state.deps.tokens.authenticate(state.write_bearer, now=now)
+    return state
+
+
+def set_payload(**updates):
+    return dict(proposition="PostgreSQL transactions provide atomic durable database updates.",
+                replace_belief_id=None, reason="S15B1_REASON_CANARY", **updates)
+
+
+async def post_set(state, payload=None, *, key=None, headers=(), **kwargs):
+    from uuid import uuid4
+
+    return await http(state, method="POST", bearer=state.write_bearer,
+                      body=set_payload() if payload is None else payload,
+                      headers=(("Idempotency-Key", str(key or uuid4())), *headers), **kwargs)
+
+
+async def test_beliefs_set_create_persisted_receipt_and_outbox(belief_write):
+    state = belief_write
+    response = await post_set(state)
+    assert response.status == 201, response.body
+    result = response.json
+    memory = result["memories"][0]
+    ident = memory["id"]
+    assert memory["revision"] == memory["source_version"] == 1
+    assert memory["masked"] and memory["content"] is None and memory["payload"] is None
+    assert memory["source"] is memory["creator"] is None
+    assert result["receipts"][0]["id"] == ident
+    assert result["receipts"][0]["source"] is result["receipts"][0]["created_by"] is None
+    assert result["admission"][0]["admitted"] is True
+    assert await sql(state, "SELECT version,source,creator FROM beliefs WHERE id=:id", {"id": ident}) == [(1,"agent","s15b1")]
+    assert await sql(state, "SELECT id,created_by FROM receipts WHERE id=:id", {"id": ident}) == [(ident,"s15b1")]
+    assert {r[0] for r in await sql(state, "SELECT id FROM outbox_entries WHERE record_id=:id", {"id": ident})} == set(result["outbox_ids"])
+    assert len(await sql(state, "SELECT request_id FROM http_request_journal WHERE request_id=:id", {"id":result["request_id"]})) == 1
+    assert b"S15B1_REASON_CANARY" not in response.body
