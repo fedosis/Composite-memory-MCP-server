@@ -699,20 +699,46 @@ async def test_belief_read_import_graph_and_no_domain_writes(belief_http, monkey
         root / "src/memory_server/application/remote_beliefs.py",
         root / "src/memory_server/transports/http/routes/beliefs.py",
     ):
-        tree = ast.parse(path.read_text())
-        forbidden = {
-            "read_memory_records",
-            "resolve_fact_rows",
-            "commit",
-            "flush",
-            "set_belief",
-            "resolve_conflict",
-            "create_async_engine",
-        }
-        assert not any(isinstance(n, ast.Attribute) and n.attr in forbidden for n in ast.walk(tree))
+        import subprocess
+
+        source = path.read_text()
+        tree = ast.parse(source)
+        baseline = subprocess.check_output(["git", "show", "05ea109:" + str(path.relative_to(root))], cwd=root).decode()
+        original = ast.parse(baseline)
+        definitions = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        symbols = {}
+        for node in tree.body:
+            if isinstance(node, definitions):
+                symbols[node.name] = node
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                symbols.update({a.asname or a.name.split(".")[0]: node for a in node.names})
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                symbols.update({
+                    n.id: node for n in ast.walk(node)
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+                })
+        roots = [n for n in original.body if isinstance(n, definitions)]
+        for node in roots:
+            assert ast.get_source_segment(source, symbols[node.name]) == ast.get_source_segment(baseline, node)
+        pending, seen, closure = [n.name for n in roots], set(), []
+        while pending:
+            name = pending.pop()
+            if name in seen or name not in symbols:
+                continue
+            seen.add(name)
+            node = symbols[name]
+            closure.extend(ast.walk(node))
+            pending.extend(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load))
+        forbidden = {"read_memory_records", "resolve_fact_rows", "flush", "set_belief", "resolve_conflict"}
+        assert not any(isinstance(n, ast.Attribute) and n.attr in forbidden for n in closure)
         assert not any(
             isinstance(n, ast.ImportFrom)
             and any(x in (n.module or "") for x in ("mutation_uow", "belief_service", "lifecycle_service"))
+            for n in closure
+        )
+        assert not any(
+            (isinstance(n, ast.Attribute) and n.attr in {"commit", "create_async_engine"})
+            or (isinstance(n, ast.Name) and n.id in {"commit", "create_async_engine"})
             for n in ast.walk(tree)
         )
     tables = [

@@ -37,6 +37,30 @@ from memory_server.models.belief import Belief
 from memory_server.models.receipt import LifecycleState
 from memory_server.transports.http.errors import HttpError
 
+# isort: split
+# Write foundation: supplied-session authority only; deliberately no HTTP port.
+from uuid import uuid4
+
+from sqlalchemy import event, select
+from storage.models.belief import BeliefORM, EvidenceORM
+from storage.models.fact import FactORM
+from storage.models.lifecycle import LifecycleEventORM
+from storage.outbox import OutboxRepository
+from storage.repositories import BeliefRepository, LifecycleRepository, ReceiptRepository
+from storage.repositories.lifecycle_repo import LifecycleConflictError, normalize_version
+
+from memory_server.admission import AdmissionDecision, MemoryAdmissionGate
+from memory_server.application.mutation_uow import MutationUoW, _is_busy
+from memory_server.models.evidence import Evidence
+from memory_server.models.receipt import MemoryReceipt
+from memory_server.services.lifecycle_service import (
+    InvalidLifecycleTransitionError,
+    LifecycleMemoryNotFoundError,
+    LifecyclePropagationLimitError,
+    LifecycleService,
+    LifecycleTransitionRequest,
+)
+
 if TYPE_CHECKING:
     from memory_server.transports.http.routes.beliefs import BeliefCursorCodec
 
@@ -459,3 +483,759 @@ class BeliefsReadHandler:
         returned = matches[: command.payload.limit]
         items = [await self._conflict(a, b, command) for _, a, b in returned]
         return self._page(command, items, more, returned[-1][0] if returned else None, upper)
+
+
+def validate_belief_mutation_command(command):
+    try:
+        if type(command) is not d.BeliefsSetCommand or command.operation != "beliefs.set":
+            raise ValueError
+        for model in (command, command.payload, *command.payload.sources):
+            if set(model.__dict__) - set(type(model).model_fields) or model.model_extra:
+                raise ValueError
+        command = d.BeliefsSetCommand.model_validate(command.model_dump(), strict=True)
+        payload = command.payload
+        if command.path_ids or not payload.proposition.strip() or not payload.reason.strip():
+            raise ValueError
+        if payload.replace_belief_id is not None:
+            validate_belief_id(payload.replace_belief_id)
+        for ident in payload.expected_versions:
+            validate_belief_id(ident)
+        for summary in payload.sources:
+            for ident in summary.derived_from:
+                validate_belief_id(ident)
+        return command
+    except (ValidationError, ValueError, TypeError, AttributeError, KeyError):
+        raise HttpError("E_VALIDATION") from None
+
+
+def _write_busy(exc):
+    original = getattr(exc, "orig", exc)
+    if not isinstance(original, sqlite3.OperationalError):
+        return False
+    code = getattr(original, "sqlite_errorcode", None)
+    return code & 255 in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) if type(code) is int else _is_busy(exc)
+
+
+async def _write_settle(awaitable):
+    async def bounded():
+        async with asyncio.timeout(1.0):
+            return await awaitable
+
+    task = asyncio.create_task(bounded())
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+class _BeliefsMutationUoW(MutationUoW):
+    async def _attempt(self, ctx, command, handler, digest):
+        try:
+            return await super()._attempt(ctx, command, handler, digest)
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            if _write_busy(exc):
+                raise HttpError("E_REQUEST_IN_PROGRESS") from None
+            raise
+
+
+def _write_version(row, kind="belief"):
+    value = row.version
+    if kind == "fact":
+        try:
+            return normalize_version(value)
+        except ValueError:
+            raise HttpError("E_INTERNAL") from None
+    if type(value) is not int or value < 1:
+        raise HttpError("E_INTERNAL")
+    return value
+
+
+def _write_valid(row, kind):
+    _write_version(row, kind)
+    if (
+        type(row.confidence) not in (float, int)
+        or not math.isfinite(row.confidence)
+        or not 0 <= row.confidence <= 1
+        or row.lifecycle_state not in {s.value for s in LifecycleState}
+    ):
+        raise HttpError("E_INTERNAL")
+    if kind == "belief" and (
+        type(row.proposition) is not str
+        or not row.proposition.strip()
+        or any(type(v) is not list or any(type(s) is not str for s in v) for v in (row.tags, row.source_ids))
+    ):
+        raise HttpError("E_INTERNAL")
+    return row
+
+
+def _write_cas(row, versions):
+    if set(versions) - {row.id}:
+        raise HttpError("E_VALIDATION")
+    if row.id not in versions:
+        raise HttpError("E_PRECONDITION_REQUIRED")
+    actual = _write_version(row)
+    if versions[row.id] != actual:
+        raise HttpError("E_VERSION_CONFLICT", details={"id": row.id, "expected": versions[row.id], "actual": actual})
+
+
+def _write_memory(row, kind, receipt_id, pending):
+    version = _write_version(row, kind)
+    return d.Memory(
+        id=row.id,
+        memory_type=kind,
+        content=None,
+        payload=None,
+        confidence=row.confidence,
+        lifecycle_state=row.lifecycle_state,
+        revision=version,
+        source_version=version,
+        source=None,
+        creator=None,
+        created_at=utc(row.created_at),
+        updated_at=utc(row.updated_at),
+        risk_tags=[],
+        receipt_id=receipt_id,
+        masked=True,
+        projection=d.ItemProjection(vector="unknown", graph="unknown", outbox="pending" if pending else "unknown"),
+    )
+
+
+def _write_receipt(receipt):
+    history = []
+    for entry in receipt.history:
+        if not isinstance(entry, dict) or entry.get("kind") not in {
+            "receipt",
+            "lifecycle",
+            "confidence",
+            "admission",
+            "relation",
+        }:
+            continue
+        if type(entry.get("id")) is not str or type(entry.get("timestamp")) is not str:
+            continue
+        try:
+            history.append(
+                d.HistoryEvent(
+                    id=entry["id"],
+                    kind=entry["kind"],
+                    timestamp=utc(entry["timestamp"]),
+                    actor=None,
+                    reason=None,
+                    revision=entry.get("revision"),
+                    from_state=entry.get("from_state"),
+                    to_state=entry.get("to_state"),
+                    receipt_id=receipt.id,
+                    evidence=None,
+                )
+            )
+        except (ValidationError, ValueError, TypeError):
+            continue
+    return d.Receipt(
+        id=receipt.id,
+        memory_type=receipt.memory_type,
+        source=None,
+        created_by=None,
+        timestamp=utc(receipt.timestamp),
+        confidence=receipt.confidence,
+        verification_status=receipt.verification_status.value,
+        lifecycle_state=receipt.lifecycle_state,
+        source_version=receipt.version,
+        history=history,
+        history_complete=False,
+    )
+
+
+def _write_admission(decision: AdmissionDecision):
+    metadata = decision.metadata
+    return d.AdmissionResult(
+        admitted=decision.admitted,
+        tag=decision.tag.value,
+        ttl_days=decision.ttl_days,
+        score=decision.score,
+        memory_kind=metadata.get("memory_kind") if isinstance(metadata.get("memory_kind"), str) else None,
+        authority_level=metadata.get("authority_level") if isinstance(metadata.get("authority_level"), str) else None,
+        epistemic_status=metadata.get("epistemic_status")
+        if isinstance(metadata.get("epistemic_status"), str)
+        else None,
+        risk_tags=[tag for tag in metadata.get("risk_tags", []) if isinstance(tag, str)],
+        reason_codes=list(decision.reason_codes),
+    )
+
+
+class BeliefsMutationHandler:
+    def __init__(self, scope, ctx, *, ticket, gate=None, clock=None):
+        self.scope, self.ctx, self.ticket = scope, ctx, ticket
+        self.gate = MemoryAdmissionGate() if gate is None else gate
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self._reset()
+
+    def _reset(self):
+        self.captured, self.observed, self.receipts = {}, {}, {}
+        self.history_count, self.history_bytes, self.instructions = 0, 0, 0
+        self.interrupted, self.effects, self.outbox_ids = None, [], []
+
+    def _progress(self):
+        self.instructions += 1000
+        if time.monotonic() >= self.ctx.deadline:
+            self.interrupted = "timeout"
+        elif self.instructions >= VM_BUDGET:
+            self.interrupted = "budget"
+        return int(self.interrupted is not None)
+
+    async def apply(self, session, command):
+        self._reset()
+        command = validate_belief_mutation_command(command)
+        conn = await session.connection()
+
+        def capture(sync, flush_context):
+            for row in sync.new:
+                if isinstance(row, LifecycleEventORM):
+                    self.captured[row.id] = (
+                        row.id,
+                        row.memory_type,
+                        row.memory_id,
+                        row.from_state,
+                        row.to_state,
+                        utc(row.timestamp),
+                    )
+                    if len(self.captured) > 1026:
+                        raise HttpError("E_INTERNAL")
+
+        async def install(driver):
+            if not callable(getattr(driver, "set_progress_handler", None)):
+                raise HttpError("E_CAPABILITY_UNAVAILABLE")
+            await driver.set_progress_handler(self._progress, 1000)
+
+        async def clear():
+            try:
+                await conn.run_sync(
+                    lambda c: c.connection.dbapi_connection.run_async(lambda a: a.set_progress_handler(None, 0))
+                )
+            except BaseException:
+                await conn.invalidate()
+                raise
+
+        event.listen(session.sync_session, "after_flush", capture)
+        try:
+            async with asyncio.timeout_at(self.ctx.deadline):
+                await conn.run_sync(lambda c: c.connection.dbapi_connection.run_async(install))
+                return await self.set_in_session(
+                    session,
+                    command.payload,
+                    expected_versions=dict(command.payload.expected_versions),
+                    reason=command.payload.reason,
+                    actor=self.ctx.principal.subject,
+                )
+        except LifecycleConflictError as exc:
+            details = {}
+            matches = [key for key in self.observed if key[1] == exc.memory_id]
+            if len(matches) == 1:
+                kind, ident = matches[0]
+                details = {"id": ident}
+                if type(exc.expected) is int and exc.expected >= 1:
+                    details["expected"] = exc.expected
+                row = await self._load(session, kind, ident)
+                if row is not None and _write_version(row, kind) != self.observed[(kind, ident)][0]:
+                    details["actual"] = _write_version(row, kind)
+            raise HttpError("E_VERSION_CONFLICT", details=details) from None
+        except LifecycleMemoryNotFoundError:
+            raise HttpError("E_NOT_FOUND") from None
+        except InvalidLifecycleTransitionError:
+            raise HttpError("E_VALIDATION") from None
+        except LifecyclePropagationLimitError:
+            raise HttpError("E_STORAGE", details={"limit": 512}) from None
+        except TimeoutError:
+            raise HttpError("E_TIMEOUT") from None
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            if self.interrupted == "timeout":
+                raise HttpError("E_TIMEOUT") from None
+            if self.interrupted == "budget":
+                raise HttpError("E_STORAGE", details={"limit": VM_BUDGET}) from None
+            raise HttpError("E_REQUEST_IN_PROGRESS" if _write_busy(exc) else "E_STORAGE") from None
+        except (HttpError, asyncio.CancelledError):
+            raise
+        except Exception:
+            raise HttpError("E_INTERNAL") from None
+        finally:
+            event.remove(session.sync_session, "after_flush", capture)
+            try:
+                await _write_settle(clear())
+            except BaseException:
+                await _write_settle(conn.invalidate())
+                raise
+
+    async def _load(self, session, kind, ident):
+        model = BeliefORM if kind == "belief" else FactORM
+        row = await session.scalar(
+            select(model).where(model.id == ident).limit(1).execution_options(populate_existing=True)
+        )
+        return _write_valid(row, kind) if row is not None else None
+
+    async def _receipt(self, session, ident, kind):
+        if ident in self.receipts:
+            return self.receipts[ident]
+        data = (
+            await session.execute(
+                text("SELECT length(CAST(history AS BLOB)),json_valid(history) FROM receipts WHERE id=:id LIMIT 1"),
+                {"id": ident},
+            )
+        ).first()
+        receipt = None
+        if data is not None:
+            if data[0] > 1048576:
+                raise HttpError("E_STORAGE", details={"limit": 1048576})
+            if (
+                not data[1]
+                or await session.scalar(
+                    text("SELECT json_type(history) FROM receipts WHERE id=:id LIMIT 1"), {"id": ident}
+                )
+                != "array"
+            ):
+                raise HttpError("E_INTERNAL")
+            rows = (
+                await session.execute(
+                    text("SELECT value FROM json_each((SELECT history FROM receipts WHERE id=:id LIMIT 1)) LIMIT 1025"),
+                    {"id": ident},
+                )
+            ).all()
+            if len(rows) > 1024:
+                raise HttpError("E_STORAGE", details={"limit": 1024})
+            self.history_count += len(rows)
+            self.history_bytes += data[0]
+            self._aggregate()
+            receipt = await ReceiptRepository(session).get(ident)
+            if receipt is None or receipt.memory_type != kind:
+                raise HttpError("E_INTERNAL")
+            self.history_bytes += len(json.dumps(receipt.history).encode()) - data[0]
+            self._aggregate()
+        self.receipts[ident] = receipt
+        return receipt
+
+    def _aggregate(self):
+        if self.history_count > 8192 or self.history_bytes > 8388608:
+            raise HttpError("E_STORAGE")
+
+    def _history_budget(self, receipt, entries):
+        existing = receipt.history if receipt is not None else []
+        history = [*existing, *entries]
+        size = len(json.dumps(history).encode())
+        if len(history) > 1024 or size > 1048576:
+            raise HttpError("E_STORAGE", details={"limit": 1024 if len(history) > 1024 else 1048576})
+        self.history_count += len(entries)
+        self.history_bytes += size - (len(json.dumps(existing).encode()) if receipt else 0)
+        self._aggregate()
+        return history
+
+    async def _persist_receipt(self, session, row, kind, entries, *, source=None, actor=None, required=False):
+        receipt = self.receipts.get(row.id)
+        if receipt is None and not required:
+            return None
+        history = [*(receipt.history if receipt else []), *entries]
+        if len(history) > 1024 or len(json.dumps(history).encode()) > 1048576:
+            raise HttpError("E_STORAGE")
+        if receipt is None:
+            receipt = await ReceiptRepository(session).create(
+                MemoryReceipt(
+                    id=row.id,
+                    memory_type=kind,
+                    source=source,
+                    created_by=actor,
+                    timestamp=utc(self.clock()),
+                    confidence=row.confidence,
+                    lifecycle_state=row.lifecycle_state,
+                    version=str(row.version),
+                    history=history,
+                )
+            )
+        else:
+            fields = dict(
+                confidence=row.confidence,
+                lifecycle_state=row.lifecycle_state,
+                version=str(row.version),
+                updated_at=row.updated_at,
+                history=history,
+            )
+            if source is not None:
+                fields["source"] = source
+            receipt = await ReceiptRepository(session).update(row.id, **fields)
+        await session.flush()
+        fresh = await session.scalar(select(type(row).id).where(type(row).id == row.id).limit(1))
+        persisted = await session.scalar(text("SELECT history FROM receipts WHERE id=:id LIMIT 1"), {"id": row.id})
+        if fresh != row.id or receipt is None or persisted is None or json.loads(persisted) != history:
+            raise HttpError("E_STORAGE")
+        self.receipts[row.id] = receipt
+        return receipt
+
+    async def _index(self, session, kind, row):
+        if len(self.outbox_ids) >= 1027:
+            raise HttpError("E_INTERNAL")
+        payload = (
+            dict(proposition=row.proposition, confidence=row.confidence, tags=list(row.tags), source=row.source)
+            if kind == "belief"
+            else dict(subject=row.subject, predicate=row.predicate, object=row.object, source=row.source)
+        )
+        try:
+            entry = await OutboxRepository(session).add_entry(kind, row.id, "index_" + kind, payload)
+        except (SQLAlchemyError, sqlite3.Error):
+            raise
+        except Exception:
+            raise HttpError("E_OUTBOX") from None
+        self.outbox_ids.append(entry.id)
+
+    async def _plan_transitions(self, session, requests):
+        if len(requests) > 2:
+            raise HttpError("E_INTERNAL")
+        frontier, plan = {}, []
+        for request in requests:
+            key = (request.memory_type, request.memory_id)
+            root = await self._load(session, *key)
+            if root is None:
+                raise HttpError("E_NOT_FOUND")
+            if not is_valid_transition(root.lifecycle_state, request.to_state):
+                raise HttpError("E_VALIDATION")
+            if _write_version(root, key[0]) != request.expected_version:
+                raise HttpError(
+                    "E_VERSION_CONFLICT",
+                    details={
+                        "id": root.id,
+                        "expected": request.expected_version,
+                        "actual": _write_version(root, key[0]),
+                    },
+                )
+            frontier.setdefault(key, (_write_version(root, key[0]), root.lifecycle_state, root.confidence))
+            version, state, confidence = frontier[key]
+            plan.append((key, version + 1, state, request.to_state, confidence, request.reason, "lifecycle"))
+            frontier[key] = (version + 1, request.to_state, confidence)
+            if request.to_state not in {"superseded", "contradicted", "discarded"}:
+                continue
+            refs = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT source_id FROM claim_relations WHERE target_id=:id "
+                            "AND relation_type='derived_from' "
+                            "ORDER BY source_id COLLATE BINARY LIMIT 513"
+                        ),
+                        {"id": root.id},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(refs) > 512:
+                raise HttpError("E_STORAGE", details={"limit": 512})
+            for ident in dict.fromkeys(refs):
+                dependent = await self._load(session, "fact", ident)
+                kind = "fact"
+                if dependent is None:
+                    dependent, kind = await self._load(session, "belief", ident), "belief"
+                if dependent is None:
+                    continue
+                key = (kind, ident)
+                frontier.setdefault(
+                    key, (_write_version(dependent, kind), dependent.lifecycle_state, dependent.confidence)
+                )
+                version, state, confidence = frontier[key]
+                confidence = max(0.1, round(confidence * 0.8, 6))
+                plan.append((key, version + 1, state, state, confidence, "parent_invalidated", "confidence"))
+                frontier[key] = (version + 1, state, confidence)
+        if len(plan) > 1026 or len(frontier) > 1027:
+            raise HttpError("E_INTERNAL")
+        for key in frontier:
+            row = await self._load(session, *key)
+            self.observed[key] = (_write_version(row, key[0]), row.lifecycle_state, row.confidence)
+        return plan, frontier
+
+    def _event_entry(self, effect, event_id, timestamp):
+        key, version, before, after, confidence, reason, kind = effect
+        return dict(
+            id=event_id,
+            kind=kind,
+            timestamp=utc(timestamp).isoformat(timespec="microseconds"),
+            revision=version,
+            from_state=before,
+            to_state=after,
+            receipt_id=key[1],
+            actor=self.ctx.principal.subject,
+            reason=reason,
+        )
+
+    async def _transitions(self, session, requests, plan, frontier):
+        captured_before = len(self.captured)
+        provider = self.scope.application.read_resources().provider
+        results = await LifecycleService(provider).transition_many_in_session(
+            session, requests, graph=None, strict_remote=True
+        )
+        captured = list(self.captured.values())[captured_before:]
+        if len(captured) != len(plan):
+            raise HttpError("E_INTERNAL")
+        propagated = [p for result in results for p in result.propagated]
+        expected = [e for e in plan if e[-1] == "confidence"]
+        if [
+            (p["memory_type"], p["memory_id"], normalize_version(p["version"]), p["confidence"]) for p in propagated
+        ] != [(*e[0], e[1], e[4]) for e in expected]:
+            raise HttpError("E_INTERNAL")
+        entries = {}
+        for record, effect in zip(captured, plan, strict=True):
+            eid, kind, ident, before, after, stamp = record
+            if ((kind, ident), before, after) != (effect[0], effect[2], effect[3]):
+                raise HttpError("E_INTERNAL")
+            entries.setdefault((kind, ident), []).append(self._event_entry(effect, eid, stamp))
+        rows = {}
+        for key, predicate in frontier.items():
+            row = await self._load(session, *key)
+            if row is None or (_write_version(row, key[0]), row.lifecycle_state, row.confidence) != predicate:
+                raise HttpError("E_VERSION_CONFLICT", details={"id": key[1]})
+            rows[key] = row
+            await self._persist_receipt(session, row, key[0], entries[key])
+            await self._index(session, key[0], row)
+        self.effects = captured
+        return rows
+
+    async def _claims(self, session, sources):
+        claims, mapped, refs = [], [], []
+        if len(sources) > 1024:
+            raise HttpError("E_STORAGE", details={"limit": 1024})
+        for summary in sources:
+            claims.append(
+                dict(
+                    method=summary.method,
+                    sources=list(summary.sources),
+                    session_id=summary.session_id,
+                    confidence=summary.confidence,
+                    source_date=summary.source_date,
+                    derived_from=list(summary.derived_from),
+                    claim_type=summary.claim_type,
+                    trusted=False,
+                    origin="remote_claim",
+                )
+            )
+            refs.extend(summary.derived_from)
+            for source in summary.sources or [""]:
+                mapped.append(
+                    (
+                        summary.method if summary.method is not None else "observation",
+                        source,
+                        summary.confidence if summary.confidence is not None else 0.5,
+                    )
+                )
+                if len(mapped) > 1024:
+                    raise HttpError("E_STORAGE", details={"limit": 1024})
+            if len(refs) > 1024:
+                raise HttpError("E_STORAGE", details={"limit": 1024})
+        for ident in dict.fromkeys(refs):
+            found = await session.scalar(
+                text(
+                    "SELECT id FROM facts WHERE id=:id UNION ALL SELECT id FROM beliefs WHERE id=:id "
+                    "UNION ALL SELECT id FROM decisions WHERE id=:id "
+                    "UNION ALL SELECT id FROM skills WHERE id=:id LIMIT 1"
+                ),
+                {"id": ident},
+            )
+            if found is None:
+                raise HttpError("E_NOT_FOUND")
+        return claims, mapped
+
+    async def _evidence(self, session, row, mapped, actor):
+        expected = []
+        for method, source, weight in mapped:
+            model = Evidence(belief_id=row.id, source_type=method, source_id=source, weight=weight, contributor=actor)
+            session.add(EvidenceORM.from_pydantic(model))
+            expected.append((model.id, method, source, weight, actor))
+        await session.flush()
+        rows = (
+            (
+                await session.execute(
+                    select(EvidenceORM).where(EvidenceORM.belief_id == row.id).order_by(EvidenceORM.id).limit(1025)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        observed = {r.id: (r.id, r.source_type, r.source_id, r.weight, r.contributor) for r in rows}
+        if len(rows) > 1024 or any(observed.get(e[0]) != e for e in expected):
+            raise HttpError("E_STORAGE")
+        source_ids = list(row.source_ids)
+        fresh = await self._load(session, "belief", row.id)
+        if fresh is None or fresh.source_ids != source_ids:
+            raise HttpError("E_INTERNAL")
+
+    async def set_in_session(self, session, payload, *, expected_versions, reason, actor):
+        payload = validate_belief_mutation_command(
+            d.BeliefsSetCommand(
+                operation="beliefs.set",
+                profile_id=self.ctx.profile_id,
+                path_ids={},
+                payload=payload,
+            )
+        ).payload
+        if type(expected_versions) is not dict or any(type(v) is not int or v < 1 for v in expected_versions.values()):
+            raise HttpError("E_VALIDATION")
+        expected_versions = dict(expected_versions)
+        if (
+            actor != self.ctx.principal.subject
+            or reason != payload.reason
+            or expected_versions != payload.expected_versions
+        ):
+            raise HttpError("E_VALIDATION")
+        target = None
+        if payload.replace_belief_id is not None:
+            target = await self._load(session, "belief", payload.replace_belief_id)
+            if target is None:
+                raise HttpError("E_NOT_FOUND")
+        candidates = (
+            await session.execute(
+                text(
+                    "SELECT id,proposition FROM beliefs WHERE lifecycle_state='active' "
+                    "ORDER BY id COLLATE BINARY LIMIT 513"
+                )
+            )
+        ).all()
+        if len(candidates) > 512:
+            raise HttpError("E_STORAGE", details={"limit": 512})
+        matches = []
+        for row in candidates:
+            if type(row.proposition) is not str or not row.proposition.strip():
+                raise HttpError("E_INTERNAL")
+            if row.proposition.strip().lower() == payload.proposition.strip().lower():
+                matches.append(row.id)
+        if len(matches) > 1 or (target is not None and matches and matches[0] != target.id):
+            raise HttpError("E_VALIDATION")
+        if target is None and matches:
+            target = await self._load(session, "belief", matches[0])
+        if target is None and expected_versions:
+            raise HttpError("E_VALIDATION")
+        if target is not None:
+            _write_cas(target, expected_versions)
+        reinforce = target is not None and payload.replace_belief_id is None
+        claims, mapped = await self._claims(session, payload.sources)
+        plan, frontier, requests = [], {}, []
+        if payload.replace_belief_id is not None:
+            requests = [
+                LifecycleTransitionRequest(
+                    target.id, "belief", "superseded", reason, actor, expected_versions[target.id]
+                )
+            ]
+            plan, frontier = await self._plan_transitions(session, requests)
+        if reinforce:
+            existing = (
+                await session.execute(
+                    text("SELECT id FROM evidence WHERE belief_id=:id ORDER BY id LIMIT 1025"), {"id": target.id}
+                )
+            ).all()
+            if len(existing) + len(mapped) > 1024:
+                raise HttpError("E_STORAGE", details={"limit": 1024})
+        decision = None
+        if not reinforce:
+            if not callable(getattr(self.gate, "classify", None)):
+                raise HttpError("E_CAPABILITY_UNAVAILABLE")
+            decision = self.gate.classify(payload.proposition, source_scope="remote", force=False, now=self.clock())
+            if not isinstance(decision, AdmissionDecision):
+                raise HttpError("E_INTERNAL")
+            if not decision.admitted:
+                raise HttpError("E_ADMISSION_REJECTED")
+        now = utc(self.clock())
+        ident = target.id if reinforce else str(uuid4())
+        version = _write_version(target) + 1 if target is not None else 1
+        confidence = (
+            max(0.0, min(1.0, (target.confidence + payload.confidence) / 2)) if reinforce else payload.confidence
+        )
+        entry = dict(
+            id=ident,
+            kind="receipt",
+            timestamp=now.isoformat(timespec="microseconds"),
+            actor=actor,
+            reason=reason,
+            revision=version,
+            receipt_id=ident,
+            claims=claims,
+            operation="beliefs.set",
+            request_id=self.ctx.request_id,
+            source=payload.source,
+            tags=list(payload.tags),
+            admission=decision.to_metadata() if decision else None,
+        )
+        if reinforce:
+            entry.update(
+                kind="confidence",
+                previous_confidence=target.confidence,
+                new_confidence=confidence,
+                from_state="active",
+                to_state="active",
+            )
+            self.observed[("belief", ident)] = (_write_version(target), target.lifecycle_state, target.confidence)
+        grouped = {}
+        for effect in plan:
+            grouped.setdefault(effect[0], []).append(self._event_entry(effect, "0" * 36, now))
+        for (kind, item_id), entries in grouped.items():
+            receipt = await self._receipt(session, item_id, kind)
+            if receipt is not None:
+                self._history_budget(receipt, entries)
+        receipt = await self._receipt(session, ident, "belief")
+        self._history_budget(receipt, [entry])
+        if reinforce:
+            await LifecycleRepository(session).transition(
+                BeliefRepository(session),
+                memory_id=ident,
+                memory_type="belief",
+                from_state=target.lifecycle_state,
+                to_state=target.lifecycle_state,
+                expected_version=expected_versions[ident],
+                confidence=confidence,
+                reason=reason,
+                triggered_by=actor,
+            )
+            row = await self._load(session, "belief", ident)
+            captured = list(self.captured.values())
+            if (
+                len(captured) != 1
+                or captured[0][1:5] != ("belief", ident, "active", "active")
+                or row.version != version
+            ):
+                raise HttpError("E_INTERNAL")
+            entry.update(
+                id=captured[0][0],
+                timestamp=captured[0][-1].isoformat(timespec="microseconds"),
+                from_state="active",
+                to_state="active",
+            )
+            row.tags = list(dict.fromkeys([*row.tags, *payload.tags]))
+            row.last_reinforced_at = row.updated_at = now
+        else:
+            created = await BeliefRepository(session).create(
+                Belief(
+                    id=ident,
+                    proposition=payload.proposition,
+                    confidence=confidence,
+                    source=payload.source,
+                    creator=actor,
+                    tags=list(payload.tags),
+                    version=version,
+                    created_at=now,
+                    updated_at=now,
+                    last_reinforced_at=now,
+                )
+            )
+            row = await self._load(session, "belief", created.id)
+        row.source_ids = list(dict.fromkeys([*row.source_ids, *(source for _, source, _ in mapped if source)]))
+        await self._evidence(session, row, mapped, actor)
+        await self._persist_receipt(session, row, "belief", [entry], source=payload.source, actor=actor, required=True)
+        await self._index(session, "belief", row)
+        returned = [row]
+        if requests:
+            final = await self._transitions(session, requests, plan, frontier)
+            returned.append(final[("belief", target.id)])
+        await session.flush()
+        result = d.WriteResult(
+            request_id=self.ctx.request_id,
+            memories=[_write_memory(r, "belief", r.id if self.receipts.get(r.id) else None, True) for r in returned],
+            receipts=[_write_receipt(self.receipts[r.id]) for r in returned if self.receipts.get(r.id)],
+            admission=[_write_admission(decision)] if decision else [],
+            outbox_ids=list(self.outbox_ids),
+            reinforced_ids=[ident] if reinforce else [],
+        )
+        if len(result.model_dump_json().encode()) > 1048576:
+            raise HttpError("E_STORAGE", details={"limit": 1048576})
+        return d.WriteResult.model_validate(result.model_dump(), strict=True)

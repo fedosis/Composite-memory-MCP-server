@@ -18,6 +18,26 @@ from tests.gateway.test_http_beliefs import context, expect_error, ident, orm_se
 from tests.gateway.test_slice_runtime import offline_embedder as offline_embedder
 
 
+@pytest.fixture(autouse=True)
+def pause_index_consumer(monkeypatch):
+    """Pause scheduling, not enqueue/storage; shutdown still joins real run()."""
+    from storage.outbox_worker import OutboxWorker
+
+    run, stop, releases = OutboxWorker.run, OutboxWorker.stop, {}
+
+    async def paused(worker):
+        release = releases.setdefault(worker, asyncio.Event())
+        await release.wait()
+        await run(worker)
+
+    def stopped(worker):
+        stop(worker)
+        releases.setdefault(worker, asyncio.Event()).set()
+
+    monkeypatch.setattr(OutboxWorker, "run", paused)
+    monkeypatch.setattr(OutboxWorker, "stop", stopped)
+
+
 def foundation():
     from memory_server.application import remote_beliefs as m
 
@@ -124,7 +144,9 @@ async def test_create_receipts_evidence_admission_and_masked_journal(belief_http
     empty = summary.model_copy(update=dict(method=None, sources=[], confidence=None))
     cmd = command(sources=[summary, empty], source="source CANARY", tags=["tag CANARY"])
     result, ctx = await write(state, cmd)
+    assert len(result.memories) == len(result.receipts) == 1
     memory, receipt = result.memories[0], result.receipts[0]
+    assert receipt.confidence == memory.confidence
     assert memory.id == receipt.id and memory.revision == memory.source_version == 1
     assert memory.masked and memory.content is memory.payload is memory.creator is memory.source is None
     assert receipt.source is receipt.created_by is None and not receipt.history_complete
@@ -214,7 +236,8 @@ async def test_replace_same_match_self_dependent_ledger_and_receipts(belief_http
     for source in (old, child, ident(99)):
         await sql(
             state,
-            "INSERT INTO claim_relations(source_id,target_id,relation_type) VALUES(:s,:t,'derived_from')",
+            "INSERT INTO claim_relations(source_id,target_id,relation_type,created_at) "
+            "VALUES(:s,:t,'derived_from',CURRENT_TIMESTAMP)",
             {"s": source, "t": old},
         )
     result, _ = await write(state, command(replace_belief_id=old, expected_versions={old: 1}))
@@ -263,7 +286,10 @@ async def test_replace_propagation_bound_includes_missing_refs(belief_http, coun
     async with state.deps.leases.acquire(context(state)) as scope:
         async with scope.application.memory.session_factory() as session, session.begin():
             await session.execute(
-                text("INSERT INTO claim_relations(source_id,target_id,relation_type) VALUES(:s,:t,'derived_from')"),
+                text(
+                    "INSERT INTO claim_relations(source_id,target_id,relation_type,created_at) "
+                    "VALUES(:s,:t,'derived_from',CURRENT_TIMESTAMP)"
+                ),
                 [{"s": ident(i + 100), "t": ident(1)} for i in range(count)],
             )
     before = await snapshot(state)
@@ -359,7 +385,6 @@ async def test_real_boundary_failure_rolls_back_all_tables(belief_http, monkeypa
     )
     with expect_error("E_OUTBOX" if boundary == "outbox" else "E_INTERNAL"):
         await write(belief_http, command(sources=[summary]))
-    monkeypatch.undo()
     assert await snapshot(belief_http) == before
 
 
@@ -400,3 +425,335 @@ async def test_writer_reservation_two_independent_connections(belief_http):
             release.set()
             await asyncio.wait_for(task, 10)
     assert (await sql(state, "SELECT version FROM beliefs WHERE id=:id", {"id": ident(1)})) == [(1,)]
+
+
+async def test_admission_rejection_and_reinforcement_bypass(belief_http, monkeypatch):
+    m = foundation()
+    before = await snapshot(belief_http)
+    with expect_error("E_ADMISSION_REJECTED"):
+        await write(belief_http, command(proposition="thanks"))
+    assert await snapshot(belief_http) == before
+    await orm_seed(belief_http, [dict(id=ident(1), proposition="thanks")])
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("reinforcement must not re-admit an existing proposition")
+
+    monkeypatch.setattr(m.MemoryAdmissionGate, "classify", forbidden)
+    result, _ = await write(belief_http, command(proposition="thanks", expected_versions={ident(1): 1}))
+    assert result.admission == [] and result.receipts[0].id == ident(1)
+    raw = json.loads((await sql(belief_http, "SELECT history FROM receipts"))[0][0])
+    assert len(raw) == 1 and raw[0]["kind"] == "confidence"
+
+
+@pytest.mark.parametrize("profile,valid", [("alpha", True), ("beta", False)])
+async def test_derived_claims_scoped_not_graph_edges(belief_http, profile, valid):
+    foundation()
+    await orm_seed(belief_http, [dict(id=ident(1), proposition="reference")], profile=profile)
+    summary = d.EvidenceSummary(
+        method="system",
+        sources=[],
+        session_id="arbitrary",
+        confidence=0,
+        source_date=None,
+        derived_from=[ident(1), ident(1)],
+        claim_type="authority",
+    )
+    before = await snapshot(belief_http)
+    if valid:
+        result, _ = await write(belief_http, command(sources=[summary]))
+        assert len(result.receipts) == 1
+        assert await sql(belief_http, "SELECT * FROM claim_relations") == []
+    else:
+        with expect_error("E_NOT_FOUND") as error:
+            await write(belief_http, command(sources=[summary]))
+        assert error.value.details == {} and await snapshot(belief_http) == before
+
+
+@pytest.mark.parametrize(
+    "history,code", [("not JSON", "E_INTERNAL"), ("{}", "E_INTERNAL"), (json.dumps(["x" * 1048576]), "E_STORAGE")]
+)
+async def test_bad_or_oversized_receipt_is_not_hydrated(belief_http, monkeypatch, history, code):
+    foundation()
+    from storage.repositories.receipt_repo import ReceiptRepository
+
+    result, _ = await write(belief_http)
+    target = result.memories[0].id
+    await sql(belief_http, "UPDATE receipts SET history=:h", {"h": history})
+    before = await snapshot(belief_http)
+
+    async def forbidden(*args):
+        pytest.fail("unbounded/corrupt history was hydrated before scalar preflight")
+
+    monkeypatch.setattr(ReceiptRepository, "get", forbidden)
+    with expect_error(code):
+        await write(belief_http, command(expected_versions={target: 1}))
+    assert await snapshot(belief_http) == before
+
+
+async def test_vm_budget_cleanup_reuses_connection(belief_http, monkeypatch):
+    m = foundation()
+    original = m.BeliefsMutationHandler.set_in_session
+    handlers = []
+
+    async def heavy(self, session, *args, **kwargs):
+        handlers.append(self)
+        await session.execute(
+            text("WITH RECURSIVE x(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM x WHERE n<10000000) SELECT sum(n) FROM x")
+        )
+        pytest.fail("real SQLite VM progress budget was omitted")
+
+    monkeypatch.setattr(m.BeliefsMutationHandler, "set_in_session", heavy)
+    with expect_error("E_STORAGE") as error:
+        await write(belief_http)
+    assert error.value.details == {"limit": 2000000}
+    assert handlers[0].instructions == 2000000
+    monkeypatch.setattr(m.BeliefsMutationHandler, "set_in_session", original)
+    assert (await write(belief_http))[0].memories[0].revision == 1
+
+
+async def test_lost_conditional_update_no_invented_actual(belief_http, monkeypatch):
+    foundation()
+    from storage.repositories.belief_repo import BeliefRepository
+
+    first, _ = await write(belief_http)
+    target = first.memories[0].id
+    before = await snapshot(belief_http)
+    original = BeliefRepository.transition_lifecycle_state
+
+    async def vanish(self, memory_id, *args, **kwargs):
+        await self._session.execute(text("DELETE FROM beliefs WHERE id=:id"), {"id": memory_id})
+        return await original(self, memory_id, *args, **kwargs)
+
+    monkeypatch.setattr(BeliefRepository, "transition_lifecycle_state", vanish)
+    with expect_error("E_VERSION_CONFLICT") as error:
+        await write(belief_http, command(expected_versions={target: 1}))
+    assert error.value.details == {"id": target, "expected": 1}
+    assert await snapshot(belief_http) == before
+
+
+async def test_replace_late_domain_failure_is_atomic(belief_http, monkeypatch):
+    foundation()
+    from memory_server.services.lifecycle_service import LifecycleService
+
+    first, _ = await write(belief_http)
+    target = first.memories[0].id
+    before = await snapshot(belief_http)
+    original = LifecycleService.transition_many_in_session
+
+    async def fail(self, *args, **kwargs):
+        await original(self, *args, **kwargs)
+        raise RuntimeError("late domain CANARY")
+
+    monkeypatch.setattr(LifecycleService, "transition_many_in_session", fail)
+    with expect_error("E_INTERNAL"):
+        await write(belief_http, command(replace_belief_id=target, expected_versions={target: 1}))
+    assert await snapshot(belief_http) == before
+
+
+@pytest.mark.parametrize("count", [512, 513])
+async def test_hydrated_propagation_bound_and_final_index_per_object(belief_http, count):
+    foundation()
+    await orm_seed(belief_http, [dict(id=ident(1), proposition="old", lifecycle_state="stale")])
+    await orm_seed(
+        belief_http,
+        [
+            dict(id=ident(i + 100), proposition=f"child {i}", lifecycle_state="stale", confidence=0.1)
+            for i in range(count)
+        ],
+    )
+    # All synthetic dependents are non-active, so this exercises the propagation
+    # ceiling rather than failing the independent active-candidate ceiling.
+    await sql(belief_http, "UPDATE beliefs SET lifecycle_state='active' WHERE id=:id", {"id": ident(1)})
+    await sql(
+        belief_http,
+        "INSERT INTO claim_relations(source_id,target_id,relation_type,created_at) "
+        "SELECT id,:parent,'derived_from',CURRENT_TIMESTAMP FROM beliefs WHERE id<>:parent",
+        {"parent": ident(1)},
+    )
+    before = await snapshot(belief_http)
+    if count == 513:
+        with expect_error("E_STORAGE"):
+            await write(belief_http, command(replace_belief_id=ident(1), expected_versions={ident(1): 1}))
+        assert await snapshot(belief_http) == before
+    else:
+        result, _ = await write(belief_http, command(replace_belief_id=ident(1), expected_versions={ident(1): 1}))
+        assert len(result.outbox_ids) == 514
+        assert len(await sql(belief_http, "SELECT * FROM lifecycle_events")) == 513
+        assert (
+            await sql(
+                belief_http,
+                "SELECT min(version),max(version),min(confidence),max(confidence) "
+                "FROM beliefs WHERE id<>:parent AND id<>:new",
+                {"parent": ident(1), "new": result.memories[0].id},
+            )
+        ) == [(2, 2, 0.1, 0.1)]
+        assert len(result.receipts) == 1  # no legacy receipt backfill
+
+
+async def test_real_competing_create_then_precondition_and_original_replay(belief_http):
+    foundation()
+    start = asyncio.Event()
+
+    async def contender():
+        await start.wait()
+        try:
+            return await write(belief_http)
+        except Exception as exc:
+            return exc
+
+    tasks = [asyncio.create_task(contender()), asyncio.create_task(contender())]
+    start.set()
+    results = await asyncio.gather(*tasks)
+    winners = [r for r in results if isinstance(r, tuple)]
+    assert len(winners) == 1
+    losers = [r for r in results if not isinstance(r, tuple)]
+    assert [r.code for r in losers] == ["E_PRECONDITION_REQUIRED"]
+    result, ctx = winners[0]
+    target = result.memories[0].id
+    await write(belief_http, command(expected_versions={target: 1}))
+    after = await snapshot(belief_http)
+    for _ in range(10):
+        replay, _ = await write(belief_http, ctx=replace(ctx, request_id=str(uuid4())))
+        assert replay == result
+    assert await snapshot(belief_http) == after
+
+
+@pytest.mark.parametrize("total", [8192, 8193])
+async def test_aggregate_receipt_history_bound_precedes_effects(belief_http, total):
+    foundation()
+    from storage.repositories.receipt_repo import ReceiptRepository
+
+    from memory_server.models.receipt import MemoryReceipt
+
+    state = belief_http
+    await orm_seed(
+        state,
+        [
+            dict(id=ident(i), proposition=f"synthetic {i}", lifecycle_state="active" if i == 1 else "stale")
+            for i in range(1, 9)
+        ],
+    )
+    async with state.deps.leases.acquire(context(state)) as scope:
+        async with scope.application.memory.session_factory() as session, session.begin():
+            for i in range(1, 9):
+                count = (1022 if total == 8192 else 1023) if i == 1 else 1023
+                await ReceiptRepository(session).create(
+                    MemoryReceipt(
+                        id=ident(i),
+                        memory_type="belief",
+                        source="fixture",
+                        created_by="fixture",
+                        timestamp=datetime.now(UTC),
+                        history=[{}] * count,
+                        version="1",
+                    )
+                )
+                if i > 1:
+                    await session.execute(
+                        text(
+                            "INSERT INTO claim_relations(source_id,target_id,relation_type,created_at) "
+                            "VALUES(:s,:t,'derived_from',CURRENT_TIMESTAMP)"
+                        ),
+                        {"s": ident(i), "t": ident(1)},
+                    )
+    before = await snapshot(state)
+    cmd = command(replace_belief_id=ident(1), expected_versions={ident(1): 1})
+    if total == 8193:
+        with expect_error("E_STORAGE"):
+            await write(state, cmd)
+        assert await snapshot(state) == before
+    else:
+        await write(state, cmd)
+        assert sum(len(json.loads(r[0])) for r in await sql(state, "SELECT history FROM receipts")) == 8192
+
+
+async def test_fact_dependent_canonical_receipt_and_worker_payload(belief_http):
+    foundation()
+    from storage.repositories import FactRepository, ReceiptRepository
+
+    from memory_server.models.fact import Fact
+    from memory_server.models.receipt import MemoryReceipt
+
+    state = belief_http
+    root, _ = await write(state)
+    target = root.memories[0].id
+    async with state.deps.leases.acquire(context(state)) as scope:
+        async with scope.application.memory.session_factory() as session, session.begin():
+            fact = await FactRepository(session).create(
+                Fact(
+                    id=ident(7),
+                    subject="subject",
+                    predicate="predicate",
+                    object="object",
+                    confidence=0.75,
+                    version="007",
+                )
+            )
+            await ReceiptRepository(session).create(
+                MemoryReceipt(
+                    id=fact.id,
+                    memory_type="fact",
+                    source="legacy-source",
+                    created_by="legacy-actor",
+                    timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+                    confidence=0.75,
+                    version="007",
+                )
+            )
+    await sql(
+        state,
+        "INSERT INTO claim_relations(source_id,target_id,relation_type,created_at) "
+        "VALUES(:s,:t,'derived_from',CURRENT_TIMESTAMP)",
+        {"s": fact.id, "t": target},
+    )
+    result, _ = await write(state, command(replace_belief_id=target, expected_versions={target: 1}))
+    assert len(result.outbox_ids) == 3
+    assert await sql(state, "SELECT version,confidence FROM facts") == [("8", 0.6)]
+    receipt = (
+        await sql(
+            state, "SELECT source,created_by,timestamp,version,history FROM receipts WHERE id=:id", {"id": fact.id}
+        )
+    )[0]
+    assert receipt[:2] == ("legacy-source", "legacy-actor") and receipt[3] == "8"
+    assert receipt[2].startswith("2025-01-01")
+    assert json.loads(receipt[4])[0]["revision"] == 8
+    payload = json.loads(
+        (await sql(state, "SELECT payload_json FROM outbox_entries WHERE record_id=:id", {"id": fact.id}))[0][0]
+    )
+    assert payload == dict(subject="subject", predicate="predicate", object="object", source=fact.source)
+
+
+async def test_direct_set_actor_and_client_map_cannot_be_substituted(belief_http):
+    m = foundation()
+    ctx = context(belief_http)
+    async with belief_http.deps.leases.acquire(ctx) as scope:
+        handler = m.BeliefsMutationHandler(scope, ctx, ticket="intent")
+        async with scope.application.memory.session_factory() as session, session.begin():
+            payload = command().payload
+            with expect_error("E_VALIDATION"):
+                await handler.set_in_session(
+                    session, payload, expected_versions={}, reason=payload.reason, actor="claimed"
+                )
+            with expect_error("E_VALIDATION"):
+                await handler.set_in_session(
+                    session,
+                    payload,
+                    expected_versions={ident(1): True},
+                    reason=payload.reason,
+                    actor=ctx.principal.subject,
+                )
+
+
+async def test_busy_classifier_is_not_blanket_storage():
+    m = foundation()
+    import sqlite3
+
+    for code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_BUSY | (2 << 8)):
+        error = sqlite3.OperationalError("not used for classification")
+        error.sqlite_errorcode = code
+        assert m._write_busy(error)
+    for code in (sqlite3.SQLITE_READONLY, sqlite3.SQLITE_ERROR, sqlite3.SQLITE_IOERR):
+        error = sqlite3.OperationalError("database is locked")
+        error.sqlite_errorcode = code
+        assert not m._write_busy(error)
+    assert not m._write_busy(RuntimeError("database is locked"))
