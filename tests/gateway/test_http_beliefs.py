@@ -303,7 +303,7 @@ async def test_beliefs_get_etag_stage_local_header_seam(belief_http, monkeypatch
     await orm_seed(state, [dict(id=IDENT, proposition="CANARY", version=7)])
     response = await http(state, f"beliefs/{IDENT}")
     assert response.status == 200, response.body
-    assert response.headers["etag"] == f'"m:belief:{IDENT}:7"'
+    assert response.headers.get("etag") == f'"m:belief:{IDENT}:7"'
     item = d.Memory.model_validate_json(response.body)
     for invalid in (None, True, "7", 0, -1):
         forged = item.model_copy(update={"revision": invalid})
@@ -435,6 +435,20 @@ async def test_conflicts_list_scoped_pairs_actions_and_analysis(belief_http, mon
     response = await http(state, "conflicts")
     assert response.status == 200, response.body
     assert response.json["items"][0]["allowed_actions"] == ["keep_b", "defer"]
+    await sql(state, "DELETE FROM claim_relations")
+    await sql(state, "UPDATE beliefs SET lifecycle_state='contradicted' WHERE id=:id", {"id": ident(1)})
+    response = await http(state, "conflicts")
+    assert response.status == 200, response.body
+    assert response.json["items"][0]["allowed_actions"] == ["keep_a", "keep_b", "discard_both", "defer"]
+    for source, target in ((ident(1), ident(1)), (ident(1), ident(2)), (ident(2), ident(1))):
+        await sql(
+            state,
+            "INSERT INTO claim_relations (source_id,target_id,relation_type,created_at) "
+            "VALUES (:a,:b,'derived_from','2025-01-01')",
+            dict(a=source, b=target),
+        )
+    response = await http(state, "conflicts")
+    assert response.status == 200 and response.json["items"][0]["allowed_actions"] == ["defer"], response.body
     monkeypatch.setattr(RelationClassifier, "classify_pair", None)
     assert (await http(state, "conflicts")).status == 503
 
@@ -823,6 +837,50 @@ async def test_belief_expiry_revocation_and_reveal_no_bypass(belief_http):
     assert (await http(state, bearer=f"cmms_{old.token.id}.{old.secret}")).status == 401
 
 
+async def test_belief_etag_exact_type_excludes_subclass_at_e1(belief_http):
+    from dataclasses import replace
+
+    from starlette.requests import Request
+
+    from memory_server.transports.http.routes.beliefs import BeliefReadRouteSpec
+
+    state = belief_http
+    await orm_seed(state, [dict(id=IDENT, proposition="CANARY")])
+    spec = next(s for s in state.specs if s.operation == "beliefs.get")
+    called = []
+
+    def forged(value):
+        called.append(value.id)
+        return '"evil"'
+
+    class SubSpec(BeliefReadRouteSpec):
+        pass
+
+    subclass = SubSpec(**{**spec.__dict__, "etag": forged})
+    scope = dict(
+        type="http",
+        method="GET",
+        path="/api/v1/profiles/alpha/beliefs/" + IDENT,
+        headers=[(b"authorization", ("Bearer " + state.bearer).encode())],
+        query_string=b"",
+        path_params={"profile": "alpha", "id": IDENT},
+        s06={"spec": subclass},
+    )
+    # The mount refuses this subclass; here cross the real Guard/E1 boundary
+    # directly to prove E1 itself grants no subclass header authority.
+    response = await state.app.guard.execute_read(
+        Request(scope), subclass, b"", "req_00000000-0000-4000-8000-000000000001", monotonic() + 30
+    )
+    assert response.status_code == 200 and "etag" not in response.headers
+    assert called == []
+    canonical = replace(spec)
+    scope["s06"]["spec"] = canonical
+    response = await state.app.guard.execute_read(
+        Request(scope), canonical, b"", "req_00000000-0000-4000-8000-000000000002", monotonic() + 30
+    )
+    assert response.status_code == 200 and response.headers.get("etag") == f'"m:belief:{IDENT}:1"'
+
+
 async def test_belief_cursor_key_custody_and_restart(belief_http, tmp_path):
     import os
     from dataclasses import replace
@@ -935,6 +993,9 @@ async def test_conflicts_frontier_512_boundary(belief_http, monkeypatch, extra_a
         )
         first = await http(state, "conflicts", query=b"limit=1")
         assert first.status == 200 and first.json["has_more"] is True, first.body
+        await orm_seed(
+            state, [dict(id=ident(0), proposition="Docker is worse than Podman", created_at=datetime(2026, 1, 1))]
+        )
         second = await http(
             state, "conflicts", query=urlencode(dict(limit=1, cursor=first.json["next_cursor"])).encode()
         )
@@ -1018,14 +1079,19 @@ async def test_belief_cancel_cleanup_retains_admission(belief_http, monkeypatch)
     task = asyncio.create_task(state.deps.ports["beliefs.list"].execute(context(state), command()))
     await asyncio.wait_for(entered.wait(), 5)
     task.cancel()
-    await asyncio.wait_for(clearing.wait(), 5)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    assert state.deps.leases.snapshot()["alpha"].admissions > 0
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 5)
+    try:
+        _, pending = await asyncio.wait({asyncio.create_task(clearing.wait())}, timeout=1)
+        for waiter in pending:
+            waiter.cancel()
+        assert clearing.is_set(), "real driver reset was omitted"
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        assert not done, "admission released before owned clear completed"
+        assert state.deps.leases.snapshot()["alpha"].admissions > 0
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
     assert state.deps.leases.snapshot()["alpha"].admissions == 0
     monkeypatch.setattr(BeliefsReadHandler, "list_beliefs", original)
     for profile in ("alpha", "beta"):
