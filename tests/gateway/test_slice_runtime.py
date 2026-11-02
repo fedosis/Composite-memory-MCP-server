@@ -655,6 +655,9 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
             "reflect",
             "traces.get",
             "traces.list",
+            "beliefs.list",
+            "beliefs.get",
+            "conflicts.list",
         }
         mutation_operations = {"memories.create", "learn", "memories.transition", "memories.invalidate"}
         assert set(deps.ports) == read_operations | mutation_operations

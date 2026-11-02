@@ -106,6 +106,7 @@ async def shell(tmp_path):
 @pytest.fixture
 async def diagnostic_http(shell):
     from memory_server.runtime.read_composition import (
+        compose_belief_read_ports,
         compose_ingestion_ports,
         compose_lifecycle_ports,
         compose_read_ports,
@@ -116,6 +117,8 @@ async def diagnostic_http(shell):
     deps, mutation_specs = compose_ingestion_ports(deps, shell.config)
     deps, lifecycle_specs = compose_lifecycle_ports(deps, shell.config)
     mutation_specs += lifecycle_specs
+    deps, belief_read_specs = compose_belief_read_ports(deps, shell.config)
+    specs += belief_read_specs
     shell.app = create_http_app(shell.config, deps, read_routes=specs, mutation_routes=mutation_specs)
     shell.bearer, _ = shell.mint(permissions=("profile.read", "audit.read"))
     shell.specs = specs
@@ -315,9 +318,9 @@ async def test_s10_five_routes_mount_and_permissions(diagnostic_http, monkeypatc
             )
             code(result, "E_CAPABILITY_UNAVAILABLE", 503)
         await missing.close()
-    assert len(shell.specs) == 21
+    assert len(shell.specs) == 24
     assert len(shell.mutation_specs) == 4
-    assert len(shell.specs) + len(shell.mutation_specs) == 25
+    assert len(shell.specs) + len(shell.mutation_specs) == 28
     code(await _http(shell, "unknown"), "E_NOT_FOUND", 404)
 
 

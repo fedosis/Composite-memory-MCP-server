@@ -181,6 +181,12 @@ class Guard:
             if isinstance(spec, ReadRouteSpec):
                 result = spec.validate_result(result)
                 response = JSONResponse(result.model_dump(mode='json'))
+                from .routes.beliefs import BeliefReadRouteSpec
+
+                if type(spec) is BeliefReadRouteSpec:
+                    tag = spec.etag(result)
+                    if tag is not None:
+                        response.headers["ETag"] = tag
             elif isinstance(spec, MutationRouteSpec):
                 response = JSONResponse(result.model_dump(mode='json'), status_code=spec.status(result))
                 mutation = MUTATION_REPLY.get()

@@ -19,6 +19,7 @@ from .errors import HttpError, error_code, error_response
 from .guards import Guard, ReadRouteSpec, secure_headers
 from .limits import read_body, validate_config
 from .routes import S06_ROUTE_SPECS, ProfilePort
+from .routes.beliefs import BELIEF_READ_ROUTE_SPECS, BeliefCursorCodec, BeliefReadRouteSpec
 from .routes.diagnostics import DIAGNOSTICS_ROUTE_SPECS, DiagnosticsRouteSpec, OutboxCursorCodec
 from .routes.graph import GRAPH_READ_ROUTE_SPECS, GraphReadRouteSpec, RelationCursorCodec
 from .routes.ingestion import INGESTION_ROUTE_SPECS, MutationRouteSpec
@@ -118,6 +119,23 @@ class HttpApp:
                     and (
                         type(spec.cursor_codec) is TraceCursorCodec
                         if spec.operation == "traces.list"
+                        else spec.cursor_codec is None
+                    )
+                )
+            elif type(spec) is BeliefReadRouteSpec:
+                canonical = BELIEF_READ_ROUTE_SPECS.get(spec.operation)
+                owner_matches = (
+                    row is not None
+                    and row.owner == "S15"
+                    and row.mutation is False
+                    and spec.operation in {"beliefs.list", "beliefs.get", "conflicts.list"}
+                    and canonical is not None
+                    and spec.parse is canonical.parse
+                    and spec.validate_result is canonical.validate_result
+                    and spec.etag is canonical.etag
+                    and (
+                        type(spec.cursor_codec) is BeliefCursorCodec
+                        if spec.operation in {"beliefs.list", "conflicts.list"}
                         else spec.cursor_codec is None
                     )
                 )
