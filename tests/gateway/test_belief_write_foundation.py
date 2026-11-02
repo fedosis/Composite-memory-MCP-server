@@ -90,10 +90,10 @@ async def snapshot(state):
     }
 
 
-async def test_mutation_port_present_without_resolve_surface():
+async def test_mutation_and_resolve_surfaces_present():
     m = foundation()
     assert hasattr(m, "RemoteBeliefsMutationPort")
-    assert not hasattr(m.BeliefsMutationHandler, "resolve_in_session")
+    assert hasattr(m.BeliefsMutationHandler, "resolve_in_session")
 
 
 @pytest.mark.parametrize(
