@@ -90,9 +90,9 @@ async def snapshot(state):
     }
 
 
-async def test_foundation_present_without_future_surface():
+async def test_mutation_port_present_without_resolve_surface():
     m = foundation()
-    assert not hasattr(m, "RemoteBeliefsMutationPort")
+    assert hasattr(m, "RemoteBeliefsMutationPort")
     assert not hasattr(m.BeliefsMutationHandler, "resolve_in_session")
 
 

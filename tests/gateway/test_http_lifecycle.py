@@ -965,7 +965,7 @@ async def test_mount_and_missing_ports_fail_closed(lifecycle, monkeypatch):
     from memory_server.transports.http.routes.lifecycle import create_lifecycle_routes
 
     h = lifecycle
-    assert len(h.app.routes) == 34
+    assert len(h.app.routes) == 35
     assert h.deps.ports["memories.transition"] is h.deps.ports["memories.invalidate"]
     assert h.deps.ports["memories.transition"] is not h.deps.ports["learn"]
     for spec in create_lifecycle_routes():

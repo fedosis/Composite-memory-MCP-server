@@ -11,7 +11,7 @@ from memory_server.application.errors import UnknownDependencyError
 from memory_server.application.gateway_retrieval import GatewayRetrievalPort, NativeCustody
 from memory_server.application.graph_read_service import GraphReadResources, create_graph_read_port
 from memory_server.application.memory_read_service import MemoryReadService
-from memory_server.application.remote_beliefs import RemoteBeliefsPort
+from memory_server.application.remote_beliefs import RemoteBeliefsMutationPort, RemoteBeliefsPort
 from memory_server.application.remote_ingestion import RemoteIngestionPort
 from memory_server.application.remote_lifecycle import RemoteLifecyclePort
 from memory_server.application.retrieval_trace import RetrievalTraceService
@@ -19,7 +19,11 @@ from memory_server.control.traces import TracesStore
 from memory_server.gateway_contracts.ports import ProfileSession
 from memory_server.settings import Settings
 from memory_server.transports.http.errors import HttpError
-from memory_server.transports.http.routes.beliefs import BeliefCursorCodec, create_belief_read_routes
+from memory_server.transports.http.routes.beliefs import (
+    BeliefCursorCodec,
+    create_belief_mutation_routes,
+    create_belief_read_routes,
+)
 from memory_server.transports.http.routes.diagnostics import OutboxCursorCodec, create_diagnostics_routes
 from memory_server.transports.http.routes.graph import RelationCursorCodec, create_graph_read_routes
 from memory_server.transports.http.routes.ingestion import create_ingestion_routes
@@ -238,6 +242,27 @@ def compose_belief_read_ports(deps, config):
     )
     port = RemoteBeliefsPort(deps, bind_read, cursor_codec=codec)
     specs = create_belief_read_routes(cursor_codec=codec)
+    ports = dict(deps.ports)
+    ports.update({spec.operation: port for spec in specs})
+    return replace(deps, ports=ports), specs
+
+
+def compose_belief_mutation_ports(deps, config):
+    if deps.leases is None:
+        raise HttpError("E_RUNTIME_NOT_READY")
+
+    def ticket():
+        current = audit_ticket.get()
+        return current.id if current is not None else None
+
+    port = RemoteBeliefsMutationPort(
+        deps,
+        ticket_provider=ticket,
+        publish_outcome=deps.access.publish_committed,
+        ttl_seconds=config.idempotency_ttl_seconds,
+        events=deps.events,
+    )
+    specs = create_belief_mutation_routes()
     ports = dict(deps.ports)
     ports.update({spec.operation: port for spec in specs})
     return replace(deps, ports=ports), specs

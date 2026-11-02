@@ -1,4 +1,4 @@
-"""Borrowed, bounded canonical belief reads; no mutation authority."""
+"""Bounded belief reads and supplied-session, scoped remote mutations."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ from memory_server.models.receipt import LifecycleState
 from memory_server.transports.http.errors import HttpError
 
 # isort: split
-# Write foundation: supplied-session authority only; deliberately no HTTP port.
+# Write authority: supplied-session foundation and scoped mutation port.
 from uuid import uuid4
 
 from sqlalchemy import event, select
@@ -47,10 +47,12 @@ from storage.models.fact import FactORM
 from storage.models.lifecycle import LifecycleEventORM
 from storage.outbox import OutboxRepository
 from storage.repositories import BeliefRepository, LifecycleRepository, ReceiptRepository
+from storage.repositories.http_request_repo import HttpRequestRepository
 from storage.repositories.lifecycle_repo import LifecycleConflictError, normalize_version
 
 from memory_server.admission import AdmissionDecision, MemoryAdmissionGate
-from memory_server.application.mutation_uow import MutationUoW, _is_busy
+from memory_server.application.mutation_uow import MUTATION_REPLY, MutationReply, MutationUoW, _digest, _is_busy
+from memory_server.gateway_contracts.ports import AuditOutcome, AuditTicket
 from memory_server.models.evidence import Evidence
 from memory_server.models.receipt import MemoryReceipt
 from memory_server.services.lifecycle_service import (
@@ -1239,3 +1241,186 @@ class BeliefsMutationHandler:
         if len(result.model_dump_json().encode()) > 1048576:
             raise HttpError("E_STORAGE", details={"limit": 1048576})
         return d.WriteResult.model_validate(result.model_dump(), strict=True)
+
+
+class RemoteBeliefsMutationPort:
+    def __init__(
+        self, deps, *, ticket_provider, publish_outcome, ttl_seconds=86400, events=None, gate=None, clock=None
+    ):
+        if (
+            not callable(ticket_provider)
+            or not callable(publish_outcome)
+            or (events is not None and not callable(getattr(events, "publish", None)))
+            or (clock is not None and not callable(clock))
+        ):
+            raise ValueError("invalid belief mutation dependencies")
+        if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 604800:
+            raise ValueError("invalid belief mutation TTL")
+        self._deps, self._ticket_provider, self._publish_outcome = deps, ticket_provider, publish_outcome
+        self._ttl, self._events = ttl_seconds, events
+        self._gate = MemoryAdmissionGate() if gate is None else gate
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def execute(self, ctx: RequestContext, command: d.BeliefsSetCommand) -> d.WriteResult:
+        if type(command) is not d.BeliefsSetCommand or command.operation != "beliefs.set":
+            raise HttpError("E_VALIDATION")
+        self._deps.tokens.verify_principal(ctx.principal, now=datetime.now(UTC))
+        require_permission(ctx.principal, "belief.write", profile_id=ctx.profile_id)
+        if ctx.profile_id is None or command.profile_id != ctx.profile_id:
+            raise HttpError("E_VALIDATION")
+        command = validate_belief_mutation_command(command)
+        if type(ctx.idempotency_key) is not UUID:
+            raise HttpError("E_IDEMPOTENCY_REQUIRED")
+        if (
+            type(ctx.deadline) not in (int, float)
+            or not math.isfinite(ctx.deadline)
+            or ctx.deadline <= time.monotonic()
+        ):
+            raise HttpError("E_TIMEOUT")
+        try:
+            ticket = self._ticket_provider()
+        except Exception:
+            raise HttpError("E_AUDIT_UNAVAILABLE") from None
+        if type(ticket) is not str or not 1 <= len(ticket) <= 256:
+            raise HttpError("E_AUDIT_UNAVAILABLE")
+        if self._deps.leases is None:
+            raise HttpError("E_RUNTIME_NOT_READY")
+        started = time.monotonic()
+        async with self._deps.leases.acquire(ctx) as scope:
+            factory = scope.application.memory.session_factory
+            uow = _BeliefsMutationUoW(
+                factory,
+                verify_principal=lambda p: self._deps.tokens.verify_principal(p, now=datetime.now(UTC)),
+                ticket_provider=lambda: ticket,
+                ttl_seconds=self._ttl,
+            )
+            handler = BeliefsMutationHandler(scope, ctx, ticket=ticket, gate=self._gate, clock=self._clock)
+            try:
+                result = await uow.run(ctx, command, handler)
+            except asyncio.CancelledError:
+                try:
+                    recovered = await _write_settle(self._resolve(factory, ctx, command))
+                except Exception:
+                    recovered = None
+                if recovered is None:
+                    raise
+                result, original, audit = recovered
+                if original == ctx.request_id and audit != ticket:
+                    raise HttpError("E_INTERNAL") from None
+                MUTATION_REPLY.set(MutationReply(original != ctx.request_id, original))
+            reply = MUTATION_REPLY.get()
+            try:
+                if reply is not None and reply.replayed:
+                    await _write_settle(self._reconcile(factory, ctx, command))
+                else:
+                    await _write_settle(self._tail(factory, uow, ctx, command, result, ticket, handler, started))
+            except Exception:
+                # Canonical commit is authoritative; publication remains pending.
+                pass
+            return result
+
+    async def _resolve(self, factory, ctx, command):
+        async with factory() as session:
+            row = await HttpRequestRepository(session).find(
+                ctx.principal.subject, ctx.profile_id, command.operation, str(ctx.idempotency_key).lower()
+            )
+            if row is None or row.digest != _digest(command):
+                return None
+            return d.WriteResult.model_validate_json(row.response_snapshot), row.request_id, row.audit_ticket_id
+
+    @staticmethod
+    def _status(result):
+        return 200 if result.reinforced_ids else 201
+
+    async def _reconcile(self, factory, ctx, command):
+        async with factory() as session, session.begin():
+            repo = HttpRequestRepository(session)
+            row = await repo.find(
+                ctx.principal.subject, ctx.profile_id, command.operation, str(ctx.idempotency_key).lower()
+            )
+            if row is None or row.digest != _digest(command) or not row.pending_publication or not row.audit_ticket_id:
+                return
+            result = d.WriteResult.model_validate_json(row.response_snapshot)
+            outcome = AuditOutcome(self._status(result), None, tuple(r.id for r in result.receipts), 0.0)
+            if await self._publish_outcome(AuditTicket(row.audit_ticket_id, row.request_id), outcome) is True:
+                await repo.mark_published(row.request_id)
+
+    async def _tail(self, factory, uow, ctx, command, result, ticket, handler, started):
+        async def audit():
+            outcome = AuditOutcome(
+                self._status(result), None, tuple(r.id for r in result.receipts), (time.monotonic() - started) * 1000
+            )
+            if await self._publish_outcome(AuditTicket(ticket, ctx.request_id), outcome) is True:
+                await uow.mark_published(ctx.request_id)
+
+        tasks = [asyncio.create_task(audit()), asyncio.create_task(self._produce(factory, ctx, command, handler))]
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _produce(self, factory, ctx, command, handler):
+        records = tuple(handler.captured.values())
+        if self._events is None or not records:
+            return
+        if len(records) > 1026:
+            return
+        observed = {}
+        ids = [r[0] for r in records]
+        async with factory() as session:
+            for offset in range(0, len(ids), 128):
+                rows = (
+                    await session.scalars(
+                        select(LifecycleEventORM).where(LifecycleEventORM.id.in_(ids[offset : offset + 128])).limit(129)
+                    )
+                ).all()
+                for row in rows:
+                    observed[row.id] = (
+                        row.id,
+                        row.memory_type,
+                        row.memory_id,
+                        row.from_state,
+                        row.to_state,
+                        utc(row.timestamp),
+                    )
+        if set(observed) != set(ids) or any(observed[r[0]] != r for r in records):
+            return
+        revisions = {key: value[0] for key, value in handler.observed.items()}
+        events = []
+        for index, (eid, kind, ident, before, after, stamp) in enumerate(records):
+            key = (kind, ident)
+            if key not in revisions:
+                return
+            revisions[key] += 1
+            wire = d.Event(
+                id=eid,
+                type="memory.transitioned"
+                if index == 0 and command.payload.replace_belief_id is not None
+                else "memory.updated",
+                profile_id=ctx.profile_id,
+                timestamp=stamp,
+                request_id=ctx.request_id,
+                memory_id=ident,
+                job_id=None,
+                severity="info",
+                data=d.EventData(
+                    revision=revisions[key],
+                    from_state=before,
+                    to_state=after,
+                    operation=command.operation,
+                    pending=None,
+                    code=None,
+                ),
+            )
+            if len(wire.model_dump_json().encode()) >= 4096:
+                return
+            events.append(wire)
+        tasks = [asyncio.create_task(self._events.publish(event)) for event in events]
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)

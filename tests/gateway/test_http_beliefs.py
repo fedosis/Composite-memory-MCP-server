@@ -1131,8 +1131,13 @@ async def belief_write(belief_http):
     state = belief_http
     now = datetime.now(UTC)
     created = state.deps.tokens._bootstrap_create(
-        d.TokenCreate(subject="s15b1", profiles=["alpha", "beta"], permissions=["belief.write", "belief.read"],
-                      expires_at=now + timedelta(hours=1)), now=now,
+        d.TokenCreate(
+            subject="s15b1",
+            profiles=["alpha", "beta"],
+            permissions=["belief.write", "belief.read"],
+            expires_at=now + timedelta(hours=1),
+        ),
+        now=now,
     )
     state.write_bearer = f"cmms_{created.token.id}.{created.secret}"
     state.write_principal = await state.deps.tokens.authenticate(state.write_bearer, now=now)
@@ -1140,16 +1145,25 @@ async def belief_write(belief_http):
 
 
 def set_payload(**updates):
-    return dict(proposition="PostgreSQL transactions provide atomic durable database updates.",
-                replace_belief_id=None, reason="S15B1_REASON_CANARY", **updates)
+    return {
+        "proposition": "PostgreSQL transactions provide atomic durable database updates.",
+        "replace_belief_id": None,
+        "reason": "S15B1_REASON_CANARY",
+        **updates,
+    }
 
 
 async def post_set(state, payload=None, *, key=None, headers=(), **kwargs):
     from uuid import uuid4
 
-    return await http(state, method="POST", bearer=state.write_bearer,
-                      body=set_payload() if payload is None else payload,
-                      headers=(("Idempotency-Key", str(key or uuid4())), *headers), **kwargs)
+    return await http(
+        state,
+        method="POST",
+        bearer=state.write_bearer,
+        body=set_payload() if payload is None else payload,
+        headers=(("Idempotency-Key", str(key or uuid4())), *headers),
+        **kwargs,
+    )
 
 
 async def test_beliefs_set_create_persisted_receipt_and_outbox(belief_write):
@@ -1165,8 +1179,796 @@ async def test_beliefs_set_create_persisted_receipt_and_outbox(belief_write):
     assert result["receipts"][0]["id"] == ident
     assert result["receipts"][0]["source"] is result["receipts"][0]["created_by"] is None
     assert result["admission"][0]["admitted"] is True
-    assert await sql(state, "SELECT version,source,creator FROM beliefs WHERE id=:id", {"id": ident}) == [(1,"agent","s15b1")]
-    assert await sql(state, "SELECT id,created_by FROM receipts WHERE id=:id", {"id": ident}) == [(ident,"s15b1")]
-    assert {r[0] for r in await sql(state, "SELECT id FROM outbox_entries WHERE record_id=:id", {"id": ident})} == set(result["outbox_ids"])
-    assert len(await sql(state, "SELECT request_id FROM http_request_journal WHERE request_id=:id", {"id":result["request_id"]})) == 1
+    assert await sql(state, "SELECT version,source,creator FROM beliefs WHERE id=:id", {"id": ident}) == [
+        (1, "agent", "s15b1")
+    ]
+    assert await sql(state, "SELECT id,created_by FROM receipts WHERE id=:id", {"id": ident}) == [(ident, "s15b1")]
+    assert {r[0] for r in await sql(state, "SELECT id FROM outbox_entries WHERE record_id=:id", {"id": ident})} == set(
+        result["outbox_ids"]
+    )
+    assert (
+        len(
+            await sql(
+                state, "SELECT request_id FROM http_request_journal WHERE request_id=:id", {"id": result["request_id"]}
+            )
+        )
+        == 1
+    )
     assert b"S15B1_REASON_CANARY" not in response.body
+
+
+async def set_snapshot(state, profile="alpha"):
+    """Fresh supplied sessions; indexing-worker bookkeeping is not canonical state."""
+    tables = (
+        "beliefs",
+        "facts",
+        "evidence",
+        "claim_relations",
+        "lifecycle_states",
+        "lifecycle_events",
+        "receipts",
+        "http_request_journal",
+    )
+    result = {table: await sql(state, f"SELECT * FROM {table} ORDER BY 1", profile=profile) for table in tables}
+    result["outbox_entries"] = await sql(
+        state, "SELECT id,record_type,record_id,operation,payload_json FROM outbox_entries ORDER BY id", profile=profile
+    )
+    return result
+
+
+def error_code(response, code, status):
+    assert response.status == status, response.body
+    assert response.json["error"]["code"] == code, response.body
+    assert "etag" not in response.headers
+    return response.json["error"]["details"]
+
+
+async def test_beliefs_set_reinforcement_requires_client_cas(belief_write, monkeypatch):
+    from uuid import uuid4
+
+    state = belief_write
+    original = await post_set(state, set_payload(confidence=0.8, tags=["first"]))
+    assert original.status == 201, original.body
+    ident = original.json["memories"][0]["id"]
+    before = await set_snapshot(state)
+    assert error_code(await post_set(state), "E_PRECONDITION_REQUIRED", 428) == {}
+    assert error_code(await post_set(state, set_payload(expected_versions={ident: 2})), "E_VERSION_CONFLICT", 409) == {
+        "id": ident,
+        "expected": 2,
+        "actual": 1,
+    }
+    assert await set_snapshot(state) == before
+    port = state.deps.ports["beliefs.set"]
+
+    def forbidden(*a, **k):
+        pytest.fail("reinforcement/replay must not classify")
+
+    monkeypatch.setattr(port._gate, "classify", forbidden)
+    payload = set_payload(expected_versions={ident: 1}, confidence=0.4, tags=["first", "second"])
+    key = uuid4()
+    updated = await post_set(state, payload, key=key)
+    assert updated.status == 200, updated.body
+    assert updated.json["reinforced_ids"] == [ident] and updated.json["admission"] == []
+    assert updated.json["memories"][0]["revision"] == 2
+    assert updated.json["memories"][0]["confidence"] == pytest.approx(0.6)
+    import json
+
+    stored = (await sql(state, "SELECT version,tags FROM beliefs WHERE id=:id", {"id": ident}))[0]
+    assert stored[0] == 2 and json.loads(stored[1]) == ["first", "second"]
+    before = await set_snapshot(state)
+    for _ in range(10):
+        replay = await post_set(state, payload, key=key)
+        assert replay.status == 200 and replay.json == updated.json
+        assert replay.headers["idempotency-replayed"] == "true"
+        assert replay.headers["x-original-request-id"] == updated.json["request_id"]
+        assert replay.headers["x-request-id"] != updated.headers["x-request-id"]
+    assert await set_snapshot(state) == before
+    error_code(await post_set(state, {**payload, "reason": "changed"}, key=key), "E_IDEMPOTENCY_CONFLICT", 409)
+
+
+async def test_beliefs_set_replace_requires_client_cas(belief_write):
+    state = belief_write
+    created = await post_set(state)
+    old = created.json["memories"][0]["id"]
+    payload = set_payload(proposition="SQLite serializes concurrent canonical database writers.", replace_belief_id=old)
+    before = await set_snapshot(state)
+    error_code(await post_set(state, {**payload, "replace_belief_id": IDENT}), "E_NOT_FOUND", 404)
+    error_code(await post_set(state, {**payload, "expected_versions": {IDENT: 1}}), "E_VALIDATION", 422)
+    assert error_code(await post_set(state, payload), "E_PRECONDITION_REQUIRED", 428) == {}
+    error_code(await post_set(state, {**payload, "expected_versions": {old: 9}}), "E_VERSION_CONFLICT", 409)
+    error_code(await post_set(state, set_payload(replace_belief_id=IDENT)), "E_NOT_FOUND", 404)
+    assert await set_snapshot(state) == before
+    # Same matching ID must still replace, never take reinforcement first.
+    response = await post_set(state, set_payload(replace_belief_id=old, expected_versions={old: 1}))
+    assert response.status == 201, response.body
+    new, previous = response.json["memories"]
+    assert new["id"] != old and new["revision"] == 2
+    assert previous["id"] == old and previous["lifecycle_state"] == "superseded" and previous["revision"] == 2
+    assert response.json["reinforced_ids"] == []
+    for receipt in response.json["receipts"]:
+        assert await sql(state, "SELECT id FROM receipts WHERE id=:id", {"id": receipt["id"]}) == [(receipt["id"],)]
+    assert await sql(state, "SELECT version,lifecycle_state FROM beliefs WHERE id=:id", {"id": old}) == [
+        (2, "superseded")
+    ]
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        (("If-Match", ""),),
+        (("If-Match", "*"),),
+        (("If-Match", 'W/"x"'),),
+        (("If-Match", '"m:belief:00000000-0000-4000-8000-000000000001:1"'),),
+        (("If-Match", '"a", "b"'),),
+        (("If-Match", '"a"'), ("If-Match", '"b"')),
+    ],
+)
+@pytest.mark.parametrize("mode", ["missing", "stale", "foreign", "replay"])
+async def test_beliefs_set_q5_header_matrix_before_lease(belief_write, monkeypatch, headers, mode):
+    from uuid import uuid4
+
+    state = belief_write
+    created = await post_set(state)
+    ident = created.json["memories"][0]["id"]
+    key = uuid4()
+    payload = set_payload(expected_versions={ident: 1})
+    if mode == "missing":
+        payload.pop("expected_versions")
+    elif mode == "stale":
+        payload["expected_versions"] = {ident: 9}
+    elif mode == "foreign":
+        payload = set_payload(replace_belief_id=IDENT)
+    else:
+        assert (await post_set(state, payload, key=key)).status == 200
+    before = await set_snapshot(state)
+    calls = []
+    original = type(state.deps.leases).acquire
+
+    def track(self, ctx):
+        calls.append(ctx)
+        return original(self, ctx)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(state.deps.leases), "acquire", track)
+        error_code(await post_set(state, payload, key=key, headers=headers), "E_VALIDATION", 422)
+        assert calls == []
+    assert await set_snapshot(state) == before
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"auto_resolve": True},
+        {"auto_resolve": False},
+        {"actor": "forged"},
+        {"force": True},
+        {"confidence": True},
+        {"confidence": "0.5"},
+        {"confidence": float("nan")},
+        {"confidence": float("inf")},
+        {"proposition": "  "},
+        {"reason": "\t"},
+        {"replace_belief_id": "00000000000040008000000000000001"},
+        {"expected_versions": {IDENT: True}},
+        {"expected_versions": {IDENT: 0}},
+        {"expected_versions": {IDENT: "1"}},
+        {"expected_versions": None},
+        {
+            "sources": [
+                {
+                    "method": None,
+                    "sources": [],
+                    "session_id": None,
+                    "confidence": True,
+                    "source_date": None,
+                    "derived_from": [],
+                    "claim_type": None,
+                }
+            ]
+        },
+    ],
+)
+async def test_beliefs_set_strict_parser_precedes_lookup(belief_write, monkeypatch, change):
+    state = belief_write
+
+    def forbidden(*a, **k):
+        pytest.fail("invalid DTO reached lease")
+
+    monkeypatch.setattr(type(state.deps.leases), "acquire", forbidden)
+    error_code(await post_set(state, set_payload(**change)), "E_VALIDATION", 422)
+
+
+@pytest.mark.parametrize(
+    "body", [b"{}", b"[]", b"null", b'{"proposition":"a","proposition":"b"}', b"\xff", b'{"confidence":NaN}']
+)
+async def test_beliefs_set_strict_json(belief_write, body):
+    error_code(await post_set(belief_write, body, headers=(("Content-Type", "application/json"),)), "E_VALIDATION", 422)
+
+
+async def test_beliefs_set_admission_evidence_claims_and_rollback(belief_write, monkeypatch):
+    import json
+
+    from storage.repositories.receipt_repo import ReceiptRepository
+
+    from memory_server.admission import MemoryAdmissionGate
+
+    state = belief_write
+    before = await set_snapshot(state)
+    error_code(await post_set(state, set_payload(proposition="ok")), "E_ADMISSION_REJECTED", 422)
+    assert await set_snapshot(state) == before
+    summary = dict(
+        method="authority",
+        sources=["opaque:CANARY", "opaque:CANARY"],
+        session_id="SESSION_CANARY",
+        confidence=0.0,
+        source_date="DATE_CANARY",
+        derived_from=[],
+        claim_type="authority",
+    )
+    payload = set_payload(sources=[summary])
+    decisions = []
+    original = MemoryAdmissionGate.classify
+
+    def classify(self, *a, **kw):
+        assert kw["source_scope"] == "remote" and kw["force"] is False
+        result = original(self, *a, **kw)
+        decisions.append(result)
+        return result
+
+    monkeypatch.setattr(MemoryAdmissionGate, "classify", classify)
+    response = await post_set(state, payload)
+    assert response.status == 201, response.body
+    assert len(decisions) == 1 and response.json["admission"][0]["score"] == decisions[0].score
+    ident = response.json["memories"][0]["id"]
+    assert (
+        await sql(
+            state,
+            "SELECT source_type,source_id,weight,contributor FROM evidence WHERE belief_id=:id ORDER BY id",
+            {"id": ident},
+        )
+        == [("authority", "opaque:CANARY", 0.0, "s15b1")] * 2
+    )
+    raw = (await sql(state, "SELECT history FROM receipts WHERE id=:id", {"id": ident}))[0][0]
+    assert json.loads(raw)[0]["claims"] == [{**summary, "trusted": False, "origin": "remote_claim"}]
+    assert b"CANARY" not in response.body
+    before = await set_snapshot(state)
+    original_create = ReceiptRepository.create
+    calls = []
+
+    async def broken(self, receipt):
+        calls.append(id(self._session) if hasattr(self, "_session") else True)
+        await original_create(self, receipt)
+        raise RuntimeError("PRIVATE_STORAGE_CANARY")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ReceiptRepository, "create", broken)
+        failure = await post_set(state, set_payload(proposition="MariaDB supports transactional database updates."))
+        error_code(failure, "E_INTERNAL", 500)
+        assert b"PRIVATE_STORAGE_CANARY" not in failure.body
+    assert calls and await set_snapshot(state) == before
+
+
+async def test_beliefs_set_original_snapshot_replay_and_revocation(belief_write):
+    from uuid import uuid4
+
+    state = belief_write
+    key = uuid4()
+    original = await post_set(state, key=key)
+    ident = original.json["memories"][0]["id"]
+    assert (await post_set(state, set_payload(expected_versions={ident: 1}))).status == 200
+    replay = await post_set(state, key=key)
+    assert replay.status == 201 and replay.json == original.json
+    # Scope and grants are rechecked for replay, not merely on the original write.
+    read_only = await http(state, method="POST", body=set_payload(), headers=(("Idempotency-Key", str(key)),))
+    error_code(read_only, "E_PERMISSION_DENIED", 403)
+
+
+async def test_beliefs_set_canonical_descriptor_and_missing_binding(belief_write):
+    from dataclasses import replace
+    from uuid import uuid4
+
+    from memory_server.transports.http.routes import beliefs as routes
+
+    state = belief_write
+    specs = routes.create_belief_mutation_routes()
+    assert len(specs) == 1 and specs[0] is routes.BELIEF_MUTATION_ROUTE_SPECS["beliefs.set"]
+    spec = specs[0]
+    for fields in (
+        {},
+        {"parse": lambda *a: None},
+        {"status": lambda *a: 200},
+        {"method": "GET"},
+        {"path": "/bad"},
+        {"permission": "memory.write"},
+    ):
+        with pytest.raises(ValueError):
+            create_http_app(state.config, state.deps, mutation_routes=(replace(spec, **fields),))
+
+    class SubSpec(type(spec)):
+        pass
+
+    with pytest.raises(ValueError):
+        create_http_app(state.config, state.deps, mutation_routes=(SubSpec(**spec.__dict__),))
+    with pytest.raises(ValueError):
+        create_http_app(state.config, state.deps, mutation_routes=(spec, spec))
+    ports = dict(state.deps.ports)
+    del ports["beliefs.set"]
+    missing = create_http_app(state.config, replace(state.deps, ports=ports), mutation_routes=specs)
+    response = await request(
+        missing,
+        spec.path.replace("{profile}", "alpha"),
+        method="POST",
+        bearer=state.write_bearer,
+        body=set_payload(),
+        headers=(("Idempotency-Key", str(uuid4())),),
+    )
+    error_code(response, "E_CAPABILITY_UNAVAILABLE", 503)
+
+
+async def test_beliefs_set_postcommit_pending_reconciles_original(belief_write, monkeypatch):
+    from uuid import uuid4
+
+    state = belief_write
+    port = state.deps.ports["beliefs.set"]
+    original_publish = port._publish_outcome
+    calls = []
+
+    async def fail(ticket, outcome):
+        calls.append((ticket, outcome))
+        return False
+
+    monkeypatch.setattr(port, "_publish_outcome", fail)
+    key = uuid4()
+    response = await post_set(state, key=key)
+    assert response.status == 201
+    assert len(calls) == 1 and calls[0][1].status == 201
+    assert await sql(state, "SELECT pending_publication FROM http_request_journal") == [(1,)]
+    error_code(
+        await post_set(state, set_payload(proposition="MySQL supports database transactions.")),
+        "E_AUDIT_UNAVAILABLE",
+        503,
+    )
+
+    async def publish(ticket, outcome):
+        calls.append((ticket, outcome))
+        return await original_publish(ticket, outcome)
+
+    monkeypatch.setattr(port, "_publish_outcome", publish)
+    replay = await post_set(state, key=key)
+    assert replay.json == response.json
+    assert calls[-1][0] == calls[0][0]
+    assert await sql(state, "SELECT pending_publication FROM http_request_journal") == [(0,)]
+    audit_rows = list(state.deps.access._db.execute("SELECT * FROM access_audit"))
+    assert audit_rows and "S15B1_REASON_CANARY" not in repr(audit_rows)
+
+
+async def test_beliefs_set_events_use_only_persisted_ids(belief_write, monkeypatch):
+    from uuid import uuid4
+
+    state = belief_write
+    events = []
+
+    class Sink:
+        async def publish(self, event):
+            assert await sql(state, "SELECT id FROM lifecycle_events WHERE id=:id", {"id": event.id}) == [(event.id,)]
+            events.append(event)
+
+    port = state.deps.ports["beliefs.set"]
+    monkeypatch.setattr(port, "_events", Sink())
+    created = await post_set(state)
+    assert created.status == 201 and events == []
+    ident = created.json["memories"][0]["id"]
+    key = uuid4()
+    payload = set_payload(expected_versions={ident: 1})
+    updated = await post_set(state, payload, key=key)
+    assert updated.status == 200 and len(events) == 1
+    assert events[0].type == "memory.updated" and events[0].data.revision == 2
+    assert (await post_set(state, payload, key=key)).json == updated.json
+    assert len(events) == 1
+    replaced = await post_set(state, set_payload(replace_belief_id=ident, expected_versions={ident: 2}))
+    assert replaced.status == 201 and len(events) == 2
+    assert events[-1].type == "memory.transitioned" and events[-1].memory_id == ident
+    assert len(events[-1].model_dump_json().encode()) < 4096
+    assert "CANARY" not in events[-1].model_dump_json()
+
+
+async def test_belief_write_import_graph_and_read_partition():
+    import ast
+    import subprocess
+    from pathlib import Path
+
+    from memory_server.application import remote_beliefs as module
+    from memory_server.transports.http.routes import beliefs as routes
+
+    base = "08ebb12a0b47bff1bbc649e4aefcfe227fd443fc"
+    for current, suffix, stop in (
+        (module, "application/remote_beliefs.py", "validate_belief_mutation_command"),
+        (routes, "transports/http/routes/beliefs.py", None),
+    ):
+        filename = Path(current.__file__)
+        old = ast.parse(subprocess.check_output(["git", "show", f"{base}:src/memory_server/{suffix}"], text=True))
+        new = ast.parse(filename.read_text())
+        definitions = {
+            n.name: n for n in new.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        for node in old.body:
+            if getattr(node, "name", None) == stop:
+                break
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                assert ast.dump(node) == ast.dump(definitions[node.name]), node.name
+        for node in ast.walk(new):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                assert name not in {"commit", "create_async_engine", "AsyncSession"}
+    assert hasattr(module, "RemoteBeliefsMutationPort")
+    assert not hasattr(module.BeliefsMutationHandler, "resolve_in_session")
+
+
+async def test_beliefs_set_cancel_cleanup_holds_lease(belief_write, monkeypatch):
+    import fcntl
+    import os
+
+    import aiosqlite
+
+    from memory_server.application.remote_beliefs import BeliefsMutationHandler
+
+    state = belief_write
+    before = await set_snapshot(state)
+    staged, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_set = BeliefsMutationHandler.set_in_session
+    original_progress = aiosqlite.Connection.set_progress_handler
+
+    async def paused_set(self, *a, **kw):
+        await original_set(self, *a, **kw)
+        staged.set()
+        await asyncio.Event().wait()
+
+    async def paused_progress(self, handler, n):
+        if handler is None:
+            cleanup.set()
+            await release.wait()
+        return await original_progress(self, handler, n)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(BeliefsMutationHandler, "set_in_session", paused_set)
+        patch.setattr(aiosqlite.Connection, "set_progress_handler", paused_progress)
+        task = asyncio.create_task(post_set(state))
+        try:
+            await asyncio.wait_for(staged.wait(), 5)
+            task.cancel()
+            await asyncio.wait_for(cleanup.wait(), 5)
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+            assert not task.done()
+            assert state.deps.leases.snapshot()["alpha"].admissions == 1
+            fd = os.open(state.roots["alpha"] / ".cmms-storage.lock", os.O_RDWR)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+    assert state.deps.leases.snapshot()["alpha"].admissions == 0
+    assert await set_snapshot(state) == before
+    assert (await post_set(state)).status == 201
+
+
+async def test_beliefs_set_cancel_after_durable_commit_recovers_original_key(belief_write, monkeypatch):
+    from uuid import uuid4
+
+    from memory_server.application.remote_beliefs import _BeliefsMutationUoW
+
+    state = belief_write
+    key = uuid4()
+    original = _BeliefsMutationUoW.run
+
+    async def committed_cancel(self, *a, **kw):
+        await original(self, *a, **kw)
+        raise asyncio.CancelledError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_BeliefsMutationUoW, "run", committed_cancel)
+        response = await post_set(state, key=key)
+        assert response.status == 201, response.body
+    replay = await post_set(state, key=key)
+    assert replay.json == response.json
+    assert len(await sql(state, "SELECT id FROM beliefs")) == 1
+    assert len(await sql(state, "SELECT request_id FROM http_request_journal")) == 1
+    assert state.deps.leases.snapshot()["alpha"].admissions == 0
+
+
+async def test_beliefs_set_cancel_tail_joins_audit_and_events(belief_write, monkeypatch):
+    from uuid import uuid4
+
+    state = belief_write
+    port = state.deps.ports["beliefs.set"]
+    seeded = await post_set(state)
+    ident = seeded.json["memories"][0]["id"]
+    entered, cleaned, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class Sink:
+        async def publish(self, event):
+            entered.set()
+            try:
+                await release.wait()
+            finally:
+                cleaned.set()
+
+    monkeypatch.setattr(port, "_events", Sink())
+    key = uuid4()
+    task = asyncio.create_task(post_set(state, set_payload(expected_versions={ident: 1}), key=key))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert state.deps.leases.snapshot()["alpha"].admissions == 1
+        # Audit must not wait on the event branch.
+        async with asyncio.timeout(0.8):
+            while await sql(
+                state, "SELECT pending_publication FROM http_request_journal WHERE idem_key=:key", {"key": str(key)}
+            ) != [(0,)]:
+                await asyncio.sleep(0)
+    finally:
+        release.set()
+        result = await asyncio.wait_for(task, 5)
+    assert result.status == 200 and cleaned.is_set()
+    assert state.deps.leases.snapshot()["alpha"].admissions == 0
+
+
+@pytest.fixture
+async def belief_socket(tmp_path, monkeypatch):
+    # Reuse the real socket/public-daemon/paused-worker harness, not its lifecycle operations.
+    from tests.gateway.test_http_lifecycle import lifecycle
+
+    async for state in lifecycle.__wrapped__(tmp_path, monkeypatch):
+        state.bearer, _ = state.mint(permissions=("belief.write", "belief.read"))
+        state.principal = await state.deps.tokens.authenticate(state.bearer, now=datetime.now(UTC))
+        yield state
+
+
+async def test_beliefs_set_real_socket_concurrent_cas_and_writer_reservation(belief_socket, monkeypatch):
+    import json
+    from uuid import uuid4
+
+    from sqlalchemy import text
+
+    from memory_server.application.remote_beliefs import BeliefsMutationHandler
+    from tests.gateway.test_slice_runtime import http_request
+
+    state = belief_socket
+
+    async def send(payload):
+        key = str(uuid4())
+        for attempt in range(40):
+            response = await http_request(
+                state.config.port,
+                "POST",
+                "/api/v1/profiles/alpha/beliefs",
+                json.dumps(payload).encode(),
+                {"Authorization": "Bearer " + state.bearer, "Content-Type": "application/json", "Idempotency-Key": key},
+            )
+            if response[0] not in (409, 503) or response[1]["error"]["code"] not in {
+                "E_REQUEST_IN_PROGRESS",
+                "E_AUDIT_UNAVAILABLE",
+            }:
+                return response
+            await asyncio.sleep(0.05)
+        pytest.fail(f"original-key convergence exhausted: {response}")
+
+    status, created = await send(set_payload())
+    assert status == 201, created
+    ident = created["memories"][0]["id"]
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = BeliefsMutationHandler.set_in_session
+
+    async def paused(self, session, *a, **kw):
+        assert session.in_transaction()
+        entered.set()
+        await release.wait()
+        return await original(self, session, *a, **kw)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(BeliefsMutationHandler, "set_in_session", paused)
+        first = asyncio.create_task(send(set_payload(expected_versions={ident: 1})))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            # A second actual connection cannot reserve a writer before the first CAS.
+            from sqlalchemy.exc import OperationalError
+
+            async with state.factories["alpha"]() as contender:
+                await contender.execute(text("PRAGMA busy_timeout=0"))
+                with pytest.raises(OperationalError) as exc:
+                    await contender.execute(text("UPDATE beliefs SET confidence=0.9 WHERE id=:id"), {"id": ident})
+                assert exc.value.orig.sqlite_errorcode & 255 in (5, 6)
+            second = asyncio.create_task(send(set_payload(expected_versions={ident: 1})))
+        finally:
+            release.set()
+        results = await asyncio.wait_for(asyncio.gather(first, second), 10)
+    assert sorted(status for status, _ in results) == [200, 409], results
+    loser = next(body for status, body in results if status == 409)
+    assert loser["error"]["code"] == "E_VERSION_CONFLICT"
+    assert loser["error"]["details"] == {"id": ident, "expected": 1, "actual": 2}
+    async with state.factories["alpha"]() as session:
+        assert await session.scalar(text("SELECT version FROM beliefs WHERE id=:id"), {"id": ident}) == 2
+        assert await session.scalar(text("SELECT count(*) FROM lifecycle_events")) == 1
+
+
+async def test_beliefs_set_receipt_readback_failure_rolls_back(belief_write, monkeypatch):
+    from sqlalchemy import text
+    from storage.repositories.receipt_repo import ReceiptRepository
+
+    state = belief_write
+    before = await set_snapshot(state)
+    original = ReceiptRepository.create
+    calls = []
+
+    async def vanished(self, receipt):
+        result = await original(self, receipt)
+        calls.append(result.id)
+        # Real INSERT followed by a real in-transaction disappearance; never a fake success.
+        session = self._session
+        await session.execute(text("DELETE FROM receipts WHERE id=:id"), {"id": result.id})
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ReceiptRepository, "create", vanished)
+        error_code(await post_set(state), "E_STORAGE", 503)
+    assert calls and await set_snapshot(state) == before
+
+
+async def test_beliefs_set_direct_port_validation_before_lease(belief_write, monkeypatch):
+    from dataclasses import replace
+    from uuid import uuid4
+
+    from memory_server.application import remote_beliefs as m
+
+    state = belief_write
+    port = m.RemoteBeliefsMutationPort(
+        state.deps, ticket_provider=lambda: "direct-ticket", publish_outcome=state.deps.access.publish_committed
+    )
+    ctx = RequestContext("direct", state.write_principal, "alpha", uuid4(), monotonic() + 10)
+    cmd = d.BeliefsSetCommand(
+        operation="beliefs.set", profile_id="alpha", path_ids={}, payload=d.BeliefRequest(**set_payload())
+    )
+    calls = []
+    original = type(state.deps.leases).acquire
+
+    def track(self, ctx):
+        calls.append(ctx)
+        return original(self, ctx)
+
+    monkeypatch.setattr(type(state.deps.leases), "acquire", track)
+    for current, command_ in (
+        (ctx, command()),
+        (replace(ctx, profile_id="beta"), cmd),
+        (replace(ctx, idempotency_key=None), cmd),
+        (replace(ctx, deadline=float("nan")), cmd),
+        (replace(ctx, principal=state.principal), cmd),
+    ):
+        with pytest.raises(Exception) as exc:
+            await port.execute(current, command_)
+        assert getattr(exc.value, "code", None) in {
+            "E_VALIDATION",
+            "E_IDEMPOTENCY_REQUIRED",
+            "E_TIMEOUT",
+            "E_PERMISSION_DENIED",
+        }
+    assert calls == []
+    cmd.payload.__dict__["actor"] = "forged"
+    with expect_error("E_VALIDATION"):
+        await port.execute(ctx, cmd)
+    assert calls == []
+    for ttl in (True, 0, 604801, 1.0):
+        with pytest.raises(ValueError):
+            m.RemoteBeliefsMutationPort(
+                state.deps,
+                ticket_provider=lambda: "t",
+                publish_outcome=state.deps.access.publish_committed,
+                ttl_seconds=ttl,
+            )
+
+
+async def test_beliefs_set_event_timeout_is_bounded_and_audit_independent(belief_write, monkeypatch):
+    state = belief_write
+    created = await post_set(state)
+    ident = created.json["memories"][0]["id"]
+    cleaned = asyncio.Event()
+
+    class Sink:
+        async def publish(self, event):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+
+    monkeypatch.setattr(state.deps.ports["beliefs.set"], "_events", Sink())
+    response = await asyncio.wait_for(post_set(state, set_payload(expected_versions={ident: 1})), 3)
+    assert response.status == 200 and cleaned.is_set()
+    assert await sql(state, "SELECT pending_publication FROM http_request_journal ORDER BY request_id") == [(0,), (0,)]
+    assert state.deps.leases.snapshot()["alpha"].admissions == 0
+
+
+async def test_beliefs_set_missing_foreign_and_ambiguous_target_precedence(belief_write):
+    state = belief_write
+    created = await post_set(state, profile="beta")
+    foreign = created.json["memories"][0]["id"]
+    assert (
+        error_code(
+            await post_set(state, set_payload(replace_belief_id=foreign, expected_versions={foreign: 99})),
+            "E_NOT_FOUND",
+            404,
+        )
+        == {}
+    )
+    await orm_seed(
+        state,
+        [
+            dict(id=ident(n), proposition="  İSTANBUL DATABASE TRANSACTIONS  ", confidence=0.6, version=1)
+            for n in (80, 81)
+        ],
+    )
+    before = await set_snapshot(state)
+    error_code(
+        await post_set(state, set_payload(proposition="i\u0307stanbul database transactions")), "E_VALIDATION", 422
+    )
+    assert await set_snapshot(state) == before
+    error_code(await post_set(state, set_payload(expected_versions={foreign: 1})), "E_VALIDATION", 422)
+
+
+async def test_beliefs_set_revoked_replay_denied(belief_write):
+    from uuid import uuid4
+
+    state = belief_write
+    key = uuid4()
+    response = await post_set(state, key=key)
+    assert response.status == 201
+    # Real control-store revocation; authentication must run again before journal replay.
+    now = datetime.now(UTC)
+    state.deps.tokens._db.execute(
+        "UPDATE tokens SET revoked_at=?,generation=generation+1 WHERE id=?",
+        (now.isoformat(), state.write_principal.token_id),
+    )
+    error_code(await post_set(state, key=key), "E_AUTH_REQUIRED", 401)
+
+
+async def test_beliefs_set_real_commit_cancel_journal_recovery(belief_write, monkeypatch):
+    from uuid import uuid4
+
+    import aiosqlite
+
+    state = belief_write
+    await set_snapshot(state)  # open the real scoped pool before installing the commit barrier
+    committed, release = asyncio.Event(), asyncio.Event()
+    original = aiosqlite.Connection.commit
+    once = True
+
+    async def commit(self):
+        nonlocal once
+        await original(self)
+        if once:
+            once = False
+            committed.set()
+            await release.wait()
+
+    key = uuid4()
+    with monkeypatch.context() as patch:
+        patch.setattr(aiosqlite.Connection, "commit", commit)
+        task = asyncio.create_task(post_set(state, key=key))
+        try:
+            await asyncio.wait_for(committed.wait(), 5)
+            assert state.deps.leases.snapshot()["alpha"].admissions == 1
+            task.cancel()
+            response = await asyncio.wait_for(task, 5)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+    assert response.status == 201, response.body
+    assert (await post_set(state, key=key)).json == response.json
+    assert len(await sql(state, "SELECT id FROM beliefs")) == 1
+    assert state.deps.leases.snapshot()["alpha"].admissions == 0

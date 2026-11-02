@@ -19,7 +19,12 @@ from .errors import HttpError, error_code, error_response
 from .guards import Guard, ReadRouteSpec, secure_headers
 from .limits import read_body, validate_config
 from .routes import S06_ROUTE_SPECS, ProfilePort
-from .routes.beliefs import BELIEF_READ_ROUTE_SPECS, BeliefCursorCodec, BeliefReadRouteSpec
+from .routes.beliefs import (
+    BELIEF_MUTATION_ROUTE_SPECS,
+    BELIEF_READ_ROUTE_SPECS,
+    BeliefCursorCodec,
+    BeliefReadRouteSpec,
+)
 from .routes.diagnostics import DIAGNOSTICS_ROUTE_SPECS, DiagnosticsRouteSpec, OutboxCursorCodec
 from .routes.graph import GRAPH_READ_ROUTE_SPECS, GraphReadRouteSpec, RelationCursorCodec
 from .routes.ingestion import INGESTION_ROUTE_SPECS, MutationRouteSpec
@@ -161,6 +166,8 @@ class HttpApp:
                 canonical, owner = INGESTION_ROUTE_SPECS[spec.operation], "S13"
             elif spec.operation in LIFECYCLE_ROUTE_SPECS:
                 canonical, owner = LIFECYCLE_ROUTE_SPECS[spec.operation], "S14"
+            elif spec.operation in BELIEF_MUTATION_ROUTE_SPECS:
+                canonical, owner = BELIEF_MUTATION_ROUTE_SPECS[spec.operation], "S15"
             else:
                 canonical, owner = None, None
             if (

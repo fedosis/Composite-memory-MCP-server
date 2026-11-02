@@ -28,6 +28,13 @@ from memory_server.transports.http.errors import HttpError
 from memory_server.transports.http.guards import ReadRouteSpec
 from memory_server.transports.http.routes.memories_read import CursorCodec
 
+# isort: split
+from pydantic import ConfigDict, TypeAdapter
+
+from memory_server.application.remote_beliefs import validate_belief_mutation_command
+from memory_server.application.remote_ingestion import write_status
+from memory_server.transports.http.routes.ingestion import MutationRouteSpec
+
 
 def _digest(command):
     if command.operation != "conflicts.list":
@@ -286,3 +293,54 @@ def create_belief_read_routes(*, cursor_codec: BeliefCursorCodec) -> tuple[Belie
         replace(spec, cursor_codec=cursor_codec) if op != "beliefs.get" else spec
         for op, spec in BELIEF_READ_ROUTE_SPECS.items()
     )
+
+
+def parse_beliefs_set(request: Request, body: bytes, profile_id: str) -> d.BeliefsSetCommand:
+    if request.headers.getlist("if-match"):
+        raise HttpError("E_VALIDATION")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    def nonfinite(value):
+        raise ValueError
+
+    try:
+        raw = json.loads(body.decode("utf-8"), object_pairs_hook=pairs, parse_constant=nonfinite)
+        if type(raw) is not dict or set(raw) - set(d.BeliefRequest.model_fields):
+            raise ValueError
+        for name, field in d.BeliefRequest.model_fields.items():
+            if name in raw:
+                TypeAdapter(
+                    field.rebuild_annotation(), config=ConfigDict(strict=True, allow_inf_nan=False)
+                ).validate_python(raw[name])
+            elif field.is_required():
+                raise ValueError
+        payload = d.BeliefRequest.model_validate(raw, strict=True)
+        command = d.BeliefsSetCommand(operation="beliefs.set", profile_id=profile_id, path_ids={}, payload=payload)
+    except (ValidationError, ValueError, TypeError, KeyError, RecursionError):
+        raise HttpError("E_VALIDATION") from None
+    return validate_belief_mutation_command(command)
+
+
+BELIEF_MUTATION_ROUTE_SPECS = MappingProxyType(
+    {
+        "beliefs.set": MutationRouteSpec(
+            "beliefs.set",
+            CATALOG.by_operation["beliefs.set"].method,
+            CATALOG.by_operation["beliefs.set"].route,
+            CATALOG.by_operation["beliefs.set"].permission,
+            parse_beliefs_set,
+            write_status,
+        ),
+    }
+)
+
+
+def create_belief_mutation_routes() -> tuple[MutationRouteSpec, ...]:
+    return (BELIEF_MUTATION_ROUTE_SPECS["beliefs.set"],)
