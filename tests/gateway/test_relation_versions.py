@@ -1310,7 +1310,7 @@ async def s16p_env(tmp_path):
         path = bindings[0].layout.graph_snapshot_path
         lock = bindings[0].layout.graph_lock_path
         if mode == "existing_snapshot_existing_lock":
-            path.write_text('{"nodes": [], "edges": []}')
+            path.write_text('{"nodes": {}, "edges": []}')
         if mode in ("existing_snapshot_existing_lock", "initial_absent_snapshot_existing_lock"):
             lock.touch()
         store = ControlStore(tmp_path / "control")
@@ -1337,7 +1337,7 @@ def _s16p_code(error):
     return getattr(error, "code", type(error).__name__)
 
 
-def _s16p_replace(path, content=b'{"nodes": [], "edges": []}'):
+def _s16p_replace(path, content=b'{"nodes": {}, "edges": []}'):
     temp = path.with_name(path.name + ".foreign")
     temp.write_bytes(content)
     os.replace(temp, path)
@@ -1356,7 +1356,16 @@ def _s16p_capture(monkeypatch, manager):
 
 def _s16p_fault_lock(path, mode):
     if mode == "foreign_lock_after_unlock":
-        _s16p_replace(path, b"foreign-lock-sentinel")
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os,pathlib,sys; p=pathlib.Path(sys.argv[1]); "
+                "t=p.with_name('foreign-lock'); t.write_bytes(b'foreign-lock-sentinel'); os.replace(t,p)",
+                str(path),
+            ],
+            check=True,
+        )
     elif mode == "lock_to_symlink":
         sentinel = path.with_name("foreign-sentinel")
         sentinel.write_bytes(b"foreign-lock-sentinel")
@@ -1465,7 +1474,7 @@ async def _s16p_publish_next(s16p_env, monkeypatch, mode, native):
         except LeaseError as error:
             outcome = error.code
         assert replaces and outcome == "success", marker
-        assert json.loads(path.read_text())["nodes"][0]["id"] == "s16p", marker
+        assert json.loads(path.read_text())["nodes"]["s16p"]["id"] == "s16p", marker
         assert entry.evidence[path][2] == path.stat().st_ino == replaces[-1], marker
         assert {p: v for p, v in entry.evidence.items() if p not in (path, lock)} == {
             p: v for p, v in before.items() if p not in (path, lock)
@@ -1779,7 +1788,7 @@ async def test_s16p_refresh_failure_is_typed_and_atomic(s16p_env, monkeypatch, c
 
                 monkeypatch.setattr(os, "fsync", broken)
             try:
-                graph.from_dict({"nodes": [{"id": "a", "type": "fact", "name": "a"}], "edges": []})
+                graph.from_dict({"nodes": {"a": {"id": "a", "type": "fact", "name": "a"}}, "edges": []})
                 error = None
             except Exception as caught:
                 error = caught
@@ -1992,9 +2001,9 @@ from memory_server.settings import Settings
 from tests.gateway.test_daemon import factory, make_binding, ctx
 async def main():
     root, mode = Path(sys.argv[1]), sys.argv[2]
-    settings = Settings(_env_file=None, outbox_poll_interval_seconds=60)
+    settings = Settings(_env_file=None, outbox_poll_interval_seconds=0.01)
     binding = make_binding(root/'profile', 'alpha', settings)
-    binding.layout.graph_snapshot_path.write_text('{"nodes": [], "edges": []}')
+    binding.layout.graph_snapshot_path.write_text('{"nodes": {}, "edges": []}')
     binding.layout.graph_lock_path.touch()
     store = ControlStore(root/'control')
     daemon = Daemon(ProfileRegistry(store, RegistryConfiguration((binding,))),
@@ -2054,7 +2063,14 @@ async def test_s16p_managed_missing_parent_never_mkdir(s16p_env, monkeypatch, mo
         async with daemon.acquire(_s16p_ctx()) as session:
             graph = session.runtime.dependencies.graph
             parent = graph._snapshot_path.parent
-            parent.rename(parent.with_name("removed-parent"))
+            pin = gp._pin_parent
+
+            def removed(path):
+                if parent.exists():
+                    parent.rename(parent.with_name("removed-parent"))
+                return pin(path)
+
+            monkeypatch.setattr(gp, "_pin_parent", removed)
             mkdirs = []
             mkdir = os.mkdir
 
@@ -2111,9 +2127,35 @@ async def test_s16p_receipt_replay_expiry_and_intervening_publish(s16p_env, monk
             elif mode == "changed_generation":
                 graph._projection_binding.state[2] += 1
             else:
-                # Narrow stamp fault retains genuine binding/current fd/generation,
-                # but removes completed-writer proof. The proof guard alone owns it.
-                object.__setattr__(receipt, "proof", None)
+                # A registered armed invocation is not a completed writer. Build an
+                # unsigned reader-derived record at the isolated issuer fault seam.
+                from memory_server.providers.graph_provider import _pin_parent, _PublicationReceipt
+
+                refresh(descriptor, receipt=receipt, proof=proof)
+                scope = daemon.manager._prepare_projection_call(graph._projection_binding, native=False)
+                path = graph._snapshot_path
+                receipt = _PublicationReceipt(
+                    scope,
+                    dict(scope.before),
+                    dict(scope.before),
+                    scope.chains,
+                    scope.before[path],
+                    scope.before[scope.binding.lock_path],
+                    False,
+                    path.open("r+"),
+                    scope.binding.lock_path.open("r+b"),
+                    _pin_parent(path),
+                    None,
+                    os.getpid(),
+                    0,
+                    monotonic(),
+                    monotonic() + 30,
+                    (),
+                    graph._nodes,
+                    graph._edges,
+                )
+                scope.records.append(receipt)
+                proof = scope.proof
             before = dict(daemon.manager._entries[0].evidence)
             try:
                 refresh(bindings[0].descriptor, receipt=receipt, proof=proof)
