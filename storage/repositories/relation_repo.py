@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from time import monotonic
 from typing import Literal, Optional
 
-from sqlalchemy import delete, event, select, text
+from sqlalchemy import String, cast, delete, event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memory_server.providers.graph_provider import GraphBudgetExceeded
@@ -21,6 +21,7 @@ from storage.repositories.relation_revision_repo import (
     RelationRevisionConflict,
     RelationRevisionRepository,
     RelationRevisionStorageError,
+    instant,
 )
 
 SQL_VM_LIMIT = 200000
@@ -193,6 +194,16 @@ class RelationRepository:
         if not before.canonical_present or type(expected_revision) is not int or expected_revision != before.revision:
             raise RelationRevisionConflict(expected_revision, before.revision, key)
         event.validate()
+        canonical_exact = (
+            ClaimRelationORM.source_id == key[0],
+            ClaimRelationORM.target_id == key[1],
+            ClaimRelationORM.relation_type == key[2],
+        )
+        captured = (
+            await self._session.execute(select(cast(ClaimRelationORM.created_at, String)).where(*canonical_exact))
+        ).scalar_one_or_none()
+        if captured is None or instant(captured) != before.canonical_created_at:
+            raise RelationRevisionStorageError()
         r = RelationRevisionORM
         exact = (r.source_id == key[0], r.target_id == key[1], r.relation_type == key[2])
         fence = ~select(r.revision).where(*exact).exists()
@@ -207,10 +218,8 @@ class RelationRepository:
             )
         outcome = await self._session.execute(
             delete(ClaimRelationORM).where(
-                ClaimRelationORM.source_id == key[0],
-                ClaimRelationORM.target_id == key[1],
-                ClaimRelationORM.relation_type == key[2],
-                ClaimRelationORM.created_at == before.canonical_created_at.replace(tzinfo=None),
+                *canonical_exact,
+                cast(ClaimRelationORM.created_at, String) == captured,
                 fence,
             )
         )
