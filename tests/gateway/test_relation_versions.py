@@ -2916,3 +2916,153 @@ async def test_relation_refresh_failure_never_marks_completed(relations, monkeyp
         assert binding.state[0] != before, marker
         async with state.deps.leases.acquire(context(state)):
             pass
+
+
+@pytest.mark.parametrize("mode", ["live", "delete", "delete_recreate"])
+async def test_relation_worker_crash_after_publish_before_status_commit(relations, monkeypatch, mode):
+    from storage.outbox import OutboxRepository
+
+    from memory_server.runtime.daemon import Daemon
+
+    state = relations
+    marker = "S16B_CRASH_RETRY"
+    await write(state)
+    if mode != "live":
+        assert (await _s16b_process(state, (await _s16b_queue(state))[0]))[:2] == ("completed", "completed")
+        await write(state, command(deleted=True))
+    entry_id = (await _s16b_queue(state))[-1]
+    before = await snapshot(state)
+    graph, path = await _s16b_graph(state)
+    old_daemon = state.deps.leases
+    async with old_daemon.acquire(context(state)) as scope:
+        database = Path(scope.runtime.dependencies.outbox_worker._engine.url.database)
+    assert (await old_daemon.close_all()).complete, marker
+
+    child = subprocess.Popen(
+        [sys.executable, "-B", "-c", _S16B_CRASH_CHILD, str(state.roots["alpha"]), entry_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        output, _ = await asyncio.to_thread(child.communicate, timeout=30)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        output, _ = await asyncio.to_thread(child.communicate)
+        pytest.fail(f"{marker}: child watchdog expired: {output}")
+    assert child.returncode == 73 and "S16B_VERIFIED_BEFORE_STATUS" in output, (marker, output)
+    desired_after_crash = int(mode == "live")
+    assert len(_s16b_matching(_s16b_reopen(path))) == desired_after_crash, marker
+    assert len(_s16b_matching(json.loads(path.read_bytes()))) == desired_after_crash, marker
+    with sqlite3.connect(database) as db:
+        assert db.execute(
+            "SELECT status,retry_count,error FROM outbox_entries WHERE id=?", (entry_id,)
+        ).fetchone() == ("processing", 0, None), marker
+        for table, rows in before.items():
+            if table != "outbox_entries":
+                assert db.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall() == rows, marker
+        columns = [row[1] for row in db.execute("PRAGMA table_info(outbox_entries)")]
+        stable = [i for i, name in enumerate(columns) if name not in ("status", "processed_at")]
+        crashed_rows = db.execute("SELECT * FROM outbox_entries ORDER BY rowid").fetchall()
+        assert [tuple(row[i] for i in stable) for row in crashed_rows] == [
+            tuple(row[i] for i in stable) for row in before["outbox_entries"]
+        ], marker
+        # Deterministically age the committed claim, not its status or identity.
+        db.execute("UPDATE outbox_entries SET processed_at='2000-01-01' WHERE id=?", (entry_id,))
+
+    restarted = Daemon(old_daemon.registry, policies=old_daemon._policies)
+    state.deps = replace(state.deps, leases=restarted)
+    try:
+        if mode == "delete_recreate":
+            await write(state)
+        retry_before = await snapshot(state)
+        immutable_outbox = await sql(
+            state,
+            "SELECT id,record_type,record_id,operation,payload_json,created_at FROM outbox_entries ORDER BY rowid"
+        )
+        async with restarted.acquire(context(state)) as scope:
+            worker = scope.runtime.dependencies.outbox_worker
+            async with worker._session_factory() as db:
+                repo = OutboxRepository(db)
+                assert await repo.reset_stale_processing(max_age_seconds=600) == 1, marker
+                await db.commit()
+            assert (await sql(state, "SELECT status FROM outbox_entries WHERE id=:id", {"id": entry_id})) == [
+                ("pending",)
+            ], marker
+            claimed = []
+            original_claim = OutboxRepository.claim_pending
+
+            async def claim(repo, limit=50):
+                entries = await original_claim(repo, limit=limit)
+                claimed.extend(e.id for e in entries)
+                return entries
+
+            monkeypatch.setattr(OutboxRepository, "claim_pending", claim)
+            worker._process_pending_limit = 1
+            result = await worker.process_all_pending()
+            assert claimed == [entry_id] and result == {"processed": 1, "failed": 0}, marker
+            assert scope.runtime.dependencies.graph is not graph, marker
+            desired_after_retry = int(mode != "delete")
+            assert len(_s16b_matching(scope.runtime.dependencies.graph.to_dict())) == desired_after_retry, marker
+        after = await snapshot(state)
+        assert all(after[t] == retry_before[t] for t in after if t != "outbox_entries"), marker
+        assert await sql(
+            state,
+            "SELECT id,record_type,record_id,operation,payload_json,created_at FROM outbox_entries ORDER BY rowid"
+        ) == immutable_outbox, marker
+        assert await sql(
+            state, "SELECT status,retry_count,error FROM outbox_entries WHERE id=:id", {"id": entry_id}
+        ) == [("completed", 0, None)], marker
+        if mode == "delete_recreate":
+            assert (await sql(state, "SELECT revision,deleted FROM relation_revisions ORDER BY revision")) == [
+                (1, 0), (2, 1), (3, 0)
+            ], marker
+        assert len(_s16b_matching(_s16b_reopen(path))) == len(
+            _s16b_matching(json.loads(path.read_bytes()))
+        ) == desired_after_retry, "S16B_CRASH_RETRY"
+        print(f"S16B_CRASH_RETRY mode={mode} exit=73 reclaimed=1 processed=1 failed=0 edges={desired_after_retry}")
+    finally:
+        assert (await restarted.close_all()).complete, marker
+
+
+_S16B_CRASH_CHILD = r"""
+import asyncio, os, sys
+from pathlib import Path
+import pytest
+from memory_server.application.profile_bundle import BundlePolicies
+from memory_server.control.profiles import ProfileRegistry, RegistryConfiguration
+from memory_server.control.store import ControlStore
+from memory_server.runtime.daemon import Daemon
+from memory_server.runtime.runtime_manager import RuntimeManager
+from memory_server.settings import Settings
+from storage.outbox import OutboxRepository
+from tests.gateway.test_daemon import factory, make_binding, ctx
+from tests.gateway.test_belief_write_foundation import pause_index_consumer
+async def main():
+    patch = pytest.MonkeyPatch()
+    pause_index_consumer.__wrapped__(patch)
+    root, entry_id = Path(sys.argv[1]), sys.argv[2]
+    settings = Settings(_env_file=None)
+    binding = make_binding(root, 'alpha', settings)
+    store = ControlStore(root.parent/'crash-control')
+    daemon = Daemon(ProfileRegistry(store, RegistryConfiguration((binding,))),
+                    policies=BundlePolicies.capture(settings), manager=RuntimeManager(factory_builder=factory))
+    async with daemon.acquire(ctx()) as scope:
+        worker = scope.runtime.dependencies.outbox_worker
+        graph = scope.runtime.dependencies.graph
+        verified = []
+        verify = graph.verify_claim_relation
+        def readback(*args, **kwargs):
+            result = verify(*args, **kwargs)
+            verified.append(True)
+            return result
+        graph.verify_claim_relation = readback
+        async def crash(repo, actual_id):
+            assert actual_id == entry_id and verified == [True], 'S16B_CRASH_RETRY'
+            print('S16B_VERIFIED_BEFORE_STATUS', flush=True)
+            os._exit(73)
+        OutboxRepository.mark_completed = crash
+        assert await worker._poll_once() == 1, 'S16B_CRASH_RETRY'
+        raise AssertionError('S16B_CRASH_RETRY: completion barrier not reached')
+asyncio.run(main())
+"""
