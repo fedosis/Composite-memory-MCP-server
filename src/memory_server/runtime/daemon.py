@@ -97,6 +97,7 @@ def _projection_lease(daemon, profile_id):
     held = daemon._held.get(asyncio.current_task(), {}).get(profile_id)
     return getattr(held, "projection_proof", _LEASE_CONTEXT.get())
 
+
 class _ProjectionAdapter:
     def __init__(self, manager):
         self.manager = manager
@@ -149,6 +150,7 @@ class _ProjectionAdapter:
 
         return submit
 
+
 class Daemon:
     """Construct inside its one running loop; never creates another manager.
 
@@ -184,7 +186,9 @@ class Daemon:
             graph = runtime.dependencies.graph
             if graph is not None and getattr(graph, "_snapshot_path", None) is not None:
                 publisher = self.manager.bind_projection_publisher(
-                    binding.descriptor, graph=graph, lease_probe=lambda: _projection_lease(self, binding.profile.id),
+                    binding.descriptor,
+                    graph=graph,
+                    lease_probe=lambda: _projection_lease(self, binding.profile.id),
                 )
                 worker = runtime.dependencies.outbox_worker
                 if worker is not None:
@@ -248,11 +252,15 @@ class Daemon:
                     self._held[caller][ctx.profile_id] = held
                     entry.admissions += 1
                     held.projection_proof = self.manager._issue_lease_proof(
-                        binding.descriptor, owner=caller, held=held,
+                        binding.descriptor,
+                        owner=caller,
+                        held=held,
                         validate=lambda: (
-                            self._held.get(caller, {}).get(ctx.profile_id) is held and held.depth > 0
+                            self._held.get(caller, {}).get(ctx.profile_id) is held
+                            and held.depth > 0
                             and held.session.binding.descriptor == binding.descriptor
-                            and held.session.runtime is runtime and held.token in runtime._admitted
+                            and held.session.runtime is runtime
+                            and held.token in runtime._admitted
                         ),
                     )
                 else:

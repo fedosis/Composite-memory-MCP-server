@@ -357,6 +357,7 @@ class _SnapshotPublication:
                 or scope.abandoned
                 or scope.sealed
                 or binding.graph is not self.graph
+                or binding.pid != os.getpid()
                 or self.path != binding.path
                 or _PROJECTION_CALL.get() is not scope
             ):
@@ -431,6 +432,7 @@ class _SnapshotPublication:
             self.tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.parent_fd
         )
         self.snapshot = os.fdopen(fd, "w+", encoding="utf-8")
+        self.nodes, self.edges = self.graph._nodes, self.graph._edges
         json.dump(self.graph.to_dict(), self.snapshot, ensure_ascii=False, indent=2)
         self.snapshot.flush()
         os.fsync(self.snapshot.fileno())
@@ -481,9 +483,9 @@ class _SnapshotPublication:
             threading.get_ident(),
             now,
             now + 30.0,
-            tuple(self.graph._journal),
-            self.graph._nodes,
-            self.graph._edges,
+            self.journal,
+            self.nodes,
+            self.edges,
         )
         self.scope.records.append(self.receipt)
 
@@ -1265,8 +1267,8 @@ class SimpleGraph:
             return
         if not snapshot_path.exists():
             return
-        if self._projection_binding is not None and snapshot_path == self._snapshot_path:
-            return self._managed_read(snapshot_path)
+        if self._same_projection_path(snapshot_path):
+            return self._managed_read(self._projection_binding.path)
         lock_path = _snapshot_lock_path(snapshot_path)
         try:
             with _file_lock(lock_path):
@@ -1329,6 +1331,10 @@ class SimpleGraph:
             return
         self._persist_snapshot()
 
+    def _same_projection_path(self, snapshot_path):
+        binding = self._projection_binding
+        return binding is not None and Path(os.path.abspath(snapshot_path)) == binding.path
+
     def _projection_evidence(self):
         from memory_server.runtime.runtime_manager import _evidence
 
@@ -1341,7 +1347,9 @@ class SimpleGraph:
                 parent = _pin_parent(snapshot_path)
                 try:
                     fd = os.open(
-                        snapshot_path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent,
+                        snapshot_path.name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=parent,
                     )
                     with os.fdopen(fd, "r", encoding="utf-8") as fh:
                         if _identity(os.fstat(fh.fileno())) != binding.state[0][snapshot_path]:
@@ -1358,6 +1366,7 @@ class SimpleGraph:
 
     def _managed_persist(self, snapshot_path, *, export=False):
         binding = self._projection_binding
+        snapshot_path = binding.path
         scope = _PROJECTION_CALL.get()
         direct = scope is None
         token = None
@@ -1368,12 +1377,13 @@ class SimpleGraph:
             token = _PROJECTION_CALL.set(scope)
         try:
             with self._snapshot_publication(snapshot_path, call_scope=scope) as publication:
+                publication.journal = tuple(self._journal)
                 if not export and not self._full_publish_pending:
                     fresh = publication.read()
                     merged = SimpleGraph()
                     if fresh is not None:
                         merged._nodes, merged._edges = fresh
-                    for op in self._journal:
+                    for op in publication.journal:
                         self._replay_op(merged, op)
                     self._nodes, self._edges = merged._nodes, merged._edges
                 self._write_snapshot(snapshot_path)
@@ -1485,7 +1495,7 @@ class SimpleGraph:
 
     def _export_snapshot(self, snapshot_path: Path) -> None:
         """Atomic export of the current in-memory state to *snapshot_path*."""
-        if self._projection_binding is not None and snapshot_path == self._snapshot_path:
+        if self._same_projection_path(snapshot_path):
             return self._managed_persist(snapshot_path, export=True)
         try:
             with self._thread_lock:
@@ -1694,7 +1704,7 @@ class SimpleGraph:
             True on success, False on failure (failure is logged, never
             raised — persistence is best-effort for producers).
         """
-        if self._projection_binding is not None and snapshot_path == self._snapshot_path:
+        if self._same_projection_path(snapshot_path):
             publication = _SNAPSHOT_WRITER.get()
             if publication is None or publication.graph is not self:
                 raise _projection_failure()

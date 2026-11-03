@@ -52,6 +52,7 @@ class _ProjectionBinding:
     lease_probe: Any
     loop: Any
     loop_thread: int
+    pid: int
     state: list
 
 
@@ -347,6 +348,7 @@ class RuntimeManager:
                 lease_probe,
                 self._loop,
                 threading.get_ident(),
+                os.getpid(),
                 [dict(entry.evidence), _chains(entry.evidence), 0],
             )
             self._projection_bindings.append(binding)
