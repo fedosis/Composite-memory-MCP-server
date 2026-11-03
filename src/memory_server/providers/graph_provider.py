@@ -37,6 +37,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import threading
 import time
 import uuid
@@ -198,8 +199,297 @@ def _snapshot_lock_path(snapshot_path: Path) -> Path:
     return snapshot_path.with_name(snapshot_path.name + ".lock")
 
 
+def _projection_failure():
+    from memory_server.runtime.runtime_manager import (
+        E_RUNTIME_RESOURCE_IDENTITY_CHANGED,
+        RuntimeManagerError,
+    )
+
+    return RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED)
+
+
+def _identity(info):
+    kind = "regular_file" if stat.S_ISREG(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode) else "special"
+    return (kind, info.st_dev, info.st_ino, info.st_mode, info.st_nlink)
+
+
+def _chains(paths):
+    from memory_server.paths import inspect_component_chain_nofollow
+
+    return {p: inspect_component_chain_nofollow(p, anchor=Path("/"))[:-1] for p in paths}
+
+
+class _PinnedParent:
+    def __init__(self, fd):
+        self.fd = fd
+
+    def fileno(self):
+        return self.fd
+
+    def __index__(self):
+        return self.fd
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def _pin_parent(snapshot_path):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", flags)
+    try:
+        for name in snapshot_path.parent.parts[1:]:
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return _PinnedParent(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _close_publication(receipt):
+    for resource in (receipt.snapshot, receipt.lock):
+        try:
+            resource.close()
+        except Exception:
+            pass
+    try:
+        receipt.parent_fd.close()
+    except OSError:
+        pass
+
+
+class PublicationProof:
+    pass
+
+
+@dataclass(frozen=True, eq=False)
+class _PublicationReceipt:
+    scope: Any
+    before: dict
+    after: dict
+    chains: dict
+    staged: tuple
+    lock_identity: tuple
+    lock_created: bool
+    snapshot: Any
+    lock: Any
+    parent_fd: int
+    proof: PublicationProof
+    pid: int
+    thread: int
+    issued_at: float
+    expires_at: float
+    journal: tuple
+    nodes: Any
+    edges: Any
+
+
+_PROJECTION_CALL = ContextVar("graph_projection_call", default=None)
+_SNAPSHOT_WRITER = ContextVar("graph_snapshot_writer", default=None)
+
+
 @contextmanager
-def _file_lock(lock_path: Path, timeout: float = GRAPH_LOCK_TIMEOUT) -> Iterator[None]:
+def _managed_reader_lock(lock_path, binding):
+    parent_fd = None
+    fh = None
+    try:
+        if _fcntl is None:
+            raise _projection_failure()
+        evidence, chains, _ = binding.state
+        if _chains(evidence) != chains:
+            raise _projection_failure()
+        parent_fd = _pin_parent(lock_path)
+        if _identity(os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)) != evidence[lock_path]:
+            raise _projection_failure()
+        fh = os.fdopen(os.open(lock_path.name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd), "r+b")
+        expected = evidence[lock_path]
+        if expected[0] != "regular_file" or expected[4] != 1 or _identity(os.fstat(fh.fileno())) != expected:
+            raise _projection_failure()
+        with _held_flock(fh):
+            if _identity(os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)) != expected:
+                raise _projection_failure()
+            yield None
+    except Exception:
+        raise _projection_failure() from None
+    finally:
+        if fh is not None:
+            fh.close()
+        if parent_fd is not None:
+            parent_fd.close()
+
+
+@contextmanager
+def _held_flock(fh):
+    deadline = time.monotonic() + GRAPH_LOCK_TIMEOUT
+    while True:
+        try:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise _projection_failure() from None
+            time.sleep(0.01)
+    try:
+        yield
+    finally:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+
+
+class _SnapshotPublication:
+    def __init__(self, graph, snapshot_path, scope):
+        self.graph, self.path, self.scope = graph, snapshot_path, scope
+        self.parent_fd = None
+        self.lock = self.snapshot = None
+        self.receipt = None
+        self.tmp = None
+        self.created = False
+
+    @contextmanager
+    def entered(self):
+        scope = self.scope
+        binding = scope.binding
+        try:
+            if (
+                _fcntl is None
+                or scope.abandoned
+                or scope.sealed
+                or binding.graph is not self.graph
+                or self.path != binding.path
+                or _PROJECTION_CALL.get() is not scope
+            ):
+                raise _projection_failure()
+            with self.graph._thread_lock:
+                self.before = dict(scope.records[-1].after if scope.records else scope.before)
+                if _chains(self.before) != scope.chains or self.graph._projection_evidence() != self.before:
+                    raise _projection_failure()
+                self.parent_fd = _pin_parent(self.path)
+                lock_before = self.before[binding.lock_path]
+                flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+                if lock_before[0] == "absent":
+                    lock_create_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+                    flags = lock_create_flags
+                    self.created = True
+                self.lock = os.fdopen(os.open(binding.lock_path.name, flags, 0o600, dir_fd=self.parent_fd), "r+b")
+                self.lock_identity = _identity(os.fstat(self.lock.fileno()))
+                if (
+                    self.lock_identity[0] != "regular_file"
+                    or self.lock_identity[4] != 1
+                    or (not self.created and self.lock_identity != lock_before)
+                ):
+                    raise _projection_failure()
+                with _held_flock(self.lock):
+                    self._check_lock()
+                    expected = dict(self.before)
+                    expected[binding.lock_path] = self.lock_identity
+                    if self.graph._projection_evidence() != expected:
+                        raise _projection_failure()
+                    token = _SNAPSHOT_WRITER.set(self)
+                    try:
+                        yield self
+                    finally:
+                        _SNAPSHOT_WRITER.reset(token)
+        except Exception:
+            raise _projection_failure() from None
+        finally:
+            if self.receipt is None:
+                if self.tmp is not None and self.parent_fd is not None:
+                    try:
+                        os.unlink(self.tmp, dir_fd=self.parent_fd)
+                    except OSError:
+                        pass
+                for resource in (self.snapshot, self.lock):
+                    if resource is not None:
+                        resource.close()
+                if self.parent_fd is not None:
+                    self.parent_fd.close()
+
+    def _check_lock(self):
+        binding = self.scope.binding
+        if (
+            _identity(os.stat(binding.lock_path.name, dir_fd=self.parent_fd, follow_symlinks=False))
+            != self.lock_identity
+            or _identity(os.fstat(self.lock.fileno())) != self.lock_identity
+            or _chains(self.before) != self.scope.chains
+        ):
+            raise _projection_failure()
+
+    def read(self):
+        if self.before[self.path][0] == "absent":
+            return None
+        fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.parent_fd)
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            if _identity(os.fstat(fh.fileno())) != self.before[self.path]:
+                raise _projection_failure()
+            return self.graph._build_state_from(json.load(fh))
+
+    def write(self):
+        self.tmp = f".{self.path.name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(
+            self.tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.parent_fd
+        )
+        self.snapshot = os.fdopen(fd, "w+", encoding="utf-8")
+        json.dump(self.graph.to_dict(), self.snapshot, ensure_ascii=False, indent=2)
+        self.snapshot.flush()
+        os.fsync(self.snapshot.fileno())
+        self.staged = _identity(os.fstat(self.snapshot.fileno()))
+        os.replace(self.tmp, self.path.name, src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd)
+        self.tmp = None
+        os.fsync(self.parent_fd)
+        if (
+            _identity(os.stat(self.path.name, dir_fd=self.parent_fd, follow_symlinks=False)) != self.staged
+            or _identity(os.fstat(self.snapshot.fileno())) != self.staged
+        ):
+            raise _projection_failure()
+        self._check_lock()
+        self._mint()
+        return True
+
+    def _mint(self):
+        probe = os.open(
+            self.scope.binding.lock_path.name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.parent_fd
+        )
+        try:
+            try:
+                _fcntl.flock(probe, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                _fcntl.flock(probe, _fcntl.LOCK_UN)
+                raise _projection_failure()
+        finally:
+            os.close(probe)
+        after = dict(self.before)
+        after[self.path] = self.staged
+        after[self.scope.binding.lock_path] = self.lock_identity
+        now = time.monotonic()
+        self.receipt = _PublicationReceipt(
+            self.scope,
+            self.before,
+            after,
+            self.scope.chains,
+            self.staged,
+            self.lock_identity,
+            self.created,
+            self.snapshot,
+            self.lock,
+            self.parent_fd,
+            PublicationProof(),
+            os.getpid(),
+            threading.get_ident(),
+            now,
+            now + 30.0,
+            tuple(self.graph._journal),
+            self.graph._nodes,
+            self.graph._edges,
+        )
+        self.scope.records.append(self.receipt)
+
+
+@contextmanager
+def _file_lock(lock_path: Path, timeout: float = GRAPH_LOCK_TIMEOUT, *, managed=None) -> Iterator[None]:
     """Acquire an exclusive advisory lock on *lock_path*.
 
     Blocking-with-timeout: if the lock cannot be acquired within *timeout*
@@ -208,6 +498,10 @@ def _file_lock(lock_path: Path, timeout: float = GRAPH_LOCK_TIMEOUT) -> Iterator
     lock automatically if the process dies, so a crashed writer can never
     deadlock later writers.
     """
+    if managed is not None:
+        with _managed_reader_lock(lock_path, managed):
+            yield None
+        return
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+b")  # noqa: PTH123 - file must be created next to snapshot
     try:
@@ -305,6 +599,7 @@ class SimpleGraph:
         # Serializes transactions on this instance within one process; the
         # file lock serializes across processes.
         self._thread_lock = threading.Lock()
+        self._projection_binding = None
 
     @contextmanager
     def suspend_persistence(self) -> Iterator[None]:
@@ -970,6 +1265,8 @@ class SimpleGraph:
             return
         if not snapshot_path.exists():
             return
+        if self._projection_binding is not None and snapshot_path == self._snapshot_path:
+            return self._managed_read(snapshot_path)
         lock_path = _snapshot_lock_path(snapshot_path)
         try:
             with _file_lock(lock_path):
@@ -1032,6 +1329,68 @@ class SimpleGraph:
             return
         self._persist_snapshot()
 
+    def _projection_evidence(self):
+        from memory_server.runtime.runtime_manager import _evidence
+
+        return _evidence(tuple(self._projection_binding.state[0]))
+
+    def _managed_read(self, snapshot_path):
+        try:
+            binding = self._projection_binding
+            with _file_lock(_snapshot_lock_path(snapshot_path), managed=binding):
+                fd = os.open(
+                    snapshot_path.name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=(parent := _pin_parent(snapshot_path)),
+                )
+                try:
+                    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                        if _identity(os.fstat(fh.fileno())) != binding.state[0][snapshot_path]:
+                            raise _projection_failure()
+                        nodes, edges = self._build_state_from(json.load(fh))
+                finally:
+                    parent.close()
+            self._swap_state(nodes, edges)
+        except Exception:
+            raise _projection_failure() from None
+
+    def _snapshot_publication(self, snapshot_path, *, call_scope):
+        return _SnapshotPublication(self, snapshot_path, call_scope).entered()
+
+    def _managed_persist(self, snapshot_path, *, export=False):
+        binding = self._projection_binding
+        scope = _PROJECTION_CALL.get()
+        direct = scope is None
+        token = None
+        if direct:
+            if threading.get_ident() != binding.loop_thread:
+                raise _projection_failure()
+            scope = binding.manager._prepare_projection_call(binding, native=False)
+            token = _PROJECTION_CALL.set(scope)
+        try:
+            with self._snapshot_publication(snapshot_path, call_scope=scope) as publication:
+                if not export and not self._full_publish_pending:
+                    fresh = publication.read()
+                    merged = SimpleGraph()
+                    if fresh is not None:
+                        merged._nodes, merged._edges = fresh
+                    for op in self._journal:
+                        self._replay_op(merged, op)
+                    self._nodes, self._edges = merged._nodes, merged._edges
+                self._write_snapshot(snapshot_path)
+            if direct:
+                receipt = scope.records[-1]
+                binding.manager.refresh_projection_identity(
+                    binding.descriptor, receipt=receipt, proof=scope.proof or receipt.proof
+                )
+        except BaseException:
+            if direct:
+                binding.manager._abort_projection_call(scope)
+            raise
+        finally:
+            if token is not None:
+                _PROJECTION_CALL.reset(token)
+
     def _persist_snapshot(self) -> None:
         """Flush this graph to its snapshot path (locked transaction).
 
@@ -1046,6 +1405,13 @@ class SimpleGraph:
         """
         snapshot_path = self._snapshot_path
         if snapshot_path is None:
+            return
+
+        if self._projection_binding is not None:
+            if self._full_publish_pending or self._journal:
+                return self._managed_persist(snapshot_path)
+            if snapshot_path.exists():
+                return self._managed_read(snapshot_path)
             return
 
         if self._full_publish_pending:
@@ -1104,6 +1470,8 @@ class SimpleGraph:
         """Refresh in-memory state from disk when nothing local is pending."""
         if not snapshot_path.exists():
             return
+        if self._projection_binding is not None:
+            return self._managed_read(snapshot_path)
         try:
             with _file_lock(_snapshot_lock_path(snapshot_path)):
                 try:
@@ -1118,6 +1486,8 @@ class SimpleGraph:
 
     def _export_snapshot(self, snapshot_path: Path) -> None:
         """Atomic export of the current in-memory state to *snapshot_path*."""
+        if self._projection_binding is not None and snapshot_path == self._snapshot_path:
+            return self._managed_persist(snapshot_path, export=True)
         try:
             with self._thread_lock:
                 with _file_lock(_snapshot_lock_path(snapshot_path)):
@@ -1325,6 +1695,11 @@ class SimpleGraph:
             True on success, False on failure (failure is logged, never
             raised — persistence is best-effort for producers).
         """
+        if self._projection_binding is not None and snapshot_path == self._snapshot_path:
+            publication = _SNAPSHOT_WRITER.get()
+            if publication is None or publication.graph is not self:
+                raise _projection_failure()
+            return publication.write()
         try:
             payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)

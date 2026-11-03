@@ -10,6 +10,7 @@ import asyncio
 import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -75,6 +76,23 @@ class _Held:
     depth: int = 1
 
 
+_LEASE_CONTEXT = ContextVar("daemon_projection_lease", default=None)
+
+
+@dataclass(frozen=True)
+class _ProjectionEnvelope:
+    value: object
+    scope: object
+
+
+@dataclass(frozen=True)
+class _ProjectionResult:
+    value: object
+
+    async def result(self):
+        return self.value
+
+
 class Daemon:
     """Construct inside its one running loop; never creates another manager.
 
@@ -102,11 +120,75 @@ class Daemon:
         if self._closing:
             raise LeaseError("E_RUNTIME_CLOSING")
 
+    def _projection_lease(self, profile_id):
+        held = self._held.get(asyncio.current_task(), {}).get(profile_id)
+        return getattr(held, "projection_proof", None)
+
+    def _refresh_projection_result(self, binding, envelope):
+        if envelope.scope.records:
+            receipt = envelope.scope.records[-1]
+            self.manager.refresh_projection_identity(
+                binding.descriptor, receipt=receipt, proof=envelope.scope.proof or receipt.proof
+            )
+        else:
+            self.manager._abort_projection_call(envelope.scope)
+
+    def _projection_submitter(self, runtime, binding):
+        from memory_server.providers.graph_provider import _PROJECTION_CALL, _close_publication
+
+        async def submit(function, /, *args, kind, **kwargs):
+            scope = self.manager._prepare_projection_call(binding, native=True)
+
+            def wrapped():
+                token = _PROJECTION_CALL.set(scope)
+                try:
+                    value = function(*args, **kwargs)
+                    scope.sealed = True
+                    return _ProjectionEnvelope(value, scope)
+                except BaseException:
+                    scope.abandoned = True
+                    for receipt in scope.records:
+                        _close_publication(receipt)
+                    raise
+                finally:
+                    _PROJECTION_CALL.reset(token)
+
+            def cleanup(future):
+                if scope.abandoned:
+                    self.manager._abort_projection_call(scope)
+
+            raw_handle = None
+            try:
+                raw_handle = await runtime.submit_native(wrapped, kind=kind)
+                raw_handle.async_result.add_done_callback(cleanup)
+                envelope = await raw_handle.result()
+                self._refresh_projection_result(binding, envelope)
+                return _ProjectionResult(envelope.value)
+            except BaseException:
+                scope.abandoned = True
+                if raw_handle is None or raw_handle.async_result.done():
+                    self.manager._abort_projection_call(scope)
+                raise
+
+        return submit
+
     async def _compose(self, entry: _Entry) -> ProfileBundle:
         binding = entry.binding
         try:
             runtime = await self.manager.get(binding.descriptor, layout=binding.layout, config=binding.config)
             entry.runtime = runtime
+            graph = runtime.dependencies.graph
+            if graph is not None and getattr(graph, "_snapshot_path", None) is not None:
+                publisher = self.manager.bind_projection_publisher(
+                    binding.descriptor, graph=graph, lease_probe=lambda: self._projection_lease(binding.profile.id),
+                )
+                worker = runtime.dependencies.outbox_worker
+                if worker is not None:
+                    if worker._native_submitter != runtime.submit_native:
+                        from memory_server.runtime.runtime_manager import RuntimeManagerError
+
+                        raise RuntimeManagerError("E_RUNTIME_DESCRIPTOR_CONFLICT") from None
+                    worker._native_submitter = self._projection_submitter(runtime, publisher)
             bundle = await ProfileBundle.compose(runtime, self._policies)
             # Publication is atomic under the same table lock as shutdown/stop.
             async with self._lock:
@@ -161,6 +243,14 @@ class Daemon:
                     held = _Held(entry, session, token)
                     self._held[caller][ctx.profile_id] = held
                     entry.admissions += 1
+                    held.projection_proof = self.manager._issue_lease_proof(
+                        binding.descriptor, owner=caller, held=held,
+                        validate=lambda: (
+                            self._held.get(caller, {}).get(ctx.profile_id) is held and held.depth > 0
+                            and held.session.binding.descriptor == binding.descriptor
+                            and held.session.runtime is runtime and held.token in runtime._admitted
+                        ),
+                    )
                 else:
                     held.depth += 1
         except asyncio.CancelledError:
@@ -169,12 +259,15 @@ class Daemon:
             raise LeaseError("E_TIMEOUT") from None
         except Exception as exc:
             raise _error(exc) from None
+        projection_context = _LEASE_CONTEXT.set(held.projection_proof)
         try:
             yield held.session
         finally:
             # Synchronous release cannot be interrupted by a second cancellation.
+            _LEASE_CONTEXT.reset(projection_context)
             held.depth -= 1
             if held.depth == 0:
+                self.manager._revoke_lease_proof(held.projection_proof)
                 runtime.release_admitted(held.token)
                 entry.admissions -= 1
                 del self._held[caller][ctx.profile_id]
