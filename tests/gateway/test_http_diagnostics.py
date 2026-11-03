@@ -322,8 +322,8 @@ async def test_s10_five_routes_mount_and_permissions(diagnostic_http, monkeypatc
             code(result, "E_CAPABILITY_UNAVAILABLE", 503)
         await missing.close()
     assert len(shell.specs) == 24
-    assert len(shell.mutation_specs) == 6
-    assert len(shell.specs) + len(shell.mutation_specs) == 30
+    assert len(shell.mutation_specs) == 8
+    assert len(shell.specs) + len(shell.mutation_specs) == 32
     code(await _http(shell, "unknown"), "E_NOT_FOUND", 404)
 
 

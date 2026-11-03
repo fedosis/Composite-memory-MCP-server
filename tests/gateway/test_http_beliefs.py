@@ -18,7 +18,16 @@ from tests.gateway.test_slice_runtime import build_registry
 from tests.gateway.test_slice_runtime import offline_embedder as offline_embedder
 
 READS = {"beliefs.list", "beliefs.get", "conflicts.list"}
-WRITES = {"memories.create", "learn", "memories.transition", "memories.invalidate", "beliefs.set", "conflicts.resolve"}
+WRITES = {
+    "memories.create",
+    "learn",
+    "memories.transition",
+    "memories.invalidate",
+    "beliefs.set",
+    "conflicts.resolve",
+    "relations.create",
+    "relations.delete",
+}
 IDENT = "00000000-0000-4000-8000-000000000001"
 
 
@@ -114,7 +123,8 @@ async def test_beliefs_get_by_id_is_not_text_search(belief_http):
 
 async def test_belief_composition_regression_counts(belief_http):
     state = belief_http
-    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 6, 30)
+    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 8, 32)
+    assert len(state.app.routes) == 38
     reads = {spec.operation for spec in state.specs}
     assert READS <= reads
     assert {spec.operation for spec in state.mutation_specs} == WRITES

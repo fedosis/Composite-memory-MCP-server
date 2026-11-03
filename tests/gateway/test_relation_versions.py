@@ -2743,10 +2743,22 @@ async def test_strict_graph_exact_intent_replay_preserves_neighbours(relations):
 async def test_relation_b_counts_and_frozen_boundaries(relations):
     state = relations
     marker = "S16B_SCOPE_COUNTS"
-    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 6, 30), (
+    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 8, 32), (
         marker
     )
-    assert len(state.app.routes) == 36 and not {"relations.create", "relations.delete"} & set(state.deps.ports), marker
+    assert len(state.app.routes) == 38, marker
+    writes = {
+        "memories.create",
+        "learn",
+        "memories.transition",
+        "memories.invalidate",
+        "beliefs.set",
+        "conflicts.resolve",
+        "relations.create",
+        "relations.delete",
+    }
+    assert {spec.operation for spec in state.mutation_specs} == writes, marker
+    assert set(state.deps.ports) == {spec.operation for spec in state.specs} | writes, marker
     base = "2896fae938feb904cdb70f7461a1b9fcc26cf6f5"
     paths = {
         "storage/outbox_worker.py": (

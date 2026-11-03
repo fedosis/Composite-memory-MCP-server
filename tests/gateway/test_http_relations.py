@@ -103,15 +103,21 @@ async def test_relation_read_etag_descriptor_identity_is_sealed(belief_http):
 
 
 async def test_relation_read_foundation_keeps_catalog_counts(belief_http):
-    from tests.gateway.test_http_shell import request
-
     state = belief_http
-    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 6, 30)
-    assert len(state.app.routes) == 36
-    assert not {"relations.create", "relations.delete"} & set(state.deps.ports)
-    for path, method in (("relations", "POST"), ("relations/" + BASIC, "DELETE")):
-        response = await request(state.app, "/api/v1/profiles/alpha/" + path, method=method, bearer=state.bearer)
-        assert response.status == 405
+    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 8, 32)
+    assert len(state.app.routes) == 38
+    writes = {
+        "memories.create",
+        "learn",
+        "memories.transition",
+        "memories.invalidate",
+        "beliefs.set",
+        "conflicts.resolve",
+        "relations.create",
+        "relations.delete",
+    }
+    assert {spec.operation for spec in state.mutation_specs} == writes
+    assert set(state.deps.ports) == {spec.operation for spec in state.specs} | writes
 
 
 async def test_relation_read_compatibility_and_privacy(tmp_path, caplog):
