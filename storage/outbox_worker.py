@@ -419,6 +419,8 @@ class OutboxWorker:
                 await self._process_index_skill(entry)
             elif entry.operation == "index_belief":
                 await self._process_index_belief(entry)
+            elif entry.operation == "relation_sync":
+                return await self._process_relation_sync(session, repo, entry)
             else:
                 raise ValueError(f"Unknown operation: {entry.operation}")
 
@@ -448,6 +450,211 @@ class OutboxWorker:
                     error_msg,
                 )
                 return "pending"
+
+    class RelationProjectionError(Exception):
+        CODES = frozenset(
+            {
+                "RELATION_PAYLOAD_INVALID",
+                "RELATION_INVARIANT_FAILED",
+                "RELATION_GRAPH_UNAVAILABLE",
+                "RELATION_PROJECTION_LIMIT",
+                "RELATION_PROJECTION_TIMEOUT",
+                "RELATION_PERSISTENCE_FAILED",
+                "RELATION_SNAPSHOT_INVALID",
+                "RELATION_READBACK_FAILED",
+            }
+        )
+
+        def __init__(self, code="Relation projection failed"):
+            super().__init__(code if type(code) is str and code in self.CODES else "Relation projection failed")
+
+    @staticmethod
+    def _relation_payload(entry):
+        import json
+        from uuid import UUID
+
+        error = OutboxWorker.RelationProjectionError
+        try:
+            p = entry.payload
+            if type(p) is not dict or set(p) != {
+                "v",
+                "source_id",
+                "target_id",
+                "relation_type",
+                "revision",
+                "event_id",
+            }:
+                raise ValueError
+            s, t, k = p["source_id"], p["target_id"], p["relation_type"]
+            if any(type(v) is not str or not 1 <= len(v) <= 1024 for v in (s, t, k)):
+                raise ValueError
+            if any(v.startswith(("rel_", "ent_", "proj_")) for v in (s, t)):
+                raise ValueError
+            if k not in ("supports", "contradicts", "derives"):
+                raise ValueError
+            if len(json.dumps([s, t, k], ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 1024:
+                raise ValueError
+            if type(p["v"]) is not int or p["v"] != 1:
+                raise ValueError
+            if type(p["revision"]) is not int or not 1 <= p["revision"] <= 9223372036854775807:
+                raise ValueError
+            e = p["event_id"]
+            if type(e) is not str or len(e) != 36 or str(UUID(e)) != e:
+                raise ValueError
+            if entry.record_type not in ("fact", "belief") or entry.record_id != s:
+                raise ValueError
+            return (s, t, k), p["revision"], e
+        except Exception:
+            raise error("RELATION_PAYLOAD_INVALID") from None
+
+    async def _process_relation_sync(self, session, repo, entry) -> str:
+        import time
+
+        error = self.RelationProjectionError
+        key, revision, event_id = self._relation_payload(entry)
+        deadline = time.monotonic() + 30.0
+        cancelled = False
+
+        async def tail():
+            from sqlalchemy import event, text
+
+            from storage.models.relation import ClaimRelationORM
+            from storage.models.relation_revision import RelationRevisionORM
+            from storage.repositories.relation_revision_repo import (
+                RelationRevisionRepository,
+                RelationRevisionStorageError,
+            )
+
+            connection = await session.connection()
+            sync = connection.sync_connection
+            statements = instructions = 0
+            stopped = None
+
+            def checkpoint():
+                if time.monotonic() >= deadline:
+                    raise error("RELATION_PROJECTION_TIMEOUT")
+
+            def before(*_):
+                nonlocal statements
+                statements += 1
+                checkpoint()
+                if statements > 64:
+                    raise error("RELATION_PROJECTION_LIMIT")
+
+            def progress():
+                nonlocal instructions, stopped
+                instructions += 1000
+                if time.monotonic() >= deadline:
+                    stopped = "RELATION_PROJECTION_TIMEOUT"
+                elif instructions >= 2_000_000:
+                    stopped = "RELATION_PROJECTION_LIMIT"
+                return int(stopped is not None)
+
+            async def bridge(callback):
+                return await connection.run_sync(lambda c: c.connection.dbapi_connection.run_async(callback))
+
+            event.listen(sync, "before_cursor_execute", before)
+            try:
+                await bridge(lambda driver: driver.set_progress_handler(progress, 1000))
+                params = dict(s=key[0], t=key[1], k=key[2])
+                reserved = await session.execute(
+                    text(
+                        "UPDATE relation_revisions SET revision=revision "
+                        "WHERE source_id=:s AND target_id=:t AND relation_type=:k AND revision=("
+                        "SELECT revision FROM relation_revisions "
+                        "WHERE source_id=:s AND target_id=:t AND relation_type=:k ORDER BY revision DESC LIMIT 1)"
+                    ),
+                    params,
+                )
+                if reserved.rowcount != 1:
+                    raise error("RELATION_INVARIANT_FAILED")
+                canonical = await session.get(ClaimRelationORM, key, populate_existing=True)
+                state = await RelationRevisionRepository(session).state(
+                    key, canonical.created_at if canonical else None
+                )
+                latest = state.latest
+                queued = await session.get(RelationRevisionORM, (*key, revision), populate_existing=True)
+                if latest is None or queued is None or revision > latest.revision or queued.event_id != event_id:
+                    raise error("RELATION_INVARIANT_FAILED")
+                if revision == latest.revision and latest.event_id != event_id:
+                    raise error("RELATION_INVARIANT_FAILED")
+                kinds = {}
+                for endpoint in dict.fromkeys(key[:2]):
+                    query = " UNION ALL ".join(
+                        f"SELECT '{kind}' AS kind,version FROM {table} WHERE id=:id"
+                        for kind, table in (
+                            ("fact", "facts"),
+                            ("belief", "beliefs"),
+                            ("decision", "decisions"),
+                            ("skill", "skills"),
+                        )
+                    )
+                    matches = (await session.execute(text(query), {"id": endpoint})).all()
+                    if len(matches) != 1 or matches[0].kind not in ("fact", "belief"):
+                        raise error("RELATION_INVARIANT_FAILED")
+                    kinds[endpoint] = matches[0].kind
+                if kinds[key[0]] != entry.record_type:
+                    raise error("RELATION_INVARIANT_FAILED")
+                graph = getattr(self._graph_router, "graph", None)
+                apply = getattr(graph, "reconcile_claim_relation", None)
+                verify = getattr(graph, "verify_claim_relation", None)
+                if not callable(apply) or not callable(verify) or self._native_submitter is None:
+                    raise error("RELATION_GRAPH_UNAVAILABLE")
+                kwargs = dict(
+                    live=not latest.deleted, source_kind=kinds[key[0]], target_kind=kinds[key[1]], deadline=deadline
+                )
+                for function in (apply, verify):
+                    checkpoint()
+                    if cancelled:
+                        return None
+                    handle = await self._native_submitter(function, *key, kind="outbox-relation-sync", **kwargs)
+                    value = await handle.result()
+                    if value is False:
+                        raise error("RELATION_READBACK_FAILED")
+                checkpoint()
+                if cancelled:
+                    return None
+                await repo.mark_completed(entry.id)
+                return "completed"
+            except RelationRevisionStorageError:
+                raise error("RELATION_INVARIANT_FAILED") from None
+            except Exception as exc:
+                from memory_server.providers.graph_provider import SimpleGraph
+
+                if stopped:
+                    raise error(stopped) from None
+                if type(exc) in (error, SimpleGraph.StrictRelationProjectionError):
+                    raise error(exc.args[0]) from None
+                raise error() from None
+            finally:
+                event.remove(sync, "before_cursor_execute", before)
+                try:
+                    await bridge(lambda driver: driver.set_progress_handler(None, 0))
+                except BaseException:
+                    await connection.invalidate()
+                    raise
+
+        async def boundary():
+            try:
+                return await tail()
+            except Exception as exc:
+                raise error(exc.args[0] if type(exc) is error else None) from None
+
+        owned = asyncio.create_task(boundary())
+        while not owned.done():
+            try:
+                await asyncio.shield(owned)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        if cancelled:
+            try:
+                owned.result()
+            except BaseException:
+                pass
+            raise asyncio.CancelledError
+        return owned.result()
 
     async def _process_index_fact(self, entry: OutboxEntry) -> None:
         """Process an index_fact entry: embed + upsert to Qdrant + sync to graph.

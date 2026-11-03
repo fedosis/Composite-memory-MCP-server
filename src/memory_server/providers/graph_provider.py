@@ -975,6 +975,250 @@ class SimpleGraph:
             self._journal.append(("delete_edge", source_id, target_id))
         self._persist_if_needed()
 
+    class StrictRelationProjectionError(Exception):
+        CODES = frozenset(
+            {
+                "RELATION_PAYLOAD_INVALID",
+                "RELATION_INVARIANT_FAILED",
+                "RELATION_GRAPH_UNAVAILABLE",
+                "RELATION_PROJECTION_LIMIT",
+                "RELATION_PROJECTION_TIMEOUT",
+                "RELATION_PERSISTENCE_FAILED",
+                "RELATION_SNAPSHOT_INVALID",
+                "RELATION_READBACK_FAILED",
+            }
+        )
+
+        def __init__(self, code="Relation projection failed"):
+            super().__init__(code if type(code) is str and code in self.CODES else "Relation projection failed")
+
+    _RELATION_BYTES = 16777216
+
+    def _relation_deadline(self, deadline):
+        if time.monotonic() >= deadline:
+            raise self.StrictRelationProjectionError("RELATION_PROJECTION_TIMEOUT")
+
+    def _relation_arguments(self, s, t, k, live, sk, tk, deadline):
+        import math
+
+        if (
+            any(type(v) is not str or not 1 <= len(v) <= 1024 for v in (s, t, k))
+            or k not in ("supports", "contradicts", "derives")
+            or type(live) is not bool
+            or type(sk) is not str
+            or sk not in ("fact", "belief")
+            or type(tk) is not str
+            or tk not in ("fact", "belief")
+            or (s == t and sk != tk)
+            or type(deadline) not in (float, int)
+            or not math.isfinite(deadline)
+        ):
+            raise self.StrictRelationProjectionError("RELATION_PAYLOAD_INVALID")
+        if (
+            any(v.startswith(("rel_", "ent_", "proj_")) for v in (s, t))
+            or len(json.dumps([s, t, k], ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 1024
+        ):
+            raise self.StrictRelationProjectionError("RELATION_PAYLOAD_INVALID")
+        self._relation_deadline(deadline)
+        if self._projection_binding is None or self._snapshot_path is None or _PROJECTION_CALL.get() is None:
+            raise self.StrictRelationProjectionError("RELATION_GRAPH_UNAVAILABLE")
+
+    def _relation_chunks(self, value, depth=0):
+        import math
+
+        error = self.StrictRelationProjectionError
+        if depth > 64:
+            raise error("RELATION_PROJECTION_LIMIT")
+        if type(value) is str:
+            if len(value) > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+            yield b'"'
+            for i in range(0, len(value), 4096):
+                yield json.dumps(value[i : i + 4096], ensure_ascii=False)[1:-1].encode("utf-8")
+            yield b'"'
+        elif value is None or type(value) is bool or type(value) is int or type(value) is float:
+            if type(value) is int and value.bit_length() > 4096:
+                raise error("RELATION_PROJECTION_LIMIT")
+            if type(value) is float and not math.isfinite(value):
+                raise error("RELATION_SNAPSHOT_INVALID")
+            yield json.dumps(value, allow_nan=False).encode("ascii")
+        elif type(value) in (list, dict):
+            if len(value) > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+            mapping = type(value) is dict
+            yield b"{" if mapping else b"["
+            for i, item in enumerate(value):
+                if i:
+                    yield b","
+                if mapping:
+                    if type(item) is not str:
+                        raise error("RELATION_SNAPSHOT_INVALID")
+                    yield from self._relation_chunks(item, depth + 1)
+                    yield b":"
+                    item = value[item]
+                yield from self._relation_chunks(item, depth + 1)
+            yield b"}" if mapping else b"]"
+        else:
+            raise error("RELATION_SNAPSHOT_INVALID")
+
+    def _relation_size(self, value):
+        total = 0
+        for chunk in self._relation_chunks(value):
+            total += len(chunk)
+            if total > self._RELATION_BYTES:
+                raise self.StrictRelationProjectionError("RELATION_PROJECTION_LIMIT")
+        return total
+
+    def _relation_preflight(self, s, t):
+        error = self.StrictRelationProjectionError
+        if self._suspend_persistence or self._full_publish_pending or self._journal:
+            raise error("RELATION_GRAPH_UNAVAILABLE")
+        if len(self._nodes) > 10000 or len(self._edges) > 10000 or len(self._edges.get(s, {}).get(t, ())) > 16:
+            raise error("RELATION_PROJECTION_LIMIT")
+        count = size = pairs = 0
+        for node in self._nodes.values():
+            size += self._relation_size(vars(node))
+            if size > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+        for targets in self._edges.values():
+            pairs += len(targets)
+            if pairs > 20000:
+                raise error("RELATION_PROJECTION_LIMIT")
+            for bucket in targets.values():
+                count += len(bucket)
+                if count > 20000:
+                    raise error("RELATION_PROJECTION_LIMIT")
+                for edge in bucket:
+                    size += self._relation_size(vars(edge))
+                    if size > self._RELATION_BYTES:
+                        raise error("RELATION_PROJECTION_LIMIT")
+        if len(self._edges.get(s, {}).get(t, ())) > 16:
+            raise error("RELATION_PROJECTION_LIMIT")
+        self._relation_size(self.to_dict())
+
+    def _relation_raw(self, raw, s, t):
+        error = self.StrictRelationProjectionError
+        if (
+            type(raw) is not dict
+            or set(raw) != {"nodes", "edges"}
+            or type(raw["nodes"]) is not dict
+            or type(raw["edges"]) is not list
+        ):
+            raise error("RELATION_SNAPSHOT_INVALID")
+        if len(raw["nodes"]) > 10000 or len(raw["edges"]) > 20000:
+            raise error("RELATION_PROJECTION_LIMIT")
+        pair = 0
+        for edge in raw["edges"]:
+            if type(edge) is not dict:
+                raise error("RELATION_SNAPSHOT_INVALID")
+            if (edge.get("source_id"), edge.get("target_id")) == (s, t):
+                pair += 1
+                if pair > 16:
+                    raise error("RELATION_PROJECTION_LIMIT")
+        self._relation_size(raw)
+        return raw
+
+    @staticmethod
+    def _apply_claim_relation(graph, op):
+        _, s, t, k, live, sk, tk = op
+        error = SimpleGraph.StrictRelationProjectionError
+        for ident, kind in ((s, sk), (t, tk)):
+            node = graph._nodes.get(ident)
+            if node is not None and node.type != kind:
+                raise error("RELATION_INVARIANT_FAILED")
+        bucket = graph._edges.get(s, {}).get(t, ())
+        if len(bucket) > 16:
+            raise error("RELATION_PROJECTION_LIMIT")
+        missing = {ident: kind for ident, kind in ((s, sk), (t, tk)) if ident not in graph._nodes}
+        retained = [edge for edge in bucket if edge.relation != k]
+        count = (
+            sum(len(b) for targets in graph._edges.values() for b in targets.values())
+            - len(bucket)
+            + len(retained)
+            + int(live)
+        )
+        if len(graph._nodes) + (len(missing) if live else 0) > 10000 or count > 20000 or len(retained) + int(live) > 16:
+            raise error("RELATION_PROJECTION_LIMIT")
+        if live:
+            for ident, kind in missing.items():
+                graph._nodes[ident] = GraphNode(ident, kind, "[MASKED]", {})
+            retained.append(GraphEdge(s, t, k, {"canonical": True}))
+        if retained:
+            graph._edges.setdefault(s, {})[t] = retained
+        elif s in graph._edges:
+            graph._edges[s].pop(t, None)
+            if not graph._edges[s]:
+                graph._edges.pop(s)
+
+    def reconcile_claim_relation(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        *,
+        live: bool,
+        source_kind: str,
+        target_kind: str,
+        deadline: float,
+    ) -> None:
+        error = self.StrictRelationProjectionError
+        try:
+            self._relation_arguments(source_id, target_id, relation_type, live, source_kind, target_kind, deadline)
+            op = ("reconcile_claim_relation", source_id, target_id, relation_type, live, source_kind, target_kind)
+            self._persist_relation_snapshot_strict(op, deadline=deadline)
+            self._relation_deadline(deadline)
+        except Exception as exc:
+            raise error(exc.args[0] if type(exc) is error else None) from None
+
+    def verify_claim_relation(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        *,
+        live: bool,
+        source_kind: str,
+        target_kind: str,
+        deadline: float,
+    ) -> None:
+        error = self.StrictRelationProjectionError
+        try:
+            self._relation_arguments(source_id, target_id, relation_type, live, source_kind, target_kind, deadline)
+            binding = self._projection_binding
+            failure = None
+            with self._thread_lock, _managed_reader_lock(binding.lock_path, binding):
+                try:
+                    self._relation_deadline(deadline)
+                    self._relation_preflight(source_id, target_id)
+                    parent = _pin_parent(binding.path)
+                    try:
+                        raw = self._read_relation_snapshot_strict(
+                            parent, binding.path, binding.state[0][binding.path], source_id, target_id
+                        )
+                    finally:
+                        parent.close()
+                    if raw != self.to_dict():
+                        raise error("RELATION_READBACK_FAILED")
+                    self._verify_relation_tuple(
+                        raw, source_id, target_id, relation_type, live, source_kind, target_kind
+                    )
+                except Exception as exc:
+                    failure = error(exc.args[0] if type(exc) is error else None)
+            if failure:
+                raise failure
+            self._relation_deadline(deadline)
+        except Exception as exc:
+            raise error(exc.args[0] if type(exc) is error else None) from None
+
+    def _verify_relation_tuple(self, raw, s, t, k, live, sk, tk):
+        matches = [e for e in raw["edges"] if (e["source_id"], e["target_id"], e["relation"]) == (s, t, k)]
+        if len(matches) != int(live) or (live and matches[0]["attributes"] != {"canonical": True}):
+            raise self.StrictRelationProjectionError("RELATION_READBACK_FAILED")
+        for ident, kind in ((s, sk), (t, tk)):
+            node = raw["nodes"].get(ident)
+            if (live and node is None) or (node is not None and node["type"] != kind):
+                raise self.StrictRelationProjectionError("RELATION_INVARIANT_FAILED")
+
     # --- Neighbor traversal ---
 
     def get_neighbors(
@@ -1690,6 +1934,8 @@ class SimpleGraph:
             _, source_id, target_id = op
             if source_id in graph._edges and target_id in graph._edges[source_id]:
                 graph.delete_edge(source_id, target_id)
+        elif kind == "reconcile_claim_relation":
+            self._apply_claim_relation(graph, op)
 
     def _write_snapshot(self, snapshot_path: Path) -> bool:
         """Atomically write the current state to *snapshot_path*.
@@ -1727,3 +1973,97 @@ class SimpleGraph:
         except Exception:
             logger.exception("Failed to persist graph snapshot to %s", snapshot_path)
             return False
+
+    def _read_relation_snapshot_strict(self, parent, path, expected, s, t):
+        error = self.StrictRelationProjectionError
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or _identity(info) != expected:
+                raise error("RELATION_SNAPSHOT_INVALID")
+            if info.st_size > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+            data = stream.read(self._RELATION_BYTES + 1)
+        if len(data) > self._RELATION_BYTES:
+            raise error("RELATION_PROJECTION_LIMIT")
+        try:
+            raw = json.loads(data)
+        except (ValueError, UnicodeError, RecursionError):
+            raise error("RELATION_SNAPSHOT_INVALID") from None
+        return self._relation_raw(raw, s, t)
+
+    def _persist_relation_snapshot_strict(self, op: tuple, *, deadline: float) -> None:
+        error = self.StrictRelationProjectionError
+        _, s, t, k, live, sk, tk = op
+        self._relation_deadline(deadline)
+        self._relation_preflight(s, t)
+        failure = None
+        with self._snapshot_publication(self._snapshot_path, call_scope=_PROJECTION_CALL.get()) as publication:
+            try:
+                self._relation_deadline(deadline)
+                self._relation_preflight(s, t)
+                if publication.before[publication.path][0] == "absent":
+                    if self._nodes or self._edges:
+                        raise error("RELATION_SNAPSHOT_INVALID")
+                    raw = {"nodes": {}, "edges": []}
+                else:
+                    raw = self._read_relation_snapshot_strict(
+                        publication.parent_fd, publication.path, publication.before[publication.path], s, t
+                    )
+                staging = SimpleGraph()
+                try:
+                    staging._nodes, staging._edges = self._build_state_from(raw)
+                except ValueError:
+                    raise error("RELATION_SNAPSHOT_INVALID") from None
+                # Ruling 002: no mutation may start late; once started, settle atomically.
+                self._relation_deadline(deadline)
+                self._replay_op(staging, op)
+                state = staging.to_dict()
+                self._relation_raw(state, s, t)
+                self._verify_relation_tuple(state, s, t, k, live, sk, tk)
+                if self._write_relation_snapshot_strict(publication, state, deadline=deadline) is not True:
+                    raise error("RELATION_PERSISTENCE_FAILED")
+                self._nodes, self._edges = staging._nodes, staging._edges
+                publication.nodes, publication.edges = self._nodes, self._edges
+                publication.journal = ()
+                publication._check_lock()
+                publication._mint()
+            except Exception as exc:
+                # The frozen P context sanitizes exceptions itself. Preserve only a
+                # closed typed code outside it; never carry the original exception.
+                failure = error(exc.args[0] if type(exc) is error else None)
+        if failure:
+            raise failure from None
+
+    def _write_relation_snapshot_strict(self, publication, state, *, deadline: float) -> bool:
+        error = self.StrictRelationProjectionError
+        self._relation_size(state)
+        publication.tmp = f".{publication.path.name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(
+            publication.tmp,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=publication.parent_fd,
+        )
+        publication.snapshot = os.fdopen(fd, "w+b")
+        total = 0
+        for chunk in self._relation_chunks(state):
+            total += len(chunk)
+            if total > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+            publication.snapshot.write(chunk)
+        publication.snapshot.flush()
+        os.fsync(publication.snapshot.fileno())
+        publication.staged = _identity(os.fstat(publication.snapshot.fileno()))
+        os.replace(
+            publication.tmp, publication.path.name, src_dir_fd=publication.parent_fd, dst_dir_fd=publication.parent_fd
+        )
+        publication.tmp = None
+        os.fsync(publication.parent_fd)
+        # Full logical readback under the same managed writer lock, before mint.
+        observed = self._read_relation_snapshot_strict(
+            publication.parent_fd, publication.path, publication.staged, "", ""
+        )
+        if observed != state:
+            raise error("RELATION_READBACK_FAILED")
+        return True
