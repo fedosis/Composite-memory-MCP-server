@@ -1338,12 +1338,11 @@ class SimpleGraph:
         try:
             binding = self._projection_binding
             with _file_lock(_snapshot_lock_path(snapshot_path), managed=binding):
-                fd = os.open(
-                    snapshot_path.name,
-                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=(parent := _pin_parent(snapshot_path)),
-                )
+                parent = _pin_parent(snapshot_path)
                 try:
+                    fd = os.open(
+                        snapshot_path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent,
+                    )
                     with os.fdopen(fd, "r", encoding="utf-8") as fh:
                         if _identity(os.fstat(fh.fileno())) != binding.state[0][snapshot_path]:
                             raise _projection_failure()

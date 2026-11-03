@@ -93,36 +93,13 @@ class _ProjectionResult:
         return self.value
 
 
-class Daemon:
-    """Construct inside its one running loop; never creates another manager.
+def _projection_lease(daemon, profile_id):
+    held = daemon._held.get(asyncio.current_task(), {}).get(profile_id)
+    return getattr(held, "projection_proof", _LEASE_CONTEXT.get())
 
-    Auth/permission verification precedes this seam (C2); registry.resolve still
-    enforces profile scope. S06 persists disable with its generation CAS, then
-    calls stop_profile; re-enable does not override a retained owner.
-    """
-
-    def __init__(self, registry: ProfileRegistry, *, policies: BundlePolicies,
-                 manager: RuntimeManager | None = None, clock=time.monotonic) -> None:
-        self.registry = registry
-        self.manager = manager if manager is not None else RuntimeManager()
-        self._loop = asyncio.get_running_loop()
-        self._lock = asyncio.Lock()
-        self._entries: dict[str, _Entry] = {}
-        self._held: dict[asyncio.Task, dict[str, _Held]] = {}
-        self._policies = policies
-        self._clock = clock
-        self._closing = False
-        self._close_task: asyncio.Task | None = None
-
-    def _check(self) -> None:
-        if asyncio.get_running_loop() is not self._loop:
-            raise LeaseError("E_RUNTIME_NOT_READY")
-        if self._closing:
-            raise LeaseError("E_RUNTIME_CLOSING")
-
-    def _projection_lease(self, profile_id):
-        held = self._held.get(asyncio.current_task(), {}).get(profile_id)
-        return getattr(held, "projection_proof", _LEASE_CONTEXT.get())
+class _ProjectionAdapter:
+    def __init__(self, manager):
+        self.manager = manager
 
     def _refresh_projection_result(self, binding, envelope):
         if envelope.scope.records:
@@ -133,7 +110,7 @@ class Daemon:
         else:
             self.manager._abort_projection_call(envelope.scope)
 
-    def _projection_submitter(self, runtime, binding):
+    def submitter(self, runtime, binding):
         from memory_server.providers.graph_provider import _PROJECTION_CALL, _close_publication
 
         async def submit(function, /, *args, kind, **kwargs):
@@ -172,6 +149,33 @@ class Daemon:
 
         return submit
 
+class Daemon:
+    """Construct inside its one running loop; never creates another manager.
+
+    Auth/permission verification precedes this seam (C2); registry.resolve still
+    enforces profile scope. S06 persists disable with its generation CAS, then
+    calls stop_profile; re-enable does not override a retained owner.
+    """
+
+    def __init__(self, registry: ProfileRegistry, *, policies: BundlePolicies,
+                 manager: RuntimeManager | None = None, clock=time.monotonic) -> None:
+        self.registry = registry
+        self.manager = manager if manager is not None else RuntimeManager()
+        self._loop = asyncio.get_running_loop()
+        self._lock = asyncio.Lock()
+        self._entries: dict[str, _Entry] = {}
+        self._held: dict[asyncio.Task, dict[str, _Held]] = {}
+        self._policies = policies
+        self._clock = clock
+        self._closing = False
+        self._close_task: asyncio.Task | None = None
+
+    def _check(self) -> None:
+        if asyncio.get_running_loop() is not self._loop:
+            raise LeaseError("E_RUNTIME_NOT_READY")
+        if self._closing:
+            raise LeaseError("E_RUNTIME_CLOSING")
+
     async def _compose(self, entry: _Entry) -> ProfileBundle:
         binding = entry.binding
         try:
@@ -180,7 +184,7 @@ class Daemon:
             graph = runtime.dependencies.graph
             if graph is not None and getattr(graph, "_snapshot_path", None) is not None:
                 publisher = self.manager.bind_projection_publisher(
-                    binding.descriptor, graph=graph, lease_probe=lambda: self._projection_lease(binding.profile.id),
+                    binding.descriptor, graph=graph, lease_probe=lambda: _projection_lease(self, binding.profile.id),
                 )
                 worker = runtime.dependencies.outbox_worker
                 if worker is not None:
@@ -188,7 +192,7 @@ class Daemon:
                         from memory_server.runtime.runtime_manager import RuntimeManagerError
 
                         raise RuntimeManagerError("E_RUNTIME_DESCRIPTOR_CONFLICT") from None
-                    worker._native_submitter = self._projection_submitter(runtime, publisher)
+                    worker._native_submitter = _ProjectionAdapter(self.manager).submitter(runtime, publisher)
             bundle = await ProfileBundle.compose(runtime, self._policies)
             # Publication is atomic under the same table lock as shutdown/stop.
             async with self._lock:
