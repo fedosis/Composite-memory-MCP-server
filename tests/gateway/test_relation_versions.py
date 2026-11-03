@@ -3078,3 +3078,378 @@ async def main():
         raise AssertionError('S16B_CRASH_RETRY: completion barrier not reached')
 asyncio.run(main())
 """
+
+
+async def _s16c_public(state, cmd=None, *, key=None):
+    from tests.gateway.test_http_shell import request
+
+    cmd = cmd or command()
+    deleted = cmd.operation == "relations.delete"
+    return await request(
+        state.app,
+        "/api/v1/profiles/alpha/relations" + ("/" + cmd.path_ids["id"] if deleted else ""),
+        method="DELETE" if deleted else "POST",
+        bearer=state.bearer,
+        body=cmd.payload.model_dump(mode="json"),
+        headers=(("Idempotency-Key", str(key or uuid4())),),
+    )
+
+
+async def test_s16c_concurrent_keys_real_uow_once(relations):
+    from memory_server.transports.http.app import create_http_app
+
+    state, key = relations, uuid4()
+    state.app = create_http_app(
+        replace(state.config, retrieval_concurrency=16),
+        state.deps,
+        read_routes=state.specs,
+        mutation_routes=state.mutation_specs,
+    )
+    barrier = asyncio.Event()
+
+    async def send(cmd=None, idem=None):
+        await barrier.wait()
+        for _ in range(40):
+            response = await _s16c_public(state, cmd, key=idem)
+            if response.status not in (409, 503) or response.json["error"]["code"] not in (
+                "E_REQUEST_IN_PROGRESS",
+                "E_AUDIT_UNAVAILABLE",
+            ):
+                return response
+            await asyncio.sleep(0.01)
+        pytest.fail("S16C_CONCURRENT contention did not settle")
+
+    tasks = [asyncio.create_task(send(idem=key)) for _ in range(10)]
+    barrier.set()
+    results = await asyncio.wait_for(asyncio.gather(*tasks), 2)
+    assert all(r.status == 201 and r.body == results[0].body for r in results), (
+        "S16C_CONCURRENT",
+        [(r.status, r.body) for r in results],
+    )
+    for table in ("claim_relations", "relation_revisions", "receipts", "outbox_entries", "http_request_journal"):
+        assert len(await sql(state, f"SELECT * FROM {table}")) == 1, ("S16C_CONCURRENT", table)
+    assert (await _s16c_public(state, command(deleted=True))).status == 200
+    pair = await asyncio.gather(send(), send())
+    assert sorted(r.status for r in pair) == [201, 409], "S16C_CONCURRENT"
+    deleted = await asyncio.gather(send(command(deleted=True, revision=3)), send(command(deleted=True, revision=3)))
+    assert sorted(r.status for r in deleted) == [200, 404], "S16C_CONCURRENT"
+    assert len(await sql(state, "SELECT * FROM receipts")) == 4, "S16C_CONCURRENT"
+
+
+@pytest.mark.parametrize("fault", ["canonical", "ledger", "receipt", "outbox", "journal", "flush", "commit", "result"])
+async def test_s16c_precommit_fault_matrix_atomic(relations, monkeypatch, fault):
+    from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction
+    from storage.outbox import OutboxRepository
+    from storage.repositories.http_request_repo import HttpRequestRepository
+    from storage.repositories.receipt_repo import ReceiptRepository
+    from storage.repositories.relation_repo import RelationRepository
+    from storage.repositories.relation_revision_repo import RelationRevisionRepository
+
+    state = relations
+    before = await snapshot(state)
+    calls = []
+
+    class Sink:
+        async def publish(self, event):
+            calls.append(event)
+
+    state.deps.ports["relations.create"]._events = Sink()
+    targets = {
+        "canonical": (RelationRepository, "create_versioned"),
+        "ledger": (RelationRevisionRepository, "append"),
+        "receipt": (ReceiptRepository, "create"),
+        "outbox": (OutboxRepository, "add_entry"),
+        "journal": (HttpRequestRepository, "add"),
+        "flush": (AsyncSession, "flush"),
+        "commit": (AsyncSessionTransaction, "__aexit__"),
+        "result": (foundation().RelationMutationHandler, "apply"),
+    }
+    cls, name = targets[fault]
+    original = getattr(cls, name)
+    injected = []
+
+    async def fail(self, *args, **kwargs):
+        if fault == "commit":
+            if args[0] is not None:
+                return await original(self, *args, **kwargs)
+            await self.rollback()
+        elif fault == "result":
+            await original(self, *args, **kwargs)
+        injected.append(True)
+        raise RuntimeError("S16C_FAULT_CANARY")
+
+    with monkeypatch.context() as m:
+        m.setattr(cls, name, fail)
+        response = await _s16c_public(state)
+    assert injected and response.status >= 500, ("S16C_UOW_ATOMIC", fault, response.body)
+    assert await snapshot(state) == before and calls == [], ("S16C_UOW_ATOMIC", fault)
+    assert "S16C_FAULT_CANARY" not in response.body.decode(), "S16C_UOW_ATOMIC"
+
+
+@pytest.mark.parametrize("mode", ["true", "false", "raise", "mark-fault", "blocked"])
+async def test_s16c_postcommit_audit_gap_original_ticket(relations, monkeypatch, mode):
+    from storage.repositories.http_request_repo import HttpRequestRepository
+
+    state, key = relations, uuid4()
+    port = state.deps.ports["relations.create"]
+    publish, finish = port._publish_outcome, state.deps.access.finish
+    published, finished = [], []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def outcome(ticket, value):
+        published.append((ticket, value))
+        if mode == "false":
+            return False
+        if mode == "raise":
+            raise RuntimeError("audit consumer")
+        if mode == "blocked":
+            entered.set()
+            await release.wait()
+        return await publish(ticket, value)
+
+    async def finishing(ticket, value):
+        finished.append(ticket)
+        return await finish(ticket, value)
+
+    async def mark_fail(*args):
+        raise RuntimeError("mark publication")
+
+    with monkeypatch.context() as m:
+        m.setattr(port, "_publish_outcome", outcome)
+        m.setattr(state.deps.access, "finish", finishing)
+        if mode == "mark-fault":
+            m.setattr(HttpRequestRepository, "mark_published", mark_fail)
+        task = asyncio.create_task(_s16c_public(state, key=key))
+        if mode == "blocked":
+            await asyncio.wait_for(entered.wait(), 2)
+            assert not task.done(), "S16C_ORIGINAL_AUDIT"
+            assert await sql(state, "SELECT pending_publication FROM http_request_journal") == [(1,)]
+            release.set()
+        first = await task
+        assert first.status == 201, "S16C_ORIGINAL_AUDIT"
+        original_ticket = published[0][0]
+        assert finished == ([original_ticket] if mode in ("true", "mark-fault", "blocked") else []), (
+            "S16C_ORIGINAL_AUDIT"
+        )
+        assert first.json["audit_id"] == original_ticket.id, "S16C_ORIGINAL_AUDIT"
+        assert first.json["request_id"] == original_ticket.request_id, "S16C_ORIGINAL_AUDIT"
+        pending = int(mode in ("false", "raise", "mark-fault"))
+        assert await sql(state, "SELECT pending_publication FROM http_request_journal") == [(pending,)]
+        if pending:
+            denied = await _s16c_public(state, command(source=ident(2), target=ident(3)))
+            assert denied.status == 503 and denied.json["error"]["code"] == "E_AUDIT_UNAVAILABLE"
+    healed = []
+
+    async def healing(ticket, value):
+        healed.append(ticket)
+        return await publish(ticket, value)
+
+    with monkeypatch.context() as m:
+        m.setattr(port, "_publish_outcome", healing)
+        m.setattr(state.deps.access, "finish", finishing)
+        count = len(finished)
+        replay = await _s16c_public(state, key=key)
+        assert replay.status == 201 and replay.body == first.body, "S16C_ORIGINAL_AUDIT"
+        current = [t for t in finished[count:] if t.id != original_ticket.id]
+        assert len(current) == 1 and finished[-1] == current[0], "S16C_ORIGINAL_AUDIT"
+        assert finished[count:].count(original_ticket) == pending, "S16C_ORIGINAL_AUDIT"
+    assert healed == ([original_ticket] if pending else []), "S16C_ORIGINAL_AUDIT"
+    assert await sql(state, "SELECT pending_publication FROM http_request_journal") == [(0,)]
+    assert len(await sql(state, "SELECT * FROM receipts")) == 1, "S16C_ORIGINAL_AUDIT"
+
+
+@pytest.mark.parametrize(
+    "mode", ["normal", "no-sink", "faulting", "corrupt-outbox", "corrupt-receipt", "readback-fault", "4096", "4097"]
+)
+async def test_s16c_c8_persisted_event_metadata(relations, monkeypatch, mode):
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from storage.models.relation_revision import RelationRevisionORM
+
+    state, key = relations, uuid4()
+    port = state.deps.ports["relations.create"]
+    events = []
+
+    class Sink:
+        async def publish(self, event):
+            events.append(event)
+            if mode == "faulting":
+                raise RuntimeError("event sink")
+
+    port._events = None if mode == "no-sink" else Sink()
+    produce = port._produce
+    get = AsyncSession.get
+
+    async def readback_fail(session, model, *args, **kwargs):
+        if model is RelationRevisionORM:
+            raise RuntimeError("readback")
+        return await get(session, model, *args, **kwargs)
+
+    async def corrupt(factory, ctx, cmd, result, ticket):
+        if mode.startswith("corrupt"):
+            async with factory() as session, session.begin():
+                statement = (
+                    "UPDATE outbox_entries SET payload_json='{}'"
+                    if mode == "corrupt-outbox"
+                    else "UPDATE receipts SET history='[]'"
+                )
+                await session.execute(text(statement))
+        return await produce(factory, ctx, cmd, result, ticket)
+
+    serialize = d.Event.model_dump_json
+
+    def boundary(envelope, *args, **kwargs):
+        value = serialize(envelope, *args, **kwargs)
+        return value + " " * (int(mode) - len(value.encode()))
+
+    with monkeypatch.context() as m:
+        m.setattr(port, "_produce", corrupt)
+        if mode in ("4096", "4097"):
+            m.setattr(d.Event, "model_dump_json", boundary)
+        if mode == "readback-fault":
+            m.setattr(AsyncSession, "get", readback_fail)
+        first = await _s16c_public(state, key=key)
+        assert first.status == 201, "S16C_C8_READBACK"
+        replay = await _s16c_public(state, key=key)
+        assert replay.body == first.body, "S16C_C8_READBACK"
+        deleted = await _s16c_public(state, command(deleted=True))
+        assert deleted.status == 200, "S16C_C8_READBACK"
+    expected = 2 if mode in ("normal", "faulting", "4096") else 0
+    assert len(events) == expected, ("S16C_C8_READBACK", mode, events)
+    rows = await sql(
+        state,
+        "SELECT event_id,changed_at,request_id,source_id,revision,deleted FROM relation_revisions ORDER BY revision",
+    )
+    for emitted, row in zip(events, rows):
+        assert (emitted.id, emitted.request_id, emitted.memory_id, emitted.data.revision) == (
+            row[0],
+            row[2],
+            row[3],
+            row[4],
+        ), "S16C_C8_READBACK"
+        assert emitted.timestamp.replace(tzinfo=None) == datetime.fromisoformat(row[1]), "S16C_C8_READBACK"
+        assert emitted.type == ("relation.deleted" if row[5] else "relation.created"), "S16C_C8_READBACK"
+        assert emitted.profile_id == "alpha" and emitted.job_id is None and emitted.severity == "info", (
+            "S16C_C8_READBACK"
+        )
+        assert len(emitted.model_dump_json().encode()) <= 4096 and "CANARY" not in emitted.model_dump_json(), (
+            "S16C_C8_READBACK"
+        )
+    assert await sql(state, "SELECT pending_publication FROM http_request_journal") == [(0,), (0,)]
+
+
+@pytest.mark.parametrize("point", ["precommit", "commit-window", "audit", "events"])
+async def test_s16c_cancel_commit_and_tail_lease_retention(relations, monkeypatch, point):
+    from contextlib import asynccontextmanager
+
+    from memory_server.application.mutation_uow import MUTATION_REPLY, MutationUoW
+
+    state, ctx = relations, fresh(relations)
+    ticket = await state.deps.access.begin(ctx, "relations.create")
+    port = foundation().RemoteRelationsWritePort(
+        state.deps,
+        ticket_provider=lambda: ticket.id,
+        publish_outcome=state.deps.access.publish_committed,
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    active = []
+    acquire = type(state.deps.leases).acquire
+
+    @asynccontextmanager
+    async def tracked(owner, actual):
+        async with acquire(owner, actual) as scope:
+            active.append(True)
+            try:
+                yield scope
+            finally:
+                active.pop()
+
+    apply, run = foundation().RelationMutationHandler.apply, MutationUoW.run
+    publish = port._publish_outcome
+
+    async def paused_apply(handler, session, cmd):
+        await apply(handler, session, cmd)
+        entered.set()
+        await release.wait()
+
+    async def paused_run(uow, *args):
+        result = await run(uow, *args)
+        entered.set()
+        await release.wait()
+        return result
+
+    async def paused_publish(*args):
+        entered.set()
+        await release.wait()
+        return await publish(*args)
+
+    class Sink:
+        async def publish(self, event):
+            entered.set()
+            await release.wait()
+
+    async def execute():
+        result = await port.execute(ctx, command())
+        return result, MUTATION_REPLY.get()
+
+    with monkeypatch.context() as m:
+        m.setattr(type(state.deps.leases), "acquire", tracked)
+        if point == "precommit":
+            m.setattr(foundation().RelationMutationHandler, "apply", paused_apply)
+        elif point == "commit-window":
+            m.setattr(MutationUoW, "run", paused_run)
+        elif point == "audit":
+            m.setattr(port, "_publish_outcome", paused_publish)
+        else:
+            port._events = Sink()
+        task = asyncio.create_task(execute())
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        if point in ("audit", "events"):
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert active == [True] and not task.done(), "S16C_CANCEL_CUSTODY"
+        release.set()
+        if point == "precommit":
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result, reply = await asyncio.wait_for(task, 2)
+            assert reply is not None and not reply.replayed and reply.original_request_id == ctx.request_id, (
+                "S16C_CANCEL_CUSTODY"
+            )
+            assert result.request_id == ctx.request_id and result.audit_id == ticket.id, "S16C_CANCEL_CUSTODY"
+        assert active == [], "S16C_CANCEL_CUSTODY"
+    count = int(point != "precommit")
+    for table in ("claim_relations", "relation_revisions", "receipts", "outbox_entries", "http_request_journal"):
+        assert len(await sql(state, f"SELECT * FROM {table}")) == count, ("S16C_CANCEL_CUSTODY", table)
+
+
+async def test_s16c_property_reopen_and_bounds(relations):
+    state, rng = relations, random.Random(1603)
+    model, replays = {}, []
+    before = await snapshot(state)
+    for step in range(24):
+        key_tuple = (ident(rng.choice((1, 2))), ident(rng.choice((1, 2))), rng.choice(("supports", "derives")))
+        revision, live = model.get(key_tuple, (0, False))
+        cmd = command(deleted=live, revision=revision or 1, source=key_tuple[0], target=key_tuple[1], kind=key_tuple[2])
+        key = uuid4()
+        result = await _s16c_public(state, cmd, key=key)
+        assert result.status == (200 if live else 201), ("S16C_STATE_MODEL", step, result.body)
+        assert result.json["relation"]["revision"] == revision + 1, "S16C_STATE_MODEL"
+        model[key_tuple] = (revision + 1, not live)
+        replays.append((cmd, key, result))
+        cmd0, key0, original = rng.choice(replays)
+        replay = await _s16c_public(state, cmd0, key=key0)
+        assert replay.body == original.body and replay.status == original.status, "S16C_STATE_MODEL"
+        actual = await sql(
+            state,
+            "SELECT source_id,target_id,relation_type,revision,deleted FROM relation_revisions "
+            "WHERE (source_id,target_id,relation_type,revision) IN "
+            "(SELECT source_id,target_id,relation_type,MAX(revision) FROM relation_revisions "
+            "GROUP BY source_id,target_id,relation_type)",
+        )
+        assert {tuple(row[:3]): (row[3], not row[4]) for row in actual} == model, "S16C_STATE_MODEL"
+    after = await snapshot(state)
+    for table in ("facts", "beliefs", "evidence", "lifecycle_states", "lifecycle_events"):
+        assert after[table] == before[table], ("S16C_STATE_MODEL", table)
