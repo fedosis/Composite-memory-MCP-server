@@ -260,3 +260,49 @@ async def test_guard_does_not_execute_subclass_etag(belief_http):
     )
     assert response.status_code == 200 and "etag" not in response.headers
     assert called == []
+
+
+@pytest.mark.parametrize("case,expected", [("create", 201), ("delete", 200), ("missing-cas", 428)])
+async def test_s16c_behavioral_red_mount_missing(belief_http, case, expected):
+    from datetime import UTC, datetime, timedelta
+    from uuid import uuid4
+
+    from storage.repositories.relation_repo import RelationRepository
+
+    from memory_server.gateway_contracts import dto as d
+    from tests.gateway.test_http_beliefs import ident, orm_seed
+    from tests.gateway.test_http_shell import request
+
+    state = belief_http
+    await orm_seed(state, [dict(id=ident(i), proposition="mount") for i in (1, 2)])
+    now = datetime.now(UTC)
+    token = state.deps.tokens._bootstrap_create(
+        d.TokenCreate(
+            subject="s16c", profiles=["alpha"], permissions=["relation.write"], expires_at=now + timedelta(hours=1)
+        ),
+        now=now,
+    )
+    bearer = f"cmms_{token.token.id}.{token.secret}"
+    versions = {ident(1): 1, ident(2): 1}
+    path = "/api/v1/profiles/alpha/relations"
+    method = "POST"
+    body = dict(
+        source_id=ident(1), target_id=ident(2), relation_type="supports", expected_versions=versions, reason="mount"
+    )
+    if case == "delete":
+        from memory_server.application.graph_read_service import relation_id
+
+        async with state.deps.leases.acquire(context(state)) as scope:
+            async with scope.application.memory.session_factory() as session, session.begin():
+                await RelationRepository(session).create(ident(1), ident(2), "supports")
+        path += "/" + relation_id(ident(1), ident(2), "supports")
+        method = "DELETE"
+        body = dict(expected_version=1, expected_versions=versions, reason="mount", confirmation=True)
+    elif case == "missing-cas":
+        del body["expected_versions"]
+    response = await request(
+        state.app, path, method=method, bearer=bearer, body=body, headers=(("Idempotency-Key", str(uuid4())),)
+    )
+    assert response.status == expected, (
+        f"S16C_PUBLIC_MOUNT_REQUIRED case={case} actual={response.status} expected={expected} {response.body!r}"
+    )
