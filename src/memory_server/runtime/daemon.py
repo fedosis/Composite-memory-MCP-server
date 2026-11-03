@@ -122,7 +122,7 @@ class Daemon:
 
     def _projection_lease(self, profile_id):
         held = self._held.get(asyncio.current_task(), {}).get(profile_id)
-        return getattr(held, "projection_proof", None)
+        return getattr(held, "projection_proof", _LEASE_CONTEXT.get())
 
     def _refresh_projection_result(self, binding, envelope):
         if envelope.scope.records:
