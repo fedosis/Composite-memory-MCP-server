@@ -130,7 +130,7 @@ class RelationMutationHandler:
             self.instructions += 1000
             if monotonic() >= self.ctx.deadline:
                 stopped = "E_TIMEOUT"
-            elif self.instructions > 2_000_000:
+            elif self.instructions >= 2_000_000:
                 stopped = "E_STORAGE"
             return int(stopped is not None)
 
@@ -172,12 +172,15 @@ class RelationMutationHandler:
                     raise
 
             cleanup = asyncio.create_task(reset())
+            cancelled = False
             while not cleanup.done():
                 try:
                     await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
-                    continue
+                    cancelled = True
             cleanup.result()
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _apply(self, session, command):
         payload = command.payload
