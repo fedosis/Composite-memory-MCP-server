@@ -11,6 +11,7 @@ from storage.models.http_request import HttpRequestJournalORM  # noqa: F401, E40
 from storage.models.lifecycle import LifecycleEventORM, LifecycleStateORM  # noqa: F401, E402
 from storage.models.receipt import MemoryReceiptORM  # noqa: F401, E402
 from storage.models.relation import ClaimRelationORM  # noqa: F401, E402
+from storage.models.relation_revision import RelationRevisionORM  # noqa: F401, E402
 from storage.models.skill import SkillORM  # noqa: F401, E402
 from storage.outbox import OutboxEntryORM  # noqa: F401, E402
 
@@ -20,6 +21,7 @@ __all__ = [
     "DecisionORM",
     "EntityORM",
     "ClaimRelationORM",
+    "RelationRevisionORM",
     "EvidenceORM",
     "FactORM",
     "HttpRequestJournalORM",

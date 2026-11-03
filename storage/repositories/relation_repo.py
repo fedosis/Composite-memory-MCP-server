@@ -10,11 +10,18 @@ from datetime import UTC, datetime
 from time import monotonic
 from typing import Literal, Optional
 
-from sqlalchemy import event, select, text
+from sqlalchemy import delete, event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memory_server.providers.graph_provider import GraphBudgetExceeded
 from storage.models.relation import ClaimRelationORM
+from storage.models.relation_revision import RelationRevisionORM
+from storage.repositories.relation_revision_repo import (
+    RelationEventContext,
+    RelationRevisionConflict,
+    RelationRevisionRepository,
+    RelationRevisionStorageError,
+)
 
 SQL_VM_LIMIT = 200000
 PROGRESS_INTERVAL = 1000
@@ -142,12 +149,27 @@ class RelationRepository:
         relation_type: str,
     ) -> ClaimRelationORM:
         """Create a relation if it does not already exist."""
+        row, _ = await self._create_tracked(source_id, target_id, relation_type, event=None, reject_existing=False)
+        return row
+
+    async def _create_tracked(self, source_id, target_id, relation_type, *, event, reject_existing):
+        from uuid import uuid4
+
         existing = await self._session.get(
             ClaimRelationORM,
             (source_id, target_id, relation_type),
         )
         if existing is not None:
-            return existing
+            if reject_existing:
+                raise RelationRevisionConflict(None, None, (source_id, target_id, relation_type))
+            return existing, None
+
+        key = (source_id, target_id, relation_type)
+        revisions = RelationRevisionRepository(self._session)
+        before = await revisions.state(key, None)
+        await revisions.verify_before(key, before)
+        event = event or RelationEventContext(str(uuid4()), datetime.now(UTC))
+        event.validate()
 
         orm = ClaimRelationORM(
             source_id=source_id,
@@ -157,7 +179,50 @@ class RelationRepository:
         self._session.add(orm)
         await self._session.flush()
         await self._session.refresh(orm)
-        return orm
+        revision = await revisions.append(
+            key, before=before, deleted=False, relation_created_at=orm.created_at, event=event
+        )
+        return orm, revision
+
+    async def create_versioned(self, source_id, target_id, relation_type, *, event):
+        return await self._create_tracked(source_id, target_id, relation_type, event=event, reject_existing=True)
+
+    async def delete_versioned(self, key, *, before, expected_revision, event):
+        revisions = RelationRevisionRepository(self._session)
+        await revisions.verify_before(key, before)
+        if not before.canonical_present or type(expected_revision) is not int or expected_revision != before.revision:
+            raise RelationRevisionConflict(expected_revision, before.revision, key)
+        event.validate()
+        r = RelationRevisionORM
+        exact = (r.source_id == key[0], r.target_id == key[1], r.relation_type == key[2])
+        fence = ~select(r.revision).where(*exact).exists()
+        if before.latest:
+            fence = (
+                select(r.revision)
+                .where(
+                    *exact, r.revision == before.latest.revision, r.deleted == 0, r.event_id == before.latest.event_id
+                )
+                .exists()
+                & ~select(r.revision).where(*exact, r.revision > before.latest.revision).exists()
+            )
+        outcome = await self._session.execute(
+            delete(ClaimRelationORM).where(
+                ClaimRelationORM.source_id == key[0],
+                ClaimRelationORM.target_id == key[1],
+                ClaimRelationORM.relation_type == key[2],
+                ClaimRelationORM.created_at == before.canonical_created_at.replace(tzinfo=None),
+                fence,
+            )
+        )
+        if outcome.rowcount != 1:
+            row = await self._session.get(ClaimRelationORM, key, populate_existing=True)
+            observed = await revisions.state(key, row.created_at if row else None)
+            if observed == before:
+                raise RelationRevisionStorageError()
+            raise RelationRevisionConflict(expected_revision, observed.revision, key)
+        return await revisions.append(
+            key, before=before, deleted=True, relation_created_at=before.canonical_created_at, event=event
+        )
 
     async def get_dependents(
         self,

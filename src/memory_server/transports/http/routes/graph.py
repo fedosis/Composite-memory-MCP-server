@@ -201,6 +201,11 @@ class RelationCursorCodec:
 
 Parser = Callable[[Request, bytes, Principal], d.GraphReadCommand]
 ResultValidator = Callable[[d.GraphReadResult], d.GraphReadResult]
+ETag = Callable[[d.GraphReadResult], str | None]
+
+
+def _no_etag(value: d.GraphReadResult) -> None:
+    return None
 
 
 @dataclass(frozen=True)
@@ -208,6 +213,7 @@ class GraphReadRouteSpec(ReadRouteSpec):
     parse: Parser
     validate_result: ResultValidator
     cursor_codec: RelationCursorCodec | None = None
+    etag: ETag = _no_etag
 
 
 def parse_get_values(request: Request, body: bytes, *, model: type[d.DTO], lists: frozenset[str]) -> dict[str, object]:
@@ -345,6 +351,23 @@ def validate_relation(value: d.GraphReadResult) -> d.Relation:
     return d.Relation.model_validate(value.model_dump(), strict=True)
 
 
+def relation_etag(value: d.GraphReadResult) -> str:
+    try:
+        if type(value) is not d.Relation:
+            raise ValueError
+        item = validate_relation(value)
+        if (
+            item.canonical is not True
+            or type(item.revision) is not int
+            or not 1 <= item.revision <= 9223372036854775807
+            or decode_relation_id(item.id) != (item.source_id, item.target_id, item.relation_type)
+        ):
+            raise ValueError
+        return f'"r:{item.id}:{item.revision}"'
+    except (ValidationError, ValueError, TypeError, AttributeError, HttpError):
+        raise HttpError("E_INTERNAL") from None
+
+
 def validate_graph_result(value: d.GraphReadResult) -> d.GraphResult:
     return d.GraphResult.model_validate(value.model_dump(), strict=True)
 
@@ -358,6 +381,7 @@ GRAPH_READ_ROUTE_SPECS: Final = MappingProxyType(
             CATALOG.by_operation[operation].permission,
             parser,
             validator,
+            etag=relation_etag if operation == "relations.get" else _no_etag,
         )
         for operation, parser, validator in (
             ("relations.for_memory", parse_relations_for_memory, validate_relation_page),

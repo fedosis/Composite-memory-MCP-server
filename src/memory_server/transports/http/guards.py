@@ -182,8 +182,13 @@ class Guard:
                 result = spec.validate_result(result)
                 response = JSONResponse(result.model_dump(mode='json'))
                 from .routes.beliefs import BeliefReadRouteSpec
+                from .routes.graph import GraphReadRouteSpec
 
                 if type(spec) is BeliefReadRouteSpec:
+                    tag = spec.etag(result)
+                    if tag is not None:
+                        response.headers["ETag"] = tag
+                elif type(spec) is GraphReadRouteSpec:
                     tag = spec.etag(result)
                     if tag is not None:
                         response.headers["ETag"] = tag

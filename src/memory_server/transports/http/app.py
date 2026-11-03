@@ -93,6 +93,7 @@ class HttpApp:
                     and canonical is not None
                     and spec.parse is canonical.parse
                     and spec.validate_result is canonical.validate_result
+                    and spec.etag is canonical.etag
                     and (
                         spec.operation not in {"relations.list", "relations.for_memory"}
                         or type(spec.cursor_codec) is RelationCursorCodec

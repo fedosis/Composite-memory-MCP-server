@@ -19,6 +19,7 @@ from storage.repositories.relation_repo import (
     RelationRepository,
     _relation_wire_ok,
 )
+from storage.repositories.relation_revision_repo import RelationRevisionRepository
 
 from memory_server.application.gateway_retrieval import NativeCustody
 from memory_server.application.memory_read_service import ReadResources, b64, project_for_caller, unb64, utc
@@ -170,14 +171,16 @@ def decode_projection_id(value: str) -> tuple[str, str, Literal["[MASKED]"]]:
         raise HttpError("E_VALIDATION") from None
 
 
-def map_relation(row) -> d.Relation:
+def map_relation(row, revision: int) -> d.Relation:
+    if type(revision) is not int or not 1 <= revision <= 9223372036854775807:
+        raise HttpError("E_INTERNAL")
     return d.Relation(
         id=relation_id(row.source_id, row.target_id, row.relation_type),
         source_id=row.source_id,
         target_id=row.target_id,
         relation_type=row.relation_type,
         canonical=True,
-        revision=None,
+        revision=revision,
         created_at=utc(row.created_at),
     )
 
@@ -204,7 +207,9 @@ def map_entity_node(representative: str) -> d.GraphNode:
     )
 
 
-def map_canonical_edge(row) -> d.GraphEdge:
+def map_canonical_edge(row, revision: int) -> d.GraphEdge:
+    if type(revision) is not int or not 1 <= revision <= 9223372036854775807:
+        raise HttpError("E_INTERNAL")
     ident = relation_id(row.source_id, row.target_id, row.relation_type)
     return d.GraphEdge(
         id=ident,
@@ -213,7 +218,7 @@ def map_canonical_edge(row) -> d.GraphEdge:
         relation_type=row.relation_type,
         canonical=True,
         canonical_relation_id=ident,
-        revision=None,
+        revision=revision,
     )
 
 
@@ -259,7 +264,15 @@ def map_graph_result(
         len(node_ids) != len(set(node_ids))
         or len(edge_ids) != len(set(edge_ids))
         or any(
-            edge.source_id not in node_ids or edge.target_id not in node_ids or edge.revision is not None
+            edge.source_id not in node_ids
+            or edge.target_id not in node_ids
+            or (
+                not (type(edge.revision) is int and 1 <= edge.revision <= 9223372036854775807)
+                if edge.canonical is True
+                else edge.revision is not None
+                if edge.canonical is False
+                else True
+            )
             for edge in edges
         )
         or any(any(vertex not in node_ids for vertex in path) for path in paths)
@@ -371,7 +384,10 @@ class GraphReadService:
                                 row = await repo.get_by_tuple(*ident, work=work)
                                 if row is None:
                                     raise HttpError("E_NOT_FOUND")
-                                return map_relation(row)
+                                revisions = await RelationRevisionRepository(session).revisions_for_rows(
+                                    (row,), maximum=200
+                                )
+                                return map_relation(row, revisions[(row.source_id, row.target_id, row.relation_type)])
                             if ident is not None:
                                 await resources.provider.read_memory(session, ident)
                             page = await repo.read_keyset_page(
@@ -383,6 +399,7 @@ class GraphReadService:
                             )
                             more = len(page.rows) > command.payload.limit
                             rows = page.rows[: command.payload.limit]
+                            revisions = await RelationRevisionRepository(session).revisions_for_rows(rows, maximum=200)
                             cursor = None
                             if more:
                                 cursor = self.cursor_codec.issue(
@@ -395,7 +412,10 @@ class GraphReadService:
                                     expires_at=state.expires_at if state else None,
                                 )
                             return d.Page[d.Relation](
-                                items=[map_relation(row) for row in rows],
+                                items=[
+                                    map_relation(row, revisions[(row.source_id, row.target_id, row.relation_type)])
+                                    for row in rows
+                                ],
                                 has_more=more,
                                 next_cursor=cursor,
                                 request_id=ctx.request_id,
@@ -685,9 +705,17 @@ class GraphReadService:
                     projection_nodes, projection_edges, representatives = await self._projection(
                         repo, window, query, ledger, work
                     )
+                    async with repo._read_window(work):
+                        revisions = await RelationRevisionRepository(session).revisions_for_rows(
+                            canonical_rows, maximum=1000
+                        )
+                        canonical_edges = [
+                            map_canonical_edge(row, revisions[(row.source_id, row.target_id, row.relation_type)])
+                            for row in canonical_rows
+                        ]
 
                 nodes = {**canonical_nodes, **projection_nodes}
-                edges = {edge.id: edge for edge in (map_canonical_edge(row) for row in canonical_rows)}
+                edges = {edge.id: edge for edge in canonical_edges}
                 edges.update({edge.id: edge for edge in projection_edges})
                 wire_roots = []
                 for root in final_roots:
