@@ -1290,6 +1290,8 @@ async def test_virtual_legacy_delete_fences_utc_instant_not_timestamp_format(rel
     assert result.relation.revision == 2 and result.relation.created_at == expected
     assert await sql(state, "SELECT count(*) FROM claim_relations") == [(0,)]
     assert await sql(state, "SELECT revision,deleted FROM relation_revisions") == [(2, 1)]
+
+
 # S16P: publication receipts are tested across real disk/native/lease boundaries.
 @pytest.fixture
 async def s16p_env(tmp_path):
