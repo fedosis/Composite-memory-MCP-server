@@ -2224,3 +2224,126 @@ async def test_s16p_abort_consumed_or_missing_is_noop(s16p_env, monkeypatch, mod
             with pytest.raises(Exception) as error:
                 refresh(descriptor, receipt=receipt, proof=proof)
             assert _s16p_code(error.value) == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_ABORT_NOOP"
+
+
+# S16B: exercise the real admitted worker, canonical S12 queue and durable graph.
+async def _s16b_process(state, entry_id):
+    from storage.outbox import OutboxEntry, OutboxEntryORM, OutboxRepository
+
+    async with state.deps.leases.acquire(context(state)) as scope:
+        worker = scope.runtime.dependencies.outbox_worker
+        async with worker._session_factory() as db:
+            row = await db.get(OutboxEntryORM, entry_id, populate_existing=True)
+            outcome = await worker._process_entry(db, OutboxRepository(db), OutboxEntry.from_orm(row))
+            await db.commit()
+        async with worker._session_factory() as db:
+            row = await db.get(OutboxEntryORM, entry_id, populate_existing=True)
+            return outcome, row.status, row.error
+
+
+async def _s16b_queue(state):
+    return [
+        row[0]
+        for row in await sql(state, "SELECT id FROM outbox_entries WHERE operation='relation_sync' ORDER BY rowid")
+    ]
+
+
+async def _s16b_graph(state):
+    async with state.deps.leases.acquire(context(state)) as scope:
+        graph = scope.runtime.dependencies.graph
+        return graph, graph._snapshot_path
+
+
+def _s16b_matching(data, source=None, target=None, kind="supports"):
+    return [
+        e
+        for e in data["edges"]
+        if (e["source_id"], e["target_id"], e["relation"]) == (source or ident(1), target or ident(2), kind)
+    ]
+
+
+def _s16b_reopen(path):
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    reopened = SimpleGraph(path)
+    reopened.load_snapshot()
+    return reopened.to_dict()
+
+
+async def test_outbox_reordered_create_delete_recreate_converges_to_latest(relations):
+    import itertools
+
+    state = relations
+    await write(state)
+    await write(state, command(deleted=True))
+    await write(state)
+    queue = await _s16b_queue(state)
+    before = await snapshot(state)
+    graph, path = await _s16b_graph(state)
+    for order in itertools.permutations(queue):
+        for entry_id in (*order, order[0]):
+            outcome, status, _ = await _s16b_process(state, entry_id)
+            assert outcome == status == "completed", "S16B_LATEST_STATE"
+            assert len(_s16b_matching(graph.to_dict())) == len(_s16b_matching(_s16b_reopen(path))) == 1, (
+                "S16B_LATEST_STATE"
+            )
+            after = await snapshot(state)
+            assert all(after[k] == before[k] for k in before if k != "outbox_entries"), "S16B_LATEST_STATE"
+    await write(state, command(deleted=True, revision=3))
+    for entry_id in (*queue, (await _s16b_queue(state))[-1]):
+        outcome, status, _ = await _s16b_process(state, entry_id)
+        assert outcome == status == "completed" and not _s16b_matching(_s16b_reopen(path)), "S16B_LATEST_STATE"
+
+
+async def test_outbox_exact_type_removal_keeps_parallel_and_reverse_edges(relations):
+    state = relations
+    await write(state)
+    await write(state, command(deleted=True))
+    graph, path = await _s16b_graph(state)
+    nodes = {
+        ident(i): dict(id=ident(i), type="belief", name="preserved", attributes={"generation": i}) for i in (1, 2, 3)
+    }
+    edges = [
+        dict(source_id=ident(1), target_id=ident(2), relation=k, attributes={"copy": i})
+        for i, k in enumerate(("supports", "supports", "supports", "contradicts", "derived_from", "derives", "entity"))
+    ]
+    edges[2]["attributes"] = {"canonical": True}
+    edges += [dict(source_id=ident(2), target_id=ident(1), relation="supports", attributes={"reverse": True})]
+    async with state.deps.leases.acquire(context(state)):
+        graph.from_dict(dict(nodes=nodes, edges=edges))
+    before = _s16b_reopen(path)
+    await _s16b_process(state, (await _s16b_queue(state))[0])
+    expected = dict(nodes=before["nodes"], edges=[e for e in before["edges"] if e not in _s16b_matching(before)])
+    assert graph.to_dict() == _s16b_reopen(path) == expected, "S16B_EXACT_TYPE"
+    assert (await sql(state, "SELECT status FROM outbox_entries WHERE operation='relation_sync' ORDER BY rowid"))[
+        0
+    ] == ("completed",), "S16B_EXACT_TYPE"
+
+
+async def test_relation_worker_typed_errors_have_sanitized_str(relations, monkeypatch, caplog):
+    state = relations
+    await write(state)
+    queue = await _s16b_queue(state)
+    graph, path = await _s16b_graph(state)
+    canary = "/private/S16B_CANARY SELECT credential payload reason"
+
+    def broken(*args, **kwargs):
+        raise RuntimeError(canary)
+
+    # Existing boundary on BASE too: do not require an absent strict symbol.
+    monkeypatch.setattr(os, "replace", broken)
+    outcome, status, error = await _s16b_process(state, queue[0])
+    allowed = {
+        "RELATION_PAYLOAD_INVALID",
+        "RELATION_INVARIANT_FAILED",
+        "RELATION_GRAPH_UNAVAILABLE",
+        "RELATION_PROJECTION_LIMIT",
+        "RELATION_PROJECTION_TIMEOUT",
+        "RELATION_PERSISTENCE_FAILED",
+        "RELATION_SNAPSHOT_INVALID",
+        "RELATION_READBACK_FAILED",
+        "Relation projection failed",
+    }
+    assert outcome == status == "pending" and error in allowed, "S16B_SANITIZED_ERROR"
+    assert canary not in error + caplog.text and all(r.exc_info is None for r in caplog.records), "S16B_SANITIZED_ERROR"
+    assert not path.exists() and not _s16b_matching(graph.to_dict()), "S16B_SANITIZED_ERROR"
