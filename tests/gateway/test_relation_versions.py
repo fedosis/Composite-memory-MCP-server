@@ -2347,3 +2347,572 @@ async def test_relation_worker_typed_errors_have_sanitized_str(relations, monkey
     assert outcome == status == "pending" and error in allowed, "S16B_SANITIZED_ERROR"
     assert canary not in error + caplog.text and all(r.exc_info is None for r in caplog.records), "S16B_SANITIZED_ERROR"
     assert not path.exists() and not _s16b_matching(graph.to_dict()), "S16B_SANITIZED_ERROR"
+
+
+async def _s16b_until(predicate):
+    async with asyncio.timeout(10):
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+
+async def test_strict_graph_capacity_wait_bounded_by_deadline(relations, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    import memory_server.providers.graph_provider as gp
+
+    state = relations
+    await write(state)
+    queue = await _s16b_queue(state)
+    before = await snapshot(state)
+    release = threading.Event()
+    async with state.deps.leases.acquire(context(state)) as scope:
+        runtime = scope.runtime
+        graph = runtime.dependencies.graph
+        path = graph._snapshot_path
+        handles = [await runtime.submit_native(release.wait, kind="s16b-capacity") for _ in range(16)]
+        task = asyncio.create_task(_s16b_process(state, queue[0]))
+        try:
+            await _s16b_until(
+                lambda: task.done() or any(r.state == "WAITING_CAPACITY" for r in runtime._owned_natives.values())
+            )
+            pending = not task.done()
+            monkeypatch.setattr(gp, "time", SimpleNamespace(monotonic=lambda: monotonic() + 120))
+            await asyncio.sleep(0.01)
+            held = not task.done()
+        finally:
+            release.set()
+            await asyncio.gather(*(h.result() for h in handles))
+        result = await task
+        await _s16b_until(lambda: not runtime._owned_natives)
+        assert pending and held and result == ("pending", "pending", "RELATION_PROJECTION_TIMEOUT"), (
+            "S16B_CAPACITY_DEADLINE"
+        )
+        assert not path.exists() and not graph.to_dict()["edges"], "S16B_CAPACITY_DEADLINE"
+        assert not graph._projection_binding.manager._projection_calls, "S16B_CAPACITY_DEADLINE"
+    after = await snapshot(state)
+    assert all(before[k] == after[k] for k in before if k != "outbox_entries"), "S16B_CAPACITY_DEADLINE"
+
+
+async def test_strict_graph_deadline_after_mutate_settles_then_timeout(relations, monkeypatch):
+    from types import SimpleNamespace
+
+    import memory_server.providers.graph_provider as gp
+
+    state = relations
+    await write(state)
+    queue = await _s16b_queue(state)
+    graph, path = await _s16b_graph(state)
+    replay = graph._replay_op
+    events = []
+
+    def expire(staging, op):
+        replay(staging, op)
+        events.append("mutated")
+        monkeypatch.setattr(gp, "time", SimpleNamespace(monotonic=lambda: monotonic() + 120))
+
+    monkeypatch.setattr(graph, "_replay_op", expire)
+    outcome = await _s16b_process(state, queue[0])
+    assert events == ["mutated"] and outcome == ("pending", "pending", "RELATION_PROJECTION_TIMEOUT"), (
+        "S16B_MUTATE_SETTLE_TIMEOUT"
+    )
+    assert len(_s16b_matching(_s16b_reopen(path))) == 1, "S16B_MUTATE_SETTLE_TIMEOUT"
+    assert not graph._projection_binding.manager._projection_calls, "S16B_MUTATE_SETTLE_TIMEOUT"
+
+
+async def test_cancel_after_native_start_retains_custody(relations, monkeypatch):
+    import threading
+
+    state = relations
+    await write(state)
+    queue = await _s16b_queue(state)
+    graph, path = await _s16b_graph(state)
+    started, release = threading.Event(), threading.Event()
+    original = graph._replay_op
+
+    def pause(staging, op):
+        started.set()
+        assert release.wait(10), "S16B_CANCELLED_CUSTODY"
+        return original(staging, op)
+
+    monkeypatch.setattr(graph, "_replay_op", pause)
+    async with state.deps.leases.acquire(context(state)) as scope:
+        engine_path = scope.runtime.dependencies.outbox_worker._engine.url.database
+        runtime = scope.runtime
+        task = asyncio.create_task(_s16b_process(state, queue[0]))
+        try:
+            await _s16b_until(lambda: started.is_set() or task.done())
+            task.cancel()
+            await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.sleep(0.01)
+            retained = started.is_set() and not task.done()
+            with sqlite3.connect(engine_path, timeout=0) as competing:
+                try:
+                    competing.execute("UPDATE relation_revisions SET revision=revision")
+                    blocked = False
+                except sqlite3.OperationalError:
+                    blocked = True
+        finally:
+            release.set()
+        cancelled = False
+        try:
+            await task
+        except asyncio.CancelledError:
+            cancelled = True
+        await _s16b_until(lambda: not runtime._owned_natives)
+        assert retained and blocked and cancelled, "S16B_CANCELLED_CUSTODY"
+        assert len(_s16b_matching(_s16b_reopen(path))) == 1, "S16B_CANCELLED_CUSTODY"
+        assert await sql(state, "SELECT status,retry_count FROM outbox_entries WHERE operation='relation_sync'") == [
+            ("pending", 0)
+        ], "S16B_CANCELLED_CUSTODY"
+        assert not graph._projection_binding.manager._projection_calls, "S16B_CANCELLED_CUSTODY"
+
+
+async def test_strict_graph_repeat_and_masked_nodes(relations):
+    state = relations
+    await write(state)
+    entry = (await _s16b_queue(state))[0]
+    graph, path = await _s16b_graph(state)
+    for _ in range(10):
+        assert (await _s16b_process(state, entry))[:2] == ("completed", "completed"), "S16B_IDEMPOTENT_MASKED"
+        raw = _s16b_reopen(path)
+        assert len(_s16b_matching(raw)) == 1, "S16B_IDEMPOTENT_MASKED"
+        assert raw["nodes"] == {
+            ident(i): dict(id=ident(i), type="belief", name="[MASKED]", attributes={}) for i in (1, 2)
+        }, "S16B_IDEMPOTENT_MASKED"
+        assert graph.to_dict() == raw, "S16B_IDEMPOTENT_MASKED"
+    await write(state, command(deleted=True))
+    for _ in range(10):
+        assert (await _s16b_process(state, entry))[0] == "completed", "S16B_IDEMPOTENT_MASKED"
+        assert _s16b_reopen(path)["nodes"] == raw["nodes"] and not _s16b_matching(graph.to_dict()), (
+            "S16B_IDEMPOTENT_MASKED"
+        )
+
+
+async def test_worker_holds_sqlite_fence_until_native_apply_settles(relations, monkeypatch):
+    import threading
+
+    state = relations
+    await write(state)
+    graph, _ = await _s16b_graph(state)
+    started, release = threading.Event(), threading.Event()
+    replay = graph._replay_op
+
+    def barrier(staging, op):
+        started.set()
+        assert release.wait(10), "S16B_FENCE_HELD"
+        replay(staging, op)
+
+    monkeypatch.setattr(graph, "_replay_op", barrier)
+    async with state.deps.leases.acquire(context(state)) as scope:
+        engine = scope.runtime.dependencies.outbox_worker._engine
+        task = asyncio.create_task(_s16b_process(state, (await _s16b_queue(state))[0]))
+        try:
+            await _s16b_until(started.is_set)
+            with sqlite3.connect(engine.url.database, timeout=0) as competing:
+                try:
+                    competing.execute("UPDATE relation_revisions SET revision=revision")
+                    blocked = False
+                except sqlite3.OperationalError:
+                    blocked = True
+            assert blocked and not task.done(), "S16B_FENCE_HELD"
+        finally:
+            release.set()
+            await task
+        with sqlite3.connect(engine.url.database, timeout=0) as competing:
+            competing.execute("UPDATE relation_revisions SET revision=revision")
+
+
+async def test_relation_worker_cancelled_error_retains_custody(relations, monkeypatch):
+    await test_cancel_after_native_start_retains_custody(relations, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "no_router",
+        "no_strict",
+        "no_native",
+        "memory_only",
+        "writer_false",
+        "permission",
+        "pre_replace",
+        "readback_false",
+    ],
+)
+async def test_strict_graph_failure_never_marks_completed(relations, monkeypatch, fault):
+    from storage.outbox import OutboxRepository
+
+    state = relations
+    await write(state)
+    before = await snapshot(state)
+    graph, path = await _s16b_graph(state)
+    entry_id = (await _s16b_queue(state))[0]
+    async with state.deps.leases.acquire(context(state)):
+        graph.from_dict(dict(nodes={}, edges=[]))
+    disk_before = path.read_bytes()
+    completions = []
+    completed = OutboxRepository.mark_completed
+
+    async def track(self, entry_id):
+        completions.append(entry_id)
+        return await completed(self, entry_id)
+
+    def fail(*args, **kwargs):
+        raise PermissionError("S16B_FAULT_CANARY /private/path")
+
+    monkeypatch.setattr(OutboxRepository, "mark_completed", track)
+    async with state.deps.leases.acquire(context(state)) as scope:
+        worker = scope.runtime.dependencies.outbox_worker
+        if fault == "no_router":
+            monkeypatch.setattr(worker, "_graph_router", None)
+        elif fault == "no_strict":
+            monkeypatch.setattr(graph, "reconcile_claim_relation", None)
+        elif fault == "no_native":
+            monkeypatch.setattr(worker, "_native_submitter", None)
+        elif fault == "memory_only":
+            monkeypatch.setattr(graph, "_snapshot_path", None)
+        elif fault == "writer_false":
+            monkeypatch.setattr(graph, "_write_relation_snapshot_strict", lambda *a, **kw: False)
+        elif fault in ("permission", "pre_replace"):
+            if fault == "permission":
+                open_fn = os.open
+
+                def denied(name, flags, *args, **kwargs):
+                    if str(name).endswith(".tmp"):
+                        return fail()
+                    return open_fn(name, flags, *args, **kwargs)
+
+                monkeypatch.setattr(os, "open", denied)
+            else:
+                monkeypatch.setattr(os, "replace", fail)
+        elif fault == "readback_false":
+            reader = graph._read_relation_snapshot_strict
+
+            def wrong(*args):
+                raw = reader(*args)
+                return dict(nodes=raw["nodes"], edges=[])
+
+            monkeypatch.setattr(graph, "_read_relation_snapshot_strict", wrong)
+        result = await _s16b_process(state, entry_id)
+        # Post-replace uncertainty deliberately invalidates the next lease;
+        # inspect canonical SQL through this still-held supplied runtime.
+        async with worker._session_factory() as db:
+            after = {k: (await db.execute(text(f'SELECT * FROM "{k}" ORDER BY rowid'))).all() for k in before}
+    assert result[:2] == ("pending", "pending") and not completions, "S16B_STRICT_FAILURE"
+    assert all(before[k] == after[k] for k in before if k != "outbox_entries"), "S16B_STRICT_FAILURE"
+    assert "S16B_FAULT_CANARY" not in result[2], "S16B_STRICT_FAILURE"
+    if fault != "readback_false":
+        assert path.read_bytes() == disk_before and not graph.to_dict()["edges"], "S16B_STRICT_FAILURE"
+
+
+async def test_strict_graph_persisted_readback_and_reopen(relations, monkeypatch):
+    from storage.outbox import OutboxRepository
+
+    state = relations
+    await write(state)
+    graph, path = await _s16b_graph(state)
+    completed = OutboxRepository.mark_completed
+    observed = []
+
+    async def verify_first(self, entry):
+        independent = json.loads(path.read_bytes())
+        observed.append(independent)
+        assert independent == graph.to_dict() == _s16b_reopen(path), "S16B_DURABLE_READBACK"
+        assert len(_s16b_matching(independent)) == 1, "S16B_DURABLE_READBACK"
+        return await completed(self, entry)
+
+    monkeypatch.setattr(OutboxRepository, "mark_completed", verify_first)
+    assert (await _s16b_process(state, (await _s16b_queue(state))[0]))[0] == "completed" and observed, (
+        "S16B_DURABLE_READBACK"
+    )
+
+
+@pytest.mark.parametrize("dimension", ["pair", "nodes", "edges", "bytes"])
+async def test_strict_graph_pair_and_snapshot_bounds(relations, monkeypatch, dimension):
+    import memory_server.providers.graph_provider as gp
+
+    state = relations
+    await write(state)
+    graph, path = await _s16b_graph(state)
+    nodes = {ident(i): dict(id=ident(i), type="belief", name="kept", attributes={}) for i in (1, 2)}
+    edges = []
+    if dimension == "pair":
+        edges = [dict(source_id=ident(1), target_id=ident(2), relation="unrelated", attributes={}) for _ in range(17)]
+    elif dimension == "nodes":
+        nodes.update({f"n{i}": dict(id=f"n{i}", type="entity", name="kept", attributes={}) for i in range(9999)})
+    elif dimension == "edges":
+        nodes["other"] = dict(id="other", type="entity", name="kept", attributes={})
+        edges = [dict(source_id="other", target_id="other", relation="unrelated", attributes={}) for _ in range(20001)]
+    else:
+        nodes[ident(1)]["name"] = "x" * 16777217
+    async with state.deps.leases.acquire(context(state)):
+        graph.from_dict(dict(nodes=nodes, edges=edges))
+    before = path.read_bytes()
+    memory = graph.to_dict()
+    builds = []
+    builder = graph._build_state_from
+
+    def tracked(raw):
+        builds.append(True)
+        return builder(raw)
+
+    monkeypatch.setattr(graph, "_build_state_from", tracked)
+    result = await _s16b_process(state, (await _s16b_queue(state))[0])
+    assert result == ("pending", "pending", "RELATION_PROJECTION_LIMIT"), "S16B_BOUND_PRECOPY"
+    assert not builds and path.read_bytes() == before and graph.to_dict() == memory, "S16B_BOUND_PRECOPY"
+    assert gp._MAX_SNAPSHOT_BYTES == 256 * 1024 * 1024, "S16B_BOUND_PRECOPY"
+
+
+@pytest.mark.parametrize(
+    "fault", ["bool_v", "bool_revision", "event", "future", "extra", "binding", "missing_endpoint"]
+)
+async def test_relation_worker_binding_invariants_and_sql_budget(relations, monkeypatch, fault):
+    from storage.outbox import OutboxEntry, OutboxEntryORM, OutboxRepository
+
+    state = relations
+    await write(state)
+    entry_id = (await _s16b_queue(state))[0]
+    graph, path = await _s16b_graph(state)
+    statements = []
+    async with state.deps.leases.acquire(context(state)) as scope:
+        worker = scope.runtime.dependencies.outbox_worker
+        if fault == "missing_endpoint":
+            await sql(state, "DELETE FROM beliefs WHERE id=:id", dict(id=ident(2)))
+        async with worker._session_factory() as db:
+            row = await db.get(OutboxEntryORM, entry_id)
+            entry = OutboxEntry.from_orm(row)
+            p = dict(entry.payload)
+            if fault == "bool_v":
+                p["v"] = True
+            elif fault == "bool_revision":
+                p["revision"] = True
+            elif fault == "event":
+                p["event_id"] = str(uuid4())
+            elif fault == "future":
+                p["revision"] = 999
+            elif fault == "extra":
+                p["reason"] = "forbidden"
+            elif fault == "binding":
+                entry.record_id = ident(3)
+            entry.payload_json = json.dumps(p)
+            conn = await db.connection()
+
+            def trace(conn, cursor, statement, *args):
+                statements.append(statement)
+
+            event.listen(conn.sync_connection, "before_cursor_execute", trace)
+            try:
+                result = await worker._process_entry(db, OutboxRepository(db), entry)
+                await db.commit()
+            finally:
+                event.remove(conn.sync_connection, "before_cursor_execute", trace)
+    assert result == "pending" and not path.exists() and not graph.to_dict()["edges"], "S16B_BINDING_BUDGET"
+    assert len(statements) <= 64, "S16B_BINDING_BUDGET"
+    if fault in ("event", "future", "missing_endpoint"):
+        assert statements[0].startswith("UPDATE relation_revisions SET revision=revision"), "S16B_BINDING_BUDGET"
+
+
+async def test_strict_graph_exact_intent_replay_preserves_neighbours(relations):
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    state = relations
+    await write(state)
+    graph, path = await _s16b_graph(state)
+    nodes = {ident(i): dict(id=ident(i), type="belief", name="kept", attributes={"v": i}) for i in (1, 2)}
+    edges = [dict(source_id=ident(2), target_id=ident(1), relation="contradicts", attributes={"generation": 2})]
+    async with state.deps.leases.acquire(context(state)):
+        graph.from_dict(dict(nodes=nodes, edges=edges))
+    # The new replay branch must be pure and use only exact directed/type intent.
+    staging = SimpleGraph()
+    staging.from_dict(dict(nodes=nodes, edges=edges))
+    for live in (True, True, False, False):
+        graph._replay_op(
+            staging, ("reconcile_claim_relation", ident(1), ident(2), "supports", live, "belief", "belief")
+        )
+        assert len(_s16b_matching(staging.to_dict())) == int(live), "S16B_INTENT_REPLAY"
+        assert [e for e in staging.to_dict()["edges"] if e not in _s16b_matching(staging.to_dict())] == edges, (
+            "S16B_INTENT_REPLAY"
+        )
+        assert staging.to_dict()["nodes"] == nodes, "S16B_INTENT_REPLAY"
+    assert (await _s16b_process(state, (await _s16b_queue(state))[0]))[0] == "completed", "S16B_INTENT_REPLAY"
+    assert _s16b_reopen(path)["nodes"] == nodes and edges[0] in _s16b_reopen(path)["edges"], "S16B_INTENT_REPLAY"
+
+
+async def test_relation_b_counts_and_frozen_boundaries(relations):
+    state = relations
+    marker = "S16B_SCOPE_COUNTS"
+    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 6, 30), (
+        marker
+    )
+    assert len(state.app.routes) == 36 and not {"relations.create", "relations.delete"} & set(state.deps.ports), marker
+    base = "2896fae938feb904cdb70f7461a1b9fcc26cf6f5"
+    paths = {
+        "storage/outbox_worker.py": (
+            "_blocking",
+            "_provider_write_error",
+            "_process_index_fact",
+            "_process_index_decision",
+            "_process_index_skill",
+            "_process_index_belief",
+            "_poll_once",
+        ),
+        "src/memory_server/providers/graph_provider.py": (
+            "get_edge",
+            "delete_edge",
+            "_persist_snapshot",
+            "_write_snapshot",
+            "_managed_persist",
+            "_snapshot_publication",
+            "_read_state_file",
+            "load_snapshot",
+        ),
+    }
+    for path, names in paths.items():
+        original = subprocess.check_output(["git", "show", f"{base}:{path}"], cwd=ROOT, text=True)
+        current = (ROOT / path).read_text()
+        for name in names:
+
+            def source(value):
+                node = next(
+                    n
+                    for n in ast.walk(ast.parse(value))
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+                )
+                return "".join(value.splitlines(keepends=True)[node.lineno - 1 : node.end_lineno])
+
+            assert source(original) == source(current), (marker, path, name)
+    worker = (ROOT / "storage/outbox_worker.py").read_text()
+    frozen = subprocess.check_output(
+        ["git", "show", f"{base}:storage/outbox_worker.py"], cwd=ROOT, text=True
+    ).splitlines(keepends=True)[428:450]
+    assert "".join(frozen) in worker, marker
+
+
+async def _s16b_receipt_rounds(state, monkeypatch, *, live, rounds):
+    from storage.outbox import OutboxRepository
+
+    import memory_server.providers.graph_provider as gp
+
+    await write(state)
+    if not live:
+        await write(state, command(deleted=True))
+    entry = (await _s16b_queue(state))[0]
+    graph, path = await _s16b_graph(state)
+    binding = graph._projection_binding
+    manager = binding.manager
+    trace, receipts = [], []
+    mint = gp._SnapshotPublication._mint
+    refresh = manager.refresh_projection_identity
+    completed = OutboxRepository.mark_completed
+    verify = graph.verify_claim_relation
+    original_publish = graph.reconcile_claim_relation
+
+    def issue(publication):
+        result = mint(publication)
+        receipts.append(publication.receipt)
+        trace.append("mint")
+        return result
+
+    def consume(descriptor, *, receipt, proof=None):
+        trace.append("refresh")
+        result = refresh(descriptor, receipt=receipt, proof=proof)
+        trace.append("consume")
+        return result
+
+    def published(*args, **kwargs):
+        original_publish(*args, **kwargs)
+        trace.append("native_return")
+
+    def readback(*args, **kwargs):
+        verify(*args, **kwargs)
+        trace.append("post_refresh_readback")
+
+    async def complete(self, entry_id):
+        trace.append("mark_completed")
+        return await completed(self, entry_id)
+
+    monkeypatch.setattr(gp._SnapshotPublication, "_mint", issue)
+    monkeypatch.setattr(manager, "refresh_projection_identity", consume)
+    monkeypatch.setattr(graph, "reconcile_claim_relation", published)
+    monkeypatch.setattr(graph, "verify_claim_relation", readback)
+    monkeypatch.setattr(OutboxRepository, "mark_completed", complete)
+    marker = "S16B_STRICT_RECEIPT_NEXT_LEASE"
+    for i in range(rounds):
+        trace.clear()
+        result = await _s16b_process(state, entry)
+        assert result[:2] == ("completed", "completed"), marker
+        assert trace == ["mint", "native_return", "refresh", "consume", "post_refresh_readback", "mark_completed"], (
+            marker
+        )
+        assert len(receipts) == i + 1 and receipts[-1].snapshot.closed and receipts[-1].lock.closed, marker
+        assert not manager._projection_calls, marker
+        raw = _s16b_reopen(path)
+        assert raw == graph.to_dict() and len(_s16b_matching(raw)) == int(live), marker
+        async with state.deps.leases.acquire(context(state)) as scope:
+            assert scope.runtime.dependencies.graph is graph, marker
+        evidence = dict(binding.state[0])
+        with pytest.raises(Exception):
+            refresh(binding.descriptor, receipt=receipts[-1], proof=receipts[-1].proof)
+        assert binding.state[0] == evidence, "S16B_REPEAT_RECEIPT_IDEMPOTENT"
+    assert len({id(r) for r in receipts}) == rounds, "S16B_REPEAT_RECEIPT_IDEMPOTENT"
+
+
+@pytest.mark.parametrize("live", [False, True])
+async def test_relation_strict_publication_receipt_refresh_next_lease(relations, monkeypatch, live):
+    await _s16b_receipt_rounds(relations, monkeypatch, live=live, rounds=1)
+
+
+@pytest.mark.parametrize("live", [False, True])
+async def test_relation_strict_repeat_consumes_fresh_receipt(relations, monkeypatch, live):
+    await _s16b_receipt_rounds(relations, monkeypatch, live=live, rounds=10)
+
+
+@pytest.mark.parametrize("fault", ["refresh", "post_refresh_readback"])
+async def test_relation_refresh_failure_never_marks_completed(relations, monkeypatch, fault):
+    from storage.outbox import OutboxRepository
+
+    import memory_server.providers.graph_provider as gp
+
+    state = relations
+    await write(state)
+    entry = (await _s16b_queue(state))[0]
+    graph, path = await _s16b_graph(state)
+    binding = graph._projection_binding
+    manager = binding.manager
+    before = dict(binding.state[0])
+    receipts, completions = [], []
+    mint = gp._SnapshotPublication._mint
+
+    def issue(publication):
+        result = mint(publication)
+        receipts.append(publication.receipt)
+        return result
+
+    def refuse(*args, **kwargs):
+        raise gp.SimpleGraph.StrictRelationProjectionError("RELATION_READBACK_FAILED") from None
+
+    async def forbidden(self, entry_id):
+        completions.append(entry_id)
+
+    monkeypatch.setattr(gp._SnapshotPublication, "_mint", issue)
+    monkeypatch.setattr(OutboxRepository, "mark_completed", forbidden)
+    if fault == "refresh":
+        monkeypatch.setattr(manager, "refresh_projection_identity", refuse)
+    else:
+        monkeypatch.setattr(graph, "verify_claim_relation", refuse)
+    result = await _s16b_process(state, entry)
+    marker = "S16B_REFRESH_NO_COMPLETION"
+    assert result[:2] == ("pending", "pending") and not completions, marker
+    assert len(receipts) == 1 and receipts[0].snapshot.closed and receipts[0].lock.closed, marker
+    assert not manager._projection_calls and len(_s16b_matching(_s16b_reopen(path))) == 1, marker
+    if fault == "refresh":
+        assert binding.state[0] == before, marker
+        with pytest.raises(Exception):
+            async with state.deps.leases.acquire(context(state)):
+                pytest.fail(marker)
+    else:
+        assert binding.state[0] != before, marker
+        async with state.deps.leases.acquire(context(state)):
+            pass
