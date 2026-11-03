@@ -1265,3 +1265,28 @@ async def test_cancel_during_queued_budget_reset_propagates_before_commit(relati
             await asyncio.gather(task, return_exceptions=True)
     assert await snapshot(state) == before, "S16A_CANCEL_RESET_MUST_ROLL_BACK"
     assert (await write(state))[0].relation.revision == 1
+
+
+@pytest.mark.parametrize(
+    "stamp,expected",
+    [
+        ("2020-01-02 03:04:05", datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)),
+        ("2020-01-02T05:04:05.123456+02:00", datetime(2020, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)),
+    ],
+)
+async def test_virtual_legacy_delete_fences_utc_instant_not_timestamp_format(relations, stamp, expected):
+    from memory_server.transports.http.errors import HttpError
+
+    state = relations
+    await sql(
+        state,
+        "INSERT INTO claim_relations VALUES(:s,:t,'supports',:stamp)",
+        {"s": ident(1), "t": ident(2), "stamp": stamp},
+    )
+    try:
+        result, _ = await write(state, command(deleted=True))
+    except HttpError as exc:
+        pytest.fail("S16A_LEGACY_TIMESTAMP_DELETE: " + exc.code)
+    assert result.relation.revision == 2 and result.relation.created_at == expected
+    assert await sql(state, "SELECT count(*) FROM claim_relations") == [(0,)]
+    assert await sql(state, "SELECT revision,deleted FROM relation_revisions") == [(2, 1)]
