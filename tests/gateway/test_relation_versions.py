@@ -1290,3 +1290,893 @@ async def test_virtual_legacy_delete_fences_utc_instant_not_timestamp_format(rel
     assert result.relation.revision == 2 and result.relation.created_at == expected
     assert await sql(state, "SELECT count(*) FROM claim_relations") == [(0,)]
     assert await sql(state, "SELECT revision,deleted FROM relation_revisions") == [(2, 1)]
+# S16P: publication receipts are tested across real disk/native/lease boundaries.
+@pytest.fixture
+async def s16p_env(tmp_path):
+    from contextlib import asynccontextmanager
+
+    from memory_server.application.profile_bundle import BundlePolicies
+    from memory_server.control.profiles import ProfileRegistry, RegistryConfiguration
+    from memory_server.control.store import ControlStore
+    from memory_server.runtime.daemon import Daemon
+    from memory_server.runtime.runtime_manager import RuntimeManager
+    from memory_server.settings import Settings
+    from tests.gateway.test_daemon import factory, make_binding
+
+    @asynccontextmanager
+    async def environment(mode="first_publish_no_lock"):
+        settings = Settings(_env_file=None, outbox_poll_interval_seconds=60)
+        bindings = tuple(make_binding(tmp_path / name, name, settings) for name in ("alpha", "beta"))
+        path = bindings[0].layout.graph_snapshot_path
+        lock = bindings[0].layout.graph_lock_path
+        if mode == "existing_snapshot_existing_lock":
+            path.write_text('{"nodes": [], "edges": []}')
+        if mode in ("existing_snapshot_existing_lock", "initial_absent_snapshot_existing_lock"):
+            lock.touch()
+        store = ControlStore(tmp_path / "control")
+        registry = ProfileRegistry(store, RegistryConfiguration(bindings))
+        daemon = Daemon(
+            registry, policies=BundlePolicies.capture(settings), manager=RuntimeManager(factory_builder=factory)
+        )
+        try:
+            yield daemon, bindings
+        finally:
+            await daemon.close_all()
+            store.close()
+
+    return environment
+
+
+def _s16p_ctx(profile="alpha"):
+    from tests.gateway.test_daemon import ctx
+
+    return ctx(profile)
+
+
+def _s16p_code(error):
+    return getattr(error, "code", type(error).__name__)
+
+
+def _s16p_replace(path, content=b'{"nodes": [], "edges": []}'):
+    temp = path.with_name(path.name + ".foreign")
+    temp.write_bytes(content)
+    os.replace(temp, path)
+
+
+def _s16p_capture(monkeypatch, manager):
+    records = []
+    original = manager.refresh_projection_identity
+
+    def capture(descriptor, *, receipt, proof=None):
+        records.append((descriptor, receipt, proof))
+
+    monkeypatch.setattr(manager, "refresh_projection_identity", capture)
+    return records, original
+
+
+def _s16p_fault_lock(path, mode):
+    if mode == "foreign_lock_after_unlock":
+        _s16p_replace(path, b"foreign-lock-sentinel")
+    elif mode == "lock_to_symlink":
+        sentinel = path.with_name("foreign-sentinel")
+        sentinel.write_bytes(b"foreign-lock-sentinel")
+        path.unlink()
+        path.symlink_to(sentinel)
+    elif mode == "lock_nlink2":
+        os.link(path, path.with_name("hardlink"))
+
+
+def _s16p_lock_race(monkeypatch, mode, manager, lock):
+    import memory_server.providers.graph_provider as gp
+
+    if mode == "foreign_lock_before_create":
+        pin = gp._pin_parent
+
+        def raced(path):
+            fd = pin(path)
+            if not lock.exists():
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(b'foreign-lock-sentinel')",
+                        str(lock),
+                    ],
+                    check=True,
+                )
+            return fd
+
+        monkeypatch.setattr(gp, "_pin_parent", raced)
+    else:
+        refresh = manager.refresh_projection_identity
+
+        def fault(descriptor, *, receipt, proof=None):
+            _s16p_fault_lock(lock, mode)
+            return refresh(descriptor, receipt=receipt, proof=proof)
+
+        monkeypatch.setattr(manager, "refresh_projection_identity", fault)
+
+
+_S16P_MODES = (
+    "first_publish_no_lock",
+    "existing_snapshot_existing_lock",
+    "initial_absent_snapshot_existing_lock",
+    "foreign_lock_before_create",
+    "foreign_lock_after_unlock",
+    "lock_to_symlink",
+    "lock_nlink2",
+)
+
+
+async def _s16p_publish_next(s16p_env, monkeypatch, mode, native):
+    from memory_server.runtime.daemon import LeaseError
+
+    negative = mode.startswith("foreign_") or mode.startswith("lock_")
+    marker = "S16P_PUBLICATION_NEXT_LEASE" if native else "S16P_LEGACY_NEXT_LEASE"
+    async with s16p_env(mode) as (daemon, bindings):
+        manager = daemon.manager
+        path, lock = bindings[0].layout.graph_snapshot_path, bindings[0].layout.graph_lock_path
+        replaces, creates = [], []
+        replace_fn, open_fn = os.replace, os.open
+
+        def observed_replace(*args, **kwargs):
+            result = replace_fn(*args, **kwargs)
+            replaces.append(path.stat().st_ino)
+            return result
+
+        def observed_open(name, flags, *args, **kwargs):
+            if (str(name) == lock.name or str(name) == str(lock)) and flags & os.O_CREAT:
+                creates.append((flags, kwargs.get("dir_fd")))
+            return open_fn(name, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", observed_replace)
+        monkeypatch.setattr(os, "open", observed_open)
+        async with daemon.acquire(_s16p_ctx()) as session:
+            graph = session.runtime.dependencies.graph
+            worker = session.runtime.dependencies.outbox_worker
+            entry = manager._entries[0]
+            before = dict(entry.evidence)
+            if mode == "first_publish_no_lock":
+                assert not path.exists() and not lock.exists(), marker
+            if negative:
+                _s16p_lock_race(monkeypatch, mode, manager, lock)
+            if not native:
+                try:
+                    graph.add_node("s16p", "fact", "published")
+                    outcome = "success"
+                except Exception as error:
+                    outcome = _s16p_code(error)
+        if native:
+            try:
+                await worker._blocking(graph.add_node, "s16p", "fact", "published", kind="s16p-publish")
+                outcome = "success"
+            except Exception as error:
+                outcome = _s16p_code(error)
+        if negative:
+            assert outcome == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_LOCK_IDENTITY_UNCHANGED"
+            assert entry.evidence == before, "S16P_LOCK_IDENTITY_UNCHANGED"
+            if mode in ("foreign_lock_before_create", "foreign_lock_after_unlock", "lock_to_symlink"):
+                assert lock.read_bytes() == b"foreign-lock-sentinel", "S16P_LOCK_IDENTITY_UNCHANGED"
+            assert len(creates) <= 1, "S16P_LOCK_IDENTITY_UNCHANGED"
+            return
+        try:
+            async with daemon.acquire(_s16p_ctx()) as again:
+                outcome = "success" if again.runtime is session.runtime else "different-runtime"
+        except LeaseError as error:
+            outcome = error.code
+        assert replaces and outcome == "success", marker
+        assert json.loads(path.read_text())["nodes"][0]["id"] == "s16p", marker
+        assert entry.evidence[path][2] == path.stat().st_ino == replaces[-1], marker
+        assert {p: v for p, v in entry.evidence.items() if p not in (path, lock)} == {
+            p: v for p, v in before.items() if p not in (path, lock)
+        }, marker
+        if mode == "first_publish_no_lock":
+            assert len(creates) == 1 and creates[0][1] is not None, "S16P_LOCK_IDENTITY_UNCHANGED"
+            assert creates[0][0] & os.O_EXCL and creates[0][0] & os.O_NOFOLLOW, "S16P_LOCK_IDENTITY_UNCHANGED"
+        async with daemon.acquire(_s16p_ctx()):
+            graph.add_node("s16p-second", "fact", "second")
+        assert len(creates) == (1 if mode == "first_publish_no_lock" else 0), "S16P_LOCK_IDENTITY_UNCHANGED"
+
+
+@pytest.mark.parametrize("mode", _S16P_MODES)
+async def test_s16p_legacy_persist_then_next_lease(s16p_env, monkeypatch, mode):
+    await _s16p_publish_next(s16p_env, monkeypatch, mode, False)
+
+
+@pytest.mark.parametrize("mode", _S16P_MODES)
+async def test_s16p_publication_proof_then_next_lease(s16p_env, monkeypatch, mode):
+    await _s16p_publish_next(s16p_env, monkeypatch, mode, True)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["none", "arbitrary_object", "copied_lease", "released_lease", "foreign_task", "other_manager", "forged_receipt"],
+)
+async def test_s16p_refresh_requires_live_proof(s16p_env, monkeypatch, fault):
+    import copy
+
+    from memory_server.runtime.runtime_manager import RuntimeManager
+
+    async with s16p_env() as (daemon, _):
+        records, refresh = _s16p_capture(monkeypatch, daemon.manager)
+        async with daemon.acquire(_s16p_ctx()) as session:
+            session.runtime.dependencies.graph.add_node("a", "fact", "a")
+            descriptor, receipt, proof = records[-1]
+            before = dict(daemon.manager._entries[0].evidence)
+            bad = None if fault == "none" else object() if fault == "arbitrary_object" else proof
+            if fault == "copied_lease":
+                bad = copy.copy(proof)
+            if fault == "forged_receipt":
+                receipt = copy.copy(receipt)
+            if fault == "released_lease":
+                daemon.manager._revoke_lease_proof(proof)
+            if fault == "other_manager":
+                refresh = RuntimeManager().refresh_projection_identity
+
+            def attempt():
+                try:
+                    refresh(descriptor, receipt=receipt, proof=bad)
+                    return "success"
+                except Exception as error:
+                    return _s16p_code(error)
+
+            if fault == "foreign_task":
+
+                async def foreign():
+                    return attempt()
+
+                outcome = await asyncio.create_task(foreign())
+            else:
+                outcome = attempt()
+            assert outcome == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_PROOF_REQUIRED"
+            assert daemon.manager._entries[0].evidence == before, "S16P_PROOF_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "final_symlink",
+        "parent_symlink",
+        "hardlink_nlink2",
+        "fifo",
+        "parent_replaced_directory",
+        "unrelated_resource_changed",
+    ],
+)
+async def test_s16p_refresh_rejects_unsafe_without_evidence_change(s16p_env, monkeypatch, fault):
+    async with s16p_env() as (daemon, bindings):
+        records, refresh = _s16p_capture(monkeypatch, daemon.manager)
+        async with daemon.acquire(_s16p_ctx()) as session:
+            graph = session.runtime.dependencies.graph
+            graph.add_node("a", "fact", "a")
+            descriptor, receipt, proof = records[-1]
+            path = bindings[0].layout.graph_snapshot_path
+            before = dict(daemon.manager._entries[0].evidence)
+            if fault == "final_symlink":
+                retained = path.with_name("retained")
+                path.rename(retained)
+                path.symlink_to(retained)
+            elif fault == "hardlink_nlink2":
+                os.link(path, path.with_name("hardlink"))
+            elif fault == "fifo":
+                path.unlink()
+                os.mkfifo(path)
+            elif fault.startswith("parent_"):
+                parent = path.parent
+                moved = parent.with_name("moved-alpha")
+                parent.rename(moved)
+                if fault == "parent_symlink":
+                    parent.symlink_to(moved, target_is_directory=True)
+                else:
+                    parent.mkdir()
+            else:
+                unrelated = bindings[0].layout.vector.local_path
+                unrelated.mkdir()
+            try:
+                refresh(descriptor, receipt=receipt, proof=proof)
+                outcome = "success"
+            except Exception as error:
+                outcome = _s16p_code(error)
+            expected = (
+                "E_RUNTIME_RESOURCE_ALIAS"
+                if fault in ("final_symlink", "hardlink_nlink2", "fifo")
+                else "E_RUNTIME_RESOURCE_IDENTITY_CHANGED"
+            )
+            assert outcome == expected, "S16P_UNSAFE_EVIDENCE_UNCHANGED"
+            assert daemon.manager._entries[0].evidence == before, "S16P_UNSAFE_EVIDENCE_UNCHANGED"
+
+
+async def test_s16p_refresh_rejects_foreign_descriptor(s16p_env, monkeypatch):
+    async with s16p_env() as (daemon, bindings):
+        async with daemon.acquire(_s16p_ctx()):
+            pass
+        async with daemon.acquire(_s16p_ctx("beta")) as session:
+            graph = session.runtime.dependencies.graph
+            worker = session.runtime.dependencies.outbox_worker
+        records, refresh = _s16p_capture(monkeypatch, daemon.manager)
+        await worker._blocking(graph.add_node, "b", "fact", "b", kind="s16p-beta")
+        descriptor, receipt, proof = records[-1]
+        # Narrow immutable-binding fault: beta-valid disk/fds and registered writer,
+        # but an alpha immutable binding. Only _publication_matches owns this guard.
+        object.__setattr__(receipt.scope.binding, "descriptor", bindings[0].descriptor)
+        before = [dict(e.evidence) for e in daemon.manager._entries]
+        try:
+            refresh(descriptor, receipt=receipt, proof=proof)
+            outcome = "success"
+        except Exception as error:
+            outcome = _s16p_code(error)
+        assert outcome == "E_RUNTIME_DESCRIPTOR_CONFLICT", "S16P_FOREIGN_REJECTED"
+        assert before == [e.evidence for e in daemon.manager._entries], "S16P_FOREIGN_REJECTED"
+        with pytest.raises(Exception) as error:
+            daemon.manager.bind_projection_publisher(bindings[0].descriptor, graph=graph, lease_probe=lambda: None)
+        assert _s16p_code(error.value) == "E_RUNTIME_DESCRIPTOR_CONFLICT", "S16P_FOREIGN_REJECTED"
+
+
+@pytest.mark.parametrize("fault", ["foreign_regular_fd", "dup_foreign_fd", "closed_reused_number"])
+async def test_s16p_refresh_rejects_foreign_fd(s16p_env, monkeypatch, tmp_path, fault):
+    async with s16p_env() as (daemon, _):
+        records, refresh = _s16p_capture(monkeypatch, daemon.manager)
+        async with daemon.acquire(_s16p_ctx()) as session:
+            session.runtime.dependencies.graph.add_node("a", "fact", "a")
+            descriptor, receipt, proof = records[-1]
+            original = receipt.snapshot
+            foreign = (tmp_path / "alpha" / "foreign-fd").open("w+")
+            try:
+                if fault == "closed_reused_number":
+                    number = original.fileno()
+                    original.close()
+                    os.dup2(foreign.fileno(), number)
+                    substitute = os.fdopen(number, "r+")
+                elif fault == "dup_foreign_fd":
+                    substitute = os.fdopen(os.dup(foreign.fileno()), "r+")
+                else:
+                    substitute = foreign
+                object.__setattr__(receipt, "snapshot", substitute)
+                try:
+                    refresh(descriptor, receipt=receipt, proof=proof)
+                    outcome = "success"
+                except Exception as error:
+                    outcome = _s16p_code(error)
+                assert outcome == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_FOREIGN_FD_REJECTED"
+            finally:
+                original.close()
+                foreign.close()
+
+
+_S16P_LOCK_PROBE = """import fcntl,sys
+f=open(sys.argv[1], 'r+b')
+try:
+ fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)
+except BlockingIOError:
+ sys.exit(7)
+"""
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "load_snapshot",
+        "resync",
+        "plain_file_lock",
+        "unlocked_read",
+        "windows_fallback",
+        "fsync_failure",
+        "dir_fsync_failure",
+        "unlock_before_mint",
+    ],
+)
+async def test_s16p_writer_custody_and_reader_no_proof(s16p_env, monkeypatch, mode):
+    import memory_server.providers.graph_provider as gp
+
+    async with s16p_env() as (daemon, bindings):
+        async with daemon.acquire(_s16p_ctx()) as session:
+            graph = session.runtime.dependencies.graph
+            graph.add_node("a", "fact", "a")
+            minted = []
+            mint = gp._SnapshotPublication._mint
+            lock = bindings[0].layout.graph_lock_path
+
+            def observed(publication):
+                probe = subprocess.run([sys.executable, "-c", _S16P_LOCK_PROBE, str(lock)])
+                assert probe.returncode == 7, "S16P_WRITER_ONLY_PROOF"
+                assert publication.snapshot.fileno() != publication.lock.fileno(), "S16P_WRITER_ONLY_PROOF"
+                mint(publication)
+                minted.append(publication.receipt)
+
+            monkeypatch.setattr(gp._SnapshotPublication, "_mint", observed)
+            graph.add_node("b", "fact", "b")
+            assert len(minted) == 1, "S16P_WRITER_ONLY_PROOF"
+            assert subprocess.run([sys.executable, "-c", _S16P_LOCK_PROBE, str(lock)]).returncode == 0, (
+                "S16P_WRITER_ONLY_PROOF"
+            )
+            minted.clear()
+            before = dict(daemon.manager._entries[0].evidence)
+            if mode == "load_snapshot":
+                graph.load_snapshot()
+            elif mode == "resync":
+                graph._resync_from_disk(graph._snapshot_path)
+            elif mode == "plain_file_lock":
+                with gp._file_lock(lock, managed=graph._projection_binding) as yielded:
+                    assert yielded is None, "S16P_WRITER_ONLY_PROOF"
+            elif mode == "unlocked_read":
+                json.loads(graph._snapshot_path.read_text())
+            else:
+                if mode == "windows_fallback":
+                    monkeypatch.setattr(gp, "_fcntl", None)
+                elif mode.endswith("fsync_failure"):
+                    fsync = os.fsync
+
+                    def broken(fd):
+                        import stat
+
+                        if mode == "fsync_failure" or stat.S_ISDIR(os.fstat(fd).st_mode):
+                            raise OSError("S16P_SYNTHETIC_CANARY")
+                        return fsync(fd)
+
+                    monkeypatch.setattr(os, "fsync", broken)
+                else:
+                    check = gp._SnapshotPublication._check_lock
+
+                    def unlocked(publication):
+                        check(publication)
+                        gp._fcntl.flock(publication.lock.fileno(), gp._fcntl.LOCK_UN)
+
+                    monkeypatch.setattr(gp._SnapshotPublication, "_check_lock", unlocked)
+                try:
+                    graph.add_node("c", "fact", "c")
+                except Exception:
+                    pass
+            assert not minted and daemon.manager._entries[0].evidence == before, "S16P_WRITER_ONLY_PROOF"
+            with pytest.raises(Exception) as error:
+                daemon.manager.refresh_projection_identity(bindings[0].descriptor, receipt=object(), proof=object())
+            assert _s16p_code(error.value) == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_WRITER_ONLY_PROOF"
+
+
+async def test_s16p_refresh_preserves_foreign_alias_denial(s16p_env, monkeypatch):
+    async with s16p_env() as (daemon, _):
+        async with daemon.acquire(_s16p_ctx("beta")):
+            pass
+        records, refresh = _s16p_capture(monkeypatch, daemon.manager)
+        async with daemon.acquire(_s16p_ctx()) as session:
+            graph = session.runtime.dependencies.graph
+            graph.add_node("a", "fact", "a")
+            descriptor, receipt, proof = records[-1]
+            beta = next(e for e in daemon.manager._entries if e.descriptor.profile_id == "beta")
+            # Reservation fault after publication isolates the unchanged alias loop.
+            beta.evidence[Path("/s16p-foreign-reservation")] = receipt.staged
+            before = [dict(e.evidence) for e in daemon.manager._entries]
+            try:
+                refresh(descriptor, receipt=receipt, proof=proof)
+                outcome = "success"
+            except Exception as error:
+                outcome = _s16p_code(error)
+            assert outcome == "E_RUNTIME_RESOURCE_ALIAS", "S16P_ALIAS_STILL_DENIED"
+            assert before == [e.evidence for e in daemon.manager._entries], "S16P_ALIAS_STILL_DENIED"
+
+
+@pytest.mark.parametrize("boundary", ["file_fsync", "dir_fsync", "refresh"])
+async def test_s16p_refresh_failure_is_typed_and_atomic(s16p_env, monkeypatch, caplog, boundary):
+    async with s16p_env() as (daemon, _):
+        async with daemon.acquire(_s16p_ctx()) as session:
+            graph = session.runtime.dependencies.graph
+            before = dict(daemon.manager._entries[0].evidence)
+            canary = "/private/S16P_CANARY SELECT credential"
+            if boundary == "refresh":
+
+                def broken(*args):
+                    raise OSError(canary)
+
+                monkeypatch.setattr(daemon.manager, "_same_published_fd", broken)
+            else:
+                fsync = os.fsync
+
+                def broken(fd):
+                    import stat
+
+                    if boundary == "file_fsync" or stat.S_ISDIR(os.fstat(fd).st_mode):
+                        raise OSError(canary)
+                    return fsync(fd)
+
+                monkeypatch.setattr(os, "fsync", broken)
+            try:
+                graph.from_dict({"nodes": [{"id": "a", "type": "fact", "name": "a"}], "edges": []})
+                error = None
+            except Exception as caught:
+                error = caught
+            assert _s16p_code(error) == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_TYPED_ATOMIC"
+            assert error.__suppress_context__ and canary not in str(error) + caplog.text, "S16P_TYPED_ATOMIC"
+            assert daemon.manager._entries[0].evidence == before and graph._full_publish_pending, "S16P_TYPED_ATOMIC"
+        try:
+            async with daemon.acquire(_s16p_ctx()):
+                outcome = "success"
+        except Exception as caught:
+            outcome = _s16p_code(caught)
+        assert outcome == "E_STORAGE", "S16P_TYPED_ATOMIC"
+
+
+async def test_s16p_no_publication_unchanged(s16p_env, monkeypatch, tmp_path):
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    async with s16p_env() as (daemon, bindings):
+        async with daemon.acquire(_s16p_ctx()) as session:
+            graph = session.runtime.dependencies.graph
+            before = dict(daemon.manager._entries[0].evidence)
+            records, refresh = _s16p_capture(monkeypatch, daemon.manager)
+            async with daemon.acquire(_s16p_ctx()) as nested:
+                assert nested.runtime is session.runtime, "S16P_NO_PUBLISH_NO_REFRESH"
+                graph.save_snapshot()
+            graph.save_snapshot(tmp_path / "unmanaged.json")
+            SimpleGraph().save_snapshot()
+            assert not records and before == daemon.manager._entries[0].evidence, "S16P_NO_PUBLISH_NO_REFRESH"
+            scope = daemon.manager._prepare_projection_call(graph._projection_binding, native=False)
+            with pytest.raises(Exception) as error:
+                refresh(bindings[0].descriptor, receipt=scope, proof=scope.proof)
+            assert _s16p_code(error.value) == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_NO_PUBLISH_NO_REFRESH"
+            daemon.manager._abort_projection_call(scope)
+            _s16p_replace(bindings[0].layout.graph_snapshot_path)
+        try:
+            async with daemon.acquire(_s16p_ctx()):
+                outcome = "success"
+        except Exception as error:
+            outcome = _s16p_code(error)
+        assert outcome == "E_STORAGE", "S16P_NO_PUBLISH_NO_REFRESH"
+    legacy = SimpleGraph(tmp_path / "legacy" / "graph.json")
+    legacy.add_node("l", "fact", "legacy")
+    reopened = SimpleGraph(legacy._snapshot_path)
+    reopened.load_snapshot()
+    assert reopened.get_node("l") is not None, "S16P_NO_PUBLISH_NO_REFRESH"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "native",
+        "direct_loop",
+        "refresh_error",
+        "close_before_refresh",
+        "cancelled_scope",
+        "multi_publish_chain",
+        "entry_completion",
+        "batch_completion",
+        "entry_refresh_error",
+        "batch_refresh_error",
+    ],
+)
+async def test_s16p_publish_refresh_order_and_completion(s16p_env, monkeypatch, mode):
+    import memory_server.providers.graph_provider as gp
+
+    async with s16p_env() as (daemon, _):
+        async with daemon.acquire(_s16p_ctx()) as session:
+            runtime = session.runtime
+            graph, worker = runtime.dependencies.graph, runtime.dependencies.outbox_worker
+        events = []
+        fsync, replace_fn, mint = os.fsync, os.replace, gp._SnapshotPublication._mint
+        refresh, consume = daemon.manager.refresh_projection_identity, daemon.manager._consume_publication
+
+        def sync(fd):
+            import stat
+
+            events.append("dir_fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file_fsync")
+            return fsync(fd)
+
+        def replace_observed(*args, **kwargs):
+            events.append("replace")
+            return replace_fn(*args, **kwargs)
+
+        def minted(publication):
+            events.append("readback")
+            mint(publication)
+            events.append("mint")
+
+        def consumed(receipt):
+            events.append("refresh_commit")
+            consume(receipt)
+            events.append("consume")
+
+        def refreshed(descriptor, *, receipt, proof=None):
+            probe = subprocess.run([sys.executable, "-c", _S16P_LOCK_PROBE, str(graph._projection_binding.lock_path)])
+            assert probe.returncode == 0, "S16P_REFRESH_ORDER"
+            events.append("unlock")
+            if mode == "refresh_error" or mode.endswith("_refresh_error"):
+                _s16p_replace(graph._snapshot_path)
+            elif mode == "close_before_refresh":
+                daemon.manager._entries[0].state = "CLOSING"
+            elif mode == "cancelled_scope":
+                receipt.scope.abandoned = True
+            return refresh(descriptor, receipt=receipt, proof=proof)
+
+        monkeypatch.setattr(os, "fsync", sync)
+        monkeypatch.setattr(os, "replace", replace_observed)
+        monkeypatch.setattr(gp._SnapshotPublication, "_mint", minted)
+        monkeypatch.setattr(daemon.manager, "refresh_projection_identity", refreshed)
+        monkeypatch.setattr(daemon.manager, "_consume_publication", consumed)
+
+        if mode.startswith(("entry_", "batch_")):
+            from storage.outbox import OutboxRepository
+
+            worker._embedder = None
+            completed = OutboxRepository.mark_completed
+
+            async def marked(repo, entry_id):
+                events.append("mark_completed")
+                return await completed(repo, entry_id)
+
+            monkeypatch.setattr(OutboxRepository, "mark_completed", marked)
+            async with worker._session_factory() as db:
+                row = await OutboxRepository(db).add_entry(
+                    "fact",
+                    "s16p-row",
+                    "index_fact",
+                    {"subject": "subject", "predicate": "supports", "object": "object"},
+                )
+                await db.commit()
+            if mode.startswith("batch_"):
+                await worker._process_fact_batch([row])
+            else:
+                async with worker._session_factory() as db:
+                    await worker._process_entry(db, OutboxRepository(db), row)
+                    await db.commit()
+            async with worker._session_factory() as db:
+                status = (
+                    await db.execute(text("SELECT status FROM outbox_entries WHERE id=:id"), {"id": row.id})
+                ).scalar_one()
+            if mode.endswith("_refresh_error"):
+                assert status != "completed" and "mark_completed" not in events, "S16P_REFRESH_ORDER"
+            else:
+                assert status == "completed" and events.index("consume") < events.index("mark_completed"), (
+                    "S16P_REFRESH_ORDER"
+                )
+            return
+
+        def publication():
+            graph.add_node("a", "fact", "a")
+            if mode == "multi_publish_chain":
+                graph.add_node("b", "fact", "b")
+            events.append("native_return")
+            return True
+
+        before = dict(daemon.manager._entries[0].evidence)
+        try:
+            if mode == "direct_loop":
+                async with daemon.acquire(_s16p_ctx()):
+                    publication()
+            else:
+                assert await worker._blocking(publication, kind="s16p-order") is True, "S16P_REFRESH_ORDER"
+            outcome = "success"
+        except Exception as error:
+            outcome = _s16p_code(error)
+        if mode in ("refresh_error", "close_before_refresh", "cancelled_scope"):
+            assert outcome == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED" and "consume" not in events, "S16P_REFRESH_ORDER"
+            assert before == daemon.manager._entries[0].evidence, "S16P_REFRESH_ORDER"
+        else:
+            assert outcome == "success", "S16P_REFRESH_ORDER"
+            expected = ["file_fsync", "replace", "dir_fsync", "readback", "mint", "unlock", "refresh_commit", "consume"]
+            assert [events.index(e) for e in expected] == sorted(events.index(e) for e in expected), (
+                "S16P_REFRESH_ORDER"
+            )
+            if mode != "direct_loop":
+                assert events.index("native_return") < events.index("refresh_commit"), "S16P_REFRESH_ORDER"
+            assert not graph._journal and not daemon.manager._projection_calls, "S16P_REFRESH_ORDER"
+
+
+@pytest.mark.parametrize("mode", ["loop_add_node", "loop_save_snapshot"])
+async def test_s16p_native_publication_concurrent_loop_persist_no_hang(tmp_path, mode):
+    # A parent-process watchdog is required because a blocked loop cannot time out itself.
+    child = subprocess.Popen(
+        [sys.executable, "-B", "-c", _S16P_CONCURRENT_CHILD, str(tmp_path), mode],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        output, _ = child.communicate(timeout=10)
+        outcome = child.returncode
+    except subprocess.TimeoutExpired:
+        child.kill()
+        output, _ = child.communicate()
+        outcome = "watchdog-killed-and-reaped"
+    print(output)
+    assert outcome == 0 and "CONTENDED_LOOP_ENTRY" in output and "NATIVE_UNLOCKED" in output, "S16P_NATIVE_LOOP_NO_HANG"
+
+
+_S16P_CONCURRENT_CHILD = r"""
+import asyncio, sys, threading
+from pathlib import Path
+from memory_server.application.profile_bundle import BundlePolicies
+from memory_server.control.profiles import ProfileRegistry, RegistryConfiguration
+from memory_server.control.store import ControlStore
+from memory_server.providers import graph_provider as gp
+from memory_server.runtime.daemon import Daemon
+from memory_server.runtime.runtime_manager import RuntimeManager
+from memory_server.settings import Settings
+from tests.gateway.test_daemon import factory, make_binding, ctx
+async def main():
+    root, mode = Path(sys.argv[1]), sys.argv[2]
+    settings = Settings(_env_file=None, outbox_poll_interval_seconds=60)
+    binding = make_binding(root/'profile', 'alpha', settings)
+    binding.layout.graph_snapshot_path.write_text('{"nodes": [], "edges": []}')
+    binding.layout.graph_lock_path.touch()
+    store = ControlStore(root/'control')
+    daemon = Daemon(ProfileRegistry(store, RegistryConfiguration((binding,))),
+                    policies=BundlePolicies.capture(settings), manager=RuntimeManager(factory_builder=factory))
+    async with daemon.acquire(ctx()) as session:
+        graph, worker = session.runtime.dependencies.graph, session.runtime.dependencies.outbox_worker
+    entered, competing, release = threading.Event(), threading.Event(), threading.Event()
+    original = gp._SnapshotPublication.write
+    initialize = gp._SnapshotPublication.__init__
+    def initialize_observed(publication, *args):
+        initialize(publication, *args)
+        if threading.current_thread() is threading.main_thread() and entered.is_set():
+            print("CONTENDED_LOOP_ENTRY", flush=True)
+            competing.set()
+    gp._SnapshotPublication.__init__ = initialize_observed
+    def mint(publication):
+        if threading.current_thread() is not threading.main_thread():
+            entered.set()
+            release.wait()
+        original(publication)
+    gp._SnapshotPublication.write = mint
+    def control():
+        entered.wait()
+        competing.wait()
+        release.set()
+    control_thread = threading.Thread(target=control, daemon=True)
+    control_thread.start()
+    async def native():
+        try:
+            await worker._blocking(graph.add_node, 'native', 'fact', 'native', kind='s16p-concurrent')
+        except Exception as error:
+            assert getattr(error, 'code', '') == 'E_RUNTIME_RESOURCE_IDENTITY_CHANGED'
+        print('NATIVE_UNLOCKED', flush=True)
+    task = asyncio.create_task(native())
+    while not entered.is_set():
+        await asyncio.sleep(0.001)
+    try:
+        if mode == 'loop_add_node':
+            graph.add_node('loop', 'fact', 'loop')
+        else:
+            graph.save_snapshot()
+    except Exception as error:
+        assert getattr(error, 'code', '') == 'E_RUNTIME_RESOURCE_IDENTITY_CHANGED'
+    await task
+    control_thread.join(1)
+    await daemon.close_all()
+    store.close()
+asyncio.run(main())
+"""
+
+
+@pytest.mark.parametrize("mode", ["persist", "same_path_export", "managed_reader_lock"])
+async def test_s16p_managed_missing_parent_never_mkdir(s16p_env, monkeypatch, mode):
+    import memory_server.providers.graph_provider as gp
+
+    async with s16p_env() as (daemon, _):
+        async with daemon.acquire(_s16p_ctx()) as session:
+            graph = session.runtime.dependencies.graph
+            parent = graph._snapshot_path.parent
+            parent.rename(parent.with_name("removed-parent"))
+            mkdirs = []
+            mkdir = os.mkdir
+
+            def recorded(*args, **kwargs):
+                mkdirs.append(args)
+                return mkdir(*args, **kwargs)
+
+            monkeypatch.setattr(os, "mkdir", recorded)
+            try:
+                if mode == "persist":
+                    graph.add_node("a", "fact", "a")
+                elif mode == "same_path_export":
+                    graph.save_snapshot(graph._snapshot_path)
+                else:
+                    with gp._file_lock(graph._projection_binding.lock_path, managed=graph._projection_binding):
+                        pass
+                outcome = "success"
+            except Exception as error:
+                outcome = _s16p_code(error)
+            assert not mkdirs and not parent.exists(), "S16P_MANAGED_NO_MKDIR"
+            assert outcome == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_MANAGED_NO_MKDIR"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "double_consume",
+        "expired",
+        "abandoned_scope",
+        "foreign_publish_after_unlock",
+        "changed_generation",
+        "refresh_without_publish",
+    ],
+)
+async def test_s16p_receipt_replay_expiry_and_intervening_publish(s16p_env, monkeypatch, mode):
+    import memory_server.runtime.runtime_manager as rm
+
+    async with s16p_env() as (daemon, bindings):
+        records, refresh = _s16p_capture(monkeypatch, daemon.manager)
+        async with daemon.acquire(_s16p_ctx()) as session:
+            graph = session.runtime.dependencies.graph
+            graph.add_node("a", "fact", "a")
+            descriptor, receipt, proof = records[-1]
+            if mode == "double_consume":
+                refresh(descriptor, receipt=receipt, proof=proof)
+            elif mode == "expired":
+                from types import SimpleNamespace
+
+                monkeypatch.setattr(rm, "time", SimpleNamespace(monotonic=lambda: receipt.expires_at + 1))
+            elif mode == "abandoned_scope":
+                receipt.scope.abandoned = True
+            elif mode == "foreign_publish_after_unlock":
+                _s16p_replace(graph._snapshot_path)
+            elif mode == "changed_generation":
+                graph._projection_binding.state[2] += 1
+            else:
+                # Narrow stamp fault retains genuine binding/current fd/generation,
+                # but removes completed-writer proof. The proof guard alone owns it.
+                object.__setattr__(receipt, "proof", None)
+            before = dict(daemon.manager._entries[0].evidence)
+            try:
+                refresh(bindings[0].descriptor, receipt=receipt, proof=proof)
+                outcome = "success"
+            except Exception as error:
+                outcome = _s16p_code(error)
+            assert outcome == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_RECEIPT_ONESHOT"
+            assert before == daemon.manager._entries[0].evidence, "S16P_RECEIPT_ONESHOT"
+
+
+@pytest.mark.parametrize("mode", ["consumed", "active", "native_cancel", "native_error"])
+async def test_s16p_abort_consumed_or_missing_is_noop(s16p_env, monkeypatch, mode):
+    import threading
+
+    async with s16p_env() as (daemon, _):
+        async with daemon.acquire(_s16p_ctx()) as session:
+            graph = session.runtime.dependencies.graph
+            worker = session.runtime.dependencies.outbox_worker
+        manager = daemon.manager
+        records, refresh = _s16p_capture(monkeypatch, manager)
+        if mode.startswith("native_"):
+            minted, release = threading.Event(), threading.Event()
+
+            def publication():
+                graph.add_node("a", "fact", "a")
+                minted.set()
+                release.wait(3)
+                if mode == "native_error":
+                    raise ValueError("synthetic after mint")
+
+            task = asyncio.create_task(worker._blocking(publication, kind="s16p-cleanup"))
+            while not minted.is_set():
+                await asyncio.sleep(0.001)
+            scope = next(iter(manager._projection_calls))
+            if mode == "native_cancel":
+                task.cancel()
+            release.set()
+            try:
+                await task
+            except (asyncio.CancelledError, ValueError):
+                pass
+            for _ in range(100):
+                if not manager._projection_calls:
+                    break
+                await asyncio.sleep(0.01)
+            assert not manager._projection_calls and all(r.snapshot.closed and r.lock.closed for r in scope.records), (
+                "S16P_ABORT_NOOP"
+            )
+            return
+        async with daemon.acquire(_s16p_ctx()):
+            graph.add_node("a", "fact", "a")
+            descriptor, receipt, proof = records[-1]
+            if mode == "consumed":
+                refresh(descriptor, receipt=receipt, proof=proof)
+            generation = graph._projection_binding.state[2]
+            evidence = dict(manager._entries[0].evidence)
+            manager.abort_projection_publication(receipt)
+            manager.abort_projection_publication(receipt)
+            manager.abort_projection_publication(object())
+            assert generation == graph._projection_binding.state[2] and evidence == manager._entries[0].evidence, (
+                "S16P_ABORT_NOOP"
+            )
+            assert receipt.snapshot.closed and receipt.lock.closed, "S16P_ABORT_NOOP"
+            with pytest.raises(Exception) as error:
+                refresh(descriptor, receipt=receipt, proof=proof)
+            assert _s16p_code(error.value) == "E_RUNTIME_RESOURCE_IDENTITY_CHANGED", "S16P_ABORT_NOOP"
