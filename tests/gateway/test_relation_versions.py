@@ -591,7 +591,7 @@ async def test_revision_and_result_overflow_are_typed_atomic(relations, monkeypa
         await write(state, command(deleted=mode == "revision_live", revision=MAX), ctx=ctx, handler=handler)
     assert await snapshot(state) == before
     if mode == "vm":
-        assert 2_000_000 <= handler.instructions <= 2_001_000
+        assert handler.instructions == 2_000_000
     if mode == "sql":
         assert handler.statements == 65
     # Strict frontier type and byte thresholds are exercised independently too.
@@ -1230,3 +1230,38 @@ async def test_exact_preflight_capacity_boundary_create_and_delete(relations, de
             "instructions",
             state.last_handler.instructions,
         )
+
+
+async def test_cancel_during_queued_budget_reset_propagates_before_commit(relations, monkeypatch):
+    import aiosqlite
+
+    state, ctx = relations, fresh(relations)
+    before = await snapshot(state)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = aiosqlite.Connection.set_progress_handler
+    paused = False
+
+    async def held(driver, callback, interval):
+        nonlocal paused
+        if callback is None and not paused:
+            paused = True
+            entered.set()
+            await release.wait()
+        return await original(driver, callback, interval)
+
+    with monkeypatch.context() as instrument:
+        instrument.setattr(aiosqlite.Connection, "set_progress_handler", held)
+        task = asyncio.create_task(write(state, ctx=ctx))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "lease cleanup must retain the queued SQLite reset"
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+    assert await snapshot(state) == before, "S16A_CANCEL_RESET_MUST_ROLL_BACK"
+    assert (await write(state))[0].relation.revision == 1
