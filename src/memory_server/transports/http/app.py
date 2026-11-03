@@ -30,6 +30,7 @@ from .routes.graph import GRAPH_READ_ROUTE_SPECS, GraphReadRouteSpec, RelationCu
 from .routes.ingestion import INGESTION_ROUTE_SPECS, MutationRouteSpec
 from .routes.lifecycle import LIFECYCLE_ROUTE_SPECS
 from .routes.profiles import validate_profile_id
+from .routes.relations_write import RELATION_MUTATION_ROUTE_SPECS
 from .routes.retrieval import RETRIEVAL_ROUTE_SPECS, RetrievalRouteSpec
 from .routes.traces import TRACE_ROUTE_SPECS, TraceCursorCodec, TraceRouteSpec
 
@@ -169,6 +170,8 @@ class HttpApp:
                 canonical, owner = LIFECYCLE_ROUTE_SPECS[spec.operation], "S14"
             elif spec.operation in BELIEF_MUTATION_ROUTE_SPECS:
                 canonical, owner = BELIEF_MUTATION_ROUTE_SPECS[spec.operation], "S15"
+            elif spec.operation in RELATION_MUTATION_ROUTE_SPECS:
+                canonical, owner = RELATION_MUTATION_ROUTE_SPECS[spec.operation], "S16"
             else:
                 canonical, owner = None, None
             if (

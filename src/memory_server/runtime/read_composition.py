@@ -14,6 +14,7 @@ from memory_server.application.memory_read_service import MemoryReadService
 from memory_server.application.remote_beliefs import RemoteBeliefsMutationPort, RemoteBeliefsPort
 from memory_server.application.remote_ingestion import RemoteIngestionPort
 from memory_server.application.remote_lifecycle import RemoteLifecyclePort
+from memory_server.application.remote_relations import RemoteRelationsWritePort
 from memory_server.application.retrieval_trace import RetrievalTraceService
 from memory_server.control.traces import TracesStore
 from memory_server.gateway_contracts.ports import ProfileSession
@@ -30,6 +31,7 @@ from memory_server.transports.http.routes.ingestion import create_ingestion_rout
 from memory_server.transports.http.routes.lifecycle import create_lifecycle_routes
 from memory_server.transports.http.routes.memories_read import CursorCodec, create_memory_read_routes
 from memory_server.transports.http.routes.profiles import audit_ticket
+from memory_server.transports.http.routes.relations_write import create_relation_mutation_routes
 from memory_server.transports.http.routes.retrieval import create_context_routes, create_search_routes
 from memory_server.transports.http.routes.traces import TraceCursorCodec, create_trace_routes
 
@@ -263,6 +265,27 @@ def compose_belief_mutation_ports(deps, config):
         events=deps.events,
     )
     specs = create_belief_mutation_routes()
+    ports = dict(deps.ports)
+    ports.update({spec.operation: port for spec in specs})
+    return replace(deps, ports=ports), specs
+
+
+def compose_relation_mutation_ports(deps, config):
+    if deps.leases is None:
+        raise HttpError("E_RUNTIME_NOT_READY")
+
+    def ticket():
+        current = audit_ticket.get()
+        return current.id if current is not None else None
+
+    port = RemoteRelationsWritePort(
+        deps,
+        ticket_provider=ticket,
+        publish_outcome=deps.access.publish_committed,
+        ttl_seconds=config.idempotency_ttl_seconds,
+        events=deps.events,
+    )
+    specs = create_relation_mutation_routes()
     ports = dict(deps.ports)
     ports.update({spec.operation: port for spec in specs})
     return replace(deps, ports=ports), specs
