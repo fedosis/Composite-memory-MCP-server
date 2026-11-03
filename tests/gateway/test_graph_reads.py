@@ -165,10 +165,10 @@ async def test_relation_tuple_id_roundtrip_stable(tmp_path):
             target_id=G,
             relation_type="supports",
             canonical=True,
-            revision=None,
+            revision=1,
             created_at="2026-10-30T00:00:00Z",
         )
-        assert row["canonical"] is True and row["revision"] is None
+        assert row["canonical"] is True and row["revision"] == 1
     assert importlib.util.find_spec("memory_server.application.graph_read_service") is not None
     codec = importlib.import_module("memory_server.application.graph_read_service")
     assert codec.relation_id(F, G, "supports") == BASIC
