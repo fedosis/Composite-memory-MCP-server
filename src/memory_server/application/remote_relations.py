@@ -12,7 +12,9 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import event, text
 from sqlalchemy.exc import SQLAlchemyError
 from storage.models.relation import ClaimRelationORM
+from storage.models.relation_revision import RelationRevisionORM
 from storage.outbox import OutboxRepository
+from storage.repositories.http_request_repo import HttpRequestRepository
 from storage.repositories.lifecycle_repo import normalize_version
 from storage.repositories.receipt_repo import ReceiptRepository
 from storage.repositories.relation_repo import RelationRepository
@@ -24,11 +26,13 @@ from storage.repositories.relation_revision_repo import (
 )
 
 from memory_server.application.graph_read_service import decode_relation_id, map_relation, relation_id
+from memory_server.application.mutation_uow import MUTATION_REPLY, MutationReply, MutationUoW, _digest
 from memory_server.control.policy import require_permission
 from memory_server.gateway_contracts import dto as d
-from memory_server.gateway_contracts.ports import RequestContext
+from memory_server.gateway_contracts.ports import AuditOutcome, AuditTicket, RequestContext
 from memory_server.models.receipt import MemoryReceipt
 from memory_server.transports.http.errors import HttpError
+from memory_server.transports.http.routes.relations_write import relation_status
 
 
 def validate_relation_command(ctx: RequestContext, command):
@@ -337,3 +341,132 @@ class RelationMutationHandler:
             raise HttpError("E_INTERNAL") from None
         _bounded(result)
         return result
+
+
+async def _relation_settle(awaitable):
+    task = asyncio.ensure_future(awaitable)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+class RemoteRelationsWritePort:
+    def __init__(self, deps, *, ticket_provider, publish_outcome, ttl_seconds=86400, events=None):
+        if (
+            not callable(ticket_provider)
+            or not callable(publish_outcome)
+            or (events is not None and not callable(getattr(events, "publish", None)))
+        ):
+            raise ValueError("invalid relation mutation dependencies")
+        if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 604800:
+            raise ValueError("invalid relation mutation TTL")
+        self._deps, self._ticket_provider, self._publish_outcome = deps, ticket_provider, publish_outcome
+        self._ttl, self._events = ttl_seconds, events
+
+    async def execute(self, ctx: RequestContext, command):
+        self._deps.tokens.verify_principal(ctx.principal, now=datetime.now(UTC))
+        command = validate_relation_command(ctx, command)
+        try:
+            ticket = self._ticket_provider()
+        except Exception:
+            raise HttpError("E_AUDIT_UNAVAILABLE") from None
+        if type(ticket) is not str or not 1 <= len(ticket) <= 256:
+            raise HttpError("E_AUDIT_UNAVAILABLE")
+        if self._deps.leases is None:
+            raise HttpError("E_RUNTIME_NOT_READY")
+        started = monotonic()
+        async with self._deps.leases.acquire(ctx) as scope:
+            factory = scope.application.memory.session_factory
+            uow = MutationUoW(
+                factory,
+                verify_principal=lambda p: self._deps.tokens.verify_principal(p, now=datetime.now(UTC)),
+                ticket_provider=lambda: ticket,
+                ttl_seconds=self._ttl,
+            )
+            handler = RelationMutationHandler(ctx, audit_id=ticket)
+
+            async def run():
+                result = await uow.run(ctx, command, handler)
+                return result, MUTATION_REPLY.get()
+
+            task = asyncio.create_task(run())
+            try:
+                try:
+                    result, reply = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    task.cancel()
+                    try:
+                        await _relation_settle(task)
+                    except BaseException:
+                        pass
+                    recovered = await _relation_settle(self._resolve(factory, ctx, command))
+                    if recovered is None:
+                        raise
+                    result, row = recovered
+                    reply = MutationReply(row.request_id != ctx.request_id, row.request_id)
+                    if not reply.replayed and row.audit_ticket_id != ticket:
+                        raise HttpError("E_INTERNAL")
+                MUTATION_REPLY.set(reply)
+                relation_status(result, command.operation == "relations.delete")
+                try:
+                    if reply is not None and reply.replayed:
+                        await _relation_settle(self._reconcile(factory, ctx, command))
+                    else:
+                        await _relation_settle(self._tail(factory, ctx, command, result, ticket, started))
+                except Exception:
+                    # Commit is authoritative; pending publication remains durable.
+                    pass
+                return result
+            finally:
+                if not task.done():
+                    task.cancel()
+                try:
+                    await _relation_settle(task)
+                except BaseException:
+                    pass
+
+    async def _resolve(self, factory, ctx, command):
+        async with asyncio.timeout(5), factory() as session:
+            row = await HttpRequestRepository(session).find(
+                ctx.principal.subject, ctx.profile_id, command.operation, str(ctx.idempotency_key).lower()
+            )
+            if row is None or row.digest != _digest(command):
+                return None
+            result = d.RelationResult.model_validate_json(row.response_snapshot, strict=True)
+            relation_status(result, command.operation == "relations.delete")
+            if result.audit_id != row.audit_ticket_id or result.request_id != row.request_id:
+                raise HttpError("E_INTERNAL")
+            return result, row
+
+    async def _reconcile(self, factory, ctx, command):
+        resolved = await self._resolve(factory, ctx, command)
+        if resolved is None:
+            return
+        result, row = resolved
+        if row.pending_publication:
+            await self._audit(factory, result, row.audit_ticket_id, 0.0)
+
+    async def _audit(self, factory, result, ticket, latency):
+        outcome = AuditOutcome(relation_status(result, result.deleted), None, tuple(result.receipt_ids), latency)
+        if await self._publish_outcome(AuditTicket(ticket, result.request_id), outcome) is True:
+            async with factory() as session, session.begin():
+                await HttpRequestRepository(session).mark_published(result.request_id)
+
+    async def _tail(self, factory, ctx, command, result, ticket, started):
+        tasks = [
+            asyncio.create_task(self._audit(factory, result, ticket, (monotonic() - started) * 1000)),
+            asyncio.create_task(self._produce(factory, ctx, command, result, ticket)),
+        ]
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _produce(self, factory, ctx, command, result, ticket):
+        return
