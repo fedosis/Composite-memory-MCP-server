@@ -469,4 +469,92 @@ class RemoteRelationsWritePort:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _produce(self, factory, ctx, command, result, ticket):
-        return
+        if self._events is None:
+            return
+        rel = result.relation
+        key = decode_relation_id(rel.id)
+        if len(result.receipt_ids) != 1 or len(result.outbox_ids) != 1:
+            return
+        async with asyncio.timeout(5), factory() as session:
+            row = await session.get(RelationRevisionORM, (*key, rel.revision))
+            resolved = await self._resolve(factory, ctx, command)
+            if row is None or resolved is None:
+                return
+            original, journal = resolved
+            receipt = (
+                await session.execute(
+                    text("SELECT history FROM receipts WHERE id=:id LIMIT 1"), {"id": result.receipt_ids[0]}
+                )
+            ).scalar_one_or_none()
+            outbox = (
+                await session.execute(
+                    text("SELECT operation,record_id,payload_json AS payload FROM outbox_entries WHERE id=:id LIMIT 1"),
+                    {"id": result.outbox_ids[0]},
+                )
+            ).first()
+
+            def utc(value):
+                return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+            if (
+                original != result
+                or journal.audit_ticket_id != ticket
+                or row.request_id != result.request_id
+                or row.action_receipt_id != result.receipt_ids[0]
+                or bool(row.deleted) != result.deleted
+                or utc(row.relation_created_at) != rel.created_at
+                or receipt is None
+                or outbox is None
+                or outbox.operation != "relation_sync"
+                or outbox.record_id != key[0]
+            ):
+                return
+            payload = json.loads(outbox.payload)
+            history = json.loads(receipt)
+            if (
+                payload
+                != dict(
+                    v=1,
+                    source_id=key[0],
+                    target_id=key[1],
+                    relation_type=key[2],
+                    revision=rel.revision,
+                    event_id=row.event_id,
+                )
+                or len(history) != 1
+                or any(
+                    history[0].get(k) != v
+                    for k, v in dict(
+                        source_id=key[0],
+                        target_id=key[1],
+                        relation_type=key[2],
+                        after=rel.revision,
+                        request_id=result.request_id,
+                        deleted=result.deleted,
+                        operation=command.operation,
+                    ).items()
+                )
+            ):
+                return
+            wire = d.Event(
+                id=row.event_id,
+                type="relation.deleted" if result.deleted else "relation.created",
+                profile_id=ctx.profile_id,
+                timestamp=utc(row.changed_at),
+                request_id=row.request_id,
+                memory_id=row.source_id,
+                job_id=None,
+                severity="info",
+                data=d.EventData(
+                    revision=row.revision,
+                    operation=command.operation,
+                    from_state=None,
+                    to_state=None,
+                    pending=None,
+                    code=None,
+                ),
+            )
+            wire = d.Event.model_validate(wire.model_dump(), strict=True)
+            if len(wire.model_dump_json().encode("utf-8")) > 4096:
+                return
+        await self._events.publish(wire)
