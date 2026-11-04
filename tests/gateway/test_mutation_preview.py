@@ -943,6 +943,11 @@ async def test_s17_preview_ttl_advisory(inspection_http):
             "S17_TTL stale before expiry"
         )
         object.__setattr__(service, "clock", lambda: T0 + timedelta(seconds=31))
+        expired_stale = await actual("archived", first.json["observed_versions"][F])
+        assert expired_stale.status == 409 and expired_stale.json["error"]["code"] == "E_VERSION_CONFLICT", (
+            "S17_TTL expired advice cannot bypass CAS"
+        )
+        assert await settled_version() == "8", "S17_TTL expired stale CAS has no effect"
         fresh = await preview(state, payload(to_state="archived"))
         assert fresh.status == 200 and fresh.json["observed_versions"][F] == 8, "S17_TTL fresh after expiry"
         assert (await actual("archived", fresh.json["observed_versions"][F])).status == 200, "S17_TTL CAS after expiry"

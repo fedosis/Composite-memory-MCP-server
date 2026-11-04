@@ -164,7 +164,10 @@ async def test_s17_admission_matches_real_gate(inspection_http, monkeypatch):
     await rows(state, "SELECT 1")  # Warm the real profile before attributing sessions.
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    sessions = []
+
     def forbidden_session(*args, **kwargs):
+        sessions.append(1)
         pytest.fail("S17_GATE_PARITY SQL-session-not-opened")
 
     monkeypatch.setattr(AsyncSession, "__init__", forbidden_session)
@@ -179,6 +182,10 @@ async def test_s17_admission_matches_real_gate(inspection_http, monkeypatch):
             body = {"text": text} | ({} if scope is None else {"source_scope": scope})
             response = await post(state, body)
             assert response.status == 200, ("S17_GATE_PARITY", response.body)
+            if text == "ok":
+                assert response.json["tag"] == "ephemeral", "S17_GATE_PARITY ephemeral"
+                assert response.json["admitted"] is False, "S17_GATE_PARITY ephemeral not admitted"
+                assert len(sessions) == 0, "S17_GATE_PARITY ephemeral zero SQL sessions"
             metadata = expected.metadata
             assert response.json == dict(
                 admitted=expected.admitted,
@@ -370,11 +377,12 @@ async def test_s17_admission_no_domain_write(inspection_http, monkeypatch):
         persisted_before = graph._snapshot_path.read_bytes() if graph._snapshot_path.exists() else None
     before = await domain_snapshot(state)
     audit = len(list(state.deps.access._db.execute("SELECT * FROM access_audit")))
-    ids = set()
+    ids, sessions = set(), []
     for _ in range(10):
         with monkeypatch.context() as patch:
 
             def forbidden_session(*args, **kwargs):
+                sessions.append(1)
                 pytest.fail("S17_NO_WRITE admission SQL-session-not-opened")
 
             patch.setattr(AsyncSession, "__init__", forbidden_session)
@@ -382,6 +390,7 @@ async def test_s17_admission_no_domain_write(inspection_http, monkeypatch):
                 state, {"text": "ok"}, headers=(("Idempotency-Key", "ignored"), ("If-Match", "ignored"))
             )
         assert response.status == 200, "S17_NO_WRITE"
+        assert sessions == [], "S17_NO_WRITE admission zero SQL sessions"
         assert graph.to_dict() == graph_before, "S17_NO_WRITE admission graph"
         persisted_after = graph._snapshot_path.read_bytes() if graph._snapshot_path.exists() else None
         assert persisted_after == persisted_before, "S17_NO_WRITE admission persisted graph"
@@ -430,10 +439,14 @@ async def test_s17_admission_privacy_failure(inspection_http, caplog, monkeypatc
         ("admitted", 1),
         ("ttl_days", True),
         ("score", float("inf")),
+        ("score", float("nan")),
+        ("score", True),
         ("risk_tags", "S17_REASON_CANARY"),
         ("risk_tags", [True]),
         ("reason_codes", [123]),
         ("memory_kind", []),
+        ("authority_level", {}),
+        ("epistemic_status", []),
         ("tag", "unknown"),
         ("hidden", "S17_SECRET_CANARY"),
     ]
@@ -535,6 +548,8 @@ async def test_s17_inspection_composition_exact_sets(tmp_path, monkeypatch):
                 )
                 composed, mounted = compose_inspection_ports(replace(state.deps, ports=ports), state.config)
             for spec in specs:
+                with pytest.raises(ValueError):
+                    create_http_app(state.config, state.deps, mutation_routes=(spec,))
                 invalid_specs = [
                     (spec, spec),
                     (replace(spec, method="GET"),),
