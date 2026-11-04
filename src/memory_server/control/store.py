@@ -356,7 +356,9 @@ class ControlStore:
                     ("jobs", {"jobs_scope", "jobs_recovery", "jobs_slots", "jobs_profile_active"}),
                     ("job_requests", {"job_requests_expiry", "job_requests_pending"}),
                 ):
-                    listed = self._connection.execute("SELECT name FROM pragma_index_list(?) WHERE origin='c'", (table,))
+                    listed = self._connection.execute(
+                        "SELECT name FROM pragma_index_list(?) WHERE origin='c'", (table,)
+                    )
                     if {row[0] for row in listed} != indexes:
                         raise ControlError("E_STORAGE")
                 self._connection.execute("PRAGMA user_version=1")
