@@ -273,10 +273,9 @@ def test_s18_job_durable_before_dispatch(owner):
 
 
 def assembled(owner, *, attach=None, publish=None, events=None):
-    from test_registry import binding
-
     from memory_server.control.profiles import ProfileRegistry, RegistryConfiguration
     from memory_server.control.tokens import TokenService
+    from tests.gateway.test_registry import binding
 
     root = owner.root.parent / "profile"
     root.mkdir(exist_ok=True)
@@ -285,7 +284,7 @@ def assembled(owner, *, attach=None, publish=None, events=None):
     issuer = replace(context().principal, permissions=frozenset({"token.manage", "index.manage"}))
     created = asyncio.run(
         tokens.create(
-            context(principal=issuer),
+            context(principal=issuer, profile_id=None),
             d.TokenCreate(
                 subject="subject", profiles=["p"], permissions=["index.manage"], expires_at=NOW + timedelta(hours=1)
             ),
