@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -160,6 +161,13 @@ async def test_s17_admission_matches_real_gate(inspection_http, monkeypatch):
         return original(self, text, **kwargs)
 
     monkeypatch.setattr(MemoryAdmissionGate, "classify", classify)
+    await rows(state, "SELECT 1")  # Warm the real profile before attributing sessions.
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    def forbidden_session(*args, **kwargs):
+        pytest.fail("S17_GATE_PARITY SQL-session-not-opened")
+
+    monkeypatch.setattr(AsyncSession, "__init__", forbidden_session)
     for text in (
         "ok",
         "The project uses SQLite for canonical memory storage.",
@@ -188,9 +196,38 @@ async def test_s17_admission_matches_real_gate(inspection_http, monkeypatch):
             )
 
 
-async def test_s17_admission_strict_wire(inspection_http):
+async def test_s17_admission_strict_wire(inspection_http, monkeypatch):
     from memory_server.transports.http.errors import HttpError
     from memory_server.transports.http.routes.inspectors import _decode
+
+    # Keep the named M07 semantic discriminator ahead of independent depth cases.
+    for value in (b"NaN", b"Infinity", b"-Infinity", b"1e999"):
+        rejected = False
+        try:
+            _decode(b'{"unknown":{"number":' + value + b"}}")
+        except HttpError as exc:
+            rejected = exc.code == "E_VALIDATION"
+        assert rejected, "S17_WIRE_STRICT nonfinite unknown nested number"
+    depth32 = b'{"x":' * 32 + b"0" + b"}" * 32
+    assert isinstance(_decode(depth32), dict), "S17_WIRE_STRICT depth32"
+    for nested in (b'{"x":' * 33 + b"0" + b"}" * 33, b'{"x":' * 2000 + b"0" + b"}" * 2000):
+        with pytest.raises(HttpError) as caught:
+            _decode(nested)
+        assert caught.value.code == "E_VALIDATION", "S17_WIRE_STRICT depth33/RecursionError"
+        error(
+            await post(inspection_http, nested, headers=(("Content-Type", "application/json"),)),
+            422,
+            "E_VALIDATION",
+            "S17_WIRE_STRICT depth33/RecursionError",
+        )
+    from memory_server.transports.http.routes import inspectors
+
+    def recurse(value, depth=0):
+        return recurse(value, depth + 1)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(inspectors, "_finite", recurse)
+        error(await post(inspection_http, {"text": "ok"}), 422, "E_VALIDATION", "S17_WIRE_STRICT actual RecursionError")
 
     bad = [
         b"\xff",
@@ -280,20 +317,74 @@ async def test_s17_admission_auth_scope(tmp_path):
                 "E_PERMISSION_DENIED",
                 "S17_AUTH_SCOPE",
             )
+            for warm in (False, True):
+                revoked = mint(state, ["memory.write"])
+                if warm:
+                    assert (await post(state, {"text": "ok"}, bearer=revoked)).status == 200, "S17_AUTH_SCOPE cached"
+                state.deps.tokens._unchecked_revoke(
+                    state.deps.tokens._local_context(datetime.now(UTC)),
+                    revoked[5:].split(".", 1)[0],
+                    d.ControlMutation(reason="revoke", confirmation=True, expected_generation=1),
+                    datetime.now(UTC),
+                    local=True,
+                )
+                error(
+                    await post(state, {"text": "ok"}, bearer=revoked), 401, "E_AUTH_REQUIRED", "S17_AUTH_SCOPE revoke"
+                )
+            error(
+                await post(
+                    state,
+                    {"text": "ok"},
+                    path=ADMISSION.replace("alpha", "unknown"),
+                    bearer=mint(state, ["memory.write"], ("unknown",)),
+                ),
+                404,
+                "E_PROFILE_NOT_FOUND",
+                "S17_AUTH_SCOPE scoped unknown",
+            )
+            disabled = await request(
+                state.app,
+                "/api/v1/profiles/alpha/disable",
+                method="POST",
+                bearer=state.bearer,
+                body=dict(reason="test", confirmation=True, expected_generation=1),
+                headers=(("Idempotency-Key", str(uuid4())),),
+            )
+            assert disabled.status == 200, ("S17_AUTH_SCOPE disable", disabled.body)
+            error(await post(state, {"text": "ok"}), 409, "E_PROFILE_DISABLED", "S17_AUTH_SCOPE disabled")
     except ValueError as exc:
         raise AssertionError("S17_AUTH_SCOPE canonical descriptor must mount") from exc
 
 
-async def test_s17_admission_no_domain_write(inspection_http):
+async def test_s17_admission_no_domain_write(inspection_http, monkeypatch):
+    import copy
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     state = inspection_http
     for profile in ("alpha", "beta"):
         await rows(state, "SELECT 1", profile=profile)
+    async with state.deps.leases.acquire(context(state)) as scope:
+        graph = scope.runtime.dependencies.graph
+        graph_before = copy.deepcopy(graph.to_dict())
+        persisted_before = graph._snapshot_path.read_bytes() if graph._snapshot_path.exists() else None
     before = await domain_snapshot(state)
     audit = len(list(state.deps.access._db.execute("SELECT * FROM access_audit")))
     ids = set()
     for _ in range(10):
-        response = await post(state, {"text": "ok"}, headers=(("Idempotency-Key", "ignored"), ("If-Match", "ignored")))
+        with monkeypatch.context() as patch:
+
+            def forbidden_session(*args, **kwargs):
+                pytest.fail("S17_NO_WRITE admission SQL-session-not-opened")
+
+            patch.setattr(AsyncSession, "__init__", forbidden_session)
+            response = await post(
+                state, {"text": "ok"}, headers=(("Idempotency-Key", "ignored"), ("If-Match", "ignored"))
+            )
         assert response.status == 200, "S17_NO_WRITE"
+        assert graph.to_dict() == graph_before, "S17_NO_WRITE admission graph"
+        persisted_after = graph._snapshot_path.read_bytes() if graph._snapshot_path.exists() else None
+        assert persisted_after == persisted_before, "S17_NO_WRITE admission persisted graph"
         ids.add(response.headers["x-request-id"])
         assert "idempotency-replayed" not in response.headers, "S17_NO_WRITE"
         assert await domain_snapshot(state) == before, "S17_NO_WRITE"
@@ -303,7 +394,7 @@ async def test_s17_admission_no_domain_write(inspection_http):
     assert all(row["state"] == "terminal" and row["result"] == "success" for row in completed), "S17_NO_WRITE"
 
 
-async def test_s17_admission_privacy_failure(inspection_http, caplog):
+async def test_s17_admission_privacy_failure(inspection_http, caplog, monkeypatch):
     state = inspection_http
     response = await post(state, {"text": "S17_CONTENT_CANARY S17_SECRET_CANARY /S17_PATH_CANARY"})
     assert response.status == 200, "S17_PRIVACY"
@@ -329,9 +420,49 @@ async def test_s17_admission_privacy_failure(inspection_http, caplog):
         error(await post(state, {"text": "ok"}), 500, "E_INTERNAL", "S17_PRIVACY")
     finally:
         object.__setattr__(service, "gate", old)
+    from prometheus_client import generate_latest
+
+    from memory_server.application.inspection_service import InspectionService
+
+    original = InspectionService._admission
+    responses = [response]
+    corruptions = [
+        ("admitted", 1),
+        ("ttl_days", True),
+        ("score", float("inf")),
+        ("risk_tags", "S17_REASON_CANARY"),
+        ("risk_tags", [True]),
+        ("reason_codes", [123]),
+        ("memory_kind", []),
+        ("tag", "unknown"),
+        ("hidden", "S17_SECRET_CANARY"),
+    ]
+    for key, value in corruptions:
+
+        async def corrupt(self, command, key=key, value=value):
+            result = await original(self, command)
+            result.__dict__[key] = value
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(InspectionService, "_admission", corrupt)
+            result = await post(state, {"text": "S17_CONTENT_CANARY /S17_PATH_CANARY"})
+        error(result, 500, "E_INTERNAL", "S17_PRIVACY result corruption")
+        responses.append(result)
+    access = [dict(row) for row in state.deps.access._db.execute("SELECT * FROM access_audit")]
+    egress = caplog.text + repr(access) + generate_latest(state.deps.metrics._registry).decode()
+    egress += "".join(r.body.decode() for r in responses)
+    for canary in (
+        "S17_CONTENT_CANARY",
+        "S17_REASON_CANARY",
+        "S17_SQL_CANARY",
+        "S17_SECRET_CANARY",
+        "/S17_PATH_CANARY",
+    ):
+        assert canary not in egress, "S17_PRIVACY access/metrics/result canary scan"
 
 
-async def test_s17_inspection_composition_exact_sets(tmp_path):
+async def test_s17_inspection_composition_exact_sets(tmp_path, monkeypatch):
     from dataclasses import replace
 
     from memory_server.gateway_contracts.catalog import CATALOG
@@ -392,7 +523,33 @@ async def test_s17_inspection_composition_exact_sets(tmp_path):
             ), "S17_COMPOSITION"
             assert {r.name for r in state.app.routes} == reads | writes | shell, "S17_COMPOSITION"
             ports = {k: v for k, v in state.deps.ports.items() if k not in {"admission.preview", "mutations.preview"}}
-            composed, mounted = compose_inspection_ports(replace(state.deps, ports=ports), state.config)
+            from memory_server.transports.http.errors import HttpError
+            from memory_server.transports.http.guards import ReadRouteSpec
+
+            with pytest.raises(HttpError) as caught:
+                compose_inspection_ports(replace(state.deps, leases=None), state.config)
+            assert caught.value.code == "E_RUNTIME_NOT_READY", "S17_COMPOSITION missing lease"
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    state.deps.leases, "acquire", lambda *args: pytest.fail("S17_COMPOSITION compose opened profile")
+                )
+                composed, mounted = compose_inspection_ports(replace(state.deps, ports=ports), state.config)
+            for spec in specs:
+                invalid_specs = [
+                    (spec, spec),
+                    (replace(spec, method="GET"),),
+                    (replace(spec, operation="memories.list"),),
+                    (
+                        ReadRouteSpec(
+                            spec.operation, spec.method, spec.path, spec.permission, spec.parse, spec.validate_result
+                        ),
+                    ),
+                    (replace(spec, parse=lambda *args: None),),
+                    (replace(spec, validate_result=lambda *args: None),),
+                ]
+                for invalid in invalid_specs:
+                    with pytest.raises(ValueError):
+                        create_http_app(state.config, state.deps, read_routes=invalid)
             assert all(composed.ports[k] is v for k, v in ports.items()), "S17_COMPOSITION"
             assert composed.ports["admission.preview"] is composed.ports["mutations.preview"], "S17_COMPOSITION"
             assert mounted == specs and all(a is b for a, b in zip(mounted, specs)), "S17_COMPOSITION"
@@ -402,24 +559,38 @@ async def test_s17_inspection_composition_exact_sets(tmp_path):
                     with pytest.raises(ValueError):
                         create_http_app(state.config, state.deps, read_routes=(clone,))
                 missing = create_http_app(state.config, replace(state.deps, ports={}), read_routes=(spec,))
-                response = await request(
-                    missing,
-                    spec.path.replace("{profile}", "alpha").replace("{id}", F),
-                    method="POST",
-                    bearer=state.bearer,
-                    body={"text": "ok"}
-                    if spec.operation == "admission.preview"
-                    else dict(
-                        operation="invalidate", memory_type="fact", to_state=None, relation_id=None, conflict_id=None
-                    ),
-                )
+                audit_before = [dict(row) for row in state.deps.access._db.execute("SELECT * FROM access_audit")]
+                with monkeypatch.context() as patch:
+                    patch.setattr(
+                        state.deps.leases,
+                        "acquire",
+                        lambda *args: pytest.fail("S17_COMPOSITION missing port acquired lease"),
+                    )
+                    response = await request(
+                        missing,
+                        spec.path.replace("{profile}", "alpha").replace("{id}", F),
+                        method="POST",
+                        bearer=state.bearer,
+                        body={"text": "ok"}
+                        if spec.operation == "admission.preview"
+                        else dict(
+                            operation="invalidate",
+                            memory_type="fact",
+                            to_state=None,
+                            relation_id=None,
+                            conflict_id=None,
+                        ),
+                    )
+                assert [
+                    dict(row) for row in state.deps.access._db.execute("SELECT * FROM access_audit")
+                ] == audit_before, "S17_COMPOSITION missing port no intent"
                 error(response, 503, "E_CAPABILITY_UNAVAILABLE", "S17_COMPOSITION")
             print("S17_COMPOSITION reads=26 mutations=8 descriptors=34 routes=40")
     except ValueError as exc:
         raise AssertionError("S17_COMPOSITION canonical inspectors must mount") from exc
 
 
-async def test_s17_inspection_headers_audit_boundary(inspection_http):
+async def test_s17_inspection_headers_audit_boundary(inspection_http, monkeypatch):
     state = inspection_http
     response = await post(state, {"text": "ok"}, headers=(("X-Request-ID", "untrusted"),))
     assert response.status == 200, "S17_HTTP_BOUNDARY"
@@ -441,3 +612,47 @@ async def test_s17_inspection_headers_audit_boundary(inspection_http):
         before = list(state.deps.access._db.execute("SELECT * FROM access_audit"))
         assert (await request(state.app, path, method="OPTIONS")).status == 204, "S17_HTTP_BOUNDARY"
         assert list(state.deps.access._db.execute("SELECT * FROM access_audit")) == before, "S17_HTTP_BOUNDARY"
+    errors = []
+    cookie = await post(state, {"text": "ok"}, bearer="", headers=(("Cookie", "session=untrusted"),))
+    error(cookie, 401, "E_AUTH_REQUIRED", "S17_HTTP_BOUNDARY cookie-only")
+    errors.append(cookie)
+    malformed = await post(state, {"text": None}, headers=(("X-Request-ID", "untrusted"),))
+    error(malformed, 422, "E_VALIDATION", "S17_HTTP_BOUNDARY")
+    errors.append(malformed)
+
+    async def audit_failure(*args, **kwargs):
+        raise OSError("S17_SECRET_CANARY /S17_PATH_CANARY")
+
+    before = [dict(row) for row in state.deps.access._db.execute("SELECT * FROM access_audit")]
+    with monkeypatch.context() as patch:
+        patch.setattr(state.deps.access, "begin", audit_failure)
+        patch.setattr(
+            state.deps.leases, "acquire", lambda *args: pytest.fail("S17_HTTP_BOUNDARY begin failure acquired lease")
+        )
+        failed_begin = await post(state, {"text": "ok"})
+    error(failed_begin, 503, "E_AUDIT_UNAVAILABLE", "S17_HTTP_BOUNDARY begin failure")
+    assert [dict(row) for row in state.deps.access._db.execute("SELECT * FROM access_audit")] == before, (
+        "S17_HTTP_BOUNDARY"
+    )
+    errors.append(failed_begin)
+    with monkeypatch.context() as patch:
+        patch.setattr(state.deps.access, "finish", audit_failure)
+        failed_finish = await post(state, {"text": "ok"})
+    error(failed_finish, 503, "E_AUDIT_UNAVAILABLE", "S17_HTTP_BOUNDARY finish failure")
+    after = [dict(row) for row in state.deps.access._db.execute("SELECT * FROM access_audit ORDER BY seq")]
+    assert len(after) == len(before) + 1 and after[-1]["state"] == "intent", "S17_HTTP_BOUNDARY finish durable intent"
+    errors.append(failed_finish)
+    for result in errors:
+        assert result.headers["x-request-id"].startswith("req_") and result.headers["x-request-id"] != "untrusted", (
+            "S17_HTTP_BOUNDARY"
+        )
+        assert result.json["error"]["request_id"] == result.headers["x-request-id"], (
+            "S17_HTTP_BOUNDARY error request ID"
+        )
+        for key, value in (
+            ("cache-control", "no-store"),
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+        ):
+            assert result.headers[key] == value, "S17_HTTP_BOUNDARY error headers"
+        assert "set-cookie" not in result.headers, "S17_HTTP_BOUNDARY error cookie"
