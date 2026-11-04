@@ -556,6 +556,44 @@ async def test_s17_preview_cancel_late_response_isolation(inspection_http, monke
         await asyncio.gather(task, return_exceptions=True)
     response = await preview(state, profile="beta")
     assert response.status == 200 and response.json["observed_versions"][F] == 19, "S17_LATE_ISOLATION"
+    # A failed progress reset must invalidate while the connection is still
+    # borrowed, not after session.rollback() has returned it to the pool.
+    from sqlalchemy import event
+
+    monkeypatch.setattr(_PreviewSnapshot, "_cleanup", original)
+    original_handler = _PreviewSnapshot._handler
+    events = []
+    pools = []
+
+    def invalidated(*args):
+        events.append("invalidate")
+
+    def checked_in(*args):
+        events.append("checkin")
+
+    async def reset_failure(self, connection, callback, step):
+        pool = connection.sync_connection.engine.pool
+        if pool not in pools:
+            pools.append(pool)
+            event.listen(pool, "invalidate", invalidated)
+            event.listen(pool, "checkin", checked_in)
+        if callback is None:
+            events.append("reset-failed")
+            raise RuntimeError("synthetic reset failure")
+        await original_handler(self, connection, callback, step)
+
+    monkeypatch.setattr(_PreviewSnapshot, "_handler", reset_failure)
+    try:
+        error(await preview(state), 503, "E_STORAGE", "S17_LATE_ISOLATION")
+        assert "invalidate" in events, ("S17_LATE_ISOLATION reset failure must invalidate", events)
+        assert events.index("invalidate") < events.index("checkin"), (
+            "S17_LATE_ISOLATION invalidation before pool release",
+            events,
+        )
+    finally:
+        for pool in pools:
+            event.remove(pool, "invalidate", invalidated)
+            event.remove(pool, "checkin", checked_in)
 
 
 async def test_s17_preview_projection_privacy(inspection_http, caplog, monkeypatch):
