@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import math
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from time import monotonic
+from uuid import UUID
 
 from pydantic import ValidationError
 from sqlalchemy import bindparam, event, text
@@ -26,7 +29,6 @@ from memory_server.gateway_contracts.ports import GatewayDependencies, ProfileSe
 from memory_server.models.receipt import LifecycleState
 from memory_server.transports.http.errors import HttpError
 from memory_server.transports.http.routes.inspectors import (
-    _decode_handle,
     _fields,
     _preview_matrix,
     _result_admission,
@@ -67,12 +69,49 @@ ORDER BY source_id COLLATE BINARY LIMIT 101
 _INVALIDATING = frozenset(("superseded", "contradicted", "discarded"))
 
 
+def _decode_handle(value, kind):
+    """Application-side codec; direct commands do not trust transport validation."""
+    if kind == "relation":
+        prefix, limit, raw_limit, arity = "rel_", 2048, 1024, 3
+    else:
+        prefix, limit, raw_limit, arity = "conf_", 261, 128, 2
+    try:
+        if type(value) is not str or not value.startswith(prefix) or len(value) > limit:
+            raise ValueError("invalid handle")
+        encoded = value[len(prefix) :]
+        raw = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+        if len(raw) > raw_limit:
+            raise ValueError("oversize handle")
+        parts = json.loads(raw.decode("utf-8"))
+        if type(parts) is not list or len(parts) != arity:
+            raise ValueError("invalid tuple")
+        for endpoint in parts[:2]:
+            if type(endpoint) is not str or str(UUID(endpoint)) != endpoint:
+                raise ValueError("noncanonical endpoint")
+        if kind == "relation":
+            if parts[2] not in ("supports", "contradicts", "derives"):
+                raise ValueError("unsupported relation")
+        elif parts[0] >= parts[1]:
+            raise ValueError("unordered pair")
+        compact = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        canonical = prefix + base64.urlsafe_b64encode(compact).decode("ascii").rstrip("=")
+        if canonical != value:
+            raise ValueError("noncanonical handle")
+        return tuple(parts)
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise HttpError("E_VALIDATION") from None
+
+
 def _now():
     return datetime.now(UTC)
 
 
 def _deadline(ctx):
-    if type(ctx.deadline) not in (int, float) or not math.isfinite(ctx.deadline):
+    try:
+        finite = type(ctx.deadline) in (int, float) and math.isfinite(ctx.deadline)
+    except OverflowError:
+        finite = False
+    if not finite:
         raise HttpError("E_VALIDATION")
     if monotonic() >= ctx.deadline:
         raise HttpError("E_TIMEOUT")
@@ -110,6 +149,8 @@ async def _settle_cleanup(cleanup: asyncio.Task) -> None:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
             cancelled = True
+        except BaseException:
+            break
     try:
         cleanup.result()
     finally:
@@ -171,7 +212,10 @@ class InspectionService:
                 self.deps.tokens.verify_principal(ctx.principal, now=datetime.now(UTC))
                 _deadline(ctx)
                 validator = _result_admission if op == "admission.preview" else _result_preview
-                return validator(result)
+                result = validator(result)
+                if op == "mutations.preview":
+                    self._validate_binding(command, result)
+                return result
         except (SQLAlchemyError, sqlite3.Error) as exc:  # noqa: F841 - mutation privacy seam
             raise HttpError("E_STORAGE") from None
         except TimeoutError:
@@ -218,6 +262,38 @@ class InspectionService:
         snapshot = _PreviewSnapshot(resources.session_factory(), resources, ctx, self.clock)
         return await snapshot.execute(command)
 
+    def _validate_binding(self, command, result):
+        """The request-free route validator cannot establish these bindings."""
+        root = command.path_ids["id"]
+        payload = command.payload
+        if result.memory_id != root:
+            raise HttpError("E_INTERNAL")
+        extra = set(result.observed_versions) - set(result.affected_ids)
+        if payload.operation == "relation_delete":
+            endpoints = _decode_handle(payload.relation_id, "relation")[:2]
+            mandatory = list(dict.fromkeys(endpoints))
+            vocabulary = {"relation_delete"}
+            if extra != {payload.relation_id}:
+                raise HttpError("E_INTERNAL")
+        elif payload.operation == "resolve":
+            mandatory = list(_decode_handle(payload.conflict_id, "conflict"))
+            vocabulary = {"keep_a", "keep_b", "merge", "mark_contradicted", "discard_both", "defer"}
+        elif payload.operation == "invalidate":
+            mandatory = [root]
+            vocabulary = {"invalidate"}
+        else:
+            mandatory = [root]
+            vocabulary = {state.value for state in LifecycleState}
+        if payload.operation != "relation_delete" and extra:
+            raise HttpError("E_INTERNAL")
+        if result.affected_ids[: len(mandatory)] != mandatory:
+            raise HttpError("E_INTERNAL")
+        rest = result.affected_ids[len(mandatory) :]
+        if rest != sorted(rest) or set(rest) & set(mandatory):
+            raise HttpError("E_INTERNAL")
+        if not set(result.allowed_actions) <= vocabulary:
+            raise HttpError("E_INTERNAL")
+
 
 class _PreviewSnapshot:
     def __init__(self, session, resources, ctx, clock):
@@ -256,12 +332,24 @@ class _PreviewSnapshot:
             raise HttpError("E_STORAGE", details={"limit": 64})
 
     async def _handler(self, connection, callback, step):
+        def install(conn):
+            bridge = getattr(conn.connection.dbapi_connection, "run_async", None)
+            if not callable(bridge):
+                raise HttpError("E_CAPABILITY_UNAVAILABLE")
+
+            async def set_handler(driver):
+                setter = getattr(driver, "set_progress_handler", None)
+                if not callable(setter):
+                    raise HttpError("E_CAPABILITY_UNAVAILABLE")
+                await setter(callback, step)
+
+            return bridge(set_handler)
+
+        run_sync = getattr(connection, "run_sync", None)
+        if not callable(run_sync):
+            raise HttpError("E_CAPABILITY_UNAVAILABLE")
         try:
-            await connection.run_sync(
-                lambda conn: conn.connection.dbapi_connection.run_async(
-                    lambda driver: driver.set_progress_handler(callback, step)
-                )
-            )
+            await run_sync(install)
         except (AttributeError, NotImplementedError):
             raise HttpError("E_CAPABILITY_UNAVAILABLE") from None
 
@@ -472,8 +560,16 @@ class _PreviewSnapshot:
             try:
                 if self._listener_installed:
                     event.remove(connection.sync_connection, "before_cursor_execute", self._statement)
+            except BaseException:
+                failed = True
+            try:
                 if self._rollback_listener_installed:
                     event.remove(connection.sync_connection, "rollback", self._rollback)
+            except BaseException:
+                failed = True
+        if failed and connection is not None:
+            try:
+                await connection.invalidate()
             except BaseException:
                 failed = True
         try:
