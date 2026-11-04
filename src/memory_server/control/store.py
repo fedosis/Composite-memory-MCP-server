@@ -155,6 +155,9 @@ class ControlTransaction(AbstractContextManager):
 
     def fetchmany(self, sql: str, parameters: Sequence[object] = (), *, limit: int) -> tuple[Mapping[str, object], ...]:
         if type(limit) is not int or not 1 <= limit <= 1000:
+            # A rejected call poisons the scope: a caught error must never let the
+            # caller exit the context and commit earlier statements.
+            self._failed = True
             raise ControlError("E_STORAGE")
         return self._query(sql, parameters, reader=True, limit=limit)
 

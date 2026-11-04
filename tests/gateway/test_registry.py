@@ -308,7 +308,7 @@ def test_schema_permissions_no_memory_open(setup, monkeypatch):
     assert store.root.stat().st_mode & 0o777 == 0o700
     assert (store.root / "control.sqlite").stat().st_mode & 0o777 == 0o600
     tables = {r[0] for r in store._connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert tables == {"profiles", "registry_state", "control_journal"}
+    assert tables == {"profiles", "registry_state", "control_journal", "jobs", "job_requests"}
     assert not any(word in table for word in ("memory", "fact", "belief", "decision", "evidence") for table in tables)
     original = sqlite3.connect
     opened = []
