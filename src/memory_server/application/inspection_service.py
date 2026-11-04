@@ -379,7 +379,12 @@ class _PreviewSnapshot:
             raise HttpError("E_TIMEOUT") from None
         finally:
             cleanup = asyncio.create_task(self._cleanup(self.connection))
-            await _settle_cleanup(cleanup)
+            try:
+                await _settle_cleanup(cleanup)
+            except HttpError:
+                if self.abort_reason == "timeout" or monotonic() >= self.ctx.deadline:
+                    raise HttpError("E_TIMEOUT") from None
+                raise
 
     async def _query(self, sql, params):
         _deadline(self.ctx)
