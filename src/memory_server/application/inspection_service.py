@@ -552,6 +552,12 @@ class _PreviewSnapshot:
                 await self._handler(connection, None, 0)
             except BaseException:
                 failed = True
+                # rollback releases the session's borrowed connection to its
+                # pool; discard a connection with an unreset handler first.
+                try:
+                    await connection.invalidate()
+                except BaseException:
+                    failed = True
         try:
             await self.session.rollback()
         except BaseException:
