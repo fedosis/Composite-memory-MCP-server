@@ -159,12 +159,27 @@ def test_s18_borrowed_transaction_lifetime(store):
 def test_s18_seam_rejected_call_poisons_scope(store):
     """S18P_SEAM: a caught pre-SQL rejection must not let earlier statements commit."""
     with storage_error(), store.borrow_transaction() as tx:
-        assert tx.execute(
-            "INSERT INTO jobs (id,profile_id,subject,token_id,operation,status,revision,created_at,"
-            "updated_at,request_id,dto_snapshot,validated_request) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("b" * 48, "p", "s", "t", "outbox_replay", "queued", 0,
-             "2026-01-01T00:00:00.000000Z", "2026-01-01T00:00:00.000000Z", "r", "{}", "{}"),
-        ) == 1
+        assert (
+            tx.execute(
+                "INSERT INTO jobs (id,profile_id,subject,token_id,operation,status,revision,created_at,"
+                "updated_at,request_id,dto_snapshot,validated_request) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "b" * 48,
+                    "p",
+                    "s",
+                    "t",
+                    "outbox_replay",
+                    "queued",
+                    0,
+                    "2026-01-01T00:00:00.000000Z",
+                    "2026-01-01T00:00:00.000000Z",
+                    "r",
+                    "{}",
+                    "{}",
+                ),
+            )
+            == 1
+        )
         with storage_error():
             tx.fetchmany("SELECT 1 LIMIT ?", (1,), limit=0)
         with storage_error():
