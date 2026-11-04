@@ -195,10 +195,21 @@ async def test_s17_lifecycle_actions_match_actual(inspection_http):
         assert response.status == 200 and response.json["observed_versions"][F] == revision, "S17_LIFECYCLE_PARITY"
 
 
-async def test_s17_direct_impact_bounded(inspection_http):
+async def test_s17_direct_impact_bounded(inspection_http, monkeypatch):
     from storage.models.belief import BeliefORM
     from storage.models.relation import ClaimRelationORM
 
+    from memory_server.application.inspection_service import _PreviewSnapshot
+
+    queries = []
+    original_query = _PreviewSnapshot._query
+
+    async def traced_query(self, sql, params):
+        result = await original_query(self, sql, params)
+        queries.append((sql, len(result)))
+        return result
+
+    monkeypatch.setattr(_PreviewSnapshot, "_query", traced_query)
     state = inspection_http
     await seed(state)
     for count in (0, 1, 99, 100, 101, 512, 513):
@@ -229,6 +240,10 @@ async def test_s17_direct_impact_bounded(inspection_http):
             assert result["count_exact"] is (count < 100), "S17_BOUNDED"
             assert result["truncated"] is (count >= 100), "S17_BOUNDED"
             assert set(result["observed_versions"]) == set(expected), "S17_BOUNDED"
+    windows = [(sql, fetched) for sql, fetched in queries if "SELECT DISTINCT source_id" in sql]
+    assert windows, "S17_BOUNDED impact must cross borrowed SQLite"
+    assert all("LIMIT 101" in sql and fetched <= 101 for sql, fetched in windows), "S17_BOUNDED raw window"
+    assert all(fetched <= 513 for sql, fetched in queries if "LIMIT 513" in sql), "S17_BOUNDED direct refs"
 
 
 async def test_s17_relation_delete_canonical_preview(inspection_http):
@@ -253,9 +268,20 @@ async def test_s17_relation_delete_canonical_preview(inspection_http):
     assert stale.status == 409, "S17_STALE_PREVIEW"
 
 
-async def test_s17_resolve_pair_actions_q10(inspection_http):
+async def test_s17_resolve_pair_actions_q10(inspection_http, monkeypatch):
+    from memory_server.application.inspection_service import _PreviewSnapshot
     from memory_server.application.remote_beliefs import encode_conflict_id as conflict_id
 
+    original = _PreviewSnapshot._query
+    windows = []
+
+    async def traced(self, sql, params):
+        result = await original(self, sql, params)
+        if "SELECT DISTINCT source_id" in sql:
+            windows.append((sql, len(result)))
+        return result
+
+    monkeypatch.setattr(_PreviewSnapshot, "_query", traced)
     state = inspection_http
     await seed(state)
     body = payload("resolve", memory_type="belief", conflict_id=conflict_id(A, B))
@@ -270,6 +296,7 @@ async def test_s17_resolve_pair_actions_q10(inspection_http):
         "defer",
     ], "S17_RESOLVE_Q10"
     assert response.json["affected_ids"] == [A, B], "S17_RESOLVE_Q10"
+    assert windows and all("LIMIT 101" in sql and fetched <= 101 for sql, fetched in windows), "S17_BOUNDED pair window"
     await change(
         state,
         "INSERT INTO claim_relations(source_id,target_id,relation_type,created_at) VALUES(:a,:b,'derived_from',:t)",
@@ -281,8 +308,8 @@ async def test_s17_resolve_pair_actions_q10(inspection_http):
     assert response.json["observed_versions"] == {A: 3, B: 5}, "S17_RESOLVE_Q10"
 
 
-async def test_s17_preview_no_write_all_operations(inspection_http):
-    from sqlalchemy import event
+async def test_s17_preview_no_write_all_operations(inspection_http, monkeypatch):
+    import copy
 
     from memory_server.application.graph_read_service import relation_id
     from memory_server.application.inspection_service import _PreviewSnapshot
@@ -318,14 +345,52 @@ async def test_s17_preview_no_write_all_operations(inspection_http):
         while await rows(state, "SELECT id FROM outbox_entries WHERE status != 'completed'"):
             await asyncio.sleep(0.01)
     before = await domain_snapshot(state)
+    async with state.deps.leases.acquire(context(state)) as scope:
+        graph = scope.runtime.dependencies.graph
+        graph_before = copy.deepcopy(graph.to_dict())
+        reopened = type(graph)(graph._snapshot_path)
+        reopened.load_snapshot()
+        persisted_before = reopened.to_dict()
+    statements = []
+    original_statement = _PreviewSnapshot._statement
+
+    def traced_statement(self, connection, cursor, statement, parameters, ctx, executemany):
+        statements.append(statement)
+        return original_statement(self, connection, cursor, statement, parameters, ctx, executemany)
+
+    monkeypatch.setattr(_PreviewSnapshot, "_statement", traced_statement)
     for item, body in operations:
+        audit_before = len(list(state.deps.access._db.execute("SELECT * FROM access_audit")))
         for _ in range(10):
             result = await preview(state, body, ident=item)
             assert result.status == 200, ("S17_NO_WRITE", result.body)
-        results = await asyncio.gather(*(preview(state, body, ident=item) for _ in range(10)))
+        ready, go = asyncio.Queue(), asyncio.Event()
+
+        async def concurrent_preview():
+            ready.put_nowait(True)
+            await go.wait()
+            return await preview(state, body, ident=item)
+
+        tasks = [asyncio.create_task(concurrent_preview()) for _ in range(10)]
+        for _ in tasks:
+            await ready.get()
+        go.set()
+        results = await asyncio.gather(*tasks)
         assert all(r.status == 200 for r in results), ("S17_NO_WRITE", [(r.status, r.body) for r in results])
         assert await domain_snapshot(state) == before, "S17_NO_WRITE"
-    assert _PreviewSnapshot is not None and event is not None
+        audit_rows = list(state.deps.access._db.execute("SELECT * FROM access_audit ORDER BY seq"))[audit_before:]
+        assert len(audit_rows) == 20, "S17_NO_WRITE audit delta"
+        assert all(row["state"] == "terminal" and row["result"] == "success" for row in audit_rows), "S17_NO_WRITE"
+        assert len({row["request_id"] for row in audit_rows}) == 20, "S17_NO_WRITE request IDs"
+        assert graph.to_dict() == graph_before, "S17_NO_WRITE in-memory graph"
+        reopened = type(graph)(graph._snapshot_path)
+        reopened.load_snapshot()
+        assert reopened.to_dict() == persisted_before, "S17_NO_WRITE persisted graph"
+    assert statements, "S17_NO_WRITE borrowed SQLite trace required"
+    assert all(sql.lstrip().split(None, 1)[0].upper() in {"SELECT", "BEGIN", "ROLLBACK"} for sql in statements), (
+        "S17_NO_WRITE SQL"
+    )
+    print("S17_NO_WRITE operations=4 sequential=40 barrier=40 terminal_audit_rows=80")
 
 
 async def test_s17_preview_stale_actual_cas(inspection_http):
@@ -380,12 +445,19 @@ async def test_s17_preview_auth_and_no_oracle(inspection_http):
     command = d.MutationsPreviewCommand(
         operation="mutations.preview", profile_id="beta", path_ids={"id": F}, payload=d.PreviewRequest(**payload())
     )
-    with pytest.raises(HttpError) as caught:
+    rejected = False
+    try:
         await state.deps.ports["mutations.preview"].execute(context(state), command)
-    assert caught.value.code == "E_VALIDATION", "S17_AUTH_SCOPE"
+    except HttpError as exc:
+        rejected = exc.code == "E_VALIDATION"
+    assert rejected, "S17_AUTH_SCOPE direct command profile binding"
 
 
-async def test_s17_preview_limits_and_backend_failure(inspection_http):
+async def test_s17_preview_limits_and_backend_failure(inspection_http, monkeypatch):
+    import json
+
+    from memory_server.application.inspection_service import _PreviewSnapshot
+    from memory_server.transports.http.app import create_http_app
     from memory_server.transports.http.errors import HttpError
 
     state = inspection_http
@@ -396,6 +468,61 @@ async def test_s17_preview_limits_and_backend_failure(inspection_http):
     with pytest.raises(HttpError) as caught:
         await state.deps.ports["mutations.preview"].execute(replace(context(state), deadline=monotonic() - 1), command)
     assert caught.value.code == "E_TIMEOUT", "S17_BOUNDED"
+    error(
+        await preview(state, b" " * 1048577, headers=(("Content-Type", "application/json"),)),
+        413,
+        "E_REQUEST_TOO_LARGE",
+        "S17_BOUNDED",
+    )
+    limited = create_http_app(
+        replace(state.config, rate_burst=1, rate_per_minute=1),
+        state.deps,
+        read_routes=state.specs,
+        mutation_routes=state.mutation_specs,
+    )
+    first = await request(limited, path(), method="POST", body=payload(), bearer=state.bearer)
+    assert first.status == 200, "S17_BOUNDED rate control"
+    rejected = await request(limited, path(), method="POST", body=payload(), bearer=state.bearer)
+    assert rejected.status == 429 and rejected.json["error"]["code"] == "E_RATE_LIMIT", "S17_BOUNDED rate"
+    assert "retry-after" in rejected.headers, "S17_BOUNDED rate"
+    before = await domain_snapshot(state)
+    original = _PreviewSnapshot._inspect
+    completed = []
+
+    async def exact_budget(self, cmd):
+        result = await original(self, cmd)
+        while self.statements < 63:
+            await self._query("SELECT 1", {})
+        completed.append(self)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_PreviewSnapshot, "_inspect", exact_budget)
+        assert (await preview(state)).status == 200, "S17_BOUNDED statement boundary"
+    assert completed[0].statements == 64, "S17_BOUNDED rollback reserved"
+
+    async def over_budget(self, cmd):
+        await exact_budget(self, cmd)
+        await self._query("SELECT 1", {})
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_PreviewSnapshot, "_inspect", over_budget)
+        response = await preview(state)
+        assert response.status == 503 and response.json["error"]["details"] == {"limit": 64}, "S17_BOUNDED statements"
+
+    async def vm_budget(self, cmd):
+        await self._query(
+            "SELECT sum(a.value*b.value) FROM json_each(:items) a CROSS JOIN json_each(:items) b",
+            {"items": json.dumps(list(range(2000)))},
+        )
+        raise AssertionError("S17_BOUNDED VM failed to interrupt real SQLite")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_PreviewSnapshot, "_inspect", vm_budget)
+        response = await preview(state)
+        assert response.status == 503 and response.json["error"]["details"] == {"limit": 2_000_000}, "S17_BOUNDED VM"
+    assert (await preview(state)).status == 200, "S17_BOUNDED callback reset"
+    assert await domain_snapshot(state) == before, "S17_BOUNDED no partial effect"
 
 
 async def test_s17_preview_cancel_late_response_isolation(inspection_http, monkeypatch):
@@ -431,14 +558,30 @@ async def test_s17_preview_cancel_late_response_isolation(inspection_http, monke
     assert response.status == 200 and response.json["observed_versions"][F] == 19, "S17_LATE_ISOLATION"
 
 
-async def test_s17_preview_projection_privacy(inspection_http, caplog):
+async def test_s17_preview_projection_privacy(inspection_http, caplog, monkeypatch):
+    from memory_server.application.inspection_service import _PreviewSnapshot
+
     state = inspection_http
     await seed(state)
     response = await preview(state)
     assert response.status == 200, "S17_PRIVACY"
     assert response.json["projections"] == dict(vector="unknown", graph="unknown", outbox="unknown"), "S17_PRIVACY"
-    for canary in ("S17_CONTENT_CANARY", "S17_REASON_CANARY", "S17_SECRET_CANARY", "/S17_PATH_CANARY"):
-        assert canary not in response.body.decode() + caplog.text, "S17_PRIVACY"
+    original = _PreviewSnapshot._query
+
+    async def sql_failure(self, sql, params):
+        return await original(self, "SELECT S17_SQL_CANARY FROM s17_missing_table", {})
+
+    monkeypatch.setattr(_PreviewSnapshot, "_query", sql_failure)
+    failed = await preview(state)
+    error(failed, 503, "E_STORAGE", "S17_PRIVACY")
+    for canary in (
+        "S17_CONTENT_CANARY",
+        "S17_REASON_CANARY",
+        "S17_SQL_CANARY",
+        "S17_SECRET_CANARY",
+        "/S17_PATH_CANARY",
+    ):
+        assert canary not in response.body.decode() + failed.body.decode() + caplog.text, "S17_PRIVACY"
 
 
 async def test_s17_preview_does_not_authorize_mutation(inspection_http):

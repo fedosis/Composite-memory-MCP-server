@@ -217,9 +217,12 @@ async def test_s17_admission_strict_wire(inspection_http):
         response = await post(inspection_http, body, headers=(("Content-Type", "application/json"),))
         error(response, 422, "E_VALIDATION", "S17_WIRE_STRICT")
     for value in (b"NaN", b"Infinity", b"-Infinity", b"1e999"):
-        with pytest.raises(HttpError) as caught:
+        rejected = False
+        try:
             _decode(b'{"unknown":{"number":' + value + b"}}")
-        assert caught.value.code == "E_VALIDATION", "S17_WIRE_STRICT"
+        except HttpError as exc:
+            rejected = exc.code == "E_VALIDATION"
+        assert rejected, "S17_WIRE_STRICT nonfinite unknown nested number"
     for text in ("x", " " + "x" * 32766 + " "):
         assert (await post(inspection_http, {"text": text})).status == 200, "S17_WIRE_STRICT"
     for query in (b"x=", b"cursor=", b"x=1&x=2"):
