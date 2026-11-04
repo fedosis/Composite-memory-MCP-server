@@ -126,7 +126,7 @@ async def test_s17_preview_public_mount_required(inspection_http):
 
 async def test_s17_preview_field_matrix(inspection_http):
     from memory_server.application.graph_read_service import relation_id
-    from memory_server.application.remote_beliefs import conflict_id
+    from memory_server.application.remote_beliefs import encode_conflict_id as conflict_id
 
     state = inspection_http
     await seed(state)
@@ -179,7 +179,17 @@ async def test_s17_lifecycle_actions_match_actual(inspection_http):
                     assert response.status == 200, ("S17_LIFECYCLE_PARITY", response.body)
                     assert response.json["allowed_actions"] == expected, "S17_LIFECYCLE_PARITY"
     await change(state, "UPDATE facts SET lifecycle_state='active' WHERE id=:id", {"id": F})
-    for value, revision in ((None, 1), ("0.1.0", 1), (" 007 ", 7), ("0", 1)):
+    # The current schema forbids a persisted NULL. Exercise its legacy
+    # normalization at the real application helper without weakening that schema.
+    from types import SimpleNamespace
+
+    from storage.repositories.lifecycle_repo import normalize_version
+
+    from memory_server.application.inspection_service import _version
+
+    assert _version(SimpleNamespace(kind="fact", version=None)) == normalize_version(None) == 1, "S17_LIFECYCLE_PARITY"
+    assert await rows(state, "SELECT version FROM facts WHERE id=:id", {"id": F}) == [("7",)], "S17_LIFECYCLE_PARITY"
+    for value, revision in (("0.1.0", 1), (" 007 ", 7), ("0", 1)):
         await change(state, "UPDATE facts SET version=:v WHERE id=:id", {"v": value, "id": F})
         response = await preview(state)
         assert response.status == 200 and response.json["observed_versions"][F] == revision, "S17_LIFECYCLE_PARITY"
@@ -244,7 +254,7 @@ async def test_s17_relation_delete_canonical_preview(inspection_http):
 
 
 async def test_s17_resolve_pair_actions_q10(inspection_http):
-    from memory_server.application.remote_beliefs import conflict_id
+    from memory_server.application.remote_beliefs import encode_conflict_id as conflict_id
 
     state = inspection_http
     await seed(state)
@@ -272,28 +282,48 @@ async def test_s17_resolve_pair_actions_q10(inspection_http):
 
 
 async def test_s17_preview_no_write_all_operations(inspection_http):
-    from memory_server.application.inspection_service import _PreviewSnapshot
     from sqlalchemy import event
 
     from memory_server.application.graph_read_service import relation_id
-    from memory_server.application.remote_beliefs import conflict_id
+    from memory_server.application.inspection_service import _PreviewSnapshot
+    from memory_server.application.remote_beliefs import encode_conflict_id as conflict_id
 
     state = inspection_http
     await seed(state)
-    assert (await relation_write(state)).status == 201, "S17_NO_WRITE"
+    # Retain a real admitted read scope while the actual write's worker settles:
+    # a new admission during atomic graph publication can observe its old inode.
+    from sqlalchemy import text
+
+    async with state.deps.leases.acquire(context(state)) as scope:
+        resources = scope.application.read_resources()
+        assert (await relation_write(state)).status == 201, "S17_NO_WRITE"
+        async with asyncio.timeout(15):
+            while True:
+                async with resources.session_factory() as session:
+                    pending = (
+                        await session.execute(text("SELECT id FROM outbox_entries WHERE status != 'completed'"))
+                    ).all()
+                if not pending:
+                    break
+                await asyncio.sleep(0.01)
     operations = [
         (F, payload()),
         (F, payload("invalidate")),
         (F, payload("relation_delete", relation_id=relation_id(A, F, "supports"))),
         (A, payload("resolve", memory_type="belief", conflict_id=conflict_id(A, B))),
     ]
+    # The actual relation write queued projection work. Observe its completion
+    # before attributing any subsequent domain changes to an Inspector request.
+    async with asyncio.timeout(15):
+        while await rows(state, "SELECT id FROM outbox_entries WHERE status != 'completed'"):
+            await asyncio.sleep(0.01)
     before = await domain_snapshot(state)
     for item, body in operations:
         for _ in range(10):
             result = await preview(state, body, ident=item)
             assert result.status == 200, ("S17_NO_WRITE", result.body)
         results = await asyncio.gather(*(preview(state, body, ident=item) for _ in range(10)))
-        assert all(r.status == 200 for r in results), "S17_NO_WRITE"
+        assert all(r.status == 200 for r in results), ("S17_NO_WRITE", [(r.status, r.body) for r in results])
         assert await domain_snapshot(state) == before, "S17_NO_WRITE"
     assert _PreviewSnapshot is not None and event is not None
 

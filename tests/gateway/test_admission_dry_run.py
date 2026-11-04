@@ -57,7 +57,12 @@ def mint(state, permissions, profiles=("alpha", "beta"), expired=False):
 @asynccontextmanager
 async def inspection_http_context(tmp_path):
     registry, roots = await build_registry(tmp_path)
-    config = HttpConfig(control_path=tmp_path / "control" / "control.sqlite", rate_burst=10000, rate_per_minute=10000)
+    config = HttpConfig(
+        control_path=tmp_path / "control" / "control.sqlite",
+        rate_burst=10000,
+        rate_per_minute=10000,
+        retrieval_concurrency=16,
+    )
     state = SimpleNamespace(config=config, roots=roots)
     ready, stop = asyncio.Event(), asyncio.Event()
 
@@ -184,9 +189,8 @@ async def test_s17_admission_matches_real_gate(inspection_http, monkeypatch):
 
 
 async def test_s17_admission_strict_wire(inspection_http):
-    from memory_server.transports.http.routes.inspectors import _decode
-
     from memory_server.transports.http.errors import HttpError
+    from memory_server.transports.http.routes.inspectors import _decode
 
     bad = [
         b"\xff",
@@ -291,7 +295,9 @@ async def test_s17_admission_no_domain_write(inspection_http):
         assert "idempotency-replayed" not in response.headers, "S17_NO_WRITE"
         assert await domain_snapshot(state) == before, "S17_NO_WRITE"
     assert len(ids) == 10, "S17_NO_WRITE"
-    assert len(list(state.deps.access._db.execute("SELECT * FROM access_audit"))) - audit == 20, "S17_NO_WRITE"
+    completed = list(state.deps.access._db.execute("SELECT * FROM access_audit ORDER BY seq"))[audit:]
+    assert len(completed) == 10, "S17_NO_WRITE"
+    assert all(row["state"] == "terminal" and row["result"] == "success" for row in completed), "S17_NO_WRITE"
 
 
 async def test_s17_admission_privacy_failure(inspection_http, caplog):
@@ -325,10 +331,9 @@ async def test_s17_admission_privacy_failure(inspection_http, caplog):
 async def test_s17_inspection_composition_exact_sets(tmp_path):
     from dataclasses import replace
 
-    from memory_server.transports.http.routes.inspectors import InspectionRouteSpec, create_inspection_routes
-
     from memory_server.gateway_contracts.catalog import CATALOG
     from memory_server.runtime.read_composition import compose_inspection_ports
+    from memory_server.transports.http.routes.inspectors import InspectionRouteSpec, create_inspection_routes
 
     specs = create_inspection_routes()
     assert all(type(s) is InspectionRouteSpec for s in specs), "S17_COMPOSITION"
