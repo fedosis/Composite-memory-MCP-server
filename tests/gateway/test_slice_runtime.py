@@ -658,6 +658,8 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
             "beliefs.list",
             "beliefs.get",
             "conflicts.list",
+            "admission.preview",
+            "mutations.preview",
         }
         mutation_operations = {
             "memories.create",

@@ -104,8 +104,8 @@ async def test_relation_read_etag_descriptor_identity_is_sealed(belief_http):
 
 async def test_relation_read_foundation_keeps_catalog_counts(belief_http):
     state = belief_http
-    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 8, 32)
-    assert len(state.app.routes) == 38
+    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (26, 8, 34)
+    assert len(state.app.routes) == 40
     writes = {
         "memories.create",
         "learn",
@@ -348,10 +348,10 @@ async def test_s16c_write_mount_catalog_permissions_and_counts(s16c):
     state = s16c
     marker = "S16C_MOUNT_COUNTS"
     assert (len(state.specs), len(state.mutation_specs), len(state.deps.ports), len(state.app.routes)) == (
-        24,
+        26,
         8,
-        32,
-        38,
+        34,
+        40,
     ), marker
     writes = {
         "memories.create",

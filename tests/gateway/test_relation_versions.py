@@ -2743,10 +2743,10 @@ async def test_strict_graph_exact_intent_replay_preserves_neighbours(relations):
 async def test_relation_b_counts_and_frozen_boundaries(relations):
     state = relations
     marker = "S16B_SCOPE_COUNTS"
-    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 8, 32), (
+    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (26, 8, 34), (
         marker
     )
-    assert len(state.app.routes) == 38, marker
+    assert len(state.app.routes) == 40, marker
     writes = {
         "memories.create",
         "learn",

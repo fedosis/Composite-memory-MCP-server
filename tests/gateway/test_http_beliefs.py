@@ -123,8 +123,8 @@ async def test_beliefs_get_by_id_is_not_text_search(belief_http):
 
 async def test_belief_composition_regression_counts(belief_http):
     state = belief_http
-    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (24, 8, 32)
-    assert len(state.app.routes) == 38
+    assert (len(state.specs), len(state.mutation_specs), len(state.specs) + len(state.mutation_specs)) == (26, 8, 34)
+    assert len(state.app.routes) == 40
     reads = {spec.operation for spec in state.specs}
     assert READS <= reads
     assert {spec.operation for spec in state.mutation_specs} == WRITES
