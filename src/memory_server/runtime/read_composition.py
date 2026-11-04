@@ -10,6 +10,7 @@ from memory_server.application.diagnostics_service import DiagnosticsResources, 
 from memory_server.application.errors import UnknownDependencyError
 from memory_server.application.gateway_retrieval import GatewayRetrievalPort, NativeCustody
 from memory_server.application.graph_read_service import GraphReadResources, create_graph_read_port
+from memory_server.application.inspection_service import InspectionService
 from memory_server.application.memory_read_service import MemoryReadService
 from memory_server.application.remote_beliefs import RemoteBeliefsMutationPort, RemoteBeliefsPort
 from memory_server.application.remote_ingestion import RemoteIngestionPort
@@ -28,6 +29,7 @@ from memory_server.transports.http.routes.beliefs import (
 from memory_server.transports.http.routes.diagnostics import OutboxCursorCodec, create_diagnostics_routes
 from memory_server.transports.http.routes.graph import RelationCursorCodec, create_graph_read_routes
 from memory_server.transports.http.routes.ingestion import create_ingestion_routes
+from memory_server.transports.http.routes.inspectors import create_inspection_routes
 from memory_server.transports.http.routes.lifecycle import create_lifecycle_routes
 from memory_server.transports.http.routes.memories_read import CursorCodec, create_memory_read_routes
 from memory_server.transports.http.routes.profiles import audit_ticket
@@ -288,4 +290,15 @@ def compose_relation_mutation_ports(deps, config):
     specs = create_relation_mutation_routes()
     ports = dict(deps.ports)
     ports.update({spec.operation: port for spec in specs})
+    return replace(deps, ports=ports), specs
+
+
+def compose_inspection_ports(deps, config):
+    del config
+    if deps.leases is None:
+        raise HttpError("E_RUNTIME_NOT_READY")
+    service = InspectionService(deps, bind_read)
+    specs = create_inspection_routes()
+    ports = dict(deps.ports)
+    ports.update({spec.operation: service for spec in specs})
     return replace(deps, ports=ports), specs

@@ -28,6 +28,7 @@ from .routes.beliefs import (
 from .routes.diagnostics import DIAGNOSTICS_ROUTE_SPECS, DiagnosticsRouteSpec, OutboxCursorCodec
 from .routes.graph import GRAPH_READ_ROUTE_SPECS, GraphReadRouteSpec, RelationCursorCodec
 from .routes.ingestion import INGESTION_ROUTE_SPECS, MutationRouteSpec
+from .routes.inspectors import INSPECTION_ROUTE_SPECS, InspectionRouteSpec
 from .routes.lifecycle import LIFECYCLE_ROUTE_SPECS
 from .routes.profiles import validate_profile_id
 from .routes.relations_write import RELATION_MUTATION_ROUTE_SPECS
@@ -145,6 +146,17 @@ class HttpApp:
                         if spec.operation in {"beliefs.list", "conflicts.list"}
                         else spec.cursor_codec is None
                     )
+                )
+            elif type(spec) is InspectionRouteSpec:
+                canonical = INSPECTION_ROUTE_SPECS.get(spec.operation)
+                owner_matches = (
+                    row is not None
+                    and row.owner == "S17"
+                    and row.mutation is False
+                    and canonical is not None
+                    and spec is canonical
+                    and spec.parse is canonical.parse
+                    and spec.validate_result is canonical.validate_result
                 )
             else:
                 owner_matches = row is not None and row.owner == "S07"

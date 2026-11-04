@@ -109,6 +109,7 @@ async def diagnostic_http(shell):
         compose_belief_mutation_ports,
         compose_belief_read_ports,
         compose_ingestion_ports,
+        compose_inspection_ports,
         compose_lifecycle_ports,
         compose_read_ports,
         compose_relation_mutation_ports,
@@ -125,6 +126,8 @@ async def diagnostic_http(shell):
     mutation_specs += belief_mutation_specs
     deps, relation_specs = compose_relation_mutation_ports(deps, shell.config)
     mutation_specs += relation_specs
+    deps, inspection_specs = compose_inspection_ports(deps, shell.config)
+    specs += inspection_specs
     shell.app = create_http_app(shell.config, deps, read_routes=specs, mutation_routes=mutation_specs)
     shell.bearer, _ = shell.mint(permissions=("profile.read", "audit.read"))
     shell.specs = specs
