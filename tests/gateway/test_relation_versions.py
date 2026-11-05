@@ -2758,7 +2758,7 @@ async def test_relation_b_counts_and_frozen_boundaries(relations):
         "relations.delete",
     }
     assert {spec.operation for spec in state.mutation_specs} == writes, marker
-    assert set(state.deps.ports) == {spec.operation for spec in state.specs} | writes, marker
+    assert set(state.deps.ports) == {spec.operation for spec in state.specs} | writes | {"jobs.get"}, marker
     base = "2896fae938feb904cdb70f7461a1b9fcc26cf6f5"
     paths = {
         "storage/outbox_worker.py": (

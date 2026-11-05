@@ -527,11 +527,11 @@ async def test_s17_inspection_composition_exact_sets(tmp_path, monkeypatch):
             shell = {"health", "ready", "profiles.list", "profiles.get", "profiles.enable", "profiles.disable"}
             assert {s.operation for s in state.specs} == reads, "S17_COMPOSITION"
             assert {s.operation for s in state.mutation_specs} == writes, "S17_COMPOSITION"
-            assert set(state.deps.ports) == reads | writes, "S17_COMPOSITION"
+            assert set(state.deps.ports) == reads | writes | {"jobs.get"}, "S17_COMPOSITION"
             assert (len(state.specs), len(state.mutation_specs), len(state.deps.ports), len(state.app.routes)) == (
                 26,
                 8,
-                34,
+                35,
                 40,
             ), "S17_COMPOSITION"
             assert {r.name for r in state.app.routes} == reads | writes | shell, "S17_COMPOSITION"

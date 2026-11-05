@@ -671,7 +671,7 @@ async def test_slice_missing_each_read_port_is_503_before_lease_or_audit(
             "relations.create",
             "relations.delete",
         }
-        assert set(deps.ports) == read_operations | mutation_operations
+        assert set(deps.ports) == read_operations | mutation_operations | {"jobs.get"}
         assert {spec.operation for spec in read_routes} == read_operations
         assert {spec.operation for spec in mutation_routes} == mutation_operations
         missing = dict(deps.ports)

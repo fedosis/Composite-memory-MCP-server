@@ -117,7 +117,7 @@ async def test_relation_read_foundation_keeps_catalog_counts(belief_http):
         "relations.delete",
     }
     assert {spec.operation for spec in state.mutation_specs} == writes
-    assert set(state.deps.ports) == {spec.operation for spec in state.specs} | writes
+    assert set(state.deps.ports) == {spec.operation for spec in state.specs} | writes | {"jobs.get"}
 
 
 async def test_relation_read_compatibility_and_privacy(tmp_path, caplog):
@@ -350,7 +350,7 @@ async def test_s16c_write_mount_catalog_permissions_and_counts(s16c):
     assert (len(state.specs), len(state.mutation_specs), len(state.deps.ports), len(state.app.routes)) == (
         26,
         8,
-        34,
+        35,
         40,
     ), marker
     writes = {
