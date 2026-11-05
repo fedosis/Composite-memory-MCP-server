@@ -128,7 +128,7 @@ async def test_belief_composition_regression_counts(belief_http):
     reads = {spec.operation for spec in state.specs}
     assert READS <= reads
     assert {spec.operation for spec in state.mutation_specs} == WRITES
-    assert set(state.deps.ports) == reads | WRITES
+    assert set(state.deps.ports) == reads | WRITES | {"jobs.get"}
     port = state.deps.ports["beliefs.set"]
     assert port is state.deps.ports["conflicts.resolve"]
     assert all(port is not state.deps.ports[op] for op in (READS | WRITES) - {"beliefs.set", "conflicts.resolve"})
