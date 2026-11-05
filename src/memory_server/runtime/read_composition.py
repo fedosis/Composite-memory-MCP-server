@@ -302,3 +302,23 @@ def compose_inspection_ports(deps, config):
     ports = dict(deps.ports)
     ports.update({spec.operation: service for spec in specs})
     return replace(deps, ports=ports), specs
+
+
+def compose_job_ports(deps, config):
+    from dataclasses import replace
+
+    from memory_server.application.job_runner import JobCoordinator
+    from memory_server.application.job_service import JobService
+    from memory_server.control.jobs import JobMetadata
+    from memory_server.transports.http.routes.jobs import JobReadAdapter, create_job_routes
+
+    del config
+    metadata = JobMetadata(deps.registry._store)
+    publish_event = deps.events.publish if deps.events is not None else None
+    jobs = JobService(
+        metadata, deps.registry, deps.tokens, deps.access.begin, deps.access.publish_committed, events=publish_event
+    )
+    coordinator = JobCoordinator(metadata, deps.leases, authorize=jobs._authorize, events=publish_event)
+    # Concrete maintenance runners/fences belong to S19/S20: read-only until injected.
+    jobs = replace(jobs, attach=coordinator.attach if coordinator.replay or coordinator.rebuild else None)
+    return replace(deps, jobs=jobs, ports={**deps.ports, "jobs.get": JobReadAdapter(jobs)}), create_job_routes()

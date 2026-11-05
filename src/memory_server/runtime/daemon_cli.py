@@ -135,6 +135,7 @@ async def run_daemon(config, registry_path, profiles_root=None, *, factory=None,
                 compose_belief_read_ports,
                 compose_ingestion_ports,
                 compose_inspection_ports,
+                compose_job_ports,
                 compose_lifecycle_ports,
                 compose_read_ports,
                 compose_relation_mutation_ports,
@@ -152,6 +153,7 @@ async def run_daemon(config, registry_path, profiles_root=None, *, factory=None,
             mutation_specs += relation_specs
             deps, inspection_specs = compose_inspection_ports(deps, config)
             specs += inspection_specs
+            deps, _ = compose_job_ports(deps, config)
             app = with_profile_ports(factory(config, deps, read_routes=specs, mutation_routes=mutation_specs),
                                      pending_control=bind_control_pending(registry, store))
             managed_signals = server_factory is None
