@@ -64,7 +64,12 @@ class JobService:
     async def _publish(self, reservation, now):
         if reservation.outcome_snapshot is None:
             reservation = self.metadata.finalize_request(reservation, AuditOutcome(202, None, (), 0.0), now=now)
-        await self.publish(AuditTicket(reservation.ticket_id, reservation.request_id), reservation.outcome_snapshot)
+        try:
+            await self.publish(AuditTicket(reservation.ticket_id, reservation.request_id), reservation.outcome_snapshot)
+        except JobError:
+            raise
+        except Exception:
+            raise JobError("E_AUDIT_UNAVAILABLE") from None
         self.metadata.mark_published(reservation, now=now)
         return reservation
 
@@ -79,11 +84,13 @@ class JobService:
         if not callable(self.attach):
             raise JobError("E_CAPABILITY_UNAVAILABLE")
         now = self.clock()
+        for pending in self.metadata.pending_outcomes(limit=100, deadline=ctx.deadline):
+            await self._publish(pending, now)
+        self.metadata.cleanup_expired(now=now, limit=100, deadline=ctx.deadline)
         try:
-            for pending in self.metadata.pending_outcomes(limit=100, deadline=ctx.deadline):
-                await self._publish(pending, now)
-            self.metadata.cleanup_expired(now=now, limit=100, deadline=ctx.deadline)
             ticket = await self.intent(ctx, "outbox.replay" if operation == "outbox_replay" else "indexes.rebuild")
+        except JobError:
+            raise
         except Exception:
             raise JobError("E_AUDIT_UNAVAILABLE") from None
         reservation = self.metadata.enqueue(
@@ -97,10 +104,7 @@ class JobService:
         )
         if reservation.replayed:
             return reservation.accepted
-        try:
-            reservation = await self._publish(reservation, now)
-        except Exception:
-            raise JobError("E_AUDIT_UNAVAILABLE") from None
+        reservation = await self._publish(reservation, now)
         if self.events is not None:
             event = d.Event(
                 id=reservation.job_id,

@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import secrets
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from time import monotonic
@@ -37,7 +38,7 @@ def request_digest(operation, payload):
     route = "outbox.replay" if operation == "outbox_replay" else "indexes.rebuild"
     return hashlib.sha256(
         canonical_json(
-            {"method": "POST", "operation": route, "path_ids": {}, "payload": payload.model_dump(mode="json")}
+            {"method": "POST", "route": route, "path_ids": {}, "payload": payload.model_dump(mode="json")}
         ).encode("utf-8")
     ).hexdigest()
 
@@ -196,6 +197,14 @@ class JobMetadata:
     def __init__(self, store):
         self.store = store
 
+    @contextmanager
+    def _tx(self):
+        try:
+            with self.store.borrow_transaction() as tx:
+                yield tx
+        except ControlError:
+            raise JobError("E_STORAGE") from None
+
     def enqueue(self, ctx, operation, payload, *, digest, ticket, now, ttl_seconds=86400):
         payload = validated_payload(operation, payload)
         created = stamp(now)
@@ -203,82 +212,79 @@ class JobMetadata:
             raise JobError("E_VALIDATION")
         route = "outbox.replay" if operation == "outbox_replay" else "indexes.rebuild"
         key = (ctx.principal.subject, ctx.profile_id, route, str(ctx.idempotency_key))
-        try:
-            with self.store.borrow_transaction() as tx:
-                previous = tx.fetchone(_REQUEST, key)
-                if previous:
-                    if previous["digest"] != digest:
-                        raise JobError("E_IDEMPOTENCY_CONFLICT")
-                    if previous["phase"] != "final":
-                        raise JobError("E_REQUEST_IN_PROGRESS", retry_after=1)
-                    return _reservation(previous, True)
-                if len(tx.fetchmany("SELECT id FROM jobs WHERE slot_held=1 LIMIT 128", limit=128)) == 128:
-                    raise JobError("E_RATE_LIMIT")
-                for _ in range(3):
-                    job_id = secrets.token_hex(24)
-                    if tx.fetchone("SELECT id FROM jobs WHERE id=? LIMIT 1", (job_id,)) is None:
-                        break
-                else:
-                    raise JobError("E_STORAGE")
-                job = d.Job(
-                    id=job_id,
-                    profile_id=ctx.profile_id,
-                    token_id=ctx.principal.token_id,
-                    operation=operation,
-                    status="queued",
-                    progress=None,
-                    created_at=now,
-                    started_at=None,
-                    finished_at=None,
-                    request_id=ctx.request_id,
-                    result=None,
-                    error_code=None,
-                )
-                accepted = d.JobAccepted(job_id=job_id, status="queued", request_id=ctx.request_id)
-                tx.execute(
-                    "INSERT INTO jobs (id,profile_id,subject,token_id,operation,created_at,updated_at,"
-                    "request_id,dto_snapshot,validated_request) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        job_id,
-                        ctx.profile_id,
-                        ctx.principal.subject,
-                        ctx.principal.token_id,
-                        operation,
-                        created,
-                        created,
-                        ctx.request_id,
-                        canonical_json(job),
-                        canonical_json(payload),
-                    ),
-                )
-                tx.execute(
-                    "INSERT INTO job_requests (subject,profile_id,route_operation,key,digest,job_id,ticket_id,"
-                    "request_id,accepted_snapshot,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        *key,
-                        digest,
-                        job_id,
-                        ticket.id,
-                        ctx.request_id,
-                        canonical_json(accepted),
-                        created,
-                        created,
-                        stamp(now + timedelta(seconds=ttl_seconds)),
-                    ),
-                )
-                reservation = _reservation(tx.fetchone(_REQUEST, key))
-            return reservation
-        except ControlError:
-            raise JobError("E_STORAGE") from None
+        with self._tx() as tx:
+            previous = tx.fetchone(_REQUEST, key)
+            if previous:
+                if previous["digest"] != digest:
+                    raise JobError("E_IDEMPOTENCY_CONFLICT")
+                if previous["phase"] != "final":
+                    raise JobError("E_REQUEST_IN_PROGRESS", retry_after=1)
+                return _reservation(previous, True)
+            if len(tx.fetchmany("SELECT id FROM jobs WHERE slot_held=1 LIMIT ?", (128,), limit=128)) == 128:
+                raise JobError("E_RATE_LIMIT")
+            for _ in range(3):
+                job_id = secrets.token_hex(24)
+                if tx.fetchone("SELECT id FROM jobs WHERE id=? LIMIT 1", (job_id,)) is None:
+                    break
+            else:
+                raise JobError("E_STORAGE")
+            job = d.Job(
+                id=job_id,
+                profile_id=ctx.profile_id,
+                token_id=ctx.principal.token_id,
+                operation=operation,
+                status="queued",
+                progress=None,
+                created_at=now,
+                started_at=None,
+                finished_at=None,
+                request_id=ctx.request_id,
+                result=None,
+                error_code=None,
+            )
+            accepted = d.JobAccepted(job_id=job_id, status="queued", request_id=ctx.request_id)
+            tx.execute(
+                "INSERT INTO jobs (id,profile_id,subject,token_id,operation,created_at,updated_at,"
+                "request_id,dto_snapshot,validated_request) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    ctx.profile_id,
+                    ctx.principal.subject,
+                    ctx.principal.token_id,
+                    operation,
+                    created,
+                    created,
+                    ctx.request_id,
+                    canonical_json(job),
+                    canonical_json(payload),
+                ),
+            )
+            tx.execute(
+                "INSERT INTO job_requests (subject,profile_id,route_operation,key,digest,job_id,ticket_id,"
+                "request_id,accepted_snapshot,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    *key,
+                    digest,
+                    job_id,
+                    ticket.id,
+                    ctx.request_id,
+                    canonical_json(accepted),
+                    created,
+                    created,
+                    stamp(now + timedelta(seconds=ttl_seconds)),
+                ),
+            )
+            reservation = _reservation(tx.fetchone(_REQUEST, key))
+        return reservation
 
     def get(self, job_id, profile_id, subject):
-        with self.store.borrow_transaction() as tx:
+        with self._tx() as tx:
             row = tx.fetchone(_SCOPE, (job_id, profile_id, subject))
             job = _job(row) if row else None
         return job
 
     def claim(self, job_id, profile_id, subject, expected_revision, *, now):
-        with self.store.borrow_transaction() as tx:
+        with self._tx() as tx:
             row = tx.fetchone(_SCOPE, (job_id, profile_id, subject))
             if not row or row["status"] != "queued" or row["revision"] != expected_revision:
                 return None
@@ -295,7 +301,7 @@ class JobMetadata:
 
     def finish(self, job_id, profile_id, subject, expected_revision, expected_status, terminal_update):
         u = terminal_update
-        with self.store.borrow_transaction() as tx:
+        with self._tx() as tx:
             row = tx.fetchone(_SCOPE, (job_id, profile_id, subject))
             if not row:
                 return None
@@ -378,7 +384,7 @@ class JobMetadata:
         )
 
     def progress(self, claim, value, *, now):
-        with self.store.borrow_transaction() as tx:
+        with self._tx() as tx:
             row = tx.fetchone(_SCOPE, (claim.job.id, claim.job.profile_id, claim.subject))
             if not row or row["status"] != "running" or row["revision"] != claim.revision:
                 return None
@@ -407,7 +413,7 @@ class JobMetadata:
     def scan_reconcile(self, *, limit=100, deadline):
         if not self._bound(limit, deadline):
             return ()
-        with self.store.borrow_transaction() as tx:
+        with self._tx() as tx:
             records = tuple(
                 RecoveryRecord(_claim(row), row["phase"], row["recovery_metadata"])
                 for row in tx.fetchmany(
@@ -421,7 +427,7 @@ class JobMetadata:
         if not self._bound(limit, deadline):
             return 0
         removed = 0
-        with self.store.borrow_transaction() as tx:
+        with self._tx() as tx:
             rows = tx.fetchmany(
                 "SELECT * FROM job_requests WHERE phase='final' AND pending_outcome=0 AND expires_at<=? "
                 "ORDER BY expires_at,job_id LIMIT ?",
@@ -447,7 +453,7 @@ class JobMetadata:
         return removed
 
     def finalize_request(self, reservation, outcome, *, now):
-        with self.store.borrow_transaction() as tx:
+        with self._tx() as tx:
             tx.execute(
                 "UPDATE job_requests SET phase='final',outcome_snapshot=?,updated_at=? "
                 "WHERE subject=? AND profile_id=? AND route_operation=? AND key=? AND digest=? AND phase='committed'",
@@ -459,7 +465,7 @@ class JobMetadata:
     def pending_outcomes(self, *, limit=100, deadline):
         if not self._bound(limit, deadline):
             return ()
-        with self.store.borrow_transaction() as tx:
+        with self._tx() as tx:
             records = tuple(
                 _reservation(row)
                 for row in tx.fetchmany(
@@ -470,7 +476,7 @@ class JobMetadata:
         return records
 
     def mark_published(self, reservation, *, now):
-        with self.store.borrow_transaction() as tx:
+        with self._tx() as tx:
             tx.execute(
                 "UPDATE job_requests SET pending_outcome=0,updated_at=? "
                 "WHERE subject=? AND profile_id=? AND route_operation=? AND key=? AND digest=? AND phase='final'",
