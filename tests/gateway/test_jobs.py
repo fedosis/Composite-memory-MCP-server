@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import importlib
+import json
 import math
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -376,3 +379,122 @@ def test_s18_job_layer_import_boundaries():
         isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("eval", "exec", "__import__")
         for n in ast.walk(tree)
     ), "S18C1_LAYERS"
+
+
+@pytest.mark.parametrize("operation,route", [("outbox_replay", "outbox.replay"), ("vector_rebuild", "indexes.rebuild")])
+def test_fix2_c6_digest(operation, route):
+    m, _ = modules()
+    envelope = {"method": "POST", "route": route, "path_ids": {}, "payload": payload().model_dump(mode="json")}
+
+    def digest(value):
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+
+    actual = m.request_digest(operation, payload())
+    assert actual == digest(envelope), "FIX2_C6_ROUTE"
+    envelope["operation"] = envelope.pop("route")
+    assert actual != digest(envelope), "FIX2_C6_NOT_OPERATION"
+
+
+@pytest.mark.parametrize(
+    "layer",
+    ["pending_outcomes", "cleanup_expired", "enqueue", "finalize_request", "mark_published", "intent", "publish"],
+)
+@pytest.mark.parametrize("typed", [False, True])
+def test_fix2_service_error_matrix(owner, monkeypatch, layer, typed):
+    m, _ = modules()
+    svc, ctx = assembled(owner)
+    error = m.JobError("E_STORAGE") if typed else RuntimeError("injected failure")
+    original = owner.borrow_transaction
+
+    @contextmanager
+    def failing_transaction():
+        from memory_server.control.store import ControlError
+
+        with original() as tx:
+            tx.fetchone("SELECT id FROM jobs LIMIT 1")
+            raise ControlError("E_STORAGE")
+            yield tx
+
+    original_method = getattr(svc.metadata, layer, None)
+
+    def fail(*args, **kwargs):
+        if typed:
+            raise error
+        with monkeypatch.context() as patch:
+            patch.setattr(owner, "borrow_transaction", failing_transaction)
+            return original_method(*args, **kwargs)
+
+    async def async_fail(*args, **kwargs):
+        raise error
+
+    if layer in ("intent", "publish"):
+        svc = replace(svc, **{layer: async_fail})
+    else:
+        monkeypatch.setattr(svc.metadata, layer, fail)
+    expected = "E_AUDIT_UNAVAILABLE" if not typed and layer in ("intent", "publish") else "E_STORAGE"
+    with pytest.raises(m.JobError) as caught:
+        asyncio.run(svc.enqueue(ctx, "outbox_replay", payload()))
+    assert caught.value.code == expected, "FIX2_SERVICE_MATRIX"
+    if typed:
+        assert caught.value is error, "FIX2_JOBERROR_IDENTITY"
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "get",
+        "claim",
+        "finish",
+        "progress",
+        "cleanup_expired",
+        "finalize_request",
+        "pending_outcomes",
+        "mark_published",
+        "scan_reconcile",
+        "enqueue",
+    ],
+)
+@pytest.mark.parametrize("typed", [False, True])
+def test_fix2_metadata_seam_errors(owner, monkeypatch, method, typed):
+    m, _ = modules()
+    from memory_server.control.store import ControlError
+
+    md = m.JobMetadata(owner)
+    r = enqueue(owner)
+    c = md.claim(r.job_id, "p", "subject", 0, now=NOW)
+    error = m.JobError("E_VALIDATION") if typed else ControlError("E_STORAGE")
+    original = owner.borrow_transaction
+
+    @contextmanager
+    def failing_transaction():
+        with original() as tx:
+            tx.fetchone("SELECT id FROM jobs WHERE id=? LIMIT 1", (r.job_id,))
+            yield tx
+            raise error
+
+    monkeypatch.setattr(owner, "borrow_transaction", failing_transaction)
+    calls = {
+        "get": lambda: md.get(r.job_id, "p", "subject"),
+        "claim": lambda: md.claim(r.job_id, "p", "subject", c.revision, now=NOW),
+        "finish": lambda: md.finish(
+            r.job_id, "p", "subject", c.revision, "running", m.TerminalUpdate("succeeded", result(), None, NOW)
+        ),
+        "progress": lambda: md.progress(c, 0.5, now=NOW),
+        "cleanup_expired": lambda: md.cleanup_expired(now=NOW, deadline=monotonic() + 5),
+        "finalize_request": lambda: md.finalize_request(r, OUTCOME, now=NOW),
+        "pending_outcomes": lambda: md.pending_outcomes(deadline=monotonic() + 5),
+        "mark_published": lambda: md.mark_published(r, now=NOW),
+        "scan_reconcile": lambda: md.scan_reconcile(deadline=monotonic() + 5),
+        "enqueue": lambda: enqueue(owner),
+    }
+    with pytest.raises(m.JobError) as caught:
+        calls[method]()
+    assert caught.value.code == ("E_VALIDATION" if typed else "E_STORAGE"), "FIX2_SEAM_STORAGE"
+    if typed:
+        assert caught.value is error, "FIX2_TX_JOBERROR_IDENTITY"
+    with original() as tx:
+        assert tx.fetchone("SELECT status FROM jobs WHERE id=?", (r.job_id,))["status"] == "running", "FIX2_ROLLBACK"
