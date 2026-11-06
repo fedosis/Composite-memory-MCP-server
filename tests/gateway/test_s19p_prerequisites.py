@@ -793,20 +793,36 @@ async def p6c_owned_claim(h, monkeypatch, *, operation, method):
         async with worker._session_factory() as session:
             if operation == "relation_sync":
                 session.add_all([BeliefORM(id=value, proposition=value) for value in (source, target)])
-                session.add(ClaimRelationORM(
-                    source_id=source, target_id=target, relation_type="supports", created_at=h.now,
-                ))
-                session.add(RelationRevisionORM(
-                    source_id=source, target_id=target, relation_type="supports", revision=1,
-                    deleted=0, relation_created_at=h.now, changed_at=h.now, event_id=event_id,
-                ))
-                payload = dict(v=1, source_id=source, target_id=target, relation_type="supports",
-                               revision=1, event_id=event_id)
+                session.add(
+                    ClaimRelationORM(
+                        source_id=source,
+                        target_id=target,
+                        relation_type="supports",
+                        created_at=h.now,
+                    )
+                )
+                session.add(
+                    RelationRevisionORM(
+                        source_id=source,
+                        target_id=target,
+                        relation_type="supports",
+                        revision=1,
+                        deleted=0,
+                        relation_created_at=h.now,
+                        changed_at=h.now,
+                        event_id=event_id,
+                    )
+                )
+                payload = dict(
+                    v=1, source_id=source, target_id=target, relation_type="supports", revision=1, event_id=event_id
+                )
             else:
                 payload = dict(subject="s", predicate="p", object="o")
             entry = await OutboxRepository(session).add_entry(
                 record_type="belief" if operation == "relation_sync" else "fact",
-                record_id=source, operation=operation, payload=payload,
+                record_id=source,
+                operation=operation,
+                payload=payload,
             )
             entry_id = entry.id
             await session.commit()
@@ -840,18 +856,23 @@ async def p6c_owned_claim(h, monkeypatch, *, operation, method):
             task = asyncio.create_task(getattr(worker, method)())
             assert await asyncio.to_thread(parked.wait, 5), "S19P_P6C_NO_COMMIT"
             async with worker._engine.connect() as connection:
-                claimed_at = (await connection.execute(text(
-                    "SELECT processed_at FROM outbox_entries WHERE id=:id"
-                ), {"id": entry_id})).scalar_one()
+                claimed_at = (
+                    await connection.execute(
+                        text("SELECT processed_at FROM outbox_entries WHERE id=:id"), {"id": entry_id}
+                    )
+                ).scalar_one()
             assert claimed_at is not None, "S19P_P6C_NO_COMMIT"
             result = await asyncio.wait_for(asyncio.shield(task), 5)
             expected = 0 if method == "_poll_once" else {"processed": 0, "failed": 0}
             assert result == expected, "S19P_P6C_NO_COMMIT"
             assert len(commits) == 1, "S19P_P6C_NO_COMMIT: work commit after claim"
             async with worker._engine.connect() as connection:
-                row = (await connection.execute(text(
-                    "SELECT status,retry_count,error,processed_at FROM outbox_entries WHERE id=:id"
-                ), {"id": entry_id})).one()
+                row = (
+                    await connection.execute(
+                        text("SELECT status,retry_count,error,processed_at FROM outbox_entries WHERE id=:id"),
+                        {"id": entry_id},
+                    )
+                ).one()
             assert tuple(row) == ("processing", 0, None, claimed_at), "S19P_P6C_NO_COMMIT"
             records = [r for r in runtime.owned_snapshot()[2] if r.thread.is_alive()]
             assert records and runtime.lock is not None, "S19P_P6C_NO_COMMIT"
@@ -898,7 +919,9 @@ async def test_s19p_p6d_exception_path_no_commit(seam_owner, monkeypatch, method
                 await asyncio.sleep(0)
         async with worker._session_factory() as session:
             entry = await OutboxRepository(session).add_entry(
-                record_type="fact", record_id=str(uuid4()), operation="index_fact",
+                record_type="fact",
+                record_id=str(uuid4()),
+                operation="index_fact",
                 payload=dict(subject="s", predicate="p", object="o"),
             )
             entry_id = entry.id
@@ -945,9 +968,12 @@ async def test_s19p_p6d_exception_path_no_commit(seam_owner, monkeypatch, method
             assert result == expected, "S19P_P6D_EXCEPTION_NO_COMMIT"
             assert len(commits) == 1, "S19P_P6D_EXCEPTION_NO_COMMIT: work commit after claim"
             async with worker._engine.connect() as connection:
-                row = (await connection.execute(text(
-                    "SELECT status,retry_count,error,processed_at FROM outbox_entries WHERE id=:id"
-                ), {"id": entry_id})).one()
+                row = (
+                    await connection.execute(
+                        text("SELECT status,retry_count,error,processed_at FROM outbox_entries WHERE id=:id"),
+                        {"id": entry_id},
+                    )
+                ).one()
             assert tuple(row[:3]) == ("processing", 0, None), "S19P_P6D_EXCEPTION_NO_COMMIT"
             assert row.processed_at is not None, "S19P_P6D_EXCEPTION_NO_COMMIT"
             assert any(r.thread.is_alive() for r in runtime.owned_snapshot()[2]), "S19P_P6D_EXCEPTION_NO_COMMIT"
@@ -1015,3 +1041,705 @@ async def test_s19p_p6c_not_exception(seam_owner, monkeypatch):
         finally:
             release.set()
             assert await handle.drain(monotonic() + 5), "S19P_P6C_NO_COMMIT"
+
+
+@pytest.fixture
+async def p3_worker(tmp_path):
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from storage.outbox_worker import OutboxWorker
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'outbox.sqlite'}")
+    worker = OutboxWorker(engine=engine, compact_interval_seconds=0)
+    await worker.initialize()
+    try:
+        yield worker
+    finally:
+        await engine.dispose()
+
+
+def p3_surface(worker):
+    import storage.outbox_worker as module
+
+    for name in ("claim_scope", "process_claimed"):
+        assert callable(getattr(worker, name, None)), "S19P_SURFACE"
+    assert isinstance(getattr(module, "OutboxClaimError", None), type), "S19P_SURFACE"
+    return module.OutboxClaimError
+
+
+async def p3_add(worker, *, operation="index_decision", payload=None):
+    from storage.outbox import OutboxRepository
+
+    async with worker._session_factory() as session:
+        entry = await OutboxRepository(session).add_entry(
+            record_type="fact",
+            record_id=str(uuid4()),
+            operation=operation,
+            payload=payload or {"choice": "local", "reason": "test"},
+        )
+        await session.commit()
+        return entry
+
+
+async def p3_rows(worker):
+    from sqlalchemy import text
+
+    async with worker._engine.connect() as connection:
+        return [
+            tuple(row)
+            for row in (
+                await connection.execute(
+                    text("SELECT id,status,retry_count,error,processed_at FROM outbox_entries ORDER BY id")
+                )
+            ).all()
+        ]
+
+
+@pytest.mark.parametrize(
+    "site",
+    [
+        "pending",
+        "exhausted",
+        "chunk",
+        "poll",
+        "compact",
+        "lance_single",
+        "lance_batch",
+        "lance_ensure",
+        "lance_optimize",
+        "qdrant_single",
+        "qdrant_batch",
+        "graph_replace",
+        "graph_malformed",
+        "graph_read",
+        "graph_lock",
+        "graph_resync",
+        "graph_publish",
+    ],
+)
+async def test_s19p_worker_secret_canary(p3_worker, monkeypatch, caplog, site):
+    import asyncio
+    import logging
+
+    from storage.outbox import OutboxRepository
+
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
+
+    worker = p3_worker
+    secret = "S19P_PRIVATE_WORKER /private/path payload=canary"
+    failure = RuntimeError(secret)
+    caplog.set_level(logging.DEBUG)
+    entry = await p3_add(worker, operation="index_fact", payload={"subject": "s", "predicate": "p", "object": "o"})
+    before = await p3_rows(worker)
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    if site.startswith(("lance_", "qdrant_", "graph_")):
+        await p3_provider_canary(worker, monkeypatch, caplog, site, fail, failure, secret)
+        return
+    if site == "poll":
+        # Fault below the real repository method, at SQL execution.
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        monkeypatch.setattr(AsyncSession, "execute", fail)
+        worker.stop()
+        worker._stop_requested = False
+        original_sleep = asyncio.sleep
+
+        async def stopped(delay):
+            worker.stop()
+            await original_sleep(0)
+
+        monkeypatch.setattr(asyncio, "sleep", stopped)
+        await worker.run()
+        monkeypatch.undo()
+    elif site == "compact":
+        from memory_server.providers.lancedb_provider import LanceDBProvider
+        from memory_server.settings import Settings
+
+        provider = LanceDBProvider(
+            db_path=str(worker._engine.url.database) + ".lance", vector_size=3, settings=Settings(_env_file=None)
+        )
+        table = await provider._get_table()
+        monkeypatch.setattr(type(table), "optimize", fail)
+        worker._qdrant = provider
+        tasks = []
+
+        def spawn(factory, *, kind):
+            task = asyncio.create_task(factory())
+            tasks.append(task)
+            return task
+
+        worker._task_spawner = spawn
+        await worker._maybe_compact()
+        await asyncio.gather(*tasks)
+    else:
+        worker._embedder = MockEmbeddingProvider(vector_size=3)
+        monkeypatch.setattr(worker._embedder, "embed", fail)
+        monkeypatch.setattr(worker._embedder, "embed_batch", fail)
+        worker._max_retries = 1 if site == "exhausted" else 3
+        if site == "chunk":
+            await worker._poll_once()
+        else:
+            async with worker._session_factory() as session:
+                repo = OutboxRepository(session)
+                claimed = await repo.claim_pending()
+                await session.commit()
+                await worker._process_entry(session, repo, claimed[0])
+                await session.commit()
+    rows = await p3_rows(worker)
+    if site in ("poll", "compact"):
+        assert rows == before, "S19P_PRIVACY"
+    else:
+        assert rows[0][0] == entry.id
+        assert rows[0][1:4] == ("failed" if site == "exhausted" else "pending", 1, "E_OUTBOX"), "S19P_PRIVACY"
+    records = [r for r in caplog.records if r.name.startswith(("storage.", "memory_server."))]
+    assert records, "S19P_PRIVACY: missing exercised sink"
+    for record in records:
+        assert secret not in repr((record.msg, record.args, record.exc_info, record.stack_info)), "S19P_PRIVACY"
+        assert secret not in record.getMessage() and not record.exc_info and not record.stack_info, "S19P_PRIVACY"
+
+
+async def test_s19p_process_claimed_contract(p3_worker):
+    from storage.outbox import OutboxEntry, OutboxRepository
+
+    worker = p3_worker
+    error = p3_surface(worker)
+    await p3_add(worker)
+    for deadline in (None, True, float("inf"), float("nan"), -1):
+        with pytest.raises(error) as caught:
+            async with worker.claim_scope(deadline=deadline):
+                pytest.fail("S19P_CLAIM: invalid deadline entered")
+        assert caught.value.code == "E_VALIDATION", "S19P_CLAIM"
+    async with worker.claim_scope(deadline=monotonic() + 5) as claim:
+        async with worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            entries = await repo.claim_pending()
+            claim.register_claimed(session, entries)
+            await session.commit()
+            entry = entries[0]
+            forged = OutboxEntry(**{**entry.__dict__, "payload_json": "{}"})
+            with pytest.raises(error) as caught:
+                await worker.process_claimed(session, repo, forged, claim=claim)
+            assert caught.value.code == "E_MAINTENANCE_CONFLICT", "S19P_CLAIM"
+            assert await worker.process_claimed(session, repo, entry, claim=claim) == "completed"
+            with pytest.raises(error) as caught:
+                await worker.process_claimed(session, repo, entry, claim=claim)
+            assert caught.value.code == "E_MAINTENANCE_CONFLICT", "S19P_CLAIM"
+            await session.commit()
+    assert (await p3_rows(worker))[0][1:4] == ("completed", 0, None), "S19P_CLAIM"
+    async with worker._session_factory() as session:
+        with pytest.raises(error):
+            await worker.process_claimed(session, OutboxRepository(session), entry, claim=claim)
+
+
+async def test_s19p_worker_claim_fence(p3_worker):
+    import asyncio
+
+    from storage.outbox import OutboxRepository
+
+    worker = p3_worker
+    p3_surface(worker)
+    await p3_add(worker)
+    async with worker.claim_scope(deadline=monotonic() + 5) as claim:
+        async with worker._session_factory() as session:
+            repo = OutboxRepository(session)
+            entries = await repo.claim_pending()
+            claim.register_claimed(session, entries)
+            await session.commit()
+            worker._stale_processing_seconds = -1
+            before = await p3_rows(worker)
+            poll = asyncio.create_task(worker._poll_once())
+            all_pending = asyncio.create_task(worker.process_all_pending())
+            try:
+                await asyncio.sleep(0)
+                assert not poll.done() and not all_pending.done(), "S19P_FENCE"
+                assert await p3_rows(worker) == before, "S19P_FENCE"
+                assert await worker.process_claimed(session, repo, entries[0], claim=claim) == "completed"
+                await session.commit()
+            finally:
+                if session.in_transaction():
+                    await session.rollback()
+    assert await asyncio.wait_for(poll, 5) == 0
+    assert await asyncio.wait_for(all_pending, 5) == {"processed": 0, "failed": 0}
+    assert (await p3_rows(worker))[0][1:4] == ("completed", 0, None), "S19P_FENCE"
+
+
+async def test_s19p_claim_scope_one_winner(p3_worker, monkeypatch):
+    import asyncio
+
+    from storage.outbox import OutboxRepository
+
+    worker = p3_worker
+    error = p3_surface(worker)
+    entry = await p3_add(worker)
+    winners = []
+    schedules = []
+
+    async def between(ids):
+        schedules.append(tuple(ids))
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(OutboxRepository, "claim_between_select_and_update", between)
+
+    async def consume():
+        async with worker.claim_scope(deadline=monotonic() + 5) as claim:
+            with pytest.raises(error):
+                async with worker.claim_scope(deadline=monotonic() + 5):
+                    pytest.fail("S19P_FENCE: nested scope")
+            async with worker._session_factory() as session:
+                repo = OutboxRepository(session)
+                entries = await repo.claim_pending()
+                claim.register_claimed(session, entries)
+                await session.commit()
+                for value in entries:
+                    winners.append(value.id)
+                    assert await worker.process_claimed(session, repo, value, claim=claim) == "completed"
+                await session.commit()
+
+    engine = worker._engine
+    await asyncio.gather(consume(), consume())
+    assert winners == [entry.id] and schedules == [(entry.id,)], "S19P_CLAIM"
+    assert worker._engine is engine, "S19P_CLAIM"
+
+
+async def p3_provider_canary(worker, monkeypatch, caplog, site, fail, failure, secret):
+    import asyncio
+    import logging
+    from pathlib import Path
+
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
+    from memory_server.providers.exceptions import ProviderWriteError
+    from memory_server.settings import Settings
+
+    worker._embedder = MockEmbeddingProvider(vector_size=3)
+    worker._max_retries = 1
+    original_rows = await p3_rows(worker)
+    probes = []
+    calls = []
+    thread = None
+    release = None
+
+    def injected(*args, **kwargs):
+        calls.append(True)
+        return fail(*args, **kwargs)
+
+    if site.startswith("lance_"):
+        import lancedb
+
+        from memory_server.providers.lancedb_provider import LanceDBProvider
+
+        provider = LanceDBProvider(
+            db_path=str(worker._engine.url.database) + ".lance", vector_size=3, settings=Settings(_env_file=None)
+        )
+        if site == "lance_ensure":
+            db = lancedb.connect(provider._db_path)
+            monkeypatch.setattr(type(db), "create_table", injected)
+            expected = "failed to ensure lancedb table 'memories': E_VECTOR_BACKEND"
+        else:
+            table = await provider._get_table()
+            if site == "lance_optimize":
+                monkeypatch.setattr(type(table), "optimize", injected)
+            else:
+                builder = table.merge_insert("id")
+                monkeypatch.setattr(type(builder), "execute", injected)
+            expected = {
+                "lance_single": "lancedb upsert failed: E_VECTOR_BACKEND",
+                "lance_batch": "lancedb upsert_batch failed: E_VECTOR_BACKEND",
+                "lance_optimize": "lancedb optimize failed: E_VECTOR_BACKEND",
+            }[site]
+        worker._qdrant = provider
+    elif site.startswith("qdrant_"):
+        from memory_server.providers.qdrant_provider import QdrantProvider
+
+        provider = QdrantProvider(location=":memory:", vector_size=3, settings=Settings(_env_file=None))
+        monkeypatch.setattr(provider._client, "upsert", injected)
+        expected = (
+            "qdrant upsert_batch failed: E_VECTOR_BACKEND"
+            if site.endswith("batch")
+            else "qdrant upsert failed: E_VECTOR_BACKEND"
+        )
+        worker._qdrant = provider
+    else:
+        import sys
+        import threading
+
+        import memory_server.providers.graph_provider as gp
+        from memory_server.router.graph_router import GraphRouter
+
+        path = Path(str(worker._engine.url.database) + ".graph.json")
+        graph = gp.SimpleGraph(snapshot_path=path)
+        worker._graph_router = GraphRouter(graph)
+        if site == "graph_resync":
+            graph.add_node(id="s", type="entity", name="s")
+            graph.add_node(id="o", type="entity", name="o")
+            worker._graph_router.sync_fact("s", "p", "o")
+        if site == "graph_replace":
+            monkeypatch.setattr(gp.os, "replace", injected)
+        elif site in ("graph_lock", "graph_resync", "graph_publish"):
+            monkeypatch.setattr(gp._fcntl, "flock", injected)
+        elif site == "graph_malformed":
+            path.write_text("{}")
+
+            def malformed(*args):
+                calls.append(True)
+                raise gp._MalformedSnapshotError(secret)
+
+            monkeypatch.setattr(graph, "_read_state_file", malformed)
+        elif site == "graph_read":
+            path.write_text("{}")
+            read = Path.read_text
+
+            def read_failure(self, *args, **kwargs):
+                if self == path:
+                    return injected()
+                return read(self, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "read_text", read_failure)
+            with pytest.raises(gp._MalformedSnapshotError) as caught:
+                graph._read_state_file(path)
+            assert caught.value.__cause__ is failure, "S19P_PRIVACY"
+            assert str(caught.value) == f"{path}: E_GRAPH_BACKEND", "S19P_PRIVACY"
+        if site == "graph_publish":
+            # Real external from_dict interleaving, paused after its flag assignment.
+            entered, release = threading.Event(), threading.Event()
+
+            def external():
+                def trace(frame, event, arg):
+                    if (
+                        event == "line"
+                        and frame.f_code is gp.SimpleGraph.from_dict.__code__
+                        and graph._full_publish_pending
+                    ):
+                        sys.settrace(None)
+                        entered.set()
+                        release.wait(10)
+                    return trace
+
+                sys.settrace(trace)
+                try:
+                    graph.from_dict({"nodes": [], "edges": []})
+                finally:
+                    sys.settrace(None)
+
+            thread = threading.Thread(target=external)
+            thread.start()
+            assert await asyncio.to_thread(entered.wait, 5), "S19P_PRIVACY: conditional interleaving"
+    try:
+        if not site.startswith("graph_"):
+            if site == "lance_optimize":
+                operation = provider.optimize
+            elif site.endswith("batch"):
+
+                async def operation():
+                    return await provider.upsert_batch([{"id": str(uuid4()), "vector": [1.0, 0.0, 0.0], "payload": {}}])
+            else:
+
+                async def operation():
+                    return await provider.upsert(point_id=str(uuid4()), vector=[1.0, 0.0, 0.0], payload={})
+
+            with pytest.raises(ProviderWriteError) as caught:
+                await operation()
+            assert type(caught.value) is ProviderWriteError and caught.value.__cause__ is failure, "S19P_PRIVACY"
+            assert str(caught.value) == expected, "S19P_PRIVACY"
+            probes.append(str(caught.value))
+        if site == "lance_optimize":
+            tasks = []
+
+            def spawn(factory, *, kind):
+                task = asyncio.create_task(factory())
+                tasks.append(task)
+                return task
+
+            worker._task_spawner = spawn
+            await worker._maybe_compact()
+            await asyncio.gather(*tasks)
+            assert await p3_rows(worker) == original_rows, "S19P_PRIVACY"
+        elif site == "graph_resync":
+            await worker._poll_once()
+        elif site.endswith("batch"):
+            await worker._poll_once()
+        else:
+            if site.startswith("graph_"):
+                await p3_add(worker)
+            await worker.process_all_pending()
+        rows = await p3_rows(worker)
+        if site.startswith("graph_"):
+            assert all(row[1:4] == ("completed", 0, None) for row in rows), "S19P_PRIVACY"
+        elif site != "lance_optimize":
+            assert all(row[1:4] == ("failed", 1, "E_VECTOR_BACKEND") for row in rows), "S19P_PRIVACY"
+        assert calls, "S19P_PRIVACY: I/O boundary not crossed"
+        records = [r for r in caplog.records if r.name.startswith(("storage.", "memory_server."))]
+        assert any(r.levelno >= logging.WARNING for r in records), "S19P_PRIVACY: catch not crossed"
+        for record in records:
+            assert secret not in repr((record.msg, record.args, record.exc_info, record.stack_info)), "S19P_PRIVACY"
+            assert secret not in logging.Formatter().format(record), "S19P_PRIVACY"
+            assert not record.exc_info and not record.stack_info, "S19P_PRIVACY"
+        assert secret not in repr((rows, probes)), "S19P_PRIVACY"
+    finally:
+        if release is not None:
+            release.set()
+        if thread is not None:
+            await asyncio.to_thread(thread.join, 5)
+            assert not thread.is_alive()
+        if site.startswith("qdrant_"):
+            provider._client.close()
+
+
+async def p3_native_claim(h, monkeypatch, *, cancel):
+    import asyncio
+    import subprocess
+    import sys
+    import threading
+
+    from storage.outbox import OutboxRepository
+
+    entered, release = threading.Event(), threading.Event()
+    consumer = contender = None
+    async with h.daemon.acquire(h.ctx) as lease:
+        runtime = lease.runtime
+        worker = runtime.dependencies.outbox_worker
+        p3_surface(worker)
+        worker.stop()
+        async with asyncio.timeout(5):
+            while any(r.kind == "outbox-worker" for r in runtime.owned_snapshot()[1]):
+                await asyncio.sleep(0)
+        # The shared S04 vector recipe is search-only; use graph native I/O.
+        await p3_add(worker, operation="index_decision")
+        original = worker._graph_router.sync_decision
+
+        def native(*args, **kwargs):
+            entered.set()
+            release.wait(20)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(worker._graph_router, "sync_decision", native)
+        worker._stale_processing_seconds = -1
+
+        async def apply():
+            async with worker.claim_scope(deadline=monotonic() + 10) as claim:
+                async with worker._session_factory() as session:
+                    repo = OutboxRepository(session)
+                    entries = await repo.claim_pending()
+                    claim.register_claimed(session, entries)
+                    await session.commit()
+                    try:
+                        result = await worker.process_claimed(session, repo, entries[0], claim=claim)
+                        await session.commit()
+                        return result
+                    except BaseException:
+                        await session.rollback()
+                        raise
+
+        try:
+            consumer = asyncio.create_task(apply())
+            assert await asyncio.to_thread(entered.wait, 5), "S19P_FENCE"
+            before = await p3_rows(worker)
+            assert before[0][1:4] == ("processing", 0, None), "S19P_FENCE"
+            contender = asyncio.create_task(worker._poll_once())
+            await asyncio.sleep(0)
+            assert not contender.done(), "S19P_FENCE"
+            if cancel:
+                consumer.cancel()
+                await asyncio.sleep(0)
+                consumer.cancel()
+                await asyncio.sleep(0)
+                assert not consumer.done(), "S19P_FENCE: cancelled before native settlement"
+                try:
+                    report = await runtime.close()
+                except asyncio.CancelledError:
+                    # The real shutdown cancels this test's admitted request too.
+                    report = await runtime.close()
+                assert report.lock_retained and runtime.lock is not None, "S19P_FENCE"
+                code = (
+                    "import pathlib,sys; from memory_server.storage_lock import RuntimeStorageLock,StorageLockError; "
+                    "root=pathlib.Path(sys.argv[1]);\n"
+                    "try: RuntimeStorageLock.acquire_exclusive(root,timeout=0.01)\n"
+                    "except StorageLockError as e: print(e.code)\n"
+                    "else: raise AssertionError('S19P_FENCE: EX released')"
+                )
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-c", code, str(runtime.root)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                assert result.returncode == 0 and result.stdout.strip() == "E_LOCK_TIMEOUT", "S19P_FENCE"
+            else:
+                from dataclasses import replace
+
+                async with h.daemon.acquire(replace(h.ctx, profile_id="beta", principal=h.worker_b)) as beta:
+                    other = beta.runtime.dependencies.outbox_worker
+                    other.stop()
+                    async with asyncio.timeout(5):
+                        while any(r.kind == "outbox-worker" for r in beta.runtime.owned_snapshot()[1]):
+                            await asyncio.sleep(0)
+                    await p3_add(other)
+                    assert await other.process_all_pending() == {"processed": 1, "failed": 0}, "S19P_FENCE"
+            assert await p3_rows(worker) == before, "S19P_FENCE"
+            release.set()
+            if cancel:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(consumer, 5)
+                assert (await p3_rows(worker))[0][1:4] == ("processing", 0, None), "S19P_FENCE"
+            else:
+                assert await asyncio.wait_for(consumer, 5) == "completed", "S19P_FENCE"
+            await asyncio.wait_for(contender, 5)
+            assert not any(r.thread.is_alive() for r in runtime.owned_snapshot()[2]), "S19P_FENCE"
+        finally:
+            release.set()
+            for task in (consumer, contender):
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_s19p_live_claim_survives_stale_reset(seam_owner, monkeypatch):
+    from storage.outbox_worker import OutboxWorker
+
+    p3_surface(OutboxWorker())
+    await p3_native_claim(seam_owner, monkeypatch, cancel=False)
+
+
+async def test_s19p_cancel_retains_fence_until_settle(seam_owner, monkeypatch):
+    from storage.outbox_worker import OutboxWorker
+
+    p3_surface(OutboxWorker())
+    await p3_native_claim(seam_owner, monkeypatch, cancel=True)
+
+
+async def test_s19p_retry_batch_native_parity(p3_worker, monkeypatch):
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
+
+    worker = p3_worker
+    p3_surface(worker)
+    worker._embedder = MockEmbeddingProvider(vector_size=3)
+    original = worker._embedder.embed_batch
+    batches = []
+
+    def embed_batch(texts):
+        batches.append(tuple(texts))
+        return original(texts)
+
+    monkeypatch.setattr(worker._embedder, "embed_batch", embed_batch)
+    for _ in range(33):
+        await p3_add(worker, operation="index_fact", payload={"subject": "s", "predicate": "p", "object": "o"})
+    await p3_add(worker)
+    assert worker._fact_batch_chunk_size == 32 and worker._poll_batch_size == 500
+    assert worker._process_pending_limit == 500 and worker._max_retries == 3
+    submitter, spawner, engine = worker._native_submitter, worker._task_spawner, worker._engine
+    assert await worker._poll_once() == 34, "S19P_PARITY"
+    assert [len(batch) for batch in batches] == [32, 1], "S19P_PARITY"
+    assert all(row[1:4] == ("completed", 0, None) for row in await p3_rows(worker)), "S19P_PARITY"
+    assert (worker._native_submitter, worker._task_spawner, worker._engine) == (submitter, spawner, engine)
+    await p3_add(worker, operation="unknown")
+    assert await worker.process_all_pending() == {"processed": 0, "failed": 0}, "S19P_PARITY"
+    assert await worker.process_all_pending() == {"processed": 0, "failed": 0}, "S19P_PARITY"
+    assert await worker.process_all_pending() == {"processed": 0, "failed": 1}, "S19P_PARITY"
+
+
+async def test_s19p_process_claimed_contract_negative_matrix(p3_worker, tmp_path):
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from storage.outbox import OutboxRepository
+    from storage.outbox_worker import OutboxWorker
+
+    worker = p3_worker
+    error = p3_surface(worker)
+    entry = await p3_add(worker)
+    foreign_engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'foreign.sqlite'}")
+    try:
+        async with worker.claim_scope(deadline=monotonic() + 5) as claim:
+            async with worker._session_factory() as session, worker._session_factory() as other:
+                repo = OutboxRepository(session)
+                entries = await repo.claim_pending()
+                await session.commit()
+                with pytest.raises(error):
+                    await worker.process_claimed(session, repo, entries[0], claim=claim)
+                claim.register_claimed(session, entries)
+                async with async_sessionmaker(foreign_engine)() as foreign:
+                    for target, borrowed, repository, token in (
+                        (worker, None, repo, claim),
+                        (worker, other, OutboxRepository(other), claim),
+                        (worker, foreign, OutboxRepository(foreign), claim),
+                        (worker, session, OutboxRepository(other), claim),
+                        (worker, session, repo, None),
+                        (OutboxWorker(engine=worker._engine), session, repo, claim),
+                    ):
+                        with pytest.raises(error) as caught:
+                            await target.process_claimed(borrowed, repository, entries[0], claim=token)
+                        assert caught.value.code == "E_MAINTENANCE_CONFLICT", "S19P_CLAIM"
+                with pytest.raises(error):
+                    await asyncio.create_task(worker.process_claimed(session, repo, entries[0], claim=claim))
+                assert (await p3_rows(worker))[0][1:4] == ("processing", 0, None), "S19P_CLAIM"
+                # A real competing repository mutation makes the registered stamp/status stale.
+                await OutboxRepository(other).mark_completed(entry.id)
+                await other.commit()
+                with pytest.raises(error):
+                    await worker.process_claimed(session, repo, entries[0], claim=claim)
+                await session.rollback()
+        assert (await p3_rows(worker))[0][1:4] == ("completed", 0, None), "S19P_CLAIM"
+    finally:
+        await foreign_engine.dispose()
+
+
+async def test_s19p_live_claim_survives_stale_reset_after_timeout(seam_owner, monkeypatch):
+    import asyncio
+    import sys
+    import threading
+
+    import memory_server.runtime.daemon as daemon_module
+    from memory_server.runtime.runtime import CMMSRuntime
+
+    release, parked = threading.Event(), threading.Event()
+    task = None
+    async with seam_owner.daemon.acquire(seam_owner.ctx) as lease:
+        runtime = lease.runtime
+        worker = runtime.dependencies.outbox_worker
+        p3_surface(worker)
+        worker.stop()
+        async with asyncio.timeout(5):
+            while any(r.kind == "outbox-worker" for r in runtime.owned_snapshot()[1]):
+                await asyncio.sleep(0)
+        await p3_add(worker)
+        original = worker._graph_router.sync_decision
+        calls = []
+
+        def native(*args, **kwargs):
+            calls.append(True)
+            value = original(*args, **kwargs)
+
+            def profile(frame, event, arg):
+                if event == "return" and frame.f_code is CMMSRuntime._native_target.__code__:
+                    sys.setprofile(None)
+                    parked.set()
+                    release.wait(20)
+
+            sys.setprofile(profile)
+            return value
+
+        monkeypatch.setattr(worker._graph_router, "sync_decision", native)
+        monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 0.05)
+        worker._stale_processing_seconds = -1
+        try:
+            task = asyncio.create_task(worker._poll_once())
+            assert await asyncio.to_thread(parked.wait, 5), "S19P_FENCE"
+            assert await asyncio.wait_for(task, 5) == 0, "S19P_FENCE"
+            before = await p3_rows(worker)
+            assert before[0][1:4] == ("processing", 0, None), "S19P_FENCE"
+            assert any(r.thread.is_alive() for r in runtime.owned_snapshot()[2]), "S19P_FENCE"
+            assert runtime.lock is not None, "S19P_FENCE"
+            assert await asyncio.wait_for(worker._poll_once(), 5) == 0, "S19P_FENCE"
+            assert await asyncio.wait_for(worker.process_all_pending(), 5) == {"processed": 0, "failed": 0}
+            assert await p3_rows(worker) == before and len(calls) == 1, "S19P_FENCE"
+        finally:
+            release.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+            async with asyncio.timeout(5):
+                while any(r.thread.is_alive() for r in runtime.owned_snapshot()[2]):
+                    await asyncio.sleep(0)
+        monkeypatch.setattr(worker._graph_router, "sync_decision", original)
+        assert await worker._poll_once() == 1, "S19P_FENCE: terminated native left a permanent fence"
+        assert (await p3_rows(worker))[0][1:4] == ("completed", 0, None), "S19P_FENCE"
