@@ -277,8 +277,8 @@ class QdrantProvider:
             await self._run(self._client.upsert, collection_name=col, points=points)
             return True
         except Exception as exc:
-            logger.error("Failed to upsert point %s in '%s': %s", pid, col, exc)
-            raise ProviderWriteError(f"qdrant upsert failed: {exc}") from exc
+            logger.error("Failed to upsert point %s in '%s': %s", pid, col, "E_VECTOR_BACKEND")
+            raise ProviderWriteError("qdrant upsert failed: E_VECTOR_BACKEND") from exc
 
     async def upsert_batch(
         self,
@@ -311,8 +311,8 @@ class QdrantProvider:
             )
             return True
         except Exception as exc:
-            logger.error("Failed to batch upsert in '%s': %s", col, exc)
-            raise ProviderWriteError(f"qdrant upsert_batch failed: {exc}") from exc
+            logger.error("Failed to batch upsert in '%s': %s", col, "E_VECTOR_BACKEND")
+            raise ProviderWriteError("qdrant upsert_batch failed: E_VECTOR_BACKEND") from exc
 
     async def search(
         self,

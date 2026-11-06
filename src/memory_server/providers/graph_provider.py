@@ -1675,7 +1675,7 @@ class SimpleGraph:
                         _cleanup_stale_tmp(snapshot_path)
                         self._write_snapshot(snapshot_path)
             except Exception:
-                logger.exception("Failed to publish graph snapshot to %s", snapshot_path)
+                logger.error("Failed to publish graph snapshot to %s: %s", snapshot_path, "E_GRAPH_BACKEND")
             return
 
         if not self._journal:
@@ -1691,10 +1691,11 @@ class SimpleGraph:
                         except _MalformedSnapshotError:
                             # Never clobber a corrupt file with a rebase that
                             # silently drops its content.
-                            logger.exception(
+                            logger.error(
                                 "Refusing to overwrite malformed snapshot %s — "
-                                "keeping file and pending mutations for retry",
+                                "keeping file and pending mutations for retry: %s",
                                 snapshot_path,
+                                "E_GRAPH_BACKEND",
                             )
                             return
                     else:
@@ -1717,7 +1718,7 @@ class SimpleGraph:
                     if self._write_snapshot(snapshot_path) is not False:
                         self._journal = []
         except Exception:
-            logger.exception("Failed to persist graph snapshot to %s", snapshot_path)
+            logger.error("Failed to persist graph snapshot to %s: %s", snapshot_path, "E_GRAPH_BACKEND")
 
     def _resync_from_disk(self, snapshot_path: Path) -> None:
         """Refresh in-memory state from disk when nothing local is pending."""
@@ -1735,7 +1736,7 @@ class SimpleGraph:
             self._swap_state(nodes, edges)
             self._journal = []
         except Exception:
-            logger.exception("Failed to resync graph state from %s", snapshot_path)
+            logger.error("Failed to resync graph state from %s: %s", snapshot_path, "E_GRAPH_BACKEND")
 
     def _export_snapshot(self, snapshot_path: Path) -> None:
         """Atomic export of the current in-memory state to *snapshot_path*."""
@@ -1809,7 +1810,7 @@ class SimpleGraph:
         except _MalformedSnapshotError:
             raise
         except Exception as exc:
-            raise _MalformedSnapshotError(f"{snapshot_path}: {exc}") from exc
+            raise _MalformedSnapshotError(f"{snapshot_path}: E_GRAPH_BACKEND") from exc
 
     @staticmethod
     def _build_state_from(data: Any) -> tuple[dict[str, GraphNode], dict[str, dict[str, list[GraphEdge]]]]:
@@ -1971,7 +1972,7 @@ class SimpleGraph:
                     pass
             return True
         except Exception:
-            logger.exception("Failed to persist graph snapshot to %s", snapshot_path)
+            logger.error("Failed to persist graph snapshot to %s: %s", snapshot_path, "E_GRAPH_BACKEND")
             return False
 
     def _read_relation_snapshot_strict(self, parent, path, expected, s, t):
