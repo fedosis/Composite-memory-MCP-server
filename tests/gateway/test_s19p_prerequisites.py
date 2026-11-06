@@ -641,10 +641,49 @@ async def test_s19p_p6_projection_result_forwarding(seam_owner):
             assert not any(hasattr(result, name) for name in ("handle", "thread", "native_future", "_record")), (
                 "S19P_P6_DRAIN"
             )
-            assert await result.result() == "projection-value", "S19P_P6_DRAIN"
             assert not await result.drain(monotonic() + 0.05) and not result.terminated, "S19P_P6_DRAIN"
             release.set()
             assert await result.drain(monotonic() + 5) and result.terminated, "S19P_P6_DRAIN"
+    finally:
+        release.set()
+
+
+async def test_s19p_p6_result_drains_before_value(seam_owner, monkeypatch):
+    import asyncio
+    import sys
+    import threading
+
+    import memory_server.runtime.daemon as daemon_module
+    from memory_server.runtime.runtime import CMMSRuntime
+
+    release, parked = threading.Event(), threading.Event()
+
+    def native():
+        def profile(frame, event, arg):
+            if event == "return" and frame.f_code is CMMSRuntime._native_target.__code__:
+                sys.setprofile(None)
+                parked.set()
+                release.wait(30)
+
+        sys.setprofile(profile)
+        return "result-value"
+
+    try:
+        monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 0.05, raising=False)
+        async with seam_owner.daemon.acquire(seam_owner.ctx) as session:
+            submit = session.runtime.dependencies.outbox_worker._native_submitter
+            result = await submit(native, kind="s19p-p6-result")
+            assert await asyncio.to_thread(parked.wait, 5), "S19P_P6_DRAIN"
+            timed_out = False
+            try:
+                await result.result()
+            except TimeoutError as exc:
+                timed_out = str(exc) == "native drain deadline"
+            assert timed_out, "S19P_P6_DRAIN"
+            assert not result.terminated, "S19P_P6_DRAIN"
+            release.set()
+            assert await result.drain(monotonic() + 5), "S19P_P6_DRAIN"
+            assert await result.result() == "result-value", "S19P_P6_DRAIN"
     finally:
         release.set()
 
@@ -654,8 +693,7 @@ async def test_s19p_p6_worker_blocks_until_native_dead(seam_owner, monkeypatch):
     import sys
     import threading
 
-    import storage.outbox_worker as worker_module
-
+    import memory_server.runtime.daemon as daemon_module
     from memory_server.runtime.runtime import CMMSRuntime
 
     release, parked = threading.Event(), threading.Event()
@@ -677,7 +715,7 @@ async def test_s19p_p6_worker_blocks_until_native_dead(seam_owner, monkeypatch):
             worker = runtime.dependencies.outbox_worker
             # Exercise the installed production projection submitter, not a replacement.
             assert worker._native_submitter != runtime.submit_native, "S19P_P6_DRAIN"
-            monkeypatch.setattr(worker_module, "DRAIN_SECONDS", 0.05, raising=False)
+            monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 0.05, raising=False)
             task = asyncio.create_task(worker._blocking(native, kind="s19p-p6-worker-timeout"))
             assert await asyncio.to_thread(parked.wait, 5), "S19P_P6_DRAIN"
             timed_out = False
@@ -694,7 +732,7 @@ async def test_s19p_p6_worker_blocks_until_native_dead(seam_owner, monkeypatch):
                     await asyncio.sleep(0)
             release.clear()
             parked.clear()
-            monkeypatch.setattr(worker_module, "DRAIN_SECONDS", 30.0)
+            monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 30.0)
             task = asyncio.create_task(worker._blocking(native, kind="s19p-p6-worker-success"))
             assert await asyncio.to_thread(parked.wait, 5), "S19P_P6_DRAIN"
             record = next(r for r in runtime.owned_snapshot()[2] if r.kind == "s19p-p6-worker-success")
@@ -704,7 +742,7 @@ async def test_s19p_p6_worker_blocks_until_native_dead(seam_owner, monkeypatch):
             assert record.state == "TERMINATED" and not record.thread.is_alive(), "S19P_P6_DRAIN"
             release.clear()
             parked.clear()
-            monkeypatch.setattr(worker_module, "DRAIN_SECONDS", 0.05)
+            monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 0.05)
             task = asyncio.create_task(worker._blocking(native, kind="s19p-p6-worker-retained"))
             assert await asyncio.to_thread(parked.wait, 5), "S19P_P6_DRAIN"
             with pytest.raises(TimeoutError, match="^native drain deadline$"):
