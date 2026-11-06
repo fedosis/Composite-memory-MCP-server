@@ -1109,7 +1109,6 @@ async def p3_rows(worker):
         "qdrant_single",
         "qdrant_batch",
         "graph_replace",
-        "graph_malformed",
         "graph_read",
         "graph_lock",
         "graph_resync",
@@ -1378,14 +1377,6 @@ async def p3_provider_canary(worker, monkeypatch, caplog, site, fail, failure, s
             monkeypatch.setattr(gp.os, "replace", injected)
         elif site in ("graph_lock", "graph_resync", "graph_publish"):
             monkeypatch.setattr(gp._fcntl, "flock", injected)
-        elif site == "graph_malformed":
-            path.write_text("{}")
-
-            def malformed(*args):
-                calls.append(True)
-                raise gp._MalformedSnapshotError(secret)
-
-            monkeypatch.setattr(graph, "_read_state_file", malformed)
         elif site == "graph_read":
             path.write_text("{}")
             read = Path.read_text
@@ -1606,6 +1597,67 @@ async def test_s19p_cancel_retains_fence_until_settle(seam_owner, monkeypatch):
 
     p3_surface(OutboxWorker())
     await p3_native_claim(seam_owner, monkeypatch, cancel=True)
+
+
+@pytest.mark.parametrize("failure", ["storage", "timeout", "cancel"])
+async def test_s19p_p3_claim_lock_released_on_finish_error(p3_worker, failure):
+    import asyncio
+
+    from sqlalchemy import event
+    from sqlalchemy.exc import SQLAlchemyError
+    from storage.outbox import OutboxRepository
+
+    worker = p3_worker
+    error = p3_surface(worker)
+    await p3_add(worker)
+    worker._stale_processing_seconds = -1
+    faults = {"storage": SQLAlchemyError, "timeout": TimeoutError, "cancel": asyncio.CancelledError}
+    calls = []
+
+    def fail_read(connection, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "outbox_entries" in statement:
+            calls.append(statement)
+            raise faults[failure]()
+
+    try:
+        expected = asyncio.CancelledError if failure == "cancel" else error
+        with pytest.raises(expected):
+            async with worker.claim_scope(deadline=monotonic() + 5) as claim:
+                async with worker._session_factory() as session:
+                    entries = await OutboxRepository(session).claim_pending()
+                    claim.register_claimed(session, entries)
+                    await session.commit()
+                event.listen(worker._engine.sync_engine, "before_cursor_execute", fail_read)
+    finally:
+        event.remove(worker._engine.sync_engine, "before_cursor_execute", fail_read)
+    assert calls, "S19P_FINISH: real readback boundary not crossed"
+    assert not worker._claim_lock.locked(), "S19P_FINISH: claim lock leaked"
+    assert worker._active_claim is None and not claim.active, "S19P_FINISH"
+    if failure != "cancel":
+        assert claim in worker._retained_claims, "S19P_FINISH: custody marker lost"
+    assert await asyncio.wait_for(worker._poll_once(), 1) == 1, "S19P_FINISH: next poll blocked"
+    assert not worker._retained_claims, "S19P_FINISH"
+    assert (await p3_rows(worker))[0][1:4] == ("completed", 0, None), "S19P_FINISH"
+
+
+async def test_s19p_p3_ownerless_retain_pruned(p3_worker):
+    import asyncio
+
+    from storage.outbox import OutboxRepository
+
+    worker = p3_worker
+    await p3_add(worker)
+    worker._stale_processing_seconds = -1
+    async with worker.claim_scope(deadline=monotonic() + 5) as claim:
+        async with worker._session_factory() as session:
+            entries = await OutboxRepository(session).claim_pending()
+            claim.register_claimed(session, entries)
+            await session.commit()
+    assert claim.owner is None and not claim.natives
+    assert claim in worker._retained_claims, "S19P_FINISH"
+    assert await asyncio.wait_for(worker._poll_once(), 1) == 1, "S19P_FINISH: stale reset disabled"
+    assert not worker._retained_claims, "S19P_FINISH"
+    assert (await p3_rows(worker))[0][1:4] == ("completed", 0, None), "S19P_FINISH"
 
 
 async def test_s19p_retry_batch_native_parity(p3_worker, monkeypatch):

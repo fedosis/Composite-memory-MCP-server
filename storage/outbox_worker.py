@@ -363,8 +363,7 @@ class OutboxWorker:
         self._retained_claims.difference_update(
             retained
             for retained in tuple(self._retained_claims)
-            if retained.owner is not None
-            and retained.owner.state == "READY"
+            if (retained.owner is None or retained.owner.state == "READY")
             and all(r.state == "TERMINATED" and (r.thread is None or not r.thread.is_alive()) for r in retained.natives)
         )
         claim = object.__new__(ActiveClaim)
@@ -391,9 +390,9 @@ class OutboxWorker:
     async def _finish_claim(self, claim, exceptional):
         from storage.outbox import OutboxEntryORM
 
-        claim.natives = () if claim.owner is None else claim.owner.owned_snapshot()[2]
-        open_transaction = any(session.in_transaction() for session in claim.sessions)
         try:
+            claim.natives = () if claim.owner is None else claim.owner.owned_snapshot()[2]
+            open_transaction = any(session.in_transaction() for session in claim.sessions)
             async with asyncio.timeout(5):
                 for session in claim.sessions:
                     if session.in_transaction():
@@ -406,9 +405,11 @@ class OutboxWorker:
         except (SQLAlchemyError, TimeoutError):
             self._retained_claims.add(claim)
             raise OutboxClaimError("E_STORAGE") from None
-        claim.active = False
-        self._active_claim = None
-        self._claim_lock.release()
+        finally:
+            claim.active = False
+            if self._active_claim is claim:
+                self._active_claim = None
+                self._claim_lock.release()
         if open_transaction and not exceptional:
             raise OutboxClaimError("E_STORAGE")
 
