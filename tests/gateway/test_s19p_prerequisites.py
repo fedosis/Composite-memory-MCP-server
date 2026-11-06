@@ -262,3 +262,304 @@ async def test_s19p_no_second_engine_and_legacy_default(seam_owner, monkeypatch)
             async with engine.connect() as connection:
                 result = await connection.exec_driver_sql("SELECT count(*) FROM outbox_entries")
                 assert result.scalar_one() == 0
+
+
+def scoped_surface():
+    import inspect
+
+    from memory_server.application.job_runner import JobCoordinator
+    from memory_server.control.jobs import JobMetadata
+
+    assert callable(getattr(JobMetadata, "scan_reconcile_scoped", None)), "S19P_SURFACE"
+    parameters = inspect.signature(JobCoordinator.reconcile_startup).parameters
+    assert {"profile_id", "custody"} <= parameters.keys(), "S19P_SURFACE"
+    assert "startup_custody" in inspect.signature(JobCoordinator).parameters, "S19P_SURFACE"
+
+
+def p2_reserve(h, *, profile="alpha", running=True):
+    from memory_server.control.jobs import request_digest
+    from memory_server.gateway_contracts.ports import AuditTicket
+    from tests.gateway.test_job_shutdown import payload
+
+    principal = h.worker_a if profile == "alpha" else h.worker_b
+    ctx = replace(h.ctx, principal=principal, profile_id=profile, idempotency_key=uuid4())
+    reservation = h.metadata.enqueue(
+        ctx,
+        "outbox_replay",
+        payload(),
+        digest=request_digest("outbox_replay", payload()),
+        ticket=AuditTicket("ticket", ctx.request_id),
+        now=h.now,
+    )
+    if not running:
+        return reservation
+    return h.metadata.claim(reservation.job_id, profile, principal.subject, 0, now=h.now)
+
+
+async def test_s19p_scoped_scan_contract(seam_owner, monkeypatch):
+    scoped_surface()
+    from memory_server.control.jobs import JobError
+
+    h = seam_owner
+    beta = p2_reserve(h, profile="beta")
+    alpha = p2_reserve(h)
+    statements = []
+    h.store._connection.set_trace_callback(lambda sql: statements.append(sql.split()[0].upper()))
+    for profile in (None, False, 1, "", "a" * 65, "é", "a\n", "a.b", "a b", "_alpha"):
+        with pytest.raises(JobError, match="^E_VALIDATION$"):
+            h.metadata.scan_reconcile_scoped(profile_id=profile, deadline=monotonic() + 2)
+    for limit in (False, 0, 1001, 1.0, "1", None):
+        with pytest.raises(JobError, match="^E_VALIDATION$"):
+            h.metadata.scan_reconcile_scoped(profile_id="alpha", limit=limit, deadline=monotonic() + 2)
+    for deadline in (True, None, "1", float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(JobError, match="^E_VALIDATION$"):
+            h.metadata.scan_reconcile_scoped(profile_id="alpha", deadline=deadline)
+    with pytest.raises(TypeError):
+        h.metadata.scan_reconcile_scoped(deadline=monotonic() + 2)
+    assert h.metadata.scan_reconcile_scoped(profile_id="alpha", deadline=monotonic() - 1) == ()
+    assert statements == [], "S19P_SCOPE"
+    # Choose the lexically later ID as target: LIMIT must follow SQL scope filtering.
+    target, foreign = sorted((alpha, beta), key=lambda claim: claim.job.id, reverse=True)
+    seen = []
+    transaction = h.store.borrow_transaction
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def borrowed():
+        with transaction() as tx:
+            fetchmany = tx.fetchmany
+
+            def fetched(sql, params, *, limit):
+                seen.append((sql, params, limit))
+                return fetchmany(sql, params, limit=limit)
+
+            monkeypatch.setattr(tx, "fetchmany", fetched)
+            yield tx
+
+    monkeypatch.setattr(h.store, "borrow_transaction", borrowed)
+    records = h.metadata.scan_reconcile_scoped(profile_id=target.job.profile_id, limit=1, deadline=monotonic() + 2)
+    assert tuple(r.claim.job.id for r in records) == (target.job.id,), "S19P_SCOPE"
+    assert seen == [
+        (
+            "SELECT * FROM jobs WHERE profile_id=? AND status='running' ORDER BY id LIMIT ?",
+            (target.job.profile_id, 1),
+            1,
+        )
+    ], "S19P_SCOPE"
+    assert h.metadata.get(foreign.job.id, foreign.job.profile_id, foreign.subject).status == "running"
+    for profile in ("a", "A0_-", "z" * 64):
+        assert h.metadata.scan_reconcile_scoped(profile_id=profile, limit=1000, deadline=monotonic() + 2) == ()
+
+
+async def test_s19p_recovery_predicates(seam_owner):
+    from memory_server.application.job_runner import JobCoordinator
+    from memory_server.control.jobs import JobError
+
+    h = seam_owner
+    statements = []
+    h.store._connection.set_trace_callback(lambda sql: statements.append(sql.split()[0].upper()))
+    coordinator = JobCoordinator(h.metadata, h.daemon, authorize=h.service.authorize)
+    try:
+        await coordinator.reconcile_startup(deadline=monotonic() + 2)
+    except JobError as exc:
+        assert exc.code == "E_RUNTIME_NOT_READY", "S19P_SCOPE"
+    else:
+        pytest.fail("S19P_SCOPE: empty legacy snapshot allowed recovery")
+    assert statements == [], "S19P_SCOPE"
+    scoped_surface()
+    for kwargs in ({"profile_id": "alpha"}, {"custody": object()}, {"profile_id": "alpha", "custody": object()}):
+        with pytest.raises(JobError, match="^E_RUNTIME_NOT_READY$"):
+            await coordinator.reconcile_startup(deadline=monotonic() + 2, **kwargs)
+    with pytest.raises(JobError, match="^E_TIMEOUT$"):
+        await coordinator.reconcile_startup(profile_id="alpha", deadline=monotonic() - 1)
+    assert statements == [], "S19P_SCOPE"
+    # Actual READY runtime is not startup authority, even while unrelated beta is owned.
+    async with h.daemon.acquire(h.ctx) as session:
+        with pytest.raises(JobError, match="^E_RUNTIME_NOT_READY$"):
+            await coordinator.reconcile_startup(profile_id="alpha", custody=session.runtime, deadline=monotonic() + 2)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "E_TIMEOUT",
+        "E_STORAGE",
+        "E_VECTOR_BACKEND",
+        "E_GRAPH_BACKEND",
+        "E_OUTBOX",
+        "E_PROJECTION_UNAVAILABLE",
+        "E_CAPABILITY_UNAVAILABLE",
+        "E_MAINTENANCE_CONFLICT",
+        "E_VERSION_CONFLICT",
+        "E_RUNTIME_NOT_READY",
+        "E_RUNTIME_CLOSING",
+        "E_RUNTIME_FAILED",
+        "E_JOB_INTERRUPTED",
+        "E_INTERNAL",
+        "unknown",
+        "forged",
+        "bool",
+        "unhashable",
+        "timeout",
+    ],
+)
+async def test_s19p_typed_c5_forwarding(seam_owner, kind):
+    from memory_server.application.job_runner import JobCoordinator
+    from memory_server.control.jobs import JobError
+    from tests.gateway.test_job_shutdown import reserve
+
+    h = seam_owner
+    canary = "PRIVATE_S19P_C5_EXCEPTION"
+    expected = "E_INTERNAL"
+    if kind.startswith("E_"):
+        error = JobError(kind)
+        expected = kind
+    elif kind == "timeout":
+        error = TimeoutError(canary)
+        expected = "E_TIMEOUT"
+    elif kind == "forged":
+        error = RuntimeError(canary)
+        error.code = "E_STORAGE"
+    else:
+        error = JobError({"unknown": "E_VALIDATION", "bool": True, "unhashable": []}[kind])
+    error.args = (canary,)
+    events = []
+
+    async def event(value):
+        events.append(value)
+
+    class Runner:
+        async def run(self, session, job, payload):
+            assert session.runtime.state == "READY"
+            raise error
+
+    coordinator = JobCoordinator(h.metadata, h.daemon, authorize=h.service.authorize, replay=Runner(), events=event)
+    reservation = reserve(h)
+    try:
+        await coordinator.attach(h.ctx, reservation)
+        await coordinator.close(deadline=monotonic() + 5)
+        job = h.metadata.get(reservation.job_id, "alpha", h.worker_a.subject)
+        assert job.error_code == expected, "S19P_C5"
+        assert job.status == ("interrupted" if expected == "E_JOB_INTERRUPTED" else "failed"), "S19P_C5"
+        assert len(events) == 1 and events[0].data.code == expected, "S19P_C5"
+        assert canary not in job.model_dump_json() + events[0].model_dump_json(), "S19P_C5"
+        with h.store.borrow_transaction() as tx:
+            row = tx.fetchone("SELECT dto_snapshot FROM jobs WHERE id=?", (reservation.job_id,))
+        assert canary not in row["dto_snapshot"], "S19P_C5"
+    finally:
+        await coordinator.close(deadline=monotonic() + 5)
+
+
+async def test_s19p_recovery_guard_and_cas(seam_owner):
+    """Metadata CAS proof only; actual startup-window L/A/R integration awaits P5."""
+    scoped_surface()
+    from memory_server.control.jobs import JobMetadata, TerminalUpdate
+    from memory_server.control.store import ControlStore
+
+    h = seam_owner
+    claim = p2_reserve(h)
+    queued = p2_reserve(h, profile="beta", running=False)
+    with ControlStore(h.store.root) as other:
+        competitor = JobMetadata(other)
+        progressed = competitor.progress(claim, 0.5, now=h.now)
+        assert progressed.revision == claim.revision + 1
+        update = TerminalUpdate("interrupted", None, "E_JOB_INTERRUPTED", h.now, phase="reconcile")
+        assert h.metadata.finish(claim.job.id, "alpha", claim.subject, claim.revision, "running", update) is None
+        completed = competitor.complete(
+            progressed,
+            importlib.import_module("memory_server.gateway_contracts.dto").JobResult(
+                selected=1, attempted=1, completed=1, failed=0, projection_digest=None, receipt_ids=[]
+            ),
+            now=h.now,
+        )
+        assert h.metadata.finish(claim.job.id, "alpha", claim.subject, claim.revision, "running", update) == completed
+    assert h.metadata.scan_reconcile_scoped(profile_id="alpha", deadline=monotonic() + 2) == ()
+    assert h.metadata.get(queued.job_id, "beta", h.worker_b.subject).status == "queued"
+
+
+def test_s19p_legacy_scan_frozen_and_production_scoped_only():
+    import ast
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    path = "src/memory_server/control/jobs.py"
+    baseline = subprocess.run(["git", "show", f"ca49f13:{path}"], cwd=root, capture_output=True, check=True).stdout
+
+    def method(source):
+        text = source.decode()
+        node = next(
+            n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.FunctionDef) and n.name == "scan_reconcile"
+        )
+        return "".join(text.splitlines(keepends=True)[node.lineno - 1 : node.end_lineno])
+
+    assert method((root / path).read_bytes()) == method(baseline), "S19P_LEGACY"
+    for folder in (root / "src", root / "storage"):
+        for source in folder.rglob("*.py"):
+            tree = ast.parse(source.read_text())
+            for node in ast.walk(tree):
+                # Reject attribute references, string/getattr aliases, imported/direct aliases,
+                # including constant fragments that could reconstruct the legacy name.
+                if isinstance(node, ast.Attribute):
+                    assert node.attr != "scan_reconcile", f"S19P_SCOPE: {source}:{node.lineno}"
+                if isinstance(node, ast.Name):
+                    assert node.id != "scan_reconcile", f"S19P_SCOPE: {source}:{node.lineno}"
+                if isinstance(node, ast.alias):
+                    assert node.name != "scan_reconcile", f"S19P_SCOPE: {source}"
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    assert "scan_reconcile" not in node.value, f"S19P_SCOPE: {source}:{node.lineno}"
+
+
+async def test_s19p_c6_request_digest(seam_owner):
+    import asyncio
+    import hashlib
+    import json
+
+    from memory_server.control.jobs import request_digest
+    from memory_server.gateway_contracts import dto as d
+    from tests.gateway.test_job_shutdown import payload, reserve
+
+    h = seam_owner
+    requests = (
+        ("outbox_replay", payload(), "outbox.replay"),
+        (
+            "vector_rebuild",
+            d.RebuildRequest(
+                reason="synthetic", confirmation=True, targets=["vector"], selection_digest="d" * 64, expected_count=1
+            ),
+            "indexes.rebuild",
+        ),
+    )
+    for operation, request, route in requests:
+        golden = json.dumps(
+            {"method": "POST", "route": route, "path_ids": {}, "payload": request.model_dump(mode="json")},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+        assert request_digest(operation, request) == hashlib.sha256(golden).hexdigest(), "S19P_C6"
+    first = reserve(h)
+    for _ in range(10):
+        assert reserve(h).accepted == first.accepted, "S19P_C6"
+
+    async def duplicate():
+        from memory_server.gateway_contracts.ports import AuditTicket
+
+        return h.metadata.enqueue(
+            h.ctx,
+            "outbox_replay",
+            payload(),
+            digest=request_digest("outbox_replay", payload()),
+            ticket=AuditTicket("ticket", h.ctx.request_id),
+            now=h.now,
+        )
+
+    copies = await asyncio.gather(*(duplicate() for _ in range(10)))
+    assert all(r.replayed and r.accepted == first.accepted for r in copies), "S19P_C6"
+    beta = reserve(h, replace(h.ctx, principal=h.worker_b, profile_id="beta"))
+    assert beta.job_id != first.job_id, "S19P_C6"
+    with h.store.borrow_transaction() as tx:
+        rows = tx.fetchmany("SELECT accepted_snapshot FROM job_requests ORDER BY job_id LIMIT ?", (10,), limit=10)
+    assert len(rows) == 2, "S19P_C6"
