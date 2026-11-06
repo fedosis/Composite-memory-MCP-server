@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from time import monotonic
+from typing import TYPE_CHECKING
 
 from memory_server.control.jobs import JobError, Reservation, TerminalUpdate
 from memory_server.gateway_contracts import dto as d
 from memory_server.gateway_contracts.ports import ProfileLeases, RebuildRunner, ReplayRunner, RequestContext
+
+if TYPE_CHECKING:
+    from memory_server.runtime.runtime import CMMSRuntime
 
 
 class JobCoordinator:
@@ -24,6 +29,7 @@ class JobCoordinator:
         rebuild: RebuildRunner | None = None,
         events=None,
         execution_seconds=300,
+        startup_custody: Callable[..., None] | None = None,
     ):
         if (
             type(execution_seconds) not in (int, float)
@@ -36,6 +42,7 @@ class JobCoordinator:
         self.execution_seconds = execution_seconds
         self._closing = False
         self._attachments = {}
+        self._startup_custody = startup_custody
 
     @staticmethod
     def _deadline(deadline):
@@ -158,6 +165,29 @@ class JobCoordinator:
                     raise
                 except Exception as exc:
                     code = "E_TIMEOUT" if isinstance(exc, TimeoutError) else "E_INTERNAL"
+                    if (
+                        isinstance(exc, JobError)
+                        and type(exc.code) is str
+                        and exc.code in frozenset(
+                            {
+                                "E_TIMEOUT",
+                                "E_STORAGE",
+                                "E_VECTOR_BACKEND",
+                                "E_GRAPH_BACKEND",
+                                "E_OUTBOX",
+                                "E_PROJECTION_UNAVAILABLE",
+                                "E_CAPABILITY_UNAVAILABLE",
+                                "E_MAINTENANCE_CONFLICT",
+                                "E_VERSION_CONFLICT",
+                                "E_RUNTIME_NOT_READY",
+                                "E_RUNTIME_CLOSING",
+                                "E_RUNTIME_FAILED",
+                                "E_JOB_INTERRUPTED",
+                                "E_INTERNAL",
+                            }
+                        )
+                    ):
+                        code = exc.code
                     job = self.metadata.fail(claim, code, now=datetime.now(UTC))
                 await self._event(claim, job)
         except BaseException as exc:
@@ -165,21 +195,31 @@ class JobCoordinator:
                 attached.set_exception(JobError(getattr(exc, "code", "E_RUNTIME_CLOSING")))
             raise
 
-    async def reconcile_startup(self, *, deadline: float) -> int:
+    async def reconcile_startup(
+        self, *, profile_id: str | None = None, custody: CMMSRuntime | None = None, deadline: float
+    ) -> int:
         """Caller must hold exclusive startup custody; never mounted on the SH daemon path."""
         self._deadline(deadline)
-        if self._attachments or any(observation.owned for observation in self.leases.snapshot().values()):
+        if profile_id is None or custody is None:
+            if self._attachments or any(observation.owned for observation in self.leases.snapshot().values()):
+                raise JobError("E_RUNTIME_NOT_READY")
+            raise JobError("E_RUNTIME_NOT_READY")
+        if self._attachments or self._startup_custody is None:
             raise JobError("E_RUNTIME_NOT_READY")
         count = 0
         while True:
             self._deadline(deadline)
-            records = self.metadata.scan_reconcile(limit=100, deadline=deadline)
+            self._startup_custody(custody, profile_id=profile_id)
+            records = self.metadata.scan_reconcile_scoped(profile_id=profile_id, limit=100, deadline=deadline)
             self._deadline(deadline)
             if not records:
                 return count
             for record in records:
                 self._deadline(deadline)
                 claim = record.claim
+                if record.claim.job.profile_id != profile_id:
+                    raise JobError("E_STORAGE")
+                self._startup_custody(custody, profile_id=profile_id)
                 job = self.metadata.finish(
                     claim.job.id,
                     claim.job.profile_id,

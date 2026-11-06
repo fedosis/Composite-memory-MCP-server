@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import secrets
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -418,6 +419,32 @@ class JobMetadata:
                 RecoveryRecord(_claim(row), row["phase"], row["recovery_metadata"])
                 for row in tx.fetchmany(
                     "SELECT * FROM jobs WHERE status='running' ORDER BY id LIMIT ?", (limit,), limit=limit
+                )
+                if monotonic() < deadline
+            )
+        return records
+
+    def scan_reconcile_scoped(
+        self, *, profile_id: str, limit: int = 100, deadline: float
+    ) -> tuple[RecoveryRecord, ...]:
+        if (
+            type(profile_id) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", profile_id, re.ASCII) is None
+            or type(limit) is not int
+            or not 1 <= limit <= 1000
+            or type(deadline) not in (int, float)
+            or not math.isfinite(deadline)
+        ):
+            raise JobError("E_VALIDATION")
+        if monotonic() >= deadline:
+            return ()
+        with self._tx() as tx:
+            records = tuple(
+                RecoveryRecord(_claim(row), row["phase"], row["recovery_metadata"])
+                for row in tx.fetchmany(
+                    "SELECT * FROM jobs WHERE profile_id=? AND status='running' ORDER BY id LIMIT ?",
+                    (profile_id, limit),
+                    limit=limit,
                 )
                 if monotonic() < deadline
             )

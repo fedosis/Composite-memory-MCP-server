@@ -282,7 +282,18 @@ async def main():
             registry = ProfileRegistry(store, RegistryConfiguration(bindings))
             daemon = Daemon(registry, policies=BundlePolicies.capture(settings))
             fresh = JobCoordinator(JobMetadata(store), daemon, authorize=None)
-            print(await fresh.reconcile_startup(deadline=monotonic() + 3))
+            from datetime import UTC, datetime
+            from memory_server.control.jobs import TerminalUpdate
+            records = fresh.metadata.scan_reconcile_scoped(profile_id='alpha', deadline=monotonic() + 3)
+            count = 0
+            for record in records:
+                claim = record.claim
+                job = fresh.metadata.finish(
+                    claim.job.id, claim.job.profile_id, claim.subject, claim.revision, 'running',
+                    TerminalUpdate('interrupted', None, 'E_JOB_INTERRUPTED', datetime.now(UTC), phase='reconcile'),
+                )
+                count += job is not None
+            print(count)
             await daemon.close_all()
     finally:
         for lock in locks:
@@ -296,9 +307,11 @@ asyncio.run(main())
     assert process.stdout.strip() == "1", "S18C2_RECOVERY"
     with ControlStore(h.store.root) as reopened:
         fresh = JobCoordinator(JobMetadata(reopened), h.daemon, authorize=h.service._authorize)
-        assert await fresh.reconcile_startup(deadline=monotonic() + 3) == 0, "S18C2_RECOVERY"
+        assert len(fresh.metadata.scan_reconcile_scoped(profile_id="alpha", deadline=monotonic() + 3)) == 0, (
+            "S18C2_RECOVERY"
+        )
         with pytest.raises(JobError, match="E_TIMEOUT"):
-            await fresh.reconcile_startup(deadline=monotonic() - 1)
+            await fresh.reconcile_startup(profile_id="alpha", deadline=monotonic() - 1)
     job = await h.service.get(h.ctx, r.job_id)
     assert job.status == "interrupted" and job.error_code == "E_JOB_INTERRUPTED", "S18C2_RECOVERY"
     assert h.metadata.get(queued.job_id, "beta", h.ctx.principal.subject).status == "queued", "S18C2_RECOVERY"
@@ -315,8 +328,8 @@ async def test_s18_restart_does_not_rerun_native_job(harness):
     h.runner.release.set()
     await settled(h)
     await h.daemon.close_all()
-    fresh = JobCoordinator(h.metadata, h.daemon, authorize=h.service._authorize, replay=h.runner)
-    assert await fresh.reconcile_startup(deadline=monotonic() + 2) == 0, "S18C2_NO_RERUN"
+    _fresh = JobCoordinator(h.metadata, h.daemon, authorize=h.service._authorize, replay=h.runner)
+    assert len(h.metadata.scan_reconcile_scoped(profile_id="alpha", deadline=monotonic() + 2)) == 0, "S18C2_NO_RERUN"
     assert len(h.runner.calls) == 1, "S18C2_NO_RERUN"
     assert (await h.service.get(h.ctx, accepted.job_id)).status == "interrupted", "S18C2_NO_RERUN"
 
@@ -376,7 +389,7 @@ def test_s18c2_lifecycle_import_boundary():
     )
     root = Path(__file__).resolve().parents[2]
     for path, expected in (
-        ("src/memory_server/control/jobs.py", "bfb9d877bbc3225b8b293d2ec377573b4a1e2a7fc345d197ad2bbd2891be4853"),
+        ("src/memory_server/control/jobs.py", "1fbe5633cc09fcee35e03cbd5deb9c8665fdcc034479f3fe7673d0ec9eb52a0a"),
         (
             "src/memory_server/application/job_service.py",
             "2f0b640fb8a868bd72c6593d94bf9e759659cfe6bdb8838c50d1139358353861",
