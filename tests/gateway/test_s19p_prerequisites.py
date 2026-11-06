@@ -654,7 +654,7 @@ async def test_s19p_p6_result_drains_before_value(seam_owner, monkeypatch):
     import threading
 
     import memory_server.runtime.daemon as daemon_module
-    from memory_server.runtime.runtime import CMMSRuntime
+    from memory_server.runtime.runtime import CMMSRuntime, NativeSettlementTimeout
 
     release, parked = threading.Event(), threading.Event()
 
@@ -677,8 +677,8 @@ async def test_s19p_p6_result_drains_before_value(seam_owner, monkeypatch):
             timed_out = False
             try:
                 await result.result()
-            except TimeoutError as exc:
-                timed_out = str(exc) == "native drain deadline"
+            except NativeSettlementTimeout as exc:
+                timed_out = str(exc) == "native settlement timeout"
             assert timed_out, "S19P_P6_DRAIN"
             assert not result.terminated, "S19P_P6_DRAIN"
             release.set()
@@ -694,7 +694,7 @@ async def test_s19p_p6_worker_blocks_until_native_dead(seam_owner, monkeypatch):
     import threading
 
     import memory_server.runtime.daemon as daemon_module
-    from memory_server.runtime.runtime import CMMSRuntime
+    from memory_server.runtime.runtime import CMMSRuntime, NativeSettlementTimeout
 
     release, parked = threading.Event(), threading.Event()
     task = None
@@ -721,8 +721,8 @@ async def test_s19p_p6_worker_blocks_until_native_dead(seam_owner, monkeypatch):
             timed_out = False
             try:
                 await asyncio.wait_for(asyncio.shield(task), 5)
-            except TimeoutError as exc:
-                timed_out = str(exc) == "native drain deadline"
+            except NativeSettlementTimeout as exc:
+                timed_out = str(exc) == "native settlement timeout"
             assert timed_out, "S19P_P6_DRAIN"
             record = next(r for r in runtime.owned_snapshot()[2] if r.kind == "s19p-p6-worker-timeout")
             assert record.thread.is_alive() and runtime.lock is not None, "S19P_P6_DRAIN"
@@ -745,7 +745,7 @@ async def test_s19p_p6_worker_blocks_until_native_dead(seam_owner, monkeypatch):
             monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 0.05)
             task = asyncio.create_task(worker._blocking(native, kind="s19p-p6-worker-retained"))
             assert await asyncio.to_thread(parked.wait, 5), "S19P_P6_DRAIN"
-            with pytest.raises(TimeoutError, match="^native drain deadline$"):
+            with pytest.raises(NativeSettlementTimeout, match="^native settlement timeout$"):
                 await asyncio.wait_for(task, 5)
             record = next(r for r in runtime.owned_snapshot()[2] if r.kind == "s19p-p6-worker-retained")
         report = await runtime.close()
@@ -759,3 +759,137 @@ async def test_s19p_p6_worker_blocks_until_native_dead(seam_owner, monkeypatch):
         release.set()
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def p6c_owned_claim(h, monkeypatch, *, operation, method):
+    import asyncio
+    import sys
+    import threading
+
+    from sqlalchemy import event, text
+    from storage.models.belief import BeliefORM
+    from storage.models.relation import ClaimRelationORM
+    from storage.models.relation_revision import RelationRevisionORM
+    from storage.outbox import OutboxRepository
+
+    import memory_server.runtime.daemon as daemon_module
+    from memory_server.runtime.runtime import CMMSRuntime
+
+    release, parked = threading.Event(), threading.Event()
+    async with h.daemon.acquire(h.ctx) as scope:
+        runtime = scope.runtime
+        worker = runtime.dependencies.outbox_worker
+        # Stop only the automatic consumer; all calls below use the real worker.
+        worker.stop()
+        async with asyncio.timeout(5):
+            while any(r.kind == "outbox-worker" for r in runtime.owned_snapshot()[1]):
+                await asyncio.sleep(0)
+        source, target, event_id = str(uuid4()), str(uuid4()), str(uuid4())
+        async with worker._session_factory() as session:
+            if operation == "relation_sync":
+                session.add_all([BeliefORM(id=value, proposition=value) for value in (source, target)])
+                session.add(ClaimRelationORM(
+                    source_id=source, target_id=target, relation_type="supports", created_at=h.now,
+                ))
+                session.add(RelationRevisionORM(
+                    source_id=source, target_id=target, relation_type="supports", revision=1,
+                    deleted=0, relation_created_at=h.now, changed_at=h.now, event_id=event_id,
+                ))
+                payload = dict(v=1, source_id=source, target_id=target, relation_type="supports",
+                               revision=1, event_id=event_id)
+            else:
+                payload = dict(subject="s", predicate="p", object="o")
+            entry = await OutboxRepository(session).add_entry(
+                record_type="belief" if operation == "relation_sync" else "fact",
+                record_id=source, operation=operation, payload=payload,
+            )
+            entry_id = entry.id
+            await session.commit()
+
+        owner = worker._graph_router.graph if operation == "relation_sync" else worker._embedder
+        name = "reconcile_claim_relation" if operation == "relation_sync" else "embed_batch"
+        original = getattr(owner, name)
+
+        def barrier(*args, **kwargs):
+            value = original(*args, **kwargs)
+
+            def profile(frame, event, arg):
+                if event == "return" and frame.f_code is CMMSRuntime._native_target.__code__:
+                    sys.setprofile(None)
+                    parked.set()
+                    release.wait(30)
+
+            sys.setprofile(profile)
+            return value
+
+        monkeypatch.setattr(owner, name, barrier)
+        monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 0.05)
+        commits = []
+
+        def committed(connection):
+            commits.append(True)
+
+        event.listen(worker._engine.sync_engine, "commit", committed)
+        task = None
+        try:
+            task = asyncio.create_task(getattr(worker, method)())
+            assert await asyncio.to_thread(parked.wait, 5), "S19P_P6C_NO_COMMIT"
+            result = await asyncio.wait_for(asyncio.shield(task), 5)
+            expected = 0 if method == "_poll_once" else {"processed": 0, "failed": 0}
+            assert result == expected, "S19P_P6C_NO_COMMIT"
+            assert len(commits) == 1, "S19P_P6C_NO_COMMIT: work commit after claim"
+            async with worker._engine.connect() as connection:
+                row = (await connection.execute(text(
+                    "SELECT status,retry_count,error,processed_at FROM outbox_entries WHERE id=:id"
+                ), {"id": entry_id})).one()
+            assert tuple(row) == ("processing", 0, None, None), "S19P_P6C_NO_COMMIT"
+            records = [r for r in runtime.owned_snapshot()[2] if r.thread.is_alive()]
+            assert records and runtime.lock is not None, "S19P_P6C_NO_COMMIT"
+            print("S19P_P6C_NO_COMMIT", operation, method, tuple(row), "claim_commits=1 native_alive EX_retained")
+        finally:
+            event.remove(worker._engine.sync_engine, "commit", committed)
+            release.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+            async with asyncio.timeout(5):
+                while any(r.thread.is_alive() for r in runtime.owned_snapshot()[2]):
+                    await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("method", ["_poll_once", "process_all_pending"])
+async def test_s19p_p6c_signal_survives_wrappers(seam_owner, monkeypatch, method):
+    await p6c_owned_claim(seam_owner, monkeypatch, operation="relation_sync", method=method)
+
+
+async def test_s19p_p6c_fact_batch_no_commit(seam_owner, monkeypatch):
+    await p6c_owned_claim(seam_owner, monkeypatch, operation="index_fact", method="_poll_once")
+
+
+async def test_s19p_p6c_not_exception(seam_owner, monkeypatch):
+    import asyncio
+    import threading
+
+    import memory_server.runtime.daemon as daemon_module
+    import memory_server.runtime.runtime as runtime_module
+
+    signal = getattr(runtime_module, "NativeSettlementTimeout", None)
+    assert signal is not None, "S19P_P6C_NO_COMMIT: settlement signal missing"
+    assert issubclass(signal, BaseException) and not issubclass(signal, Exception), "S19P_P6C_NO_COMMIT"
+    release, entered = threading.Event(), threading.Event()
+
+    def native():
+        entered.set()
+        release.wait(30)
+
+    async with seam_owner.daemon.acquire(seam_owner.ctx) as session:
+        handle = await session.runtime.submit_native(native, kind="s19p-p6c-type")
+        try:
+            assert await asyncio.to_thread(entered.wait, 5), "S19P_P6C_NO_COMMIT"
+            monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 0.05)
+            result = daemon_module._ProjectionResult(None, handle)
+            with pytest.raises(signal, match="^native settlement timeout$"):
+                await result.result()
+            assert not result.terminated and session.runtime.lock is not None, "S19P_P6C_NO_COMMIT"
+        finally:
+            release.set()
+            assert await handle.drain(monotonic() + 5), "S19P_P6C_NO_COMMIT"
