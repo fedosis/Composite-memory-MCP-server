@@ -11,7 +11,7 @@ import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from memory_server.application.profile_bundle import BundlePolicies, ProfileBundle
@@ -27,6 +27,8 @@ from memory_server.paths import StorageLayoutError
 from memory_server.runtime.errors import StorageOwnershipError
 from memory_server.runtime.runtime import CMMSRuntime, ShutdownReport
 from memory_server.runtime.runtime_manager import CloseAllReport, ProfileCloseOutcome, RuntimeManager
+
+_DRAIN_SECONDS = 30.0
 
 
 class LeaseError(Exception):
@@ -88,9 +90,21 @@ class _ProjectionEnvelope:
 @dataclass(frozen=True)
 class _ProjectionResult:
     value: object
+    _handle: object | None = field(default=None, repr=False, compare=False)
 
     async def result(self):
+        if self._handle is not None and not await self._handle.drain(time.monotonic() + _DRAIN_SECONDS):
+            raise TimeoutError("native drain deadline")
         return self.value
+
+    async def drain(self, deadline: float) -> bool:
+        if self._handle is None:
+            return True
+        return await self._handle.drain(deadline)
+
+    @property
+    def terminated(self) -> bool:
+        return self._handle is None or bool(self._handle.terminated)
 
 
 def _projection_lease(daemon, profile_id):
@@ -141,7 +155,7 @@ class _ProjectionAdapter:
                 raw_handle.async_result.add_done_callback(cleanup)
                 envelope = await raw_handle.result()
                 self._refresh_projection_result(binding, envelope)
-                return _ProjectionResult(envelope.value)
+                return _ProjectionResult(envelope.value, raw_handle)
             except BaseException:
                 scope.abandoned = True
                 if raw_handle is None or raw_handle.async_result.done():

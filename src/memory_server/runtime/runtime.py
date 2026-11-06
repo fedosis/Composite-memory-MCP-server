@@ -12,6 +12,7 @@ import concurrent.futures
 import contextvars
 import copy
 import inspect
+import math
 import os
 import threading
 import time
@@ -199,6 +200,16 @@ class NativeCallHandle:
     @property
     def terminated(self) -> bool:
         return self._record.state == _NATIVE_DEAD
+
+    async def drain(self, deadline: float) -> bool:
+        """Wait (bounded) until the native thread is dead. Never cancels or releases."""
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError("invalid drain deadline")
+        while self._record.state != _NATIVE_DEAD:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.01)
+        return True
 
 
 class CMMSRuntime:
