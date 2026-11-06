@@ -157,6 +157,14 @@ class ProfileRegistry:
         store._configure(tuple(records))
         self._bindings = MappingProxyType(bindings)
 
+    @property
+    def control_store(self) -> ControlStore:
+        return self._store
+
+    @control_store.setter
+    def control_store(self, value: ControlStore) -> None:
+        raise AttributeError("control_store is read-only")
+
     def _authorise(self, principal: Principal, profile_id: str, permission: d.Permission | None = None) -> None:
         _validate_id(profile_id)
         # Check scope BEFORE any existence or database lookup, even unknown IDs.

@@ -379,7 +379,7 @@ def test_s18c2_lifecycle_import_boundary():
         ("src/memory_server/control/jobs.py", "bfb9d877bbc3225b8b293d2ec377573b4a1e2a7fc345d197ad2bbd2891be4853"),
         (
             "src/memory_server/application/job_service.py",
-            "ec4b979e198c0de9214ec4eeeaf601b7e5bb81f1ae3a835a7a276a525c1c8c51",
+            "2f0b640fb8a868bd72c6593d94bf9e759659cfe6bdb8838c50d1139358353861",
         ),
         ("tests/gateway/test_jobs.py", "b0a8f1cb9d0c91ee167ac9bf0f966f360911935ee3dcde1b169304e93225126a"),
     ):

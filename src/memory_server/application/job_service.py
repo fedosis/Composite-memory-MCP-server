@@ -11,7 +11,7 @@ from uuid import UUID
 
 from memory_server.control.jobs import JobError, canonical_json, request_digest, validated_payload
 from memory_server.gateway_contracts import dto as d
-from memory_server.gateway_contracts.ports import AuditOutcome, AuditTicket
+from memory_server.gateway_contracts.ports import AuditOutcome, AuditTicket, RequestContext
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class JobService:
     events: object = None
     clock: object = lambda: datetime.now(UTC)
 
-    async def _authorize(self, ctx, job_id=None):
+    async def authorize(self, ctx: RequestContext, job_id: str | None = None) -> None:
         if ctx.principal is None:
             raise JobError("E_AUTH_REQUIRED")
         try:
@@ -43,6 +43,9 @@ class JobService:
         except Exception as exc:
             raise JobError(getattr(exc, "code", "E_INTERNAL")) from None
 
+    async def _authorize(self, ctx, job_id=None):
+        return await self.authorize(ctx, job_id)
+
     @staticmethod
     def _deadline(ctx):
         if type(ctx.deadline) not in (int, float) or not math.isfinite(ctx.deadline):
@@ -51,7 +54,7 @@ class JobService:
             raise JobError("E_TIMEOUT")
 
     async def get(self, ctx, job_id):
-        await self._authorize(ctx, job_id)
+        await self.authorize(ctx, job_id)
         self._deadline(ctx)
         try:
             job = self.metadata.get(job_id, ctx.profile_id, ctx.principal.subject)
@@ -74,7 +77,7 @@ class JobService:
         return reservation
 
     async def enqueue(self, ctx, operation, payload):
-        await self._authorize(ctx)
+        await self.authorize(ctx)
         payload = validated_payload(operation, payload)
         self._deadline(ctx)
         if ctx.idempotency_key is None:
