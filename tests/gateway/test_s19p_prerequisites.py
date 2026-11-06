@@ -870,6 +870,118 @@ async def test_s19p_p6c_fact_batch_no_commit(seam_owner, monkeypatch):
     await p6c_owned_claim(seam_owner, monkeypatch, operation="index_fact", method="_poll_once")
 
 
+@pytest.mark.parametrize("method", ["_poll_once", "process_all_pending"])
+async def test_s19p_p6d_exception_path_no_commit(seam_owner, monkeypatch, method):
+    import asyncio
+    import sys
+    import threading
+
+    from sqlalchemy import event, text
+    from storage.outbox import OutboxRepository
+
+    import memory_server.runtime.daemon as daemon_module
+    from memory_server.runtime.runtime import CMMSRuntime, NativeSettlementTimeout
+
+    release, parked = threading.Event(), threading.Event()
+    failure = RuntimeError("S19P_SYNTHETIC_NATIVE_FAILURE")
+    async with seam_owner.daemon.acquire(seam_owner.ctx) as scope:
+        runtime = scope.runtime
+        worker = runtime.dependencies.outbox_worker
+        worker.stop()
+        async with asyncio.timeout(5):
+            while any(r.kind == "outbox-worker" for r in runtime.owned_snapshot()[1]):
+                await asyncio.sleep(0)
+        async with worker._session_factory() as session:
+            entry = await OutboxRepository(session).add_entry(
+                record_type="fact", record_id=str(uuid4()), operation="index_fact",
+                payload=dict(subject="s", predicate="p", object="o"),
+            )
+            entry_id = entry.id
+            await session.commit()
+
+        def failing_embedder(*args, **kwargs):
+            def profile(frame, event, arg):
+                if event == "return" and frame.f_code is CMMSRuntime._native_target.__code__:
+                    sys.setprofile(None)
+                    parked.set()
+                    release.wait(30)
+
+            sys.setprofile(profile)
+            raise failure
+
+        monkeypatch.setattr(worker._embedder, "embed_batch", failing_embedder)
+        monkeypatch.setattr(worker._embedder, "embed", failing_embedder)
+        monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 0.05)
+        commits = []
+        settlements = []
+        submit = worker._native_submitter
+
+        async def observed_submit(*args, **kwargs):
+            try:
+                return await submit(*args, **kwargs)
+            except NativeSettlementTimeout as exc:
+                settlements.append(exc)
+                raise
+
+        monkeypatch.setattr(worker, "_native_submitter", observed_submit)
+
+        def committed(connection):
+            commits.append(True)
+
+        event.listen(worker._engine.sync_engine, "commit", committed)
+        task = None
+        try:
+            task = asyncio.create_task(getattr(worker, method)())
+            assert await asyncio.to_thread(parked.wait, 5), "S19P_P6D_EXCEPTION_NO_COMMIT"
+            result = await asyncio.wait_for(asyncio.shield(task), 5)
+            assert len(settlements) == 1, "S19P_P6D_EXCEPTION_NO_COMMIT: missing call-level signal"
+            assert settlements[0].__cause__ is failure, "S19P_P6D_EXCEPTION_NO_COMMIT"
+            expected = 0 if method == "_poll_once" else {"processed": 0, "failed": 0}
+            assert result == expected, "S19P_P6D_EXCEPTION_NO_COMMIT"
+            assert len(commits) == 1, "S19P_P6D_EXCEPTION_NO_COMMIT: work commit after claim"
+            async with worker._engine.connect() as connection:
+                row = (await connection.execute(text(
+                    "SELECT status,retry_count,error,processed_at FROM outbox_entries WHERE id=:id"
+                ), {"id": entry_id})).one()
+            assert tuple(row[:3]) == ("processing", 0, None), "S19P_P6D_EXCEPTION_NO_COMMIT"
+            assert row.processed_at is not None, "S19P_P6D_EXCEPTION_NO_COMMIT"
+            assert any(r.thread.is_alive() for r in runtime.owned_snapshot()[2]), "S19P_P6D_EXCEPTION_NO_COMMIT"
+            print("S19P_P6D_EXCEPTION_NO_COMMIT", method, tuple(row), "commits=1 native_alive")
+        finally:
+            event.remove(worker._engine.sync_engine, "commit", committed)
+            release.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+            async with asyncio.timeout(5):
+                while any(r.thread.is_alive() for r in runtime.owned_snapshot()[2]):
+                    await asyncio.sleep(0)
+
+
+async def test_s19p_p6d_exception_after_termination_preserved(seam_owner, monkeypatch):
+    from memory_server.runtime.runtime import NativeCallHandle
+
+    failure = RuntimeError("S19P_SYNTHETIC_NATIVE_FAILURE")
+    original = NativeCallHandle.result
+
+    async def settled_result(handle):
+        try:
+            return await original(handle)
+        finally:
+            assert await handle.drain(monotonic() + 5), "S19P_P6D_EXCEPTION_PRESERVED"
+            assert handle.terminated, "S19P_P6D_EXCEPTION_PRESERVED"
+
+    def failing_native():
+        raise failure
+
+    monkeypatch.setattr(NativeCallHandle, "result", settled_result)
+    async with seam_owner.daemon.acquire(seam_owner.ctx) as session:
+        submit = session.runtime.dependencies.outbox_worker._native_submitter
+        with pytest.raises(RuntimeError) as caught:
+            await submit(failing_native, kind="s19p-p6d-dead-exception")
+        assert caught.value is failure, "S19P_P6D_EXCEPTION_PRESERVED"
+        print("S19P_P6D_EXCEPTION_PRESERVED original_exception_identity native_terminated")
+
+
 async def test_s19p_p6c_not_exception(seam_owner, monkeypatch):
     import asyncio
     import threading
