@@ -235,6 +235,8 @@ class OutboxWorker:
         Returns:
             Number of entries processed (0 when the queue was empty).
         """
+        from memory_server.runtime.runtime import NativeSettlementTimeout
+
         if self._session_factory is None:
             return 0
 
@@ -264,12 +266,18 @@ class OutboxWorker:
         other_entries = [e for e in entries if e.operation != "index_fact"]
 
         if fact_entries:
-            await self._process_fact_batch(fact_entries)
+            try:
+                await self._process_fact_batch(fact_entries)
+            except NativeSettlementTimeout:
+                return 0
 
         for entry in other_entries:
             async with self._session_factory() as session:
                 repo = OutboxRepository(session)
-                await self._process_entry(session, repo, entry)
+                try:
+                    await self._process_entry(session, repo, entry)
+                except NativeSettlementTimeout:
+                    return 0
                 await session.commit()
 
         return len(entries)
@@ -803,6 +811,8 @@ class OutboxWorker:
             ``pending`` (reset by ``increment_retry``) and are counted in
             NEITHER bucket — they are re-picked by the next poll/run.
         """
+        from memory_server.runtime.runtime import NativeSettlementTimeout
+
         processed = 0
         failed = 0
 
@@ -815,7 +825,10 @@ class OutboxWorker:
             await session.commit()
 
             for entry in entries:
-                status = await self._process_entry(session, repo, entry)
+                try:
+                    status = await self._process_entry(session, repo, entry)
+                except NativeSettlementTimeout:
+                    return {"processed": processed, "failed": failed}
                 if status == "completed":
                     processed += 1
                 elif status == "failed":

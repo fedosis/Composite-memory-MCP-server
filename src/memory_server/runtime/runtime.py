@@ -45,6 +45,10 @@ E_RUNTIME_UNPROVABLE_RESOURCE_OWNERSHIP = "E_RUNTIME_UNPROVABLE_RESOURCE_OWNERSH
 _AMBIGUOUS_SQL_KINDS = frozenset({"file_uri", "remote"})
 
 
+class NativeSettlementTimeout(BaseException):
+    """Native thread still alive after bounded drain; claim must stay owned. Not Exception by design."""
+
+
 def ensure_layout_eligible(layout: Any) -> None:
     """O2/§2.1 eligibility, evaluated from the frozen layout only (no I/O).
 

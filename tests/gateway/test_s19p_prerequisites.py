@@ -834,6 +834,11 @@ async def p6c_owned_claim(h, monkeypatch, *, operation, method):
         try:
             task = asyncio.create_task(getattr(worker, method)())
             assert await asyncio.to_thread(parked.wait, 5), "S19P_P6C_NO_COMMIT"
+            async with worker._engine.connect() as connection:
+                claimed_at = (await connection.execute(text(
+                    "SELECT processed_at FROM outbox_entries WHERE id=:id"
+                ), {"id": entry_id})).scalar_one()
+            assert claimed_at is not None, "S19P_P6C_NO_COMMIT"
             result = await asyncio.wait_for(asyncio.shield(task), 5)
             expected = 0 if method == "_poll_once" else {"processed": 0, "failed": 0}
             assert result == expected, "S19P_P6C_NO_COMMIT"
@@ -842,7 +847,7 @@ async def p6c_owned_claim(h, monkeypatch, *, operation, method):
                 row = (await connection.execute(text(
                     "SELECT status,retry_count,error,processed_at FROM outbox_entries WHERE id=:id"
                 ), {"id": entry_id})).one()
-            assert tuple(row) == ("processing", 0, None, None), "S19P_P6C_NO_COMMIT"
+            assert tuple(row) == ("processing", 0, None, claimed_at), "S19P_P6C_NO_COMMIT"
             records = [r for r in runtime.owned_snapshot()[2] if r.thread.is_alive()]
             assert records and runtime.lock is not None, "S19P_P6C_NO_COMMIT"
             print("S19P_P6C_NO_COMMIT", operation, method, tuple(row), "claim_commits=1 native_alive EX_retained")

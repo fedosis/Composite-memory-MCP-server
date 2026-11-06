@@ -25,7 +25,7 @@ from memory_server.gateway_contracts.ports import (
 )
 from memory_server.paths import StorageLayoutError
 from memory_server.runtime.errors import StorageOwnershipError
-from memory_server.runtime.runtime import CMMSRuntime, ShutdownReport
+from memory_server.runtime.runtime import CMMSRuntime, NativeSettlementTimeout, ShutdownReport
 from memory_server.runtime.runtime_manager import CloseAllReport, ProfileCloseOutcome, RuntimeManager
 
 _DRAIN_SECONDS = 30.0
@@ -94,7 +94,7 @@ class _ProjectionResult:
 
     async def result(self):
         if self._handle is not None and not await self._handle.drain(time.monotonic() + _DRAIN_SECONDS):
-            raise TimeoutError("native drain deadline")
+            raise NativeSettlementTimeout("native settlement timeout")
         return self.value
 
     async def drain(self, deadline: float) -> bool:
