@@ -604,14 +604,15 @@ async def test_s19p_p6_drain_contract(tmp_path):
         await runtime.close()
 
 
-async def test_s19p_p6_projection_result_forwarding(seam_owner):
+async def test_s19p_p6_projection_result_forwarding(seam_owner, monkeypatch):
     import asyncio
     import sys
     import threading
     from dataclasses import fields
 
+    import memory_server.runtime.daemon as daemon_module
     from memory_server.runtime.daemon import _ProjectionResult
-    from memory_server.runtime.runtime import CMMSRuntime
+    from memory_server.runtime.runtime import CMMSRuntime, NativeSettlementTimeout
 
     release, parked = threading.Event(), threading.Event()
 
@@ -627,8 +628,8 @@ async def test_s19p_p6_projection_result_forwarding(seam_owner):
 
     try:
         empty = _ProjectionResult("projection-value")
-        assert callable(getattr(empty, "drain", None)), "S19P_P6_DRAIN"
-        assert await empty.drain(monotonic()) and empty.terminated, "S19P_P6_DRAIN"
+        assert not any(hasattr(empty, name) for name in ("drain", "terminated")), "S19P_P6_DRAIN"
+        assert await empty.result() == "projection-value", "S19P_P6_DRAIN"
         async with seam_owner.daemon.acquire(seam_owner.ctx) as session:
             runtime = session.runtime
             handle = await runtime.submit_native(native, kind="s19p-p6-forward")
@@ -641,9 +642,13 @@ async def test_s19p_p6_projection_result_forwarding(seam_owner):
             assert not any(hasattr(result, name) for name in ("handle", "thread", "native_future", "_record")), (
                 "S19P_P6_DRAIN"
             )
-            assert not await result.drain(monotonic() + 0.05) and not result.terminated, "S19P_P6_DRAIN"
+            monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 0.05)
+            with pytest.raises(NativeSettlementTimeout, match="^native settlement timeout$"):
+                await result.result()
+            assert not handle.terminated, "S19P_P6_DRAIN"
             release.set()
-            assert await result.drain(monotonic() + 5) and result.terminated, "S19P_P6_DRAIN"
+            monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 5)
+            assert await result.result() == "projection-value" and handle.terminated, "S19P_P6_DRAIN"
     finally:
         release.set()
 
@@ -680,9 +685,9 @@ async def test_s19p_p6_result_drains_before_value(seam_owner, monkeypatch):
             except NativeSettlementTimeout as exc:
                 timed_out = str(exc) == "native settlement timeout"
             assert timed_out, "S19P_P6_DRAIN"
-            assert not result.terminated, "S19P_P6_DRAIN"
+            assert not result._handle.terminated, "S19P_P6_DRAIN"
             release.set()
-            assert await result.drain(monotonic() + 5), "S19P_P6_DRAIN"
+            monkeypatch.setattr(daemon_module, "_DRAIN_SECONDS", 5)
             assert await result.result() == "result-value", "S19P_P6_DRAIN"
     finally:
         release.set()
@@ -1006,7 +1011,7 @@ async def test_s19p_p6c_not_exception(seam_owner, monkeypatch):
             result = daemon_module._ProjectionResult(None, handle)
             with pytest.raises(signal, match="^native settlement timeout$"):
                 await result.result()
-            assert not result.terminated and session.runtime.lock is not None, "S19P_P6C_NO_COMMIT"
+            assert not handle.terminated and session.runtime.lock is not None, "S19P_P6C_NO_COMMIT"
         finally:
             release.set()
             assert await handle.drain(monotonic() + 5), "S19P_P6C_NO_COMMIT"

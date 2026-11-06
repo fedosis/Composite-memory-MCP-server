@@ -97,15 +97,6 @@ class _ProjectionResult:
             raise NativeSettlementTimeout("native settlement timeout")
         return self.value
 
-    async def drain(self, deadline: float) -> bool:
-        if self._handle is None:
-            return True
-        return await self._handle.drain(deadline)
-
-    @property
-    def terminated(self) -> bool:
-        return self._handle is None or bool(self._handle.terminated)
-
 
 def _projection_lease(daemon, profile_id):
     held = daemon._held.get(asyncio.current_task(), {}).get(profile_id)
@@ -156,8 +147,11 @@ class _ProjectionAdapter:
                 envelope = await raw_handle.result()
                 self._refresh_projection_result(binding, envelope)
                 return _ProjectionResult(envelope.value, raw_handle)
-            except BaseException:
+            except BaseException as exc:
                 scope.abandoned = True
+                if raw_handle is not None:
+                    if not await raw_handle.drain(time.monotonic() + _DRAIN_SECONDS):
+                        raise NativeSettlementTimeout("native settlement timeout") from exc
                 if raw_handle is None or raw_handle.async_result.done():
                     self.manager._abort_projection_call(scope)
                 raise
