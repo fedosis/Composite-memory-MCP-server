@@ -1795,3 +1795,87 @@ async def test_s19p_live_claim_survives_stale_reset_after_timeout(seam_owner, mo
         monkeypatch.setattr(worker._graph_router, "sync_decision", original)
         assert await worker._poll_once() == 1, "S19P_FENCE: terminated native left a permanent fence"
         assert (await p3_rows(worker))[0][1:4] == ("completed", 0, None), "S19P_FENCE"
+
+
+def test_s19p_p4_roundtrip_and_dto_shape():
+    import hashlib
+    import json
+
+    from pydantic import ValidationError
+
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.gateway_contracts.ports import Principal, RequestContext
+
+    name = "memory_server.application.maintenance_preview"
+    assert importlib.util.find_spec(name) is not None, "S19P_SURFACE"
+    m = importlib.import_module(name)
+    assert callable(getattr(m, "MaintenancePlanCodec", None)), "S19P_SURFACE"
+    now = datetime(2026, 11, 7, tzinfo=UTC)
+    principal = Principal(
+        "synthetic", "worker-A", None, frozenset({"alpha"}), frozenset({"index.manage"}), 1, now + timedelta(hours=1)
+    )
+    ctx = RequestContext("req_p4", principal, "alpha", None, monotonic() + 30)
+    ident = str(uuid4())
+    row = m.MaintenanceRow(ident, str(uuid4()), "fact", "index_fact", "failed", 1, now, None)
+    canonical = json.dumps(
+        [[row.id, row.record_id, "fact", "index_fact", "failed", 1, "2026-11-07T00:00:00.000000Z", None]],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+    material = m.MaintenancePlanMaterial(
+        1,
+        "cmms.outbox.maintenance-plan.v1",
+        "alpha",
+        1,
+        "worker-A",
+        "failed",
+        (ident,),
+        1,
+        (row,),
+        hashlib.sha256(canonical).hexdigest(),
+        now,
+        now + timedelta(seconds=900),
+    )
+    codec = m.MaintenancePlanCodec(bytes(range(32)))
+    token = codec.issue(material)
+    plan = d.MaintenancePlan(
+        selection_digest=token,
+        selected_ids=[ident],
+        selected_count=1,
+        expires_at=material.expiry,
+        generation=material.generation,
+        selection="failed",
+    )
+    wire = plan.model_dump_json()
+    assert d.MaintenancePlan.model_validate_json(wire) == plan
+    assert set(json.loads(wire)) == {
+        "selection_digest",
+        "selected_ids",
+        "selected_count",
+        "expires_at",
+        "generation",
+        "selection",
+    }
+    assert (
+        codec.verify(
+            token,
+            ctx=ctx,
+            selection="failed",
+            selected_ids=(ident,),
+            expected_count=1,
+            registry_generation=1,
+            rows=(row,),
+            now=now,
+        )
+        == material
+    ), "S19P_PLAN_TOKEN"
+    for changes in ({"selected_count": True}, {"extra": 1}, {"selected_ids": [ident, ident]}, {"selected_count": 0}):
+        with pytest.raises(ValidationError):
+            d.MaintenancePlan.model_validate({**plan.model_dump(), **changes})
+    assert "maintenance_plan" not in d.Page.model_fields
+    assert (
+        d.OutboxMaintenancePage(items=[], next_cursor=None, has_more=False, request_id="req_p4").maintenance_plan
+        is None
+    )

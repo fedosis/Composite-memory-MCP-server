@@ -860,6 +860,27 @@ class MaintenanceRequest(DTO):
     expected_count: int = Field(ge=1, le=100)
 
 
+class MaintenancePlan(DTO):
+    selection_digest: str = Field(max_length=512, pattern=r"^[\x00-\x7f]*$")
+    selected_ids: list[
+        Annotated[str, Field(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
+    ] = Field(max_length=100)
+    selected_count: int = Field(ge=0, le=100)
+    expires_at: UTCDatetime
+    generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    selection: Literal["failed", "pending"]
+
+    @model_validator(mode="after")
+    def _selection_shape(self) -> MaintenancePlan:
+        if len(set(self.selected_ids)) != len(self.selected_ids) or self.selected_count != len(self.selected_ids):
+            raise ValueError("E_VALIDATION")
+        return self
+
+
+class OutboxMaintenancePage(Page[OutboxItem]):
+    maintenance_plan: MaintenancePlan | None = None
+
+
 class RebuildRequest(DTO):
     reason: str = Field(min_length=1, max_length=2048)
     confirmation: TrueLiteral

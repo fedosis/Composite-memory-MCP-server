@@ -264,6 +264,12 @@ class JobPort(Protocol):
     async def get(self, ctx: RequestContext, job_id: str) -> d.Job: ...
 
 
+class MaintenancePreviewProvider(Protocol):
+    async def preview(
+        self, ctx: RequestContext, *, selection: Literal["failed", "pending"], limit: int = 100
+    ) -> d.MaintenancePlan: ...
+
+
 class ReplayRunner(Protocol):
     async def run(self, session: ProfileSession, job: d.Job, request: d.MaintenanceRequest) -> d.JobResult: ...
 
