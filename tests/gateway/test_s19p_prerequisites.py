@@ -2475,3 +2475,144 @@ def test_s19p_p4_m4_mutant():
     assert exc.value.code == "E_MAINTENANCE_CONFLICT", "S19P_PLAN_TOKEN"
     assert codec.issue(material) == pristine
     assert p4_verify(codec, pristine, ctx, material) == material
+
+
+async def test_s19p_startup_callback_before_ready(tmp_path):
+    import asyncio
+
+    from memory_server.runtime.errors import RuntimeNotReadyError
+    from memory_server.runtime.runtime import CMMSRuntime
+    from memory_server.storage_lock import RuntimeStorageLock, StorageLockError
+
+    root = tmp_path / "alpha"
+    runtime = CMMSRuntime(root, profile_id="alpha")
+    calls = []
+
+    async def callback(current, *, deadline):
+        calls.append(current)
+        assert current is runtime and current.state == "STARTING"
+        assert deadline > asyncio.get_running_loop().time()
+        current.check_startup_custody(profile_id="alpha", canonical_root=root)
+        for profile, other_root in (("beta", root), ("alpha", tmp_path / "beta")):
+            with pytest.raises(RuntimeNotReadyError):
+                current.check_startup_custody(profile_id=profile, canonical_root=other_root)
+        assert current._admitted == set()
+        with pytest.raises(RuntimeNotReadyError):
+            current.spawn_owned_task(lambda: asyncio.sleep(0), kind="startup-probe")
+        with pytest.raises(RuntimeNotReadyError):
+            current.admit()
+        assert current._admitted == set()
+        with pytest.raises((StorageLockError, TimeoutError)):
+            contender = await asyncio.wait_for(RuntimeStorageLock.acquire_exclusive_async(root, timeout=0.2), timeout=1)
+            contender.release_exclusive()
+        current.check_startup_custody(profile_id="alpha", canonical_root=root)
+        assert current.state == "STARTING"
+
+    runtime.configure_startup_recovery(callback, timeout_seconds=2)
+    try:
+        assert await runtime.start() is runtime
+        assert runtime.state == "READY" and runtime.started is True
+        assert calls == [runtime]
+        assert await runtime.start() is runtime
+        assert calls == [runtime]
+        with pytest.raises(RuntimeNotReadyError):
+            runtime.check_startup_custody(profile_id="alpha", canonical_root=root)
+    finally:
+        await runtime.close()
+
+
+async def test_s19p_startup_failure_closed(tmp_path):
+    import asyncio
+    from functools import partial
+
+    from memory_server.control.jobs import JobError
+    from memory_server.runtime.errors import RuntimeNotReadyError, StorageOwnershipError
+    from memory_server.runtime.runtime import CMMSRuntime
+    from memory_server.storage_lock import RuntimeStorageLock
+
+    for mode, error in (("job", JobError), ("timeout", TimeoutError), ("cancel", asyncio.CancelledError)):
+        root = tmp_path / mode
+        runtime = CMMSRuntime(root, profile_id="alpha")
+        calls = []
+
+        async def callback(current, *, deadline):
+            calls.append(current)
+            assert current.state == "STARTING"
+            current.check_startup_custody(profile_id="alpha", canonical_root=root)
+            if mode == "job":
+                raise JobError("E_TIMEOUT")
+            if mode == "cancel":
+                raise asyncio.CancelledError()
+            await asyncio.sleep(60)
+            pytest.fail("startup timeout did not cancel callback")
+
+        runtime.configure_startup_recovery(callback, timeout_seconds=0.05)
+        try:
+            with pytest.raises(error) as exc:
+                await asyncio.wait_for(runtime.start(), timeout=2)
+            if mode == "job":
+                assert exc.value.code == "E_TIMEOUT"
+            if mode == "timeout":
+                assert isinstance(runtime._start_error, TimeoutError)
+            assert calls == [runtime]
+            assert runtime.state != "READY" and runtime.started is False
+            assert runtime._startup_window is False
+            assert runtime._cleanup_task is not None
+            await asyncio.wait_for(asyncio.shield(runtime._cleanup_task), timeout=2)
+            assert runtime.lock is None
+            assert runtime._cleanup_task.result().lock_retained is False
+            with pytest.raises(RuntimeNotReadyError):
+                runtime.check_startup_custody(profile_id="alpha", canonical_root=root)
+            contender = await asyncio.wait_for(RuntimeStorageLock.acquire_exclusive_async(root, timeout=0.2), timeout=1)
+            contender.release_exclusive()
+        finally:
+            await runtime.close()
+
+    calls = []
+
+    async def callback(current, *, deadline):
+        calls.append(current)
+
+    root = tmp_path / "occupied"
+    holder = await RuntimeStorageLock.acquire_exclusive_async(root, timeout=0.2)
+    runtime = CMMSRuntime(
+        root,
+        profile_id="alpha",
+        acquire_lock=partial(RuntimeStorageLock.acquire_exclusive_async, timeout=0.2),
+    )
+    runtime.configure_startup_recovery(callback, timeout_seconds=1)
+    try:
+        with pytest.raises(StorageOwnershipError):
+            await asyncio.wait_for(runtime.start(), timeout=2)
+        assert calls == []
+        assert runtime.started is False and runtime.lock is None
+    finally:
+        holder.release_exclusive()
+        await runtime.close()
+
+    runtime = CMMSRuntime(tmp_path / "registration", profile_id="alpha")
+    with pytest.raises(ValueError):
+        runtime.configure_startup_recovery(None, timeout_seconds=1)
+    for timeout in (0, -1, True, float("inf"), "1"):
+        with pytest.raises(ValueError):
+            runtime.configure_startup_recovery(callback, timeout_seconds=timeout)
+    runtime.configure_startup_recovery(callback, timeout_seconds=1)
+    with pytest.raises(ValueError):
+        runtime.configure_startup_recovery(callback, timeout_seconds=1)
+    try:
+        await runtime.start()
+        assert runtime.started is True and calls == [runtime]
+        with pytest.raises(ValueError):
+            runtime.configure_startup_recovery(callback, timeout_seconds=1)
+    finally:
+        await runtime.close()
+    with pytest.raises(ValueError):
+        runtime.configure_startup_recovery(callback, timeout_seconds=1)
+
+    late = CMMSRuntime(tmp_path / "late-registration", profile_id="alpha")
+    try:
+        await late.start()
+        with pytest.raises(ValueError):
+            late.configure_startup_recovery(callback, timeout_seconds=1)
+    finally:
+        await late.close()

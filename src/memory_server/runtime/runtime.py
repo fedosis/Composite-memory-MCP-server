@@ -251,6 +251,11 @@ class CMMSRuntime:
         self._acquire_lock = acquire_lock or RuntimeStorageLock.acquire_exclusive_async
         self._clock, self._sleep = clock, sleep
         self.state = "NEW"
+        self._startup_recovery = None
+        self._startup_timeout = None
+        self._startup_window = False
+        self._startup_identity = None
+        self._startup_deadline = None
         self.lock: Any = None
         self._start_task: asyncio.Task | None = None
         self._cleanup_task: asyncio.Task | None = None
@@ -276,6 +281,38 @@ class CMMSRuntime:
     @classmethod
     def create(cls, layout: Any, dependencies: RuntimeDependencies | None = None, **kwargs: Any) -> CMMSRuntime:
         return cls(layout, dependencies, **kwargs)
+
+    def configure_startup_recovery(self, callback: Callable[..., Any], *, timeout_seconds: float) -> None:
+        if (
+            self.state != "NEW"
+            or self._start_task is not None
+            or self._startup_recovery is not None
+            or not callable(callback)
+            or type(timeout_seconds) not in (int, float)
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError()
+        self._startup_recovery, self._startup_timeout = callback, timeout_seconds
+
+    def check_startup_custody(self, *, profile_id: str, canonical_root: Path) -> None:
+        if (
+            not self._startup_window
+            or self.state != "STARTING"
+            or self._startup_identity is None
+            or asyncio.current_task() is not self._startup_identity[0]
+            or os.getpid() != self._startup_identity[1]
+            or asyncio.get_running_loop() is not self._startup_identity[2]
+            or self._clock() >= self._startup_deadline
+            or self.lock is None
+            or self.lock is not self._startup_identity[3]
+            or profile_id != self.profile_id
+            or not isinstance(canonical_root, Path)
+            or not canonical_root.is_absolute()
+            or canonical_root != self.root
+            or self._admitted
+        ):
+            raise RuntimeNotReadyError()
 
     @property
     def started(self) -> bool:
@@ -311,6 +348,7 @@ class CMMSRuntime:
         try:
             try:
                 self.lock = await self._acquire_lock(self.root)
+                self._startup_identity = (asyncio.current_task(), os.getpid(), asyncio.get_running_loop(), self.lock)
             except StorageLockError as exc:
                 raise StorageOwnershipError(exc) from exc
             self._built = [
@@ -334,6 +372,16 @@ class CMMSRuntime:
             if vector is not None and type(vector).__name__ == "LanceDBProvider":
                 if getattr(vector, "_native_submitter", None) is None:
                     raise RuntimeError("runtime-created LanceDBProvider missing native_submitter")
+            if self._startup_recovery is not None:
+                self._startup_deadline = self._clock() + self._startup_timeout
+                self._startup_window = True
+                try:
+                    async with asyncio.timeout_at(self._startup_deadline):
+                        await self._startup_recovery(self, deadline=self._startup_deadline)
+                finally:
+                    self._startup_window = False
+            if self.state != "STARTING":
+                raise RuntimeClosingError()
             self.state = "READY"
             return self
         except BaseException as exc:
