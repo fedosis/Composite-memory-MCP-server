@@ -168,7 +168,8 @@ class JobCoordinator:
                     if (
                         isinstance(exc, JobError)
                         and type(exc.code) is str
-                        and exc.code in frozenset(
+                        and exc.code
+                        in frozenset(
                             {
                                 "E_TIMEOUT",
                                 "E_STORAGE",

@@ -353,6 +353,9 @@ async def test_s19p_scoped_scan_contract(seam_owner, monkeypatch):
 
 
 async def test_s19p_recovery_predicates(seam_owner):
+    from memory_server.application.job_service import JobService
+
+    assert callable(getattr(JobService, "authorize", None)), "S19P_SURFACE"
     from memory_server.application.job_runner import JobCoordinator
     from memory_server.control.jobs import JobError
 
@@ -405,6 +408,9 @@ async def test_s19p_recovery_predicates(seam_owner):
     ],
 )
 async def test_s19p_typed_c5_forwarding(seam_owner, kind):
+    from memory_server.application.job_service import JobService
+
+    assert callable(getattr(JobService, "authorize", None)), "S19P_SURFACE"
     from memory_server.application.job_runner import JobCoordinator
     from memory_server.control.jobs import JobError
     from tests.gateway.test_job_shutdown import reserve
@@ -2133,6 +2139,7 @@ async def test_s19p_preview_negative_matrix(seam_owner, tmp_path, case):
     import json
     import os
 
+    assert importlib.util.find_spec("memory_server.application.maintenance_preview") is not None, "S19P_SURFACE"
     from memory_server.application import maintenance_preview as m
     from memory_server.control.jobs import JobError
     from memory_server.control.store import ControlError
@@ -2342,6 +2349,7 @@ async def test_s19p_c6_plan_token_journal(seam_owner):
     import hashlib
     import json
 
+    assert importlib.util.find_spec("memory_server.application.maintenance_preview") is not None, "S19P_SURFACE"
     from memory_server.application import maintenance_preview as m
     from memory_server.control.jobs import JobError, request_digest
     from memory_server.gateway_contracts import dto as d
@@ -2412,6 +2420,7 @@ def test_s19p_p4_m4_mutant():
     import hashlib
     from pathlib import Path
 
+    assert importlib.util.find_spec("memory_server.application.maintenance_preview") is not None, "S19P_SURFACE"
     from memory_server.application import maintenance_preview as m
     from memory_server.control.jobs import JobError
     from memory_server.gateway_contracts.ports import Principal, RequestContext
@@ -2478,6 +2487,13 @@ def test_s19p_p4_m4_mutant():
 
 
 async def test_s19p_startup_callback_before_ready(tmp_path, seam_owner, monkeypatch):
+    from memory_server.runtime import read_composition
+    from memory_server.runtime.runtime import CMMSRuntime
+
+    assert callable(getattr(CMMSRuntime, "configure_startup_recovery", None)) and callable(
+        getattr(CMMSRuntime, "check_startup_custody", None)
+    ), "S19P_SURFACE"
+    assert callable(getattr(read_composition, "create_job_recovery_builder", None)), "S19P_SURFACE"
     await p5_owner_startup(seam_owner, monkeypatch)
     import asyncio
 
@@ -2523,6 +2539,13 @@ async def test_s19p_startup_callback_before_ready(tmp_path, seam_owner, monkeypa
 
 
 async def test_s19p_startup_failure_closed(tmp_path, seam_owner, monkeypatch):
+    from memory_server.runtime import read_composition
+    from memory_server.runtime.runtime import CMMSRuntime
+
+    assert callable(getattr(CMMSRuntime, "configure_startup_recovery", None)) and callable(
+        getattr(CMMSRuntime, "check_startup_custody", None)
+    ), "S19P_SURFACE"
+    assert callable(getattr(read_composition, "create_job_recovery_builder", None)), "S19P_SURFACE"
     await p5_owner_failure(seam_owner, monkeypatch)
     import asyncio
     from functools import partial
@@ -2621,6 +2644,13 @@ async def test_s19p_startup_failure_closed(tmp_path, seam_owner, monkeypatch):
 
 
 def p5_assembly(h, *, builder=None, timeout=5):
+    from memory_server.runtime import read_composition
+    from memory_server.runtime.runtime import CMMSRuntime
+
+    assert callable(getattr(CMMSRuntime, "configure_startup_recovery", None)) and callable(
+        getattr(CMMSRuntime, "check_startup_custody", None)
+    ), "S19P_SURFACE"
+    assert callable(getattr(read_composition, "create_job_recovery_builder", None)), "S19P_SURFACE"
     from memory_server.application.profile_bundle import BundlePolicies
     from memory_server.runtime.daemon import Daemon
     from memory_server.runtime.read_composition import create_job_recovery_builder
@@ -2866,6 +2896,13 @@ def p5_launch(root, profile, log):
 
 
 async def test_s19p_scoped_recovery_two_processes(seam_owner, monkeypatch):
+    from memory_server.runtime import read_composition
+    from memory_server.runtime.runtime import CMMSRuntime
+
+    assert callable(getattr(CMMSRuntime, "configure_startup_recovery", None)) and callable(
+        getattr(CMMSRuntime, "check_startup_custody", None)
+    ), "S19P_SURFACE"
+    assert callable(getattr(read_composition, "create_job_recovery_builder", None)), "S19P_SURFACE"
     import asyncio
 
     from memory_server.control.jobs import JobError
@@ -2924,6 +2961,13 @@ async def test_s19p_scoped_recovery_two_processes(seam_owner, monkeypatch):
 
 
 async def test_s19p_restart_no_dispatch(seam_owner, monkeypatch):
+    from memory_server.runtime import read_composition
+    from memory_server.runtime.runtime import CMMSRuntime
+
+    assert callable(getattr(CMMSRuntime, "configure_startup_recovery", None)) and callable(
+        getattr(CMMSRuntime, "check_startup_custody", None)
+    ), "S19P_SURFACE"
+    assert callable(getattr(read_composition, "create_job_recovery_builder", None)), "S19P_SURFACE"
     import asyncio
 
     from memory_server.application.job_runner import JobCoordinator
