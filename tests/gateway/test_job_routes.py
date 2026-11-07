@@ -131,7 +131,11 @@ def test_s18_job_wiring_legacy_identity():
     candidate = (root / read).read_bytes()
     assert candidate.startswith(original), "S18C2_WIRING"
     added = ast.parse(candidate[len(original) :].decode())
-    assert len(added.body) == 1 and added.body[0].name == "compose_job_ports", "S18C2_WIRING"
+    assert [node.name for node in added.body] == [
+        "compose_job_ports",
+        "JobRecoveryOwner",
+        "create_job_recovery_builder",
+    ], "S18C2_WIRING"
     assert compose_job_ports.__name__ == "compose_job_ports", "S18C2_WIRING"
     source = (root / cli).read_bytes()
     lines = (b"                compose_job_ports,\n", b"            deps, _ = compose_job_ports(deps, config)\n")

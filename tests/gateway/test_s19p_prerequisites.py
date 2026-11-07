@@ -2477,7 +2477,8 @@ def test_s19p_p4_m4_mutant():
     assert p4_verify(codec, pristine, ctx, material) == material
 
 
-async def test_s19p_startup_callback_before_ready(tmp_path):
+async def test_s19p_startup_callback_before_ready(tmp_path, seam_owner, monkeypatch):
+    await p5_owner_startup(seam_owner, monkeypatch)
     import asyncio
 
     from memory_server.runtime.errors import RuntimeNotReadyError
@@ -2521,7 +2522,8 @@ async def test_s19p_startup_callback_before_ready(tmp_path):
         await runtime.close()
 
 
-async def test_s19p_startup_failure_closed(tmp_path):
+async def test_s19p_startup_failure_closed(tmp_path, seam_owner, monkeypatch):
+    await p5_owner_failure(seam_owner, monkeypatch)
     import asyncio
     from functools import partial
 
@@ -2616,3 +2618,362 @@ async def test_s19p_startup_failure_closed(tmp_path):
             late.configure_startup_recovery(callback, timeout_seconds=1)
     finally:
         await late.close()
+
+
+def p5_assembly(h, *, builder=None, timeout=5):
+    from memory_server.application.profile_bundle import BundlePolicies
+    from memory_server.runtime.daemon import Daemon
+    from memory_server.runtime.read_composition import create_job_recovery_builder
+    from memory_server.runtime.runtime_manager import RuntimeManager
+    from tests.gateway.test_daemon import factory
+
+    owner = create_job_recovery_builder(
+        h.registry, None, bindings=h.bindings, factory_builder=builder or factory, timeout_seconds=timeout
+    )
+    manager = RuntimeManager(factory_builder=owner.factory_builder)
+    daemon = Daemon(h.registry, policies=BundlePolicies.capture(h.settings), manager=manager)
+    owner.bind_leases(daemon)
+    return owner, daemon
+
+
+async def p5_owner_startup(h, monkeypatch):
+    import asyncio
+
+    from memory_server.application.job_runner import JobCoordinator
+    from memory_server.runtime.errors import RuntimeNotReadyError
+    from memory_server.runtime.runtime import CMMSRuntime
+    from tests.gateway.test_daemon import factory
+
+    built, calls, spawned = [], [], []
+
+    def builder(layout, **kwargs):
+        result = factory(layout, **kwargs)
+        built.append(result.runtime)
+        return result
+
+    owner, daemon = p5_assembly(h, builder=builder)
+    original = JobCoordinator.reconcile_startup
+    spawn = CMMSRuntime.spawn_owned_task
+
+    def recorded_spawn(current, *args, **kwargs):
+        spawned.append((current, current.state))
+        return spawn(current, *args, **kwargs)
+
+    async def reconcile(coordinator, *, profile_id, custody, deadline):
+        calls.append((coordinator, custody))
+        assert custody is built[-1] and custody.state == "STARTING", "S19P_STARTUP"
+        binding = next(b for b in h.bindings if b.profile.id == profile_id)
+        custody.check_startup_custody(profile_id=profile_id, canonical_root=binding.layout.data_root)
+        observation = daemon.snapshot()[profile_id]
+        assert observation.state == "not_started" and observation.retained and not observation.owned
+        assert observation.admissions == 0 and not spawned
+        assert custody.dependencies.outbox_worker is not None
+        with pytest.raises(RuntimeNotReadyError):
+            custody.admit()
+        with pytest.raises(ValueError):
+            owner.factory_builder(binding.layout, config=binding.config)
+        assert len(built) == len(calls), "S19P_REPLACEMENT"
+        with pytest.raises(ValueError):
+            custody.configure_startup_recovery(owner._startup_recovery, timeout_seconds=5)
+        validate = coordinator._startup_custody
+        foreign = CMMSRuntime(binding.layout.data_root, profile_id=profile_id)
+        with pytest.raises(RuntimeNotReadyError):
+            validate(foreign, profile_id=profile_id)
+        with pytest.raises(RuntimeNotReadyError):
+            validate(custody, profile_id="missing")
+        with pytest.raises(RuntimeNotReadyError):
+            custody.check_startup_custody(profile_id=profile_id, canonical_root=h.store.root)
+
+        async def wrong_task():
+            with pytest.raises(RuntimeNotReadyError):
+                validate(custody, profile_id=profile_id)
+
+        await asyncio.create_task(wrong_task())
+        result = await original(coordinator, profile_id=profile_id, custody=custody, deadline=deadline)
+        assert custody.state == "STARTING" and not spawned
+        return result
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(JobCoordinator, "reconcile_startup", reconcile)
+            patch.setattr(CMMSRuntime, "spawn_owned_task", recorded_spawn)
+            async with daemon.acquire(h.ctx) as session:
+                assert session.runtime is built[0] and session.runtime.state == "READY"
+                assert spawned and all(state == "READY" for _, state in spawned)
+                assert await session.runtime.start() is session.runtime
+                assert len(calls) == 1
+            # One coordinator must resolve beta through the same closure, not capture alpha.
+            spawned.clear()
+            async with daemon.acquire(replace(h.ctx, principal=h.worker_b, profile_id="beta")) as beta:
+                assert beta.runtime is built[1] and beta.runtime.state == "READY"
+            assert len(calls) == 2 and calls[0][0] is calls[1][0]
+        with pytest.raises(ValueError):
+            owner.bind_leases(daemon)
+        with pytest.raises(ValueError):
+            owner.factory_builder(h.bindings[0].layout, config=h.bindings[0].config)
+        await daemon.close_all()
+        assert built[0].state == "CLOSED" and built[0].lock is None
+        replacement = owner.factory_builder(h.bindings[0].layout, config=h.bindings[0].config)
+        assert replacement.runtime is not built[0]
+        await replacement.runtime.close()
+    finally:
+        await daemon.close_all()
+        await owner.close(deadline=monotonic() + 5)
+
+
+async def p5_owner_failure(h, monkeypatch):
+    from memory_server.application.job_runner import JobCoordinator
+    from memory_server.control.jobs import JobError
+    from memory_server.runtime.daemon import LeaseError
+    from memory_server.runtime.runtime import CMMSRuntime
+    from memory_server.storage_lock import RuntimeStorageLock
+    from tests.gateway.test_daemon import factory
+
+    for mode in ("job", "timeout"):
+        built, calls, spawns = [], [], []
+
+        def builder(layout, **kwargs):
+            result = factory(layout, **kwargs)
+            built.append(result.runtime)
+            return result
+
+        owner, daemon = p5_assembly(h, builder=builder)
+
+        async def failed(coordinator, *, profile_id, custody, deadline):
+            coordinator._startup_custody(custody, profile_id=profile_id)
+            calls.append(custody)
+            assert custody.state == "STARTING" and not custody._admitted
+            with pytest.raises(ValueError):
+                owner.factory_builder(h.bindings[0].layout, config=h.bindings[0].config)
+            with pytest.raises(ValueError):
+                owner.bind_leases(daemon)
+            if mode == "job":
+                raise JobError("E_STORAGE")
+            raise TimeoutError()
+
+        def forbidden_spawn(*args, **kwargs):
+            spawns.append(args)
+            pytest.fail("S19P_STARTUP: worker spawned after failed recovery")
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(JobCoordinator, "reconcile_startup", failed)
+                patch.setattr(CMMSRuntime, "spawn_owned_task", forbidden_spawn)
+                with pytest.raises(LeaseError) as exc:
+                    async with daemon.acquire(h.ctx):
+                        pytest.fail("S19P_STARTUP: failed recovery admitted")
+            assert exc.value.code == ("E_STORAGE" if mode == "job" else "E_TIMEOUT")
+            assert calls == built and len(built) == 1 and not spawns
+            runtime = built[0]
+            assert runtime.state != "READY" and not runtime._admitted and runtime.lock is None
+            assert daemon.snapshot()["alpha"].admissions == 0
+            contender = await RuntimeStorageLock.acquire_exclusive_async(h.bindings[0].layout.data_root, timeout=0.2)
+            contender.release_exclusive()
+        finally:
+            await daemon.close_all()
+            await owner.close(deadline=monotonic() + 5)
+
+
+def p5_rows(store, profile):
+    """Ordered values of every column, preserving SQLite blobs and scalar types."""
+    import pickle
+    import sqlite3
+
+    with sqlite3.connect(f"file:{store.root / 'control.sqlite'}?mode=ro", uri=True) as connection:
+        rows = []
+        for table, order in (("jobs", "id"), ("job_requests", "job_id,subject,key")):
+            cursor = connection.execute(f"SELECT * FROM {table} WHERE profile_id=? ORDER BY {order}", (profile,))
+            rows.append((tuple(column[0] for column in cursor.description), cursor.fetchall()))
+    return pickle.dumps(rows, protocol=5)
+
+
+async def p5_wait_file(path, child=None, log=None):
+    import asyncio
+
+    deadline = monotonic() + 20
+    while not path.exists():
+        if child is not None and child.poll() is not None:
+            pytest.fail("S19P_PROCESS: child exited: " + log.read_text())
+        assert monotonic() < deadline, "S19P_PROCESS: barrier timeout"
+        await asyncio.sleep(0.01)
+
+
+async def p5_child(root, profile):
+    """Executed in a disposable OS process, not an in-process fake owner."""
+    from unittest.mock import patch
+
+    from memory_server.control.access_audit import AccessAuditStore
+    from memory_server.control.jobs import JobMetadata
+    from memory_server.control.profiles import ProfileRegistry, RegistryConfiguration
+    from memory_server.control.store import ControlStore
+    from memory_server.control.tokens import TokenService
+    from memory_server.settings import Settings
+    from tests.gateway.test_daemon import ctx, make_binding, principal
+
+    settings = Settings(_env_file=None, outbox_poll_interval_seconds=0.01)
+    bindings = tuple(make_binding(root / name, name, settings) for name in ("alpha", "beta"))
+    with ControlStore(root / "control") as store:
+        access = AccessAuditStore(root / "child-access")
+        registry = ProfileRegistry(store, RegistryConfiguration(bindings, access, TokenService(store)))
+        h = SimpleNamespace(
+            registry=registry,
+            bindings=bindings,
+            settings=settings,
+            metadata=JobMetadata(store),
+            worker_a=principal("alpha"),
+            worker_b=principal("beta"),
+            ctx=ctx(profile),
+            now=datetime.now(UTC),
+        )
+        owner, daemon = p5_assembly(h)
+        try:
+            async with daemon.acquire(h.ctx) as session:
+                assert session.runtime.state == "READY" and session.runtime.lock is not None
+                with patch(
+                    "memory_server.control.jobs.secrets.token_hex",
+                    return_value=("0" if profile == "beta" else "f") * 48,
+                ):
+                    claim = p2_reserve(h, profile=profile)
+                claim = h.metadata.progress(claim, 0.25, now=datetime.now(UTC))
+                (root / "child-ready").write_text(claim.job.id)
+                await p5_wait_file(root / "resume")
+                claim = h.metadata.progress(claim, 0.5, now=datetime.now(UTC))
+                assert claim is not None
+                (root / "child-progressed").write_text(claim.job.id)
+                await p5_wait_file(root / "stop")
+        finally:
+            await daemon.close_all()
+            await owner.close(deadline=monotonic() + 5)
+            access.close()
+
+
+def p5_launch(root, profile, log):
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import asyncio,sys; from pathlib import Path; "
+        "from tests.gateway.test_s19p_prerequisites import p5_child; "
+        "asyncio.run(p5_child(Path(sys.argv[1]), sys.argv[2]))"
+    )
+    return subprocess.Popen(
+        [sys.executable, "-c", code, str(root), profile],
+        env=dict(os.environ, PYTHONPATH="src", PYTHONDONTWRITEBYTECODE="1"),
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
+
+
+async def test_s19p_scoped_recovery_two_processes(seam_owner, monkeypatch):
+    import asyncio
+
+    from memory_server.control.jobs import JobError
+    from memory_server.storage_lock import RuntimeStorageLock, StorageLockError
+
+    h = seam_owner
+    log_path = h.tmp_path / "child.log"
+    with log_path.open("wb") as log:
+        child = p5_launch(h.tmp_path, "beta", log)
+        owner = daemon = None
+        try:
+            await p5_wait_file(h.tmp_path / "child-ready", child, log_path)
+            assert child.pid != __import__("os").getpid()
+            with pytest.raises((StorageLockError, TimeoutError)):
+                contender = await RuntimeStorageLock.acquire_exclusive_async(
+                    h.bindings[1].layout.data_root, timeout=0.2
+                )
+                contender.release_exclusive()
+            before = p5_rows(h.store, "beta")
+            with monkeypatch.context() as patch:
+                patch.setattr("memory_server.control.jobs.secrets.token_hex", lambda n: "f" * 48)
+                alpha = p2_reserve(h)
+            assert (h.tmp_path / "child-ready").read_text() < alpha.job.id
+            assert (
+                h.metadata.scan_reconcile_scoped(profile_id="alpha", limit=1, deadline=monotonic() + 5)[0].claim
+                == alpha
+            )
+            statements = []
+            h.store._connection.set_trace_callback(statements.append)
+            try:
+                for profile in (None, False, "", "bad.profile"):
+                    with pytest.raises(JobError, match="^E_VALIDATION$"):
+                        h.metadata.scan_reconcile_scoped(profile_id=profile, deadline=monotonic() + 5)
+                assert h.metadata.scan_reconcile_scoped(profile_id="alpha", deadline=monotonic() - 1) == ()
+                assert statements == [], "S19P_SCOPE: rejected scans issued SQL"
+                owner, daemon = p5_assembly(h)
+                async with daemon.acquire(h.ctx) as session:
+                    assert session.runtime.state == "READY" and session.runtime.lock is not None
+                    assert h.metadata.get(alpha.job.id, "alpha", alpha.subject).status == "interrupted"
+            finally:
+                h.store._connection.set_trace_callback(None)
+            assert any("FROM jobs WHERE profile_id='alpha' AND status='running'" in sql for sql in statements)
+            assert p5_rows(h.store, "beta") == before, "S19P_SCOPE: B rows changed at barrier"
+            (h.tmp_path / "resume").touch()
+            await p5_wait_file(h.tmp_path / "child-progressed", child, log_path)
+            assert p5_rows(h.store, "beta") != before, "S19P_PROCESS: B did not resume writes"
+            (h.tmp_path / "stop").touch()
+            assert await asyncio.to_thread(child.wait, timeout=10) == 0, log_path.read_text()
+        finally:
+            if child.poll() is None:
+                child.kill()
+                await asyncio.to_thread(child.wait, timeout=5)
+            if daemon is not None:
+                await daemon.close_all()
+                await owner.close(deadline=monotonic() + 5)
+
+
+async def test_s19p_restart_no_dispatch(seam_owner, monkeypatch):
+    import asyncio
+
+    from memory_server.application.job_runner import JobCoordinator
+    from memory_server.gateway_contracts import dto as d
+
+    h = seam_owner
+    queued = p2_reserve(h, profile="beta", running=False)
+    interrupted = p2_reserve(h, profile="beta")
+    h.metadata.fail(interrupted, "E_JOB_INTERRUPTED", now=h.now)
+    succeeded = p2_reserve(h, profile="beta")
+    h.metadata.complete(
+        succeeded,
+        d.JobResult(selected=1, attempted=1, completed=1, failed=0, projection_digest=None, receipt_ids=[]),
+        now=h.now,
+    )
+    assert h.metadata.get(queued.job_id, "beta", h.worker_b.subject).status == "queued"
+    before = p5_rows(h.store, "beta")
+    log_path = h.tmp_path / "crash-child.log"
+    with log_path.open("wb") as log:
+        child = p5_launch(h.tmp_path, "alpha", log)
+        try:
+            await p5_wait_file(h.tmp_path / "child-ready", child, log_path)
+            with h.store.borrow_transaction() as tx:
+                assert tx.fetchone("SELECT status FROM jobs WHERE id=?", ("f" * 48,))["status"] == "running"
+            child.kill()
+            assert await asyncio.to_thread(child.wait, timeout=5) == -9
+        finally:
+            if child.poll() is None:
+                child.kill()
+                await asyncio.to_thread(child.wait, timeout=5)
+    dispatches = []
+
+    async def forbidden_dispatch(*args, **kwargs):
+        dispatches.append(args)
+        pytest.fail("S19P_DISPATCH: recovery dispatched a job")
+
+    owner, daemon = p5_assembly(h)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(JobCoordinator, "attach", forbidden_dispatch)
+            patch.setattr(JobCoordinator, "_child", forbidden_dispatch)
+            async with daemon.acquire(h.ctx) as session:
+                assert session.runtime.state == "READY" and session.runtime.lock is not None
+                from tests.gateway.test_daemon import principal
+
+                job = h.metadata.get("f" * 48, "alpha", principal("alpha").subject)
+                assert job.status == "interrupted" and job.error_code == "E_JOB_INTERRUPTED"
+                assert owner._coordinator.replay is None and owner._coordinator.rebuild is None
+        assert dispatches == []
+        assert p5_rows(h.store, "beta") == before, "S19P_SCOPE: restart changed B rows"
+    finally:
+        await daemon.close_all()
+        await owner.close(deadline=monotonic() + 5)
