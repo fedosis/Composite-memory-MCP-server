@@ -1797,7 +1797,7 @@ async def test_s19p_live_claim_survives_stale_reset_after_timeout(seam_owner, mo
         assert (await p3_rows(worker))[0][1:4] == ("completed", 0, None), "S19P_FENCE"
 
 
-def test_s19p_p4_roundtrip_and_dto_shape():
+async def test_s19p_preview_contract_roundtrip(seam_owner):
     import hashlib
     import json
 
@@ -1879,3 +1879,599 @@ def test_s19p_p4_roundtrip_and_dto_shape():
         d.OutboxMaintenancePage(items=[], next_cursor=None, has_more=False, request_id="req_p4").maintenance_plan
         is None
     )
+
+    from pathlib import Path
+
+    for forbidden in ("diagnostics_service", "DiagnosticsReadWork", "mutation_uow", "S10"):
+        assert forbidden not in Path(m.__file__).read_text(), "S19P_SURFACE"
+    async with seam_owner.daemon.acquire(seam_owner.ctx) as lease:
+        runtime = lease.runtime
+        engine = runtime.dependencies.sqlite.engine
+        assert runtime.dependencies.outbox_worker._engine is engine
+        await p4_stop_worker(runtime)
+        await p4_seed(runtime, ("failed", "failed", "pending", "completed"))
+        await p4_preview_on_engine(m, runtime, seam_owner.ctx, limit=100, count=2)
+    beta_ctx = replace(seam_owner.ctx, principal=seam_owner.worker_b, profile_id="beta")
+    async with seam_owner.daemon.acquire(beta_ctx) as lease:
+        await p4_stop_worker(lease.runtime)
+        empty = await p4_preview_on_engine(m, lease.runtime, beta_ctx, limit=100, count=0)
+        assert empty.generation == hashlib.sha256(b"[]").hexdigest()
+        await p4_seed(lease.runtime, ("failed", "failed"))
+        await p4_preview_on_engine(m, lease.runtime, beta_ctx, limit=1, count=1)
+
+    rows = tuple(replace(row, id=str(uuid4())) for _ in range(100))
+    rows = tuple(sorted(rows, key=lambda row: (row.created_at, row.id)))
+    now = datetime.max.replace(tzinfo=UTC) - timedelta(seconds=900)
+    long_ctx = replace(ctx, profile_id="p" * 90, principal=replace(principal, subject="s" * 200))
+    large = p4_material(m, long_ctx, rows, now, registry_generation=9223372036854775807)
+    token = codec.issue(large)
+    import base64
+
+    assert token.isascii() and len(token) <= 512
+    assert len(base64.urlsafe_b64decode(token.split(".")[0] + "==")) <= 384
+    assert p4_verify(codec, token, long_ctx, large) == large
+
+
+async def p4_stop_worker(runtime):
+    import asyncio
+
+    runtime.dependencies.outbox_worker.stop()
+    async with asyncio.timeout(5):
+        while any(record.kind == "outbox-worker" for record in runtime.owned_snapshot()[1]):
+            await asyncio.sleep(0)
+
+
+async def p4_seed(runtime, statuses):
+    from storage.outbox import OutboxRepository
+
+    async with runtime.dependencies.outbox_worker._session_factory() as session:
+        repo = OutboxRepository(session)
+        for status in statuses:
+            entry = await repo.add_entry("fact", str(uuid4()), "index_fact", {})
+            await session.commit()
+            if status == "failed":
+                assert await repo.mark_failed(entry.id, "E_STORAGE")
+            elif status == "completed":
+                assert await repo.mark_completed(entry.id)
+            await session.commit()
+
+
+async def p4_counts(engine):
+    from sqlalchemy import text
+
+    async with engine.connect() as connection:
+        statuses = tuple(
+            (
+                await connection.execute(
+                    text("SELECT status, COUNT(*) FROM outbox_entries GROUP BY status ORDER BY status")
+                )
+            ).all()
+        )
+        total = (await connection.execute(text("SELECT COUNT(*) FROM outbox_entries"))).scalar_one()
+    return statuses, total
+
+
+def p4_generation(rows):
+    import hashlib
+    import json
+
+    values = [
+        [
+            row.id,
+            row.record_id,
+            row.record_type,
+            row.operation,
+            row.status,
+            row.retry_count,
+            row.created_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            None if row.processed_at is None else row.processed_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        ]
+        for row in rows
+    ]
+    return hashlib.sha256(
+        json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+    ).hexdigest()
+
+
+def p4_material(m, ctx, rows, now, *, registry_generation=1):
+    return m.MaintenancePlanMaterial(
+        1,
+        "cmms.outbox.maintenance-plan.v1",
+        ctx.profile_id,
+        registry_generation,
+        ctx.principal.subject,
+        "failed",
+        tuple(row.id for row in rows),
+        len(rows),
+        rows,
+        p4_generation(rows),
+        now,
+        now + timedelta(seconds=900),
+    )
+
+
+def p4_verify(codec, token, ctx, material, **changes):
+    args = dict(
+        ctx=ctx,
+        selection=material.selection,
+        selected_ids=material.selected_ids,
+        expected_count=material.expected_count,
+        registry_generation=material.registry_generation,
+        rows=material.rows,
+        now=material.issued_at,
+    )
+    return codec.verify(token, **(args | changes))
+
+
+async def p4_preview_on_engine(m, runtime, ctx, *, limit, count):
+    from sqlalchemy import DateTime, event, text
+
+    engine = runtime.dependencies.sqlite.engine
+    assert runtime.dependencies.outbox_worker._engine is engine
+    sql = (
+        "SELECT id,record_id,record_type,operation,status,retry_count,created_at,processed_at\n"
+        "FROM outbox_entries WHERE status=:selection\n"
+        "ORDER BY created_at,id LIMIT :fetch_limit"
+    )
+    records, snapshots = [], []
+
+    def recorder(connection, cursor, statement, parameters, context, executemany):
+        if "outbox_entries" in statement:
+            records.append((statement, parameters, context.compiled, context.compiled_parameters))
+
+    async def read_rows(ctx, *, selection, limit):
+        async with engine.connect() as connection:
+            result = await connection.execute(
+                text(sql).columns(created_at=DateTime(), processed_at=DateTime()),
+                {"selection": selection, "fetch_limit": limit + 1},
+            )
+            rows = []
+            for value in result.mappings():
+                data = dict(value)
+                for field in ("created_at", "processed_at"):
+                    if data[field] is not None:
+                        assert data[field].tzinfo is None
+                        data[field] = data[field].replace(tzinfo=UTC)
+                rows.append(m.MaintenanceRow(**data))
+        snapshots.append(tuple(rows))
+        return m.MaintenanceReadSnapshot(ctx.profile_id, 1, tuple(rows))
+
+    async def authorize(ctx):
+        return None
+
+    codec = m.MaintenancePlanCodec(bytes(range(32)))
+    provider = m.MaintenancePreviewProvider(
+        authorize=authorize, read_rows=read_rows, codec=codec, clock=lambda: datetime.now(UTC)
+    )
+    before = await p4_counts(engine)
+    event.listen(engine.sync_engine, "before_cursor_execute", recorder)
+    try:
+        plan = await provider.preview(ctx, selection="failed", limit=limit)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", recorder)
+    assert await p4_counts(engine) == before
+    assert len(records) == 1
+    statement, parameters, compiled, binds = records[0]
+    assert " ".join(str(compiled.statement).split()) == " ".join(sql.split())
+    assert " ".join(statement.split()) == " ".join(sql.replace(":selection", "?").replace(":fetch_limit", "?").split())
+    assert binds == [{"selection": "failed", "fetch_limit": limit + 1}]
+    assert dict(zip(compiled.positiontup, parameters, strict=True)) == binds[0]
+    assert binds[0]["fetch_limit"] <= 101
+    rows = snapshots[0][:limit]
+    assert len(snapshots[0]) == (limit + 1 if limit == 1 else count)
+    assert plan.selected_count == count
+    assert plan.selected_ids == [row.id for row in rows]
+    assert plan.generation == p4_generation(rows)
+    now = plan.expires_at - timedelta(seconds=900)
+    material = p4_material(m, ctx, rows, now)
+    assert codec.issue(material) == plan.selection_digest
+    assert p4_verify(codec, plan.selection_digest, ctx, material) == material
+    assert plan.selection_digest.isascii() and len(plan.selection_digest) <= 512
+    return plan
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "key-none",
+        "key-short",
+        "key-str",
+        "key-empty",
+        "ttl-zero",
+        "ttl-large",
+        "ttl-bool",
+        "file-valid",
+        "file-root",
+        "file-mode",
+        "file-symlink",
+        "file-short",
+        "file-long",
+        "file-hardlink",
+        "file-missing",
+        "rotation",
+        "auth-required",
+        "auth-denied",
+        "none-authorize",
+        "none-read_rows",
+        "none-codec",
+        "none-clock",
+        "selection-done",
+        "selection-none",
+        "limit-zero",
+        "limit-large",
+        "limit-bool",
+        "deadline",
+        "read-timeout",
+        "read-storage",
+        "snapshot-profile",
+        "duplicate-rows",
+        "row-status",
+        "row-bound",
+        "row-retry-bool",
+        "token-duplicate",
+        "token-padding",
+        "token-noncanonical",
+        "token-long",
+        "token-unicode",
+        "token-version",
+        "token-mac",
+        "token-expired",
+        "token-future",
+        "token-ttl",
+        "token-r",
+        "token-g",
+        "token-ids",
+        "token-count",
+        "token-retry",
+        "token-subject",
+        "uuid-uppercase",
+        "uuid-lowercase",
+    ],
+)
+async def test_s19p_preview_negative_matrix(seam_owner, tmp_path, case):
+    import base64
+    import json
+    import os
+
+    from memory_server.application import maintenance_preview as m
+    from memory_server.control.jobs import JobError
+    from memory_server.control.store import ControlError
+
+    h = seam_owner
+    codec = m.MaintenancePlanCodec(bytes(range(32)))
+    row = m.MaintenanceRow(
+        "abcdefab-1234-1234-1234-123456abcdef", str(uuid4()), "fact", "index_fact", "failed", 0, h.now, None
+    )
+    material = p4_material(m, h.ctx, (row,), h.now)
+    token = codec.issue(material)
+    expected = "E_VALIDATION"
+
+    if case.startswith("key-") or case.startswith("ttl-"):
+        options = {
+            "key-none": dict(key=None),
+            "key-short": dict(key=b"x" * 31),
+            "key-str": dict(key="x" * 32),
+            "key-empty": dict(key=b""),
+            "ttl-zero": dict(key=b"x" * 32, ttl_seconds=0),
+            "ttl-large": dict(key=b"x" * 32, ttl_seconds=901),
+            "ttl-bool": dict(key=b"x" * 32, ttl_seconds=True),
+        }
+        if case == "key-none":
+            expected = "E_CAPABILITY_UNAVAILABLE"
+        with pytest.raises(JobError) as exc:
+            m.MaintenancePlanCodec(**options[case])
+    elif case.startswith("file-"):
+        root = tmp_path / "key-root"
+        root.mkdir(mode=0o700)
+        path = root / "maintenance-plan-v1.key"
+        if case != "file-missing":
+            path.write_bytes(b"k" * {"file-short": 31, "file-long": 33}.get(case, 32))
+            os.chmod(path, 0o600)
+        if case == "file-root":
+            os.chmod(root, 0o755)
+        elif case == "file-mode":
+            os.chmod(path, 0o644)
+        elif case == "file-hardlink":
+            os.link(path, root / "hardlink")
+            assert path.stat().st_nlink == 2
+        elif case == "file-symlink":
+            target = root / "target"
+            path.rename(target)
+            os.symlink(target, path)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            if case == "file-valid":
+                assert m.load_maintenance_plan_key(fd) == b"k" * 32
+                return
+            expected = "E_STORAGE"
+            with pytest.raises(JobError) as exc:
+                m.load_maintenance_plan_key(fd)
+        finally:
+            os.close(fd)
+    elif case in {"rotation", "uuid-uppercase", "uuid-lowercase"} or case.startswith("token-"):
+        args = {}
+        if case == "uuid-lowercase":
+            assert p4_verify(codec, token, h.ctx, material) == material
+            assert material.selected_ids == ("abcdefab-1234-1234-1234-123456abcdef",)
+            return
+        if case == "uuid-uppercase":
+            args = dict(selected_ids=(row.id.upper(),), rows=(replace(row, id=row.id.upper()),))
+        elif case in {"token-duplicate", "token-version", "token-g"}:
+            header_segment, mac = token.split(".")
+            raw = base64.urlsafe_b64decode(header_segment + "==")
+            header = json.loads(raw)
+            if case == "token-duplicate":
+                raw = b'{"v":1,' + raw[1:]
+            else:
+                header["v" if case == "token-version" else "g"] = 2 if case == "token-version" else "b" * 64
+                raw = json.dumps(header, sort_keys=True, separators=(",", ":")).encode()
+            token = base64.urlsafe_b64encode(raw).rstrip(b"=").decode() + "." + mac
+        elif case == "token-padding":
+            token = token.replace(".", "=.")
+        elif case == "token-noncanonical":
+            head, mac = token.split(".")
+            alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            index = alphabet.index(mac[-1])
+            assert index % 4 == 0
+            token = head + "." + mac[:-1] + alphabet[index + 1]
+        elif case == "token-long":
+            token = "a" * 513
+        elif case == "token-unicode":
+            token = "é"
+        else:
+            expected = "E_MAINTENANCE_CONFLICT"
+            if case == "rotation":
+                codec = m.MaintenancePlanCodec(b"b" * 32)
+            elif case == "token-mac":
+                head, mac = token.split(".")
+                token = head + "." + ("A" if mac[0] != "A" else "B") + mac[1:]
+            elif case == "token-expired":
+                args["now"] = material.expiry
+            elif case == "token-future":
+                args["now"] = material.issued_at - timedelta(microseconds=1)
+            elif case == "token-ttl":
+                codec = m.MaintenancePlanCodec(bytes(range(32)), ttl_seconds=60)
+            elif case == "token-r":
+                args["registry_generation"] = 2
+            elif case == "token-ids":
+                args["selected_ids"] = (str(uuid4()),)
+            elif case == "token-count":
+                args.update(expected_count=0, selected_ids=())
+            elif case == "token-retry":
+                # Change a supported persisted field, then reconstruct the actual current row.
+                from sqlalchemy import DateTime, text
+                from storage.outbox import OutboxRepository
+
+                async with h.daemon.acquire(h.ctx) as lease:
+                    runtime = lease.runtime
+                    await p4_stop_worker(runtime)
+                    async with runtime.dependencies.outbox_worker._session_factory() as session:
+                        repo = OutboxRepository(session)
+                        entry = await repo.add_entry("fact", str(uuid4()), "index_fact", {})
+                        await session.commit()
+                        await repo.mark_failed(entry.id, "E_STORAGE")
+                        await session.commit()
+                        statement = text(
+                            "SELECT id,record_id,record_type,operation,status,retry_count,created_at,processed_at "
+                            "FROM outbox_entries WHERE id=:id"
+                        ).columns(created_at=DateTime(), processed_at=DateTime())
+
+                        async def persisted():
+                            value = dict((await session.execute(statement, {"id": entry.id})).mappings().one())
+                            for field in ("created_at", "processed_at"):
+                                if value[field] is not None:
+                                    value[field] = value[field].replace(tzinfo=UTC)
+                            return m.MaintenanceRow(**value)
+
+                        material = p4_material(m, h.ctx, (await persisted(),), h.now)
+                        token = codec.issue(material)
+                        await repo.increment_retry(entry.id, "E_STORAGE")
+                        await session.commit()
+                        args["rows"] = (await persisted(),)
+                        assert args["rows"][0].retry_count == material.rows[0].retry_count + 1
+            elif case == "token-subject":
+                args["ctx"] = replace(h.ctx, principal=replace(h.worker_a, subject="worker-B"))
+        if case == "token-g":
+            expected = "E_MAINTENANCE_CONFLICT"
+        target_ctx = args.pop("ctx", h.ctx)
+        with pytest.raises(JobError) as exc:
+            p4_verify(codec, token, target_ctx, material, **args)
+    else:
+        async with h.daemon.acquire(h.ctx) as lease:
+            runtime = lease.runtime
+            await p4_stop_worker(runtime)
+            await p4_seed(runtime, ("failed", "pending", "completed"))
+            engine = runtime.dependencies.sqlite.engine
+            before = await p4_counts(engine)
+            reads = []
+
+            async def authorize(ctx):
+                if case in {"auth-required", "auth-denied"}:
+                    raise JobError("E_AUTH_REQUIRED" if case == "auth-required" else "E_PERMISSION_DENIED")
+
+            async def read_rows(ctx, *, selection, limit):
+                reads.append(True)
+                if case == "read-timeout":
+                    raise TimeoutError
+                if case == "read-storage":
+                    raise ControlError("E_STORAGE")
+                rows = (row,)
+                if case == "duplicate-rows":
+                    rows = (row, row)
+                elif case == "row-status":
+                    rows = (replace(row, status="pending"),)
+                elif case == "row-retry-bool":
+                    rows = (replace(row, retry_count=True),)
+                elif case == "row-bound":
+                    rows = tuple(
+                        sorted((replace(row, id=str(uuid4())) for _ in range(3)), key=lambda r: (r.created_at, r.id))
+                    )
+                return m.MaintenanceReadSnapshot("beta" if case == "snapshot-profile" else ctx.profile_id, 1, rows)
+
+            options = dict(authorize=authorize, read_rows=read_rows, codec=codec, clock=lambda: h.now)
+            preview_args = dict(selection="failed", limit=1)
+            ctx = h.ctx
+            if case.startswith("none-"):
+                options[case.removeprefix("none-")] = None
+                expected = "E_CAPABILITY_UNAVAILABLE"
+            elif case.startswith("auth-"):
+                expected = "E_AUTH_REQUIRED" if case == "auth-required" else "E_PERMISSION_DENIED"
+            elif case.startswith("selection-"):
+                preview_args["selection"] = "done" if case == "selection-done" else None
+            elif case.startswith("limit-"):
+                preview_args["limit"] = {"limit-zero": 0, "limit-large": 101, "limit-bool": True}[case]
+            elif case == "deadline":
+                ctx = replace(ctx, deadline=monotonic() - 1)
+                expected = "E_TIMEOUT"
+            elif case.startswith("read-"):
+                expected = "E_TIMEOUT" if case == "read-timeout" else "E_STORAGE"
+            else:
+                expected = "E_INTERNAL"
+            try:
+                with pytest.raises(JobError) as exc:
+                    provider = m.MaintenancePreviewProvider(**options)
+                    await provider.preview(ctx, **preview_args)
+            finally:
+                assert await p4_counts(engine) == before, "S19P_PREVIEW_READ_ONLY"
+            if case.startswith(("none-", "auth-", "selection-", "limit-")) or case == "deadline":
+                assert reads == []
+    assert exc.value.code == expected, case
+
+
+async def test_s19p_c6_plan_token_journal(seam_owner):
+    import hashlib
+    import json
+
+    from memory_server.application import maintenance_preview as m
+    from memory_server.control.jobs import JobError, request_digest
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.gateway_contracts.ports import AuditTicket
+
+    h = seam_owner
+    for legacy_digest in ("a" * 64, "legacy-digest"):
+        request = d.MaintenanceRequest(
+            reason="synthetic",
+            confirmation=True,
+            selection="failed",
+            event_ids=[str(uuid4())],
+            selection_digest=legacy_digest,
+            expected_count=1,
+        )
+        assert d.MaintenanceRequest.model_validate_json(request.model_dump_json()) == request
+        ctx = replace(h.ctx, idempotency_key=uuid4())
+        golden = json.dumps(
+            {"method": "POST", "route": "outbox.replay", "path_ids": {}, "payload": request.model_dump(mode="json")},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+        digest = request_digest("outbox_replay", request)
+        assert digest == hashlib.sha256(golden).hexdigest(), "S19P_C6"
+
+        def enqueue():
+            return h.metadata.enqueue(
+                ctx,
+                "outbox_replay",
+                request,
+                digest=digest,
+                ticket=AuditTicket("ticket", ctx.request_id),
+                now=h.now,
+            )
+
+        first = enqueue()
+
+        def snapshot():
+            with h.store.borrow_transaction() as tx:
+                value = tx.fetchone("SELECT accepted_snapshot FROM job_requests WHERE job_id=?", (first.job_id,))
+                count = tx.fetchone("SELECT COUNT(*) AS n FROM job_requests", ())
+                jobs = tx.fetchone("SELECT COUNT(*) AS n FROM jobs", ())
+            return value["accepted_snapshot"], count["n"], jobs["n"]
+
+        before = snapshot()
+        # Complete the existing journal lifecycle before exercising C6 replay.
+        from memory_server.gateway_contracts.ports import AuditOutcome
+
+        first = h.metadata.finalize_request(first, AuditOutcome(202, None, (), 0.0), now=h.now)
+        h.metadata.mark_published(first, now=h.now)
+        assert snapshot() == before
+        assert isinstance(before[0], (bytes, str))
+        for _ in range(10):
+            duplicate = enqueue()
+            assert duplicate.replayed and duplicate.accepted == first.accepted
+            assert snapshot() == before, "S19P_C6"
+        codec = m.MaintenancePlanCodec(bytes(range(32)))
+        material = p4_material(m, ctx, (), h.now)
+        with pytest.raises(JobError) as exc:
+            p4_verify(codec, legacy_digest, ctx, material)
+        assert exc.value.code == "E_VALIDATION"
+        assert snapshot() == before, "S19P_C6"
+
+
+def test_s19p_p4_m4_mutant():
+    import hashlib
+    from pathlib import Path
+
+    from memory_server.application import maintenance_preview as m
+    from memory_server.control.jobs import JobError
+    from memory_server.gateway_contracts.ports import Principal, RequestContext
+
+    path = Path(m.__file__)
+    original = path.read_bytes()
+    saved = hashlib.sha256(original).hexdigest()
+    anchor = b"canonical(projection(material))"
+    assert original.count(anchor) == 1, "S19P_PLAN_TOKEN"
+    now = datetime(2026, 11, 7, tzinfo=UTC)
+    principal = Principal(
+        "synthetic", "worker-A", None, frozenset({"alpha"}), frozenset({"index.manage"}), 1, now + timedelta(hours=1)
+    )
+    ctx = RequestContext("req_m4", principal, "alpha", None, monotonic() + 30)
+    foreign = replace(ctx, principal=replace(principal, subject="worker-B"))
+    codec = m.MaintenancePlanCodec(bytes(range(32)))
+    material = p4_material(m, ctx, (), now)
+    pristine = codec.issue(material)
+    try:
+        path.write_bytes(original.replace(anchor, b"canonical(self._material(material))"))
+        importlib.invalidate_caches()
+        importlib.reload(m)
+        material = p4_material(m, ctx, (), now)
+        codec = m.MaintenancePlanCodec(bytes(range(32)))
+        mutant = codec.issue(material)
+        assert p4_verify(codec, mutant, foreign, material).subject == "worker-B", "S19P_PLAN_TOKEN"
+        # The actual regression node must turn RED, not merely observe the mutant here.
+        import os
+        import subprocess
+        import sys
+
+        red = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/gateway/test_s19p_prerequisites.py::test_s19p_preview_negative_matrix[token-subject]",
+                "--basetemp=/home/shtorm/.hermes/cache/scratch/s19p-p4-fix2/m4-red",
+                "-p",
+                "no:cacheprovider",
+            ],
+            cwd=path.parents[3],
+            env={**os.environ, "PYTHONPATH": "src", "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert red.returncode == 1, red.stdout + red.stderr
+        assert "DID NOT RAISE" in red.stdout and "1 failed" in red.stdout, red.stdout
+        print("S19P_PLAN_TOKEN M4 RED: token-subject, 1 failed (DID NOT RAISE)")
+    finally:
+        path.write_bytes(original)
+        importlib.invalidate_caches()
+        importlib.reload(m)
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == saved, "S19P_PLAN_TOKEN"
+    material = p4_material(m, ctx, (), now)
+    codec = m.MaintenancePlanCodec(bytes(range(32)))
+    with pytest.raises(JobError) as exc:
+        p4_verify(codec, codec.issue(material), foreign, material)
+    assert exc.value.code == "E_MAINTENANCE_CONFLICT", "S19P_PLAN_TOKEN"
+    assert codec.issue(material) == pristine
+    assert p4_verify(codec, pristine, ctx, material) == material
