@@ -27,7 +27,11 @@ from memory_server.settings import get_settings  # noqa: E402
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # fileConfig defaults to disable_existing_loggers=True, which switches every
+    # already-created application logger to disabled in this process. A migration
+    # run in-process (tests, daemon profile maintenance) then silences
+    # storage.*/memory_server.* logging until restart.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
