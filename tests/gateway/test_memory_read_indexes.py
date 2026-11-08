@@ -111,10 +111,10 @@ def _models(kind, i, created, updated):
     )
 
 
-async def _seed_12k(provider):
+async def _seed_12k(provider, per_kind=3000):
     rows = []
     for kind in KINDS:
-        for i in range(3000):
+        for i in range(per_kind):
             # Same timestamps occur in every type; include 0/1/999999 usecs and
             # adjacent days so the type/id tie-breaker is unavoidable.
             created = BASE + timedelta(days=i // 100, microseconds=(0, 1, 999999)[i % 3])
@@ -346,8 +346,8 @@ async def test_one_noncanonical_table_disables_all_table_raw_path(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [1, 200])
-async def test_legacy_and_raw_keyset_filter_pages_are_identical_on_same_immutable_db(seeded, limit):
-    raw, db = seeded
+async def test_legacy_and_raw_keyset_filter_pages_are_identical_on_same_immutable_db(seeded_equivalence, limit):
+    raw, db = seeded_equivalence
     legacy = REFERENCE_PROVIDER(f"sqlite+aiosqlite:///{db}")
     await legacy.initialize()
     try:
@@ -372,36 +372,58 @@ async def test_legacy_and_raw_keyset_filter_pages_are_identical_on_same_immutabl
             left, right = [], []
             after_l = after_r = None
             upper_l = upper_r = None
-            while True:
-                old = await _page(legacy, query, after=after_l, upper=upper_l)
-                new = await _page(raw, raw_query, after=after_r, upper=upper_r)
-                assert old.upper == new.upper
-                assert old.has_more == new.has_more
-                assert _keys(old) == _keys(new)
-                if EQUIVALENCE_TRACE is not None:
-                    EQUIVALENCE_TRACE.append(
-                        dict(
-                            limit=limit,
-                            filters=overrides,
-                            after=after_l,
-                            upper=old.upper,
-                            has_more=old.has_more,
-                            old_keys=_keys(old),
-                            new_keys=_keys(new),
+            # One session per side: a session per page made this test O(pages x connect)
+            # cost and turned the limit=1 case into a multi-minute hang (12k pages).
+            async with legacy._session_factory() as legacy_session, raw._session_factory() as raw_session:
+                while True:
+                    old = await legacy.read_memory_page(legacy_session, query, after=after_l, upper=upper_l)
+                    new = await raw.read_memory_page(raw_session, raw_query, after=after_r, upper=upper_r)
+                    assert old.upper == new.upper
+                    assert old.has_more == new.has_more
+                    assert _keys(old) == _keys(new)
+                    if EQUIVALENCE_TRACE is not None:
+                        EQUIVALENCE_TRACE.append(
+                            dict(
+                                limit=limit,
+                                filters=overrides,
+                                after=after_l,
+                                upper=old.upper,
+                                has_more=old.has_more,
+                                old_keys=_keys(old),
+                                new_keys=_keys(new),
+                            )
                         )
-                    )
-                left.extend(_keys(old))
-                right.extend(_keys(new))
-                if not old.has_more:
-                    break
-                after_l = _next_after(old)
-                after_r = _next_after(new)
-                upper_l = old.upper
-                upper_r = new.upper
+                    left.extend(_keys(old))
+                    right.extend(_keys(new))
+                    if not old.has_more:
+                        break
+                    after_l = _next_after(old)
+                    after_r = _next_after(new)
+                    upper_l = old.upper
+                    upper_r = new.upper
             assert left == right
             assert len(left) == len(right)
     finally:
         await legacy.close()
+
+
+@pytest.fixture
+async def seeded_equivalence(tmp_path):
+    """Smaller dataset for the O(pages) equivalence test.
+
+    The legacy side evaluates the ``s07_timestamp`` UDF for every row of every
+    page, so the 12k-row fixture makes the limit=1 case O(n^2) and takes minutes.
+    300 rows per kind still spans the three days the filter matrix needs
+    (2024-01-01 .. 2024-01-03) and keeps the microsecond tie-breakers.
+    """
+    db = tmp_path / "equivalence.db"
+    provider = SQLiteProvider(f"sqlite+aiosqlite:///{db}")
+    await provider.initialize()
+    await _seed_12k(provider, per_kind=300)
+    try:
+        yield provider, db
+    finally:
+        await provider.close()
 
 
 @pytest.mark.asyncio
