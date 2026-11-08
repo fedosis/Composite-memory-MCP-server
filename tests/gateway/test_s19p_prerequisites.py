@@ -2467,7 +2467,7 @@ async def test_s19p_c6_plan_token_journal(seam_owner):
         assert snapshot() == before, "S19P_C6"
 
 
-def test_s19p_p4_m4_mutant():
+def test_s19p_p4_m4_mutant(tmp_path):
     import hashlib
     from pathlib import Path
 
@@ -2510,7 +2510,7 @@ def test_s19p_p4_m4_mutant():
                 "pytest",
                 "-q",
                 "tests/gateway/test_s19p_prerequisites.py::test_s19p_preview_negative_matrix[token-subject]",
-                "--basetemp=/home/shtorm/.hermes/cache/scratch/s19p-p4-fix2/m4-red",
+                f"--basetemp={tmp_path / 'm4-red'}",
                 "-p",
                 "no:cacheprovider",
             ],
