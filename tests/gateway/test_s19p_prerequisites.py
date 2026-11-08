@@ -1112,7 +1112,10 @@ def sink_capture(caplog, request):
 
     Binding pytest's capture handler to the sink loggers makes this test measure
     the worker's logging, not the process-wide configuration another test left
-    behind. Restoration uses a finalizer rather than ``monkeypatch`` because the
+    behind. The cause itself is fixed at source (``alembic/env.py`` now passes
+    ``disable_existing_loggers=False``); this binding stays as a guard so no
+    other ambient logging state can silently disable the measurement.
+    Restoration uses a finalizer rather than ``monkeypatch`` because the
     ``poll`` branch calls ``monkeypatch.undo()`` and would strip the capture.
     """
     import logging
