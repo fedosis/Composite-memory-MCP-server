@@ -1100,6 +1100,56 @@ async def p3_rows(worker):
         ]
 
 
+@pytest.fixture
+def sink_capture(caplog, request):
+    """Capture the sink loggers themselves instead of the ambient root logger.
+
+    Order dependence found in the full gateway run: `alembic/env.py` calls
+    `fileConfig(alembic.ini)` in-process for migration tests, and `fileConfig`
+    defaults to ``disable_existing_loggers=True``. Every application logger that
+    already exists at that point is switched to ``disabled`` for the rest of the
+    pytest process, so a later root-level ``caplog`` sees no records at all.
+
+    Binding pytest's capture handler to the sink loggers makes this test measure
+    the worker's logging, not the process-wide configuration another test left
+    behind. Restoration uses a finalizer rather than ``monkeypatch`` because the
+    ``poll`` branch calls ``monkeypatch.undo()`` and would strip the capture.
+    """
+    import logging
+
+    handler = caplog.handler
+    app_roots = ("storage", "memory_server")
+    app_loggers = {name: logging.getLogger(name) for name in app_roots}
+    for name, candidate in list(logging.Logger.manager.loggerDict.items()):
+        if isinstance(candidate, logging.Logger) and any(
+            name == root or name.startswith(root + ".") for root in app_roots
+        ):
+            app_loggers[name] = candidate
+    saved = []
+    for name, logger in app_loggers.items():
+        saved.append((name, logger, logger.disabled, logger.level, logger.propagate, list(logger.handlers)))
+        logger.disabled = False
+        logger.level = logging.DEBUG
+        logger.propagate = True
+        if name in app_roots:
+            logger.handlers = [*logger.handlers, handler]
+
+    def restore():
+        for name, logger, disabled, level, propagate, handlers in saved:
+            logger.disabled = disabled
+            logger.level = level
+            logger.propagate = propagate
+            logger.handlers = handlers
+
+    request.addfinalizer(restore)
+    sink = logging.getLogger("storage.outbox_worker")
+    sink.warning("S19P_CAPTURE_PROBE")
+    captured = {record.name for record in caplog.records if record.getMessage() == "S19P_CAPTURE_PROBE"}
+    assert captured == {"storage.outbox_worker"}, f"S19P_PRIVACY: capture unavailable ({sorted(captured)})"
+    caplog.clear()
+    return caplog
+
+
 @pytest.mark.parametrize(
     "site",
     [
@@ -1121,7 +1171,7 @@ async def p3_rows(worker):
         "graph_publish",
     ],
 )
-async def test_s19p_worker_secret_canary(p3_worker, monkeypatch, caplog, site):
+async def test_s19p_worker_secret_canary(p3_worker, monkeypatch, sink_capture, site):
     import asyncio
     import logging
 
@@ -1129,6 +1179,7 @@ async def test_s19p_worker_secret_canary(p3_worker, monkeypatch, caplog, site):
 
     from memory_server.providers.embedding_provider import MockEmbeddingProvider
 
+    caplog = sink_capture
     worker = p3_worker
     secret = "S19P_PRIVATE_WORKER /private/path payload=canary"
     failure = RuntimeError(secret)
