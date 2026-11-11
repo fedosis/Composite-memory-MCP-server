@@ -43,9 +43,16 @@ SRC_ROOT = REPO_ROOT / "src"
 FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "runtime_contracts.json"
 CONTRACTS_DIR = REPO_ROOT / "contracts"
 CODER_SCRATCH_ROOT = Path(
-    "/home/shtorm/.hermes/profiles/coder/cache/scratch/cmms-runtime-refactor-exclusive"
+    os.environ.get(
+        "CMMS_C00_SCRATCH_ROOT",
+        "/home/shtorm/.hermes/profiles/coder/cache/scratch/cmms-runtime-refactor-exclusive",
+    )
 )
 SCRATCH = Path(os.environ.get("CMMS_C00_SCRATCH", str(CODER_SCRATCH_ROOT / "C00")))
+#: Root the tree under test is a disposable checkout of. Defaults to scratch (the
+#: coder-profile layout, where the tree is a copy inside it); the pinned harness
+#: keeps the tree and the artifact scratch separate and declares both.
+SOURCE_ROOT = Path(os.environ.get("CMMS_C00_SOURCE_ROOT", str(SCRATCH)))
 BASE_REPO = Path(os.environ.get("CMMS_C00_REPO", str(SCRATCH / "base-3c5f11a7")))
 PYTHON = Path(os.environ.get("CMMS_C00_PY", "/home/shtorm/memory-server/.venv/bin/python"))
 SERVER_BIN = Path(
@@ -393,8 +400,13 @@ def _capture_native(monkeypatch: pytest.MonkeyPatch, synthetic: Any) -> dict[str
 
     monkeypatch.setattr(
         embedding_module, "SentenceTransformerEmbeddingProvider", MockEmbeddingProvider)
-    root, home, db = synthetic.root, synthetic.root / "native-home", synthetic.root / "native.db"
+    root, home = synthetic.root, synthetic.root / "native-home"
     home.mkdir(parents=True, exist_ok=True)
+    # Profile mode keeps every store below ``hermes_home``: ``data_root`` defaults
+    # to "." and the layout root becomes the profile home (paths.py:290-292), so a
+    # sqlite target one level above it is a split layout and is refused before
+    # construction (runtime/runtime.py:96-99). The db belongs inside the home.
+    db = home / "native.db"
 
     def build():
         provider = HermesProvider()
@@ -724,8 +736,12 @@ def test_baseline_snapshots_were_produced_by_real_transports(baseline) -> None:
 def test_baseline_harness_paths_are_inside_scratch(baseline) -> None:
     """Isolation guard: every harness path is inside scratch, never a live root."""
     assert SCRATCH.is_dir() and _inside(SCRATCH, CODER_SCRATCH_ROOT)
-    assert _inside(REPO_ROOT, SCRATCH), (
-        f"the source under test must be the disposable copy, got {REPO_ROOT}")
+    assert REPO_ROOT == SOURCE_ROOT or _inside(REPO_ROOT, SOURCE_ROOT), (
+        f"the source under test must be inside its declared root "
+        f"{SOURCE_ROOT}, got {REPO_ROOT}")
+    for live_root in LIVE_DATA_ROOTS:
+        assert not _inside(REPO_ROOT, live_root), (
+            f"the source under test is a live root: {REPO_ROOT}")
     for path in baseline["paths"]:
         assert _inside(path, SCRATCH), f"harness path outside scratch: {path}"
         for live_root in LIVE_DATA_ROOTS:
