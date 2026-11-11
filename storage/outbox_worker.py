@@ -216,7 +216,17 @@ class OutboxWorker:
         self._active_claim = None
         self._retained_claims = set()
         self._stop_requested = False
+        self._maintenance_paused = False
+        self._maintenance_pause_ack = False
         self._last_compact_at: float = 0.0
+
+    def _pause_for_maintenance(self, *, custody) -> None:
+        from memory_server.runtime.runtime import MaintenanceCustody
+
+        if type(custody) is not MaintenanceCustody:
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        custody._identity[0]._check_maintenance_worker(custody, self)
+        self._maintenance_paused = True
 
     def stop(self) -> None:
         """Signal the run loop to exit after the current iteration.
@@ -267,6 +277,10 @@ class OutboxWorker:
             self._poll_interval_seconds,
         )
         while not self._stop_requested:
+            if self._maintenance_paused:
+                self._maintenance_pause_ack = True
+                await asyncio.sleep(0.05)
+                continue
             try:
                 processed = await self._poll_once()
             except Exception:
@@ -308,6 +322,8 @@ class OutboxWorker:
         """
         import time
 
+        if self._maintenance_paused:
+            return
         if self._qdrant is None:
             return
         optimize = getattr(self._qdrant, "optimize", None)
@@ -317,7 +333,8 @@ class OutboxWorker:
             return
         self._last_compact_at = time.monotonic()
 
-        async def _compact() -> None:
+        @_fenced
+        async def _compact(self) -> None:
             try:
                 ok = await optimize(
                     cleanup_older_than=timedelta(hours=self._compact_cleanup_hours),
@@ -330,9 +347,9 @@ class OutboxWorker:
                 )
 
         if self._task_spawner is None:
-            asyncio.create_task(_compact())
+            asyncio.create_task(_compact(self))
         else:
-            self._compact_task = self._task_spawner(_compact, kind="outbox-compact")
+            self._compact_task = self._task_spawner(lambda: _compact(self), kind="outbox-compact")
 
     def claim_scope(self, *, deadline: float) -> AsyncContextManager[ActiveClaim]:
         return self._claim_scope(deadline)
@@ -355,11 +372,16 @@ class OutboxWorker:
         assert task is not None
         if self._active_claim is not None and self._active_claim.task is task:
             raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        if self._maintenance_paused:
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
         try:
             async with asyncio.timeout_at(deadline):
                 await self._claim_lock.acquire()
         except TimeoutError:
             raise OutboxClaimError("E_TIMEOUT") from None
+        if self._maintenance_paused:
+            self._claim_lock.release()
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
         self._retained_claims.difference_update(
             retained
             for retained in tuple(self._retained_claims)
