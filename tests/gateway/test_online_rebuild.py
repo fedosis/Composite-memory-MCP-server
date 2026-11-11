@@ -9,6 +9,118 @@ import pytest
 from memory_server.runtime.runtime import CMMSRuntime
 
 
+async def worker_runtime(root):
+    from storage.outbox_worker import OutboxWorker
+
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+    from memory_server.runtime.dependencies import RuntimeDependencies
+
+    async def sqlite(owner):
+        provider = SQLiteProvider(url=f"sqlite+aiosqlite:///{owner.root / 'memory.db'}")
+        await provider.initialize()
+        return provider
+
+    async def worker(owner):
+        result = OutboxWorker(
+            engine=owner.dependencies.sqlite.engine,
+            task_spawner=owner.spawn_owned_task,
+            native_submitter=owner.submit_native,
+            poll_interval_seconds=0.01,
+        )
+        await result.initialize()
+        return result
+
+    runtime = CMMSRuntime(
+        root, profile_id="a",
+        dependencies=RuntimeDependencies(recipes=(("sqlite", sqlite), ("outbox_worker", worker))),
+    )
+    await runtime.start()
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_s20a_pause_requires_custody(tmp_path):
+    runtime = await worker_runtime(tmp_path / "a")
+    worker = runtime.dependencies.outbox_worker
+    token = runtime.admit()
+    try:
+        hook = getattr(worker, "_pause_for_maintenance", None)
+        assert callable(hook), "S20A_PAUSE_CUSTODY: private hook missing"
+        for invalid in (None, object()):
+            with pytest.raises(Exception):
+                hook(custody=invalid)
+            assert not worker._maintenance_paused, "S20A_PAUSE_CUSTODY"
+        assert not hasattr(worker, "pause") and not hasattr(worker, "resume"), "S20A_PAUSE_CUSTODY"
+        custody = runtime.begin_maintenance(
+            profile_id="a", canonical_root=runtime.root, deadline=time.monotonic() + 10,
+        )
+
+        async def foreign_task():
+            with pytest.raises(Exception):
+                hook(custody=custody)
+            assert not worker._maintenance_paused, "S20A_PAUSE_CUSTODY: foreign task"
+
+        await asyncio.create_task(foreign_task())
+        hook(custody=custody)
+        assert worker._maintenance_paused, "S20A_PAUSE_CUSTODY"
+        with pytest.raises(Exception) as rejected:
+            async with worker.claim_scope(deadline=time.monotonic() + 1):
+                pytest.fail("S20A_PAUSE_CUSTODY: paused claim entered")
+        assert rejected.value.code == "E_MAINTENANCE_CONFLICT"
+    finally:
+        runtime.release_admitted(token)
+        assert (await runtime.close()).code is None
+
+
+@pytest.mark.asyncio
+async def test_s20a_pause_same_loop_queued_claim(tmp_path):
+    runtime = await worker_runtime(tmp_path / "a")
+    worker = runtime.dependencies.outbox_worker
+    token = runtime.admit()
+    engine, sessions = worker._engine, worker._session_factory
+    queued = asyncio.Event()
+    rejected = asyncio.Event()
+
+    async def waiter():
+        queued.set()
+        try:
+            async with worker.claim_scope(deadline=time.monotonic() + 5):
+                pytest.fail("S20A_LOOP: queued claim crossed pause")
+        except Exception as exc:
+            assert exc.code == "E_MAINTENANCE_CONFLICT", "S20A_LOOP"
+            rejected.set()
+
+    parent = pending = None
+    try:
+        hook = getattr(worker, "_pause_for_maintenance", None)
+        assert callable(hook), "S20A_LOOP: private hook missing"
+        async with worker.claim_scope(deadline=time.monotonic() + 5):
+            pending = asyncio.create_task(waiter())
+            await queued.wait()
+            custody = runtime.begin_maintenance(
+                profile_id="a", canonical_root=runtime.root, deadline=time.monotonic() + 10,
+            )
+            hook(custody=custody)
+            assert worker._active_claim is not None, "S20A_LOOP: active claim interrupted"
+        await pending
+        assert rejected.is_set() and not worker._claim_lock.locked(), "S20A_LOOP"
+        parent = runtime.spawn_owned_task(worker.run, kind="daemon-worker-parent")
+        await runtime.drain_maintenance(custody, worker_task=parent)
+        assert worker._maintenance_pause_ack and not parent.done(), "S20A_WORKER_IDENTITY"
+        assert worker._engine is engine and worker._session_factory is sessions, "S20A_LOOP"
+        worker.stop()
+        await asyncio.wait_for(asyncio.shield(parent), 1)
+        assert worker._maintenance_paused, "S20A_LOOP: terminal stop opened gate"
+    finally:
+        worker.stop()
+        if pending is not None:
+            await asyncio.gather(pending, return_exceptions=True)
+        if parent is not None:
+            await asyncio.gather(parent, return_exceptions=True)
+        runtime.release_admitted(token)
+        assert (await runtime.close()).code is None
+
+
 def required(runtime, name):
     method = getattr(runtime, name, None)
     assert callable(method), f"S20A_SURFACE: {name}"
