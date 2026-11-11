@@ -12,10 +12,15 @@ class TestHybridRouter:
     @pytest.fixture
     def router(self):
         from memory_server.providers.embedding_provider import MockEmbeddingProvider
+        from memory_server.providers.graph_provider import SimpleGraph
         from memory_server.providers.qdrant_provider import QdrantProvider
 
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
         embedder = MockEmbeddingProvider(vector_size=384)
+        # HybridRouter requires all three capabilities (hybrid_router.py:120-121);
+        # an empty graph leaves graph-stage results empty, so routing priority is
+        # unchanged for these cases.
+        graph = SimpleGraph()
 
         # Create custom rules: graph/entity rules high priority for test control
         rules = RoutingRuleSet()
@@ -30,6 +35,7 @@ class TestHybridRouter:
             vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
+            graph=graph,
         )
 
     async def test_route_hits_rules_first(self, router):
