@@ -768,6 +768,89 @@ def test_s20a_recovery_scope_and_rollback(tmp_path):
                 stream.close()
 
 
+@pytest.mark.parametrize("fault", ["publish-fsync", "readback", "rollback", "closing"])
+def test_s20a_publication_readback_rollback_failure(tmp_path, monkeypatch, fault):
+    root = tmp_path / "profile"
+    if fault == "rollback":
+        before = kill_at(root, "published", "dir-fsync", "after")
+        rename = os.rename
+        attempts = []
+
+        def fail_rollback(src, dst, **kwargs):
+            if src == "old-graph":
+                attempts.append((src, dst))
+                raise OSError("rollback syscall fault")
+            return rename(src, dst, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rename", fail_rollback)
+            assert asyncio.run(restart_owner(root)) == ("E_STORAGE", "FAILED", []), "S20A_PUBLISH: rollback admitted"
+        assert attempts == [("old-graph", "graph.json")], "S20A_PUBLISH: blind retry"
+        journal = next((root / projections._OWNED_DIRECTORY).glob("*/journal.json"))
+        assert json.loads(journal.read_bytes())["phase"] == "rollback", "S20A_PUBLISH: missing rollback intent"
+        # Crash the real next recovery while the retained rollback is executing.
+        kill_at(root, "rollback", "rename", "after")
+        assert asyncio.run(restart_owner(root)) == (None, "READY", ["recipes"]), "S20A_PUBLISH: repeated rollback"
+        assert disk_scope(root)[:2] == before[:2], "S20A_PUBLISH: nonselected/canonical mutation"
+        return
+
+    async def exercise():
+        from tests.gateway.test_online_rebuild import projection_owner
+
+        async with projection_owner(root) as (owner, custody):
+            before = disk_scope(root)
+            snapshot = await projections.snapshot_owned_projection_records(owner, custody=custody)
+            rename, fsync, stat = os.rename, os.fsync, os.stat
+            swapped, injected = False, []
+
+            def observed_rename(src, dst, **kwargs):
+                nonlocal swapped
+                result = rename(src, dst, **kwargs)
+                if src == "graph" and dst == "graph.json":
+                    swapped = True
+                    if fault == "closing":
+                        owner._begin_close()
+                return result
+
+            def failing_fsync(fd):
+                if swapped and fault == "publish-fsync" and not injected:
+                    injected.append("fsync")
+                    raise OSError("publish fsync fault")
+                return fsync(fd)
+
+            def failing_stat(path, *args, **kwargs):
+                if swapped and fault == "readback" and path == "graph.json" and not injected:
+                    injected.append("readback")
+                    raise OSError("readback stat fault")
+                return stat(path, *args, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(os, "rename", observed_rename)
+                patch.setattr(os, "fsync", failing_fsync)
+                patch.setattr(os, "stat", failing_stat)
+                if fault == "closing":
+                    await projections.rebuild_owned_projections(snapshot, custody=custody, targets=frozenset({"graph"}))
+                    assert owner.state == "CLOSING", "S20A_PUBLISH: close reopened"
+                    with pytest.raises(Exception):
+                        owner.finish_maintenance(custody)
+                    assert owner.state == "CLOSING", "S20A_PUBLISH: finish reopened"
+                else:
+                    with pytest.raises(Exception) as rejected:
+                        await projections.rebuild_owned_projections(snapshot, custody=custody,
+                                                                    targets=frozenset({"graph"}))
+                    assert rejected.value.code == "E_STORAGE", "S20A_PUBLISH: syscall failure escaped"
+                    assert injected, "S20A_PUBLISH: fault did not cross production boundary"
+                assert swapped and owner._maintenance_state == "blocked", "S20A_PUBLISH: fence reopened"
+                assert owner.lock._fh is not None, "S20A_PUBLISH: EX dropped"
+            assert disk_scope(root)[:2] == before[:2], "S20A_PUBLISH: canonical/outbox/nonselected mutation"
+            return before
+
+    before = asyncio.run(exercise())
+    assert asyncio.run(restart_owner(root)) == (None, "READY", ["recipes"]), "S20A_PUBLISH: recovery"
+    assert disk_scope(root) == before, "S20A_PUBLISH: whole selected rollback not coherent"
+    assert asyncio.run(restart_owner(root)) == (None, "READY", ["recipes"]), "S20A_PUBLISH: repeat recovery"
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "scope":
         asyncio.run(scope_child(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]))
