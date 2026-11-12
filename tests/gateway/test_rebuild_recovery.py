@@ -851,6 +851,117 @@ def test_s20a_publication_readback_rollback_failure(tmp_path, monkeypatch, fault
     assert asyncio.run(restart_owner(root)) == (None, "READY", ["recipes"]), "S20A_PUBLISH: repeat recovery"
 
 
+JOURNAL_CASES = ["trace", "bounds", "unknown-schema", "truncation", "symlink", "hardlink", "traversal",
+                 "cross-device", "fsync-failure", "rename-ambiguity", "old-identity", "staged-identity",
+                 "reconciled-identity"] + [f"null-{phase}" for phase in
+                                          ("captured", "stage", "verified", "publish", "published", "rollback")]
+
+
+@pytest.mark.parametrize("case", JOURNAL_CASES)
+def test_s20a_manifest_durability_identity(tmp_path, monkeypatch, case):
+    import errno
+
+    root = tmp_path / "profile"
+    if case in {"cross-device", "rename-ambiguity"}:
+        async def exercise():
+            from tests.gateway.test_online_rebuild import projection_owner
+
+            async with projection_owner(root) as (owner, custody):
+                before = disk_scope(root)
+                snapshot = await projections.snapshot_owned_projection_records(owner, custody=custody)
+                rename, attempts = os.rename, []
+
+                def fault(src, dst, **kwargs):
+                    if src == "graph.json":
+                        attempts.append((src, dst))
+                        if case == "rename-ambiguity":
+                            rename(src, dst, **kwargs)
+                        raise OSError(errno.EXDEV if case == "cross-device" else errno.EIO, "fault syscall")
+                    return rename(src, dst, **kwargs)
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(os, "rename", fault)
+                    with pytest.raises(Exception) as rejected:
+                        await projections.rebuild_owned_projections(snapshot, custody=custody,
+                                                                    targets=frozenset({"graph"}))
+                    assert rejected.value.code == "E_STORAGE", "S20A_JOURNAL: rename failure not rejected"
+                assert attempts == [("graph.json", "old-graph")], "S20A_JOURNAL: destructive rename retried"
+                assert owner._maintenance_state == "blocked", "S20A_JOURNAL: fence lost"
+                if case == "cross-device":
+                    assert disk_scope(root) == before, "S20A_JOURNAL: cross-device copy/delete fallback"
+                return before
+
+        before = asyncio.run(exercise())
+        assert asyncio.run(restart_owner(root)) == (None, "READY", ["recipes"]), "S20A_JOURNAL: recovery"
+        assert disk_scope(root) == before, "S20A_JOURNAL: ambiguous rename not reconciled"
+        return
+
+    before = kill_at(root, "snapshot", "dir-fsync", "after")
+    journal = next((root / projections._OWNED_DIRECTORY).glob("*/journal.json"))
+    state = json.loads(journal.read_bytes())
+    if case == "bounds":
+        journal.write_bytes(b" " * (projections._OWNED_LIMITS["journal_bytes"] + 1))
+    elif case == "truncation":
+        journal.write_bytes(b'{"version":')
+    elif case in {"symlink", "hardlink"}:
+        held = journal.with_name("held.json")
+        journal.rename(held)
+        if case == "symlink":
+            journal.symlink_to(held.name)
+        else:
+            os.link(held, journal)
+    elif case not in {"trace", "fsync-failure"}:
+        if case == "unknown-schema":
+            state["version"] = 999
+        elif case == "traversal":
+            state["paths"]["graph"] = "../graph.json"
+        elif case == "old-identity":
+            state["old"]["graph"] = None
+        elif case == "staged-identity":
+            state["staged"] = {"graph": [True, 2, "a" * 64, 1]}
+        elif case == "reconciled-identity":
+            state.update(phase="reconciled", snapshot={"unknown": 1})
+        else:
+            state.update(phase=case.removeprefix("null-"), snapshot=None)
+        with projections._owned_dir(journal.parent) as run:
+            projections._owned_journal(run, state)
+    raw = journal.read_bytes()
+    fsync, replace = os.fsync, os.replace
+    trace = []
+
+    def observed_fsync(fd):
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if path.name.startswith("journal-"):
+            trace.append("file-fsync")
+            if case == "fsync-failure":
+                raise OSError(errno.EIO, "file fsync fault")
+        result = fsync(fd)
+        if path == journal.parent:
+            trace.append("dir-fsync")
+        return result
+
+    def observed_replace(src, dst, **kwargs):
+        result = replace(src, dst, **kwargs)
+        trace.append("replace")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", observed_fsync)
+        patch.setattr(os, "replace", observed_replace)
+        result = asyncio.run(restart_owner(root))
+    if case == "trace":
+        assert result == (None, "READY", ["recipes"]), "S20A_JOURNAL: valid rejected"
+        assert trace == ["file-fsync", "replace", "dir-fsync"], "S20A_JOURNAL: durability order"
+        assert asyncio.run(restart_owner(root)) == result, "S20A_JOURNAL: reconciliation not idempotent"
+    else:
+        assert result == ("E_STORAGE", "FAILED", []), "S20A_JOURNAL: unsafe admitted"
+        assert journal.read_bytes() == raw, "S20A_JOURNAL: unsafe journal mutated"
+        if case == "fsync-failure":
+            assert trace == ["file-fsync"], "S20A_JOURNAL: failed fsync still replaced journal"
+            assert asyncio.run(restart_owner(root)) == (None, "READY", ["recipes"]), "S20A_JOURNAL: retry"
+    assert disk_scope(root) == before, "S20A_JOURNAL: canonical/outbox/nonselected/live mutation"
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "scope":
         asyncio.run(scope_child(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]))
