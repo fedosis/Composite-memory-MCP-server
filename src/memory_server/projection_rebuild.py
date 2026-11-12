@@ -1548,7 +1548,8 @@ def _owned_load_journal(fd, runtime, run_id, root):
     if (not isinstance(state["old"], dict) or set(state["old"]) != {"vector", "graph"}
         or not isinstance(state["staged"], dict) or not set(state["staged"]) <= {"vector", "graph"}):
         raise MaintenanceError("E_STORAGE")
-    snapshots = [] if state["snapshot"] is None and state["phase"] == "snapshot" else [state["snapshot"]]
+    snapshots = ([] if state["snapshot"] is None and state["phase"] in {"snapshot", "reconciled"}
+                 else [state["snapshot"]])
     for identity in [*state["old"].values(), *state["staged"].values(), *snapshots]:
         if (not isinstance(identity, list) or len(identity) != 4
             or any(type(identity[index]) is not int or identity[index] < 0 for index in (0, 1, 3))
