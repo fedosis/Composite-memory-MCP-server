@@ -216,6 +216,30 @@ class NativeCallHandle:
         return True
 
 
+class MaintenanceError(RuntimeError):
+    """Content-free maintenance failures; never expose provider diagnostics."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+class MaintenanceCustody:
+    """Owner-issued, immutable identity; possession alone grants no authority."""
+
+    __slots__ = ("_identity",)
+
+    def __new__(cls):
+        raise TypeError("MaintenanceCustody is runtime-issued")
+
+    def __setattr__(self, name, value):
+        raise AttributeError("immutable custody")
+
+    @property
+    def self_task(self):
+        return self._identity[1]
+
+
 class CMMSRuntime:
     """Resources, tasks and uncertain outcomes stay owned until proven safe.
 
@@ -252,6 +276,8 @@ class CMMSRuntime:
         self._clock, self._sleep = clock, sleep
         self.state = "NEW"
         self._startup_recovery = None
+        self._maintenance_custody = None
+        self._maintenance_state = "idle"
         self._startup_timeout = None
         self._startup_window = False
         self._startup_identity = None
@@ -356,6 +382,17 @@ class CMMSRuntime:
                 for n in ("sqlite", "graph", "embedder", "vector")
                 if getattr(self.dependencies, n) is not None
             ]
+            from memory_server.projection_rebuild import _reconcile_owned_projections
+
+            _reconcile_owned_projections(self)
+            if self._startup_recovery is not None:
+                self._startup_deadline = self._clock() + self._startup_timeout
+                self._startup_window = True
+                try:
+                    async with asyncio.timeout_at(self._startup_deadline):
+                        await self._startup_recovery(self, deadline=self._startup_deadline)
+                finally:
+                    self._startup_window = False
             for name, build in self.dependencies.recipes:
                 if self.state != "STARTING":
                     raise RuntimeClosingError()
@@ -372,14 +409,6 @@ class CMMSRuntime:
             if vector is not None and type(vector).__name__ == "LanceDBProvider":
                 if getattr(vector, "_native_submitter", None) is None:
                     raise RuntimeError("runtime-created LanceDBProvider missing native_submitter")
-            if self._startup_recovery is not None:
-                self._startup_deadline = self._clock() + self._startup_timeout
-                self._startup_window = True
-                try:
-                    async with asyncio.timeout_at(self._startup_deadline):
-                        await self._startup_recovery(self, deadline=self._startup_deadline)
-                finally:
-                    self._startup_window = False
             if self.state != "STARTING":
                 raise RuntimeClosingError()
             self.state = "READY"
@@ -403,6 +432,8 @@ class CMMSRuntime:
             raise RuntimeClosingError()
         if self.state == "FAILED":
             raise RuntimeFailedError()
+        if self._maintenance_state != "idle":
+            raise MaintenanceError("E_MAINTENANCE_CONFLICT")
 
     def admit(self) -> asyncio.Task:
         self._check_admission()
@@ -419,6 +450,125 @@ class CMMSRuntime:
     def register_admitted(self, task: asyncio.Task) -> None:
         self._check_admission()
         self._admitted.add(task)
+
+    def begin_maintenance(
+        self, *, profile_id: str, canonical_root: Path, deadline: float,
+    ) -> MaintenanceCustody:
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise MaintenanceError("E_VALIDATION")
+        self._check_admission()
+        task = asyncio.current_task()
+        if (
+            self.state != "READY" or task is None or task not in self._admitted
+            or profile_id != self.profile_id or not isinstance(canonical_root, Path)
+            or not canonical_root.is_absolute() or canonical_root != self.root
+            or canonical_root.resolve() != canonical_root
+            or not isinstance(self.lock, RuntimeStorageLock) or self.lock._fh is None
+            or self.lock.root != self.root
+        ):
+            raise MaintenanceError("E_RUNTIME_NOT_READY")
+        if deadline <= self._clock():
+            raise MaintenanceError("E_TIMEOUT")
+        custody = object.__new__(MaintenanceCustody)
+        object.__setattr__(custody, "_identity", (
+            self, task, os.getpid(), asyncio.get_running_loop(), self.lock,
+            self.root, self.profile_id, self._owned_epoch, deadline,
+        ))
+        self._maintenance_custody = custody
+        self._maintenance_state = "draining"
+        return custody
+
+    def check_maintenance(self, custody: MaintenanceCustody) -> None:
+        if custody is not self._maintenance_custody or custody is None:
+            raise MaintenanceError("E_MAINTENANCE_CONFLICT")
+        owner, task, pid, loop, lock, root, profile, epoch, deadline = custody._identity
+        if (
+            owner is not self or task is not asyncio.current_task()
+            or task not in self._admitted or pid != os.getpid()
+            or loop is not asyncio.get_running_loop() or self.state != "READY"
+            or lock is not self.lock or lock._fh is None or lock.root != root
+            or root != self.root or profile != self.profile_id
+            or self._maintenance_state not in {"draining", "active", "blocked"}
+            or epoch > self._owned_epoch
+        ):
+            raise MaintenanceError("E_RUNTIME_NOT_READY")
+        if self._clock() >= deadline:
+            raise MaintenanceError("E_TIMEOUT")
+
+    def _check_maintenance_worker(self, custody, worker):
+        self.check_maintenance(custody)
+        if (
+            worker is not self.dependencies.outbox_worker or worker is None
+            or getattr(worker._task_spawner, "__self__", None) is not self
+            or getattr(worker._native_submitter, "__self__", None) is not self
+            or self.dependencies.sqlite is None
+            or worker._engine is not self.dependencies.sqlite.engine
+        ):
+            raise MaintenanceError("E_MAINTENANCE_CONFLICT")
+
+    def _maintenance_worker_parent(self, worker_task, worker):
+        if not isinstance(worker_task, asyncio.Task) or worker_task.done() or worker is None:
+            raise MaintenanceError("E_MAINTENANCE_CONFLICT")
+        records = [record for record in self._owned_tasks.values() if record.task is worker_task]
+        coroutine = worker_task.get_coro()
+        frame = getattr(coroutine, "cr_frame", None)
+        if (
+            len(records) != 1 or records[0].kind != "daemon-worker-parent"
+            or records[0].state != "ATTACHED" or frame is None
+            or frame.f_locals.get("self") is not worker
+            or getattr(coroutine, "cr_code", None) is not worker.run.__func__.__code__
+        ):
+            raise MaintenanceError("E_MAINTENANCE_CONFLICT")
+
+    async def drain_maintenance(
+        self, custody: MaintenanceCustody, *, worker_task: asyncio.Task[None] | None = None,
+    ) -> None:
+        self.check_maintenance(custody)
+        worker = self.dependencies.outbox_worker
+        if worker_task is not None:
+            self._maintenance_worker_parent(worker_task, worker)
+        if worker is not None:
+            self._check_maintenance_worker(custody, worker)
+            worker._pause_for_maintenance(custody=custody)
+        try:
+            while True:
+                self.check_maintenance(custody)
+                epoch, tasks, natives = self.owned_snapshot()
+                live_tasks = self._live_tasks(tasks)
+                if worker_task is not None:
+                    self._maintenance_worker_parent(worker_task, worker)
+                pending = {
+                    task for task in self._admitted
+                    if task is not custody.self_task and not task.done()
+                }
+                pending.update(
+                    record.task for record in live_tasks
+                    if record.task is not custody.self_task and record.task is not worker_task
+                    and record.task is not None and not record.task.done()
+                )
+                pending.update(future for future in self._executors.values() if not future.done())
+                worker_busy = worker is not None and (
+                    not worker._maintenance_pause_ack or worker._active_claim is not None
+                    or worker._retained_claims or worker._claim_lock.locked()
+                    or (worker._compact_task is not None and not worker._compact_task.done())
+                )
+                unknown_task = any(record.task is None for record in live_tasks)
+                if not pending and not self._live_natives(natives) and not worker_busy and not unknown_task:
+                    await asyncio.sleep(0)
+                    self.check_maintenance(custody)
+                    if epoch == self._owned_epoch:
+                        self._maintenance_state = "active"
+                        return
+                else:
+                    await asyncio.sleep(0.01)
+        except BaseException:
+            self._maintenance_state = "blocked"
+            raise
+
+    def finish_maintenance(self, custody: MaintenanceCustody) -> None:
+        self.check_maintenance(custody)
+        self._maintenance_state = "blocked"
+        raise MaintenanceError("E_MAINTENANCE_CONFLICT")
 
     def preflight(self) -> None:
         """O2/§2.1 eligibility gate.

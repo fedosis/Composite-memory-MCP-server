@@ -162,15 +162,27 @@ async def test_s17_admission_matches_real_gate(inspection_http, monkeypatch):
 
     monkeypatch.setattr(MemoryAdmissionGate, "classify", classify)
     await rows(state, "SELECT 1")  # Warm the real profile before attributing sessions.
+    import traceback
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
     sessions = []
+    original_session_init = AsyncSession.__init__
 
-    def forbidden_session(*args, **kwargs):
-        sessions.append(1)
-        pytest.fail("S17_GATE_PARITY SQL-session-not-opened")
+    def attributed_session(self, *args, **kwargs):
+        # S20_RULINGS_009: background composition is not preview-request SQL.
+        if any(
+            "/memory_server/transports/http/" in frame.filename
+            or (
+                frame.filename.endswith("/memory_server/application/inspection_service.py")
+                and frame.name in {"execute", "_admission", "_preview"}
+            )
+            for frame in traceback.extract_stack()
+        ):
+            sessions.append(1)
+        original_session_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(AsyncSession, "__init__", forbidden_session)
+    monkeypatch.setattr(AsyncSession, "__init__", attributed_session)
     for text in (
         "ok",
         "The project uses SQLite for canonical memory storage.",
@@ -201,6 +213,17 @@ async def test_s17_admission_matches_real_gate(inspection_http, monkeypatch):
             assert calls[before:] == [(text, dict(source_scope=scope or "agent", now=T0, force=False))], (
                 "S17_GATE_PARITY"
             )
+
+    # Admission classification is SQL-free for every tag. Mutation preview must
+    # open a real SQL snapshot even when its target does not exist.
+    before_sessions = len(sessions)
+    response = await post(
+        state,
+        dict(operation="invalidate", memory_type="fact", to_state=None, relation_id=None, conflict_id=None),
+        path=f"/api/v1/profiles/alpha/memories/{F}/preview",
+    )
+    error(response, 404, "E_NOT_FOUND", "S17_GATE_PARITY positive control")
+    assert len(sessions) > before_sessions, "S17_GATE_PARITY positive control preview SQL observed"
 
 
 async def test_s17_admission_strict_wire(inspection_http, monkeypatch):
