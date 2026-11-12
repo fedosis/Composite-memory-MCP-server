@@ -256,6 +256,64 @@ def required(runtime, name):
     return method
 
 
+def test_s20a_surface_required():
+    import __future__
+
+    import ast
+    import subprocess
+    from pathlib import Path
+
+    from storage.outbox_worker import OutboxWorker
+
+    from memory_server import projection_rebuild as projections
+    from memory_server.runtime import runtime as runtime_module
+
+    for owner, names in (
+        (CMMSRuntime, ("begin_maintenance", "drain_maintenance", "check_maintenance", "finish_maintenance")),
+        (OutboxWorker, ("_pause_for_maintenance",)),
+        (projections, ("snapshot_owned_projection_records", "rebuild_owned_projections")),
+    ):
+        for name in names:
+            assert callable(getattr(owner, name, None)), f"S20A_SURFACE: {owner}.{name}"
+
+    # Signature-only BASE declarations: do not import/execute another runtime,
+    # register duplicate metrics, or treat the surface as behavioural evidence.
+    root = Path(__file__).resolve().parents[2]
+    base = "9b07be1262cc7b1185bd97596a934f998ad592d2"
+    for module, path, class_name, names in (
+        (projections, "src/memory_server/projection_rebuild.py", None, (
+            "rebuild_projections", "iter_canonical_projection_records",
+            "verify_staged_projections", "verify_published_projections",
+        )),
+        (runtime_module, "src/memory_server/runtime/runtime.py", "CMMSRuntime", (
+            "configure_startup_recovery", "admit", "release_admitted", "register_admitted",
+            "spawn_owned_task", "submit_native",
+        )),
+    ):
+        source = subprocess.check_output(["git", "show", f"{base}:{path}"], cwd=root)
+        tree = ast.parse(source)
+        parent = tree if class_name is None else next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        owner = module if class_name is None else getattr(module, class_name)
+        for name in names:
+            declarations = [node for node in parent.body if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name]
+            assert len(declarations) == 1, f"S20A_SURFACE: BASE declaration {name}"
+            declaration = declarations[0]
+            declaration.body = [ast.Pass()]
+            declaration.decorator_list = []
+            stub = ast.fix_missing_locations(ast.Module(body=[declaration], type_ignores=[]))
+            namespace = dict(vars(module))
+            exec(compile(stub, "<BASE-signature>", "exec",
+                         flags=__future__.annotations.compiler_flag, dont_inherit=True), namespace)
+            assert inspect.signature(getattr(owner, name)) == inspect.signature(namespace[name]), (
+                f"S20A_SURFACE: strict legacy signature {name}"
+            )
+    assert "job_token" not in inspect.signature(CMMSRuntime.begin_maintenance).parameters, "S20A_SURFACE"
+    assert not hasattr(OutboxWorker, "pause") and not hasattr(OutboxWorker, "resume"), "S20A_SURFACE"
+
+
 @pytest.mark.asyncio
 async def test_s20a_ready_maintenance_admission(tmp_path):
     first = CMMSRuntime(tmp_path / "a", profile_id="a")
