@@ -53,7 +53,6 @@ def nodes(raw):
 
 @pytest.mark.parametrize("path,start,end,digest", PINS)
 def test_s20a_frozen_boundaries(path, start, end, digest):
-    owned_surface()
     before = subprocess.check_output(["git", "show", f"{BASE}:{path}"], cwd=ROOT)
     after = (ROOT / path).read_bytes()
     base_lines, new_lines = before.splitlines(keepends=True), after.splitlines(keepends=True)
@@ -73,6 +72,37 @@ def test_s20a_frozen_boundaries(path, start, end, digest):
     assert actual == expected, "S20A_FROZEN: byte identity"
 
 
+def owned_references(owned):
+    return {
+        item.attr if isinstance(item, ast.Attribute) else item.id
+        for node in owned for item in ast.walk(node)
+        if isinstance(item, (ast.Name, ast.Attribute))
+    }
+
+
+@pytest.mark.parametrize("expression,name", [
+    ("f(asyncio.to_thread, work)", "to_thread"),
+    ("f(to_thread, work)", "to_thread"),
+    ("Thread(target=_observe_vector_artifact)", "_observe_vector_artifact"),
+    ("f(_staged_ids)", "_staged_ids"),
+])
+def test_s20a_ast_function_arguments(expression, name):
+    assert name in owned_references([ast.parse(expression)]), "S20A_AST_ARGUMENT"
+
+
+@pytest.mark.parametrize("name", ["snapshot_owned_projection_records", "rebuild_owned_projections"])
+def test_s20a_new_api_bytes(name):
+    before = subprocess.check_output(["git", "show", f"{BASE}:{P}"], cwd=ROOT)
+    after = (ROOT / P).read_bytes()
+    declaration = f"async def {name}(".encode()
+    assert declaration not in before, "S20A_NEW_API_BYTES: invalid BASE oracle"
+    assert after != before and declaration in after, "S20A_NEW_API_BYTES: no new API bytes"
+
+
+def test_s20a_owned_surface():
+    owned_surface()
+
+
 def test_s20a_owned_reader_no_legacy_observer():
     owned_surface()
     source = (ROOT / P).read_bytes()
@@ -83,12 +113,8 @@ def test_s20a_owned_reader_no_legacy_observer():
     legacy_names = {node.name for node in ast.parse(base).body if isinstance(node, definitions)}
     owned = [node for node in tree.body if isinstance(node, definitions) and node.name not in legacy_names]
     forbidden = {"to_thread", "_staged_ids", "_observe_vector_artifact", "rebuild_projections", "to_arrow"}
-    calls = {
-        call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
-        for node in owned for call in ast.walk(node)
-        if isinstance(call, ast.Call) and isinstance(call.func, (ast.Name, ast.Attribute))
-    }
-    assert not (calls & forbidden), "S20A_OWNED_NO_LEGACY_OBSERVER"
+    references = owned_references(owned)
+    assert not (references & forbidden), "S20A_OWNED_NO_LEGACY_OBSERVER"
     for name, start, end in (("_observe_vector_artifact", 496, 561), ("_staged_ids", 840, 866)):
         old_node, new_node = old_nodes[name], new_nodes[name]
         assert (old_node.lineno, old_node.end_lineno) == (start, end), "S20A_FROZEN: observer span"

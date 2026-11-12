@@ -20,13 +20,16 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import math
 import os
+import re
 import sqlite3
 import stat
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from types import MappingProxyType
 from typing import AbstractSet, Any, Literal, Mapping, Sequence
@@ -1061,8 +1064,7 @@ _OWNED_LIMITS = MappingProxyType({
     "reserve": 5 * 1024**3, "rows": 2000, "chunk_bytes": 64 * 1024**2,
     "snapshot": 900, "stage": 900, "verify": 300, "job": 3600,
     "generations": 2, "retention": 24 * 3600, "journal_bytes": 4096,
-    "overhead": 64 * 1024 * 16,
-})
+    "overhead": 64 * 1024 * 16})
 _OWNED_TABLES = (("belief", "beliefs"), ("decision", "decisions"), ("fact", "facts"), ("skill", "skills"))
 _OWNED_DIRECTORY = ".projection-rebuild"
 _OWNED_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -1144,15 +1146,12 @@ def _owned_inventory(fd, name, *, sync=False):
             if sync:
                 os.fsync(child)
     else:
-        opened = _owned_file(fd, name)
-        try:
-            while block := os.read(opened, _OWNED_LIMITS["chunk_bytes"]):
+        with os.fdopen(_owned_file(fd, name), "rb") as stream:
+            while block := stream.read(_OWNED_LIMITS["chunk_bytes"]):
                 digest.update(block)
                 size += len(block)
             if sync:
-                os.fsync(opened)
-        finally:
-            os.close(opened)
+                os.fsync(stream.fileno())
     return [info.st_dev, info.st_ino, digest.hexdigest(), size]
 
 
@@ -1230,17 +1229,29 @@ def _owned_journal(fd, state):
         raise MaintenanceError("E_STORAGE")
     name = f"journal-{uuid4().hex}.tmp"
     opened = _owned_file(fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-    try:
-        with os.fdopen(opened, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(name, "journal.json", src_dir_fd=fd, dst_dir_fd=fd)
-        os.fsync(fd)
-    except BaseException:
-        raise
+    with os.fdopen(opened, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(name, "journal.json", src_dir_fd=fd, dst_dir_fd=fd)
+    os.fsync(fd)
 
 
+def _owned_errors(function):
+    @wraps(function)
+    async def boundary(*args, custody, **kwargs):
+        try:
+            return await function(*args, custody=custody, **kwargs)
+        except OSError as exc:
+            code = "E_TIMEOUT" if isinstance(exc, TimeoutError) else "E_STORAGE"
+            logging.getLogger(__name__).warning("owned I/O failure errno=%s", exc.errno)
+        custody._identity[0]._maintenance_state = "blocked"
+        # Raise outside the handler: no path-bearing exception context escapes.
+        raise MaintenanceError(code)
+    return boundary
+
+
+@_owned_errors
 async def snapshot_owned_projection_records(runtime, *, custody) -> SnapshotRecord:
     runtime.check_maintenance(custody)
     if runtime._maintenance_state != "active" or runtime.dependencies.sqlite is None:
@@ -1283,7 +1294,8 @@ async def snapshot_owned_projection_records(runtime, *, custody) -> SnapshotReco
                         with _owned_dir(runtime.root) as root:
                             _owned_free(root)
 
-                    pending = asyncio.create_task(raw.driver_connection.backup(target, pages=256, progress=progress))
+                    pending = runtime.spawn_owned_task(lambda: raw.driver_connection.backup(
+                        target, pages=256, progress=progress), kind="projection-backup-driver")
                     cancelled = False
                     while not pending.done():
                         try:
@@ -1315,13 +1327,10 @@ async def snapshot_owned_projection_records(runtime, *, custody) -> SnapshotReco
             state.update(snapshot=identity, bytes_written=identity[3], bytes_verified=identity[3], phase="captured")
             _owned_journal(run, state)
         snapshot = object.__new__(SnapshotRecord)
-        for key, value in {"run_id": run_id, "profile_id": runtime.profile_id,
-                           "snapshot_url": f"sqlite+aiosqlite:///{destination}", "snapshot_digest": identity[2],
-                           "records": records, "content_digest": content_digest}.items():
-            object.__setattr__(snapshot, key, value)
-        registry = getattr(runtime, "_projection_snapshots", None)
-        if registry is None:
-            runtime._projection_snapshots = registry = {}
+        vars(snapshot).update(run_id=run_id, profile_id=runtime.profile_id,
+                              snapshot_url=f"sqlite+aiosqlite:///{destination}", snapshot_digest=identity[2],
+                              records=records, content_digest=content_digest)
+        registry = vars(runtime).setdefault("_projection_snapshots", {})
         registry[id(snapshot)] = (snapshot, custody, state, time.monotonic())
         return snapshot
     except BaseException:
@@ -1419,6 +1428,7 @@ def _owned_stage(path, records, targets, embedder, dimension, end):
     _owned_check_time(end)
 
 
+@_owned_errors
 async def rebuild_owned_projections(snapshot, *, custody, targets, allow_network_embedding=False) -> RebuildResult:
     runtime = custody._identity[0]
     runtime.check_maintenance(custody)
@@ -1435,10 +1445,14 @@ async def rebuild_owned_projections(snapshot, *, custody, targets, allow_network
         raise MaintenanceError("E_MAINTENANCE_CONFLICT")
     embedder = runtime.dependencies.embedder
     if "vector" in targets:
+        from memory_server.providers import embedding_provider as embedding
+
         if embedder is None or not callable(getattr(embedder, "embed_batch", None)):
             raise MaintenanceError("E_PROJECTION_UNAVAILABLE")
-        if not allow_network_embedding:
-            raise MaintenanceError("E_PROJECTION_UNAVAILABLE")
+        local = type(embedder) is embedding.MockEmbeddingProvider or (
+            type(embedder) is embedding.SentenceTransformerEmbeddingProvider and embedder._model is not None)
+        if not allow_network_embedding and not local:
+            raise MaintenanceError("E_CAPABILITY_UNAVAILABLE")
     _, _, state, started = registered
     if state["phase"] != "captured":
         raise MaintenanceError("E_MAINTENANCE_CONFLICT")
@@ -1496,9 +1510,6 @@ async def rebuild_owned_projections(snapshot, *, custody, targets, allow_network
         expected = expected_projection(records)
         nodes_digest, edges_digest = expected_graph_digests(expected)
         return RebuildResult(expected.eligible_counts, id_digest(expected.vector_ids), nodes_digest, edges_digest, 1)
-    except TimeoutError:
-        runtime._maintenance_state = "blocked"
-        raise MaintenanceError("E_TIMEOUT") from None
     except BaseException:
         runtime._maintenance_state = "blocked"
         raise
@@ -1512,18 +1523,15 @@ def _owned_load_journal(fd, runtime, run_id, root):
         raise MaintenanceError("E_STORAGE")
 
     def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise MaintenanceError("E_STORAGE")
-            result[key] = value
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise MaintenanceError("E_STORAGE")
         return result
 
     state = json.loads(raw, object_pairs_hook=unique)
     keys = {"version", "run", "profile", "root", "config", "paths", "old", "staged", "targets", "phase",
             "intent", "snapshot", "bytes_written", "bytes_verified", "free_before", "free_after"}
-    if (
-        not isinstance(state, dict) or set(state) != keys or type(state["version"]) is not int
+    if (not isinstance(state, dict) or set(state) != keys or type(state["version"]) is not int
         or state["version"] != 1 or state["run"] != run_id
         or state["profile"] != hashlib.sha256(runtime.profile_id.encode()).hexdigest()
         or state["config"] != hashlib.sha256(repr(runtime.config).encode()).hexdigest()
@@ -1535,8 +1543,7 @@ def _owned_load_journal(fd, runtime, run_id, root):
         or not set(state["targets"]) <= {"vector", "graph"}
         or state["intent"] not in [None, *state["targets"]]
         or any(type(state[key]) is not int or state[key] < 0
-               for key in ("bytes_written", "bytes_verified", "free_before", "free_after"))
-    ):
+               for key in ("bytes_written", "bytes_verified", "free_before", "free_after"))):
         raise MaintenanceError("E_STORAGE")
     for key in ("old", "staged"):
         if not isinstance(state[key], dict) or not set(state[key]) <= {"vector", "graph"}:
@@ -1544,8 +1551,7 @@ def _owned_load_journal(fd, runtime, run_id, root):
         for identity in state[key].values():
             if (not isinstance(identity, list) or len(identity) != 4
                 or any(type(identity[index]) is not int or identity[index] < 0 for index in (0, 1, 3))
-                or not isinstance(identity[2], str) or len(identity[2]) != 64
-                or any(char not in "0123456789abcdef" for char in identity[2])):
+                or not isinstance(identity[2], str) or not re.fullmatch("[0-9a-f]{64}", identity[2])):
                 raise MaintenanceError("E_STORAGE")
     if set(state["old"]) != {"vector", "graph"}:
         raise MaintenanceError("E_STORAGE")

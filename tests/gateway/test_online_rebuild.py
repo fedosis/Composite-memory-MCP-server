@@ -3,10 +3,139 @@
 import asyncio
 import inspect
 import time
+import traceback
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 
 from memory_server.runtime.runtime import CMMSRuntime
+
+
+@asynccontextmanager
+async def projection_owner(root, embedder=None):
+    from sqlalchemy import text
+
+    from memory_server import projection_rebuild as p
+    from memory_server.providers.graph_provider import SimpleGraph
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+    from memory_server.runtime.dependencies import RuntimeDependencies
+
+    async def sqlite(owner):
+        provider = SQLiteProvider(url=f"sqlite+aiosqlite:///{root / 'memory.db'}")
+        await provider.initialize()
+        async with provider.engine.begin() as connection:
+            await connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+            await connection.execute(text("INSERT INTO alembic_version VALUES ('0007')"))
+            await connection.execute(text(
+                "INSERT INTO facts(id,subject,predicate,object,dedup_key,confidence,creator,source,"
+                "created_at,updated_at,verification_status,lifecycle_state,version) VALUES "
+                "('f','subject','predicate','object','f',0.8,'test','test','2026-10-30 00:00:00.000000',"
+                "'2026-10-30 00:00:00.000000','verified','active','1')"
+            ))
+        return provider
+
+    required(p, "snapshot_owned_projection_records")
+    layout = SimpleNamespace(data_root=root, vector=SimpleNamespace(backend="lancedb", local_path=root / "vector"),
+                             graph_snapshot_path=root / "graph.json")
+    runtime = CMMSRuntime(layout, profile_id="a", dependencies=RuntimeDependencies(
+        embedder=embedder, recipes=(("sqlite", sqlite),),
+    ))
+    await runtime.start()
+    root.chmod(0o700)
+    (root / "vector").mkdir(mode=0o700)
+    SimpleGraph().save_snapshot(root / "graph.json")
+    (root / "graph.json").chmod(0o600)
+    token = runtime.admit()
+    try:
+        begin = required(runtime, "begin_maintenance")
+        custody = begin(profile_id="a", canonical_root=root, deadline=time.monotonic() + 30)
+        await runtime.drain_maintenance(custody)
+        yield runtime, custody
+    finally:
+        runtime.release_admitted(token)
+        assert (await runtime.close()).code is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["snapshot", "rebuild"])
+async def test_s20a_owner_oserror_no_absolute_path(tmp_path, caplog, phase):
+    from memory_server import projection_rebuild as p
+
+    canary = tmp_path / "ABSOLUTE_PATH_CANARY"
+    async with projection_owner(canary) as (runtime, custody):
+        if phase == "rebuild":
+            snapshot = await p.snapshot_owned_projection_records(runtime, custody=custody)
+        # Real FS failures: snapshot os.open has an absolute canary filename;
+        # rebuild stat fails inside its publication preflight, after native read.
+        moved = canary.with_name("held-root")
+        if phase == "snapshot":
+            canary.rename(moved)
+        else:
+            (canary / "graph.json").unlink()
+        caught = None
+        try:
+            if phase == "snapshot":
+                await p.snapshot_owned_projection_records(runtime, custody=custody)
+            else:
+                await p.rebuild_owned_projections(snapshot, custody=custody, targets=frozenset({"graph"}))
+        except Exception as exc:
+            caught = exc
+        finally:
+            if phase == "snapshot":
+                moved.rename(canary)
+        assert caught is not None, "S20A_CANARY_ERROR_REQUIRED"
+        public = repr(caught.args) + str(caught) + ''.join(traceback.format_exception(caught))
+        assert str(tmp_path) not in public and "ABSOLUTE_PATH_CANARY" not in public, "S20A_CANARY_PUBLIC_PATH"
+        assert getattr(caught, "code", None) == "E_STORAGE", "S20A_CANARY_STORAGE_CODE"
+        assert caught.__context__ is None and caught.__cause__ is None, "S20A_CANARY_EXCEPTION_CHAIN"
+        for record in caplog.records:
+            rendered = repr(record.__dict__)
+            assert str(tmp_path) not in rendered and "ABSOLUTE_PATH_CANARY" not in rendered, "S20A_CANARY_LOG_PATH"
+        assert runtime._maintenance_state == "blocked", "S20A_CANARY_FAIL_CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_s20a_backup_driver_owned_registry(tmp_path, monkeypatch):
+    from memory_server import projection_rebuild as p
+
+    async with projection_owner(tmp_path / "a") as (runtime, custody):
+        spawn = runtime.spawn_owned_task
+        attached = []
+
+        def observed_spawn(factory, *, kind):
+            task = spawn(factory, kind=kind)
+            records = runtime.owned_snapshot()[1]
+            assert any(r.task is task and r.kind == kind for r in records), "S20A_BACKUP_REGISTERED"
+            attached.append(kind)
+            return task
+
+        monkeypatch.setattr(runtime, "spawn_owned_task", observed_spawn)
+        await p.snapshot_owned_projection_records(runtime, custody=custody)
+        assert attached == ["projection-backup", "projection-backup-driver"], "S20A_BACKUP_DRIVER_OWNED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", [False, True])
+async def test_s20a_network_false_local_remote(tmp_path, remote):
+    from memory_server import projection_rebuild as p
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider, OpenAIEmbeddingProvider
+
+    embedder = (OpenAIEmbeddingProvider(base_url="https://not-contacted.invalid/v1")
+                if remote else MockEmbeddingProvider())
+    async with projection_owner(tmp_path / "a", embedder) as (runtime, custody):
+        snapshot = await p.snapshot_owned_projection_records(runtime, custody=custody)
+        if remote:
+            with pytest.raises(Exception) as rejected:
+                await p.rebuild_owned_projections(snapshot, custody=custody, targets=frozenset({"vector"}),
+                                                  allow_network_embedding=False)
+            assert rejected.value.code == "E_CAPABILITY_UNAVAILABLE", "S20A_NETWORK_REMOTE_REFUSED"
+            assert embedder._client is None, "S20A_NETWORK_ZERO_CLIENT"
+        else:
+            result = await p.rebuild_owned_projections(snapshot, custody=custody, targets=frozenset({"vector"}),
+                                                       allow_network_embedding=False)
+            assert result is not None and embedder._cache, "S20A_NETWORK_LOCAL_WORKS"
+            assert runtime.dependencies.embedder is embedder, "S20A_NETWORK_CAPTURED_PROVIDER"
 
 
 async def worker_runtime(root):
