@@ -568,6 +568,84 @@ def test_s20a_kill9_mid_publish_then_rebuild(tmp_path):
     assert disk_scope(root)[:2] == before[:2], "S20A_KILL9: canonical/outbox/nonselected mutated"
 
 
+@pytest.mark.parametrize("case", ["recovery", "no-journal", "truncated", "ambiguity"])
+def test_s20a_startup_preprovider_single_callback(tmp_path, monkeypatch, case):
+    root = tmp_path / "profile"
+    if case != "no-journal":
+        kill_at(root, "published", "dir-fsync", "after")
+        journal = next((root / projections._OWNED_DIRECTORY).glob("*/journal.json"))
+        if case == "truncated":
+            journal.write_bytes(b'{"version":')
+        elif case == "ambiguity":
+            (root / "graph.json").write_bytes(b"unknown generation")
+
+    async def exercise():
+        from memory_server.providers.sqlite_provider import SQLiteProvider
+
+        trace, effects = [], []
+
+        async def build(owner):
+            trace.append("recipes")
+            provider = SQLiteProvider(url=f"sqlite+aiosqlite:///{root / 'memory.db'}")
+            await provider.initialize()
+            return provider
+
+        owner = CMMSRuntime(recovery_layout(root), profile_id="a",
+                            dependencies=RuntimeDependencies(recipes=(("sqlite", build),)))
+        fsync = os.fsync
+
+        def observed(fd):
+            fsync(fd)
+            path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            if path.is_dir() and (path / "journal.json").is_file():
+                if json.loads((path / "journal.json").read_bytes())["phase"] == "reconciled":
+                    assert owner.lock._fh is not None, "S20A_STARTUP: recovery without EX"
+                    if "H03 recovery" not in trace:
+                        trace.extend(["EX", "H03 recovery"])
+
+        async def forbidden_task():
+            effects.append("spawn")
+
+        async def callback(runtime, *, deadline):
+            assert runtime is owner and runtime.state == "STARTING", "S20A_STARTUP: wrong callback window"
+            runtime.check_startup_custody(profile_id="a", canonical_root=root)
+            if case == "no-journal":
+                assert owner.lock._fh is not None, "S20A_STARTUP: no EX"
+                assert not (root / projections._OWNED_DIRECTORY).exists(), "S20A_STARTUP: unexpected journal"
+                trace.extend(["EX", "H03 no-journal"])
+            else:
+                assert trace == ["EX", "H03 recovery"], "S20A_STARTUP: callback before recovery"
+            trace.append("callback")
+            with pytest.raises(Exception) as rejected:
+                await runtime.submit_native(lambda: effects.append("native"), kind="forbidden-startup")
+            assert rejected.value.code == "E_RUNTIME_NOT_READY", "S20A_STARTUP: native admitted"
+            with pytest.raises(Exception) as rejected:
+                runtime.spawn_owned_task(forbidden_task, kind="forbidden-startup")
+            assert rejected.value.code == "E_RUNTIME_NOT_READY", "S20A_STARTUP: spawn admitted"
+
+        owner.configure_startup_recovery(callback, timeout_seconds=5)
+        with pytest.raises(ValueError):
+            owner.configure_startup_recovery(callback, timeout_seconds=5)
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(os, "fsync", observed)
+                if case in {"truncated", "ambiguity"}:
+                    with pytest.raises(Exception) as rejected:
+                        await owner.start()
+                    assert rejected.value.code == "E_STORAGE", "S20A_STARTUP: unsafe admitted"
+                    assert trace == [], "S20A_STARTUP: provider/callback constructed on unsafe evidence"
+                else:
+                    await owner.start()
+                    trace.append(owner.state)
+                    recovery = "H03 no-journal" if case == "no-journal" else "H03 recovery"
+                    assert trace == ["EX", recovery, "callback", "recipes", "READY"], "S20A_STARTUP: order/count"
+                assert effects == [], "S20A_STARTUP: native/spawn side effect"
+        finally:
+            assert (await owner.close()).code is None, "S20A_STARTUP: close"
+
+    asyncio.run(exercise())
+
+
 if __name__ == "__main__":
     assert sys.argv[1] == "crash", "S20A_RESTART: invalid child mode"
     asyncio.run(crash_child(Path(sys.argv[2]), *sys.argv[3:]))
