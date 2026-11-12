@@ -1,0 +1,23 @@
+/home/shtorm/.hermes/workspace/gw-harness/venv/lib/python3.12/site-packages/pytest_asyncio/plugin.py:300: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the "fixture" caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+........................................................................ [ 53%]
+..............................................................           [100%]
+=============================== warnings summary ===============================
+tests/gateway/test_s19p_prerequisites.py: 18 warnings
+tests/gateway/test_admission_dry_run.py: 32 warnings
+  /home/shtorm/.local/share/uv/python/cpython-3.12.16-linux-x86_64-gnu/lib/python3.12/concurrent/futures/thread.py:59: DeprecationWarning: table_names() is deprecated, use list_tables() instead
+    result = self.fn(*self.args, **self.kwargs)
+
+tests/gateway/test_s19p_prerequisites.py: 18 warnings
+tests/gateway/test_admission_dry_run.py: 52 warnings
+  /home/shtorm/.local/share/uv/python/cpython-3.12.16-linux-x86_64-gnu/lib/python3.12/asyncio/events.py:88: DeprecationWarning: table_names() is deprecated, use list_tables() instead
+    self._context.run(self._callback, *self._args)
+
+tests/gateway/test_admission_dry_run.py: 20 warnings
+  /home/shtorm/.hermes/workspace/gw-s20/src/memory_server/runtime/runtime.py:721: DeprecationWarning: table_names() is deprecated, use list_tables() instead
+    result = ctx.run(function, *args, **kwargs)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+134 passed, 140 warnings in 71.94s (0:01:11)
