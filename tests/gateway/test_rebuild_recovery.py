@@ -739,6 +739,7 @@ def test_s20a_recovery_scope_and_rollback(tmp_path):
     from memory_server.control.jobs import JobMetadata
     from memory_server.control.store import ControlStore
     from memory_server.gateway_contracts.ports import ProfileRecord
+    from memory_server.runtime.errors import RuntimeNotReadyError
     from tests.gateway.test_jobs import NOW, context, enqueue, final
 
     root, other, control = (tmp_path / name for name in ("a", "b", "control"))
@@ -758,6 +759,14 @@ def test_s20a_recovery_scope_and_rollback(tmp_path):
                 assert selector.select(8), "S20A_SCOPE: B barrier timeout"
                 assert child.stdout.readline() == b"B-RUNNING\n", "S20A_SCOPE: B failed before barrier"
             before = metadata_rows(store, "b")
+            disk_before = disk_scope(other)
+            contender = subprocess.run(
+                [sys.executable, "-c", "import fcntl,sys\nf=open(sys.argv[1],'rb')\n"
+                 "try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+                 "except BlockingIOError: print('EX')\n", str(other / ".cmms-storage.lock")],
+                capture_output=True, text=True, timeout=3, check=True,
+            )
+            assert contender.stdout.strip() == "EX", "S20A_SCOPE: B not holding actual EX"
             artifacts = (other / "canary").stat().st_ino, (other / "canary").read_bytes()
             journal = next((root / projections._OWNED_DIRECTORY).glob("*/journal.json"))
             old_journal = journal.read_bytes()
@@ -766,8 +775,8 @@ def test_s20a_recovery_scope_and_rollback(tmp_path):
                 active = None
 
                 def custody(runtime, *, profile_id):
-                    assert runtime is active, "S20A_SCOPE: wrong runtime admitted"
                     runtime.check_startup_custody(profile_id=profile_id, canonical_root=root)
+                    assert runtime is active, "S20A_SCOPE: wrong runtime admitted"
 
                 coordinator = JobCoordinator(metadata, None, authorize=None, startup_custody=custody)
 
@@ -775,11 +784,11 @@ def test_s20a_recovery_scope_and_rollback(tmp_path):
                     nonlocal active
                     active = runtime
                     for wrong_runtime, profile in ((CMMSRuntime(root, profile_id="a"), "a"), (runtime, "b")):
-                        with pytest.raises(Exception):
+                        with pytest.raises(RuntimeNotReadyError):
                             custody(wrong_runtime, profile_id=profile)
 
                     async def wrong_task():
-                        with pytest.raises(Exception):
+                        with pytest.raises(RuntimeNotReadyError):
                             custody(runtime, profile_id="a")
 
                     await asyncio.create_task(wrong_task())
@@ -787,7 +796,7 @@ def test_s20a_recovery_scope_and_rollback(tmp_path):
                         profile_id="a", custody=runtime, deadline=deadline) == 1, "S20A_SCOPE: scoped count"
 
                 no_ex = CMMSRuntime(root, profile_id="a")
-                with pytest.raises(Exception):
+                with pytest.raises(RuntimeNotReadyError):
                     no_ex.check_startup_custody(profile_id="a", canonical_root=root)
                 assert await restart_owner(root, callback=callback) == (None, "READY", ["recipes"]), "S20A_SCOPE"
                 assert not coordinator._attachments, "S20A_SCOPE: redispatch"
@@ -797,6 +806,7 @@ def test_s20a_recovery_scope_and_rollback(tmp_path):
             assert journal.read_bytes() != old_journal, "S20A_SCOPE: A journal not reconciled"
             assert metadata.get(a.job_id, "a", "subject").status == "interrupted", "S20A_SCOPE: A not interrupted"
             assert metadata_rows(store, "b") == before, "S20A_SCOPE: B ordered metadata changed"
+            assert disk_scope(other) == disk_before, "S20A_SCOPE: B canonical/outbox/artifacts changed"
             assert ((other / "canary").stat().st_ino, (other / "canary").read_bytes()) == artifacts, "S20A_SCOPE"
             assert child.poll() is None, "S20A_SCOPE: B did not retain process/EX"
             child.stdin.write(b"G")
