@@ -763,3 +763,97 @@ async def test_s20a_finish_x10_no_unlock_or_republish(tmp_path, monkeypatch):
                 worker.stop()
                 await asyncio.gather(parent, return_exceptions=True)
             assert foreign.state == "READY", "S20A_FINISH_NO_UNLOCK: foreign owner changed"
+
+
+@pytest.mark.asyncio
+async def test_s20a_snapshot_owner_wal(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import shutil
+    import sqlite3
+    from pathlib import Path
+
+    import aiosqlite
+    from sqlalchemy import text
+
+    from memory_server import projection_rebuild as p
+
+    async with projection_owner(tmp_path / "a") as (runtime, custody):
+        engine = runtime.dependencies.sqlite.engine
+        async with engine.connect() as connection:
+            raw = await connection.get_raw_connection()
+            borrowed = raw.driver_connection
+            await connection.execute(text("PRAGMA wal_autocheckpoint=0"))
+            await connection.execute(text("UPDATE facts SET object='committed WAL payload' WHERE id='f'"))
+            await connection.commit()
+            rows = (await connection.execute(text("SELECT * FROM facts ORDER BY id"))).mappings().all()
+            expected = [dict(row) for row in rows]
+        live = runtime.root / "memory.db"
+        wal = Path(str(live) + "-wal")
+        assert wal.is_file() and wal.stat().st_size > 0, "S20A_SNAPSHOT: committed WAL missing"
+        # An immutable reader deliberately ignores WAL: the committed value must
+        # differ from the main-file-only view, or this would not prove backup.
+        with sqlite3.connect(f"file:{live}?immutable=1", uri=True) as main_only:
+            try:
+                old = main_only.execute("SELECT object FROM facts WHERE id='f'").fetchone()
+            except sqlite3.OperationalError:
+                old = None
+        assert old != ("committed WAL payload",), "S20A_SNAPSHOT: row already checkpointed"
+        calls, constructors, observations = [], [], []
+        original_backup = aiosqlite.Connection.backup
+        original_connect = sqlite3.connect
+        original_engine = p.create_async_engine
+        original_observe = p._observe_snapshot
+
+        async def backup(self, target, **kwargs):
+            assert self is borrowed, "S20A_SNAPSHOT: backup did not borrow owner driver"
+            calls.append("borrowed-backup")
+            return await original_backup(self, target, **kwargs)
+
+        def connect(database, *args, **kwargs):
+            constructors.append(str(database))
+            assert str(live) not in str(database), "S20A_SNAPSHOT: new live sqlite constructor"
+            return original_connect(database, *args, **kwargs)
+
+        def snapshot_engine(url, *args, **kwargs):
+            constructors.append(str(url))
+            assert str(live) not in str(url), "S20A_SNAPSHOT: new live SQLAlchemy engine"
+            return original_engine(url, *args, **kwargs)
+
+        def observe(url, observed, errors):
+            original_observe(url, observed, errors)
+            observations.append((observed.snapshot_integrity, observed.snapshot_revision, list(errors)))
+
+        def no_copy(*args, **kwargs):
+            pytest.fail("S20A_SNAPSHOT: source database/WAL file-copy attempted")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(aiosqlite.Connection, "backup", backup)
+            patch.setattr(sqlite3, "connect", connect)
+            patch.setattr(p, "create_async_engine", snapshot_engine)
+            patch.setattr(p, "_observe_snapshot", observe)
+            for name in ("copyfile", "copy", "copy2"):
+                patch.setattr(shutil, name, no_copy)
+            snapshot = await p.snapshot_owned_projection_records(runtime, custody=custody)
+            eligible = [record async for record in p.iter_canonical_projection_records(snapshot.snapshot_url,
+                                                                                     batch_size=1)]
+        assert calls == ["borrowed-backup"], "S20A_SNAPSHOT: real backup not executed"
+        assert runtime.dependencies.sqlite.engine is engine, "S20A_SNAPSHOT: owner engine replaced"
+        assert observations == [("ok", "0007", [])], "S20A_SNAPSHOT: integrity/revision"
+        assert len(eligible) == 1 and eligible[0].record_id == "f", "S20A_SNAPSHOT: exact eligible ID"
+        payload = dict(expected[0])
+        payload.pop("id")
+        assert dict(eligible[0].payload) == payload, "S20A_SNAPSHOT: exact eligible WAL content"
+        assert tuple(eligible) == snapshot.records, "S20A_SNAPSHOT: owner/iterator content mismatch"
+        destination = Path(snapshot.snapshot_url.removeprefix("sqlite+aiosqlite:///"))
+        assert constructors and all(str(destination) in value for value in constructors), (
+            "S20A_SNAPSHOT: constructors not confined to snapshot-only path"
+        )
+        assert any(value.startswith("sqlite+aiosqlite:") for value in constructors), "S20A_SNAPSHOT: iterator engine"
+        assert hashlib.sha256(destination.read_bytes()).hexdigest() == snapshot.snapshot_digest, (
+            "S20A_SNAPSHOT: independent snapshot file digest"
+        )
+        canonical = json.dumps(("fact", "f", payload), sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        assert hashlib.sha256(canonical).hexdigest() == snapshot.content_digest, (
+            "S20A_SNAPSHOT: independent content digest"
+        )
