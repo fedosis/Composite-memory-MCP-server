@@ -13,7 +13,7 @@ from memory_server.runtime.runtime import CMMSRuntime
 
 
 @asynccontextmanager
-async def projection_owner(root, embedder=None):
+async def projection_owner(root, embedder=None, *, live_target=None, unavailable=frozenset()):
     from sqlalchemy import text
 
     from memory_server import projection_rebuild as p
@@ -36,14 +36,30 @@ async def projection_owner(root, embedder=None):
         return provider
 
     required(p, "snapshot_owned_projection_records")
+    async def live(owner):
+        if live_target == "vector":
+            from memory_server.providers.lancedb_provider import LanceDBProvider
+
+            return LanceDBProvider(db_path=str(root / "vector"), native_submitter=owner.submit_native)
+        graph = SimpleGraph()
+        graph.save_snapshot(root / "graph.json")
+        graph.load_snapshot(root / "graph.json")
+        return graph
+
     layout = SimpleNamespace(data_root=root, vector=SimpleNamespace(backend="lancedb", local_path=root / "vector"),
-                             graph_snapshot_path=root / "graph.json")
+                             graph_snapshot_path=root / "graph.json", unavailable_projections=unavailable)
+    recipes = (("sqlite", sqlite),) + (((live_target, live),) if live_target is not None else ())
     runtime = CMMSRuntime(layout, profile_id="a", dependencies=RuntimeDependencies(
-        embedder=embedder, recipes=(("sqlite", sqlite),),
+        embedder=embedder, recipes=recipes,
     ))
     await runtime.start()
+    if live_target == "vector":
+        await runtime.dependencies.vector._get_table()
     root.chmod(0o700)
-    (root / "vector").mkdir(mode=0o700)
+    (root / "vector").mkdir(mode=0o700, exist_ok=True)
+    (root / "vector").chmod(0o700)
+    for item in (root / "vector").rglob("*"):
+        item.chmod(0o700 if item.is_dir() else 0o600)
     SimpleGraph().save_snapshot(root / "graph.json")
     (root / "graph.json").chmod(0o600)
     token = runtime.admit()
@@ -973,3 +989,140 @@ async def test_s20a_target_selective_native(tmp_path, monkeypatch, selection):
             ), "S20A_TARGETS: disk graph edge mapping"
         assert result.eligible_counts == expected.eligible_counts, "S20A_TARGETS: result counts"
         assert runtime._maintenance_state == "blocked", "S20A_TARGETS: publication unlocked owner"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "vector-shape", "vector-id", "vector-payload", "vector-duplicate",
+    "graph-type", "graph-edge", "valid", "open-vector", "open-graph",
+])
+async def test_s20a_selected_verification_real_artifacts(tmp_path, monkeypatch, case):
+    import hashlib
+    import json
+    import os
+
+    import lancedb
+    import pyarrow as pa
+
+    from memory_server import projection_rebuild as p
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
+
+    # Required-field schema identity is deliberately left to the existing T02
+    # regression. Here schema corruption changes the actual vector dimension.
+    live_target = case.removeprefix("open-") if case.startswith("open-") else None
+    async with projection_owner(tmp_path / "a", MockEmbeddingProvider(), live_target=live_target) as (runtime, custody):
+        snapshot = await p.snapshot_owned_projection_records(runtime, custody=custody)
+        paths = {"vector": runtime.root / "vector", "graph": runtime.root / "graph.json"}
+        before = {target: artifact_identity(path) for target, path in paths.items()}
+        stage_state, events, renames = {}, [], []
+        original_stage, original_reader = p._owned_stage, p._owned_vector_read
+        original_graph, original_rename = p._observe_graph_artifact, os.rename
+
+        def stage(path, records, targets, embedder, dimension, end):
+            original_stage(path, records, targets, embedder, dimension, end)
+            if case.startswith("vector-"):
+                database = lancedb.connect(str(path / "vector"))
+                table = database.open_table("memories")
+                rows, schema = table.to_arrow().to_pylist(), table.schema
+                if case == "vector-shape":
+                    schema = pa.schema([("id", pa.string()), ("vector", pa.list_(pa.float32(), dimension - 1)),
+                                        ("_metadata", pa.string())])
+                    rows[0]["vector"] = rows[0]["vector"][:-1]
+                elif case == "vector-id":
+                    rows[0]["id"] = "unexpected-vector-id"
+                elif case == "vector-payload":
+                    payload = json.loads(rows[0]["_metadata"])
+                    payload["object"] = "corrupt payload"
+                    rows[0]["_metadata"] = json.dumps(payload)
+                else:
+                    rows.append(dict(rows[0]))
+                database.drop_table("memories")
+                database.create_table("memories", schema=schema).add(rows)
+            elif case.startswith("graph-"):
+                data = json.loads((path / "graph").read_bytes())
+                if case == "graph-type":
+                    next(iter(data["nodes"].values()))["type"] = "skill"
+                else:
+                    data["edges"][0]["relation"] = "corrupt-relation"
+                (path / "graph").write_text(json.dumps(data))
+            for item in path.rglob("*"):
+                item.chmod(0o700 if item.is_dir() else 0o600)
+            stage_state.update(path=path, identity={target: artifact_identity(path / target) for target in targets})
+
+        def reader(*args):
+            events.append("bounded-owner-vector")
+            return original_reader(*args)
+
+        def graph(*args):
+            events.append("shared-graph-observer")
+            return original_graph(*args)
+
+        def rename(*args, **kwargs):
+            renames.append((args, kwargs))
+            return original_rename(*args, **kwargs)
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("S20A_VERIFY: vector MUST use bounded owner verifier; legacy observer forbidden (RULINGS_010)")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(p, "_owned_stage", stage)
+            patch.setattr(p, "_owned_vector_read", reader)
+            patch.setattr(p, "_observe_graph_artifact", graph)
+            patch.setattr(p, "_observe_vector_artifact", forbidden)
+            patch.setattr(os, "rename", rename)
+            caught, result = None, None
+            try:
+                result = await p.rebuild_owned_projections(snapshot, custody=custody,
+                                                         targets=frozenset({"vector", "graph"}))
+            except p.MaintenanceError as exc:
+                caught = exc
+        run = runtime.root / p._OWNED_DIRECTORY / snapshot.run_id
+        journal = json.loads((run / "journal.json").read_bytes())
+        if live_target is not None:
+            assert caught is not None and caught.code == "E_MAINTENANCE_CONFLICT", "S20A_VERIFY: open destination"
+            assert not stage_state and events == [] and journal["phase"] == "captured", (
+                "S20A_VERIFY: open/live provider reached stage/verifiers"
+            )
+        else:
+            assert events.count("bounded-owner-vector") == 1, (
+                "S20A_VERIFY: mandatory vector half MUST cross bounded owner verifier, never legacy vector observer"
+            )
+            if not case.startswith("vector-"):
+                assert events == ["bounded-owner-vector", "shared-graph-observer"], (
+                    "S20A_VERIFY: mandatory graph half MUST cross shared _observe_graph_artifact (RULINGS_010)"
+                )
+            if case == "valid":
+                assert caught is None and journal["phase"] == "published", "S20A_VERIFY: positive publication"
+                assert len(renames) == 4, "S20A_VERIFY: actual whole selected rename"
+                for target, path in paths.items():
+                    assert artifact_identity(path) == stage_state["identity"][target], (
+                        "S20A_VERIFY: independently read published disk differs from staged bytes/identity"
+                    )
+                rows = lancedb.connect(str(paths["vector"])).open_table("memories").to_arrow().to_pylist()
+                data = json.loads(paths["graph"].read_bytes())
+                def digest(values):
+                    return hashlib.sha256("\n".join(sorted(values)).encode()).hexdigest()
+                assert result.vector_ids_digest == digest({row["id"] for row in rows}), (
+                    "S20A_VERIFY: published vector digest must equal independent disk read, not result.valid"
+                )
+                assert result.graph_nodes_digest == digest({node["id"] for node in data["nodes"].values()}), (
+                    "S20A_VERIFY: published graph node digest independent read"
+                )
+                assert result.graph_edges_digest == digest({
+                    f"{edge['source_id']}|{edge['target_id']}|{edge['relation']}" for edge in data["edges"]
+                }), "S20A_VERIFY: published graph edge digest independent read"
+            else:
+                assert caught is not None and caught.code == (
+                    "E_VECTOR_BACKEND" if case.startswith("vector-") else "E_GRAPH_BACKEND"
+                ), "S20A_VERIFY: bounded vector/shared graph corruption not rejected"
+                assert journal["phase"] == "stage", "S20A_VERIFY: corrupt artifact reached publication"
+                for target in paths:
+                    assert artifact_identity(stage_state["path"] / target) == stage_state["identity"][target], (
+                        "S20A_VERIFY: verifier mutated staged bytes/identity"
+                    )
+        if case != "valid":
+            assert renames == [] and not list(run.glob("old-*")), "S20A_VERIFY: rejected artifact renamed"
+            for target, path in paths.items():
+                assert artifact_identity(path) == before[target], "S20A_VERIFY: rejected artifact changed live bytes"
+        if live_target is None:
+            assert runtime._maintenance_state == "blocked", "S20A_VERIFY: verifier/publication lost fence"
