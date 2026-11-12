@@ -43,3 +43,4 @@ PLAN-claim-stacks.md
 scripts/claim_stacks_insert.sql
 specs/access-control-architecture.md
 specs/cmms-graph-batch.diff
+.cmms-storage.lock
