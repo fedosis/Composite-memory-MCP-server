@@ -503,7 +503,8 @@ async def wait_observed(predicate, marker):
 
 
 @pytest.mark.asyncio
-async def test_s20a_drain_exact_job_token(tmp_path, monkeypatch):
+@pytest.mark.parametrize("last_hold", ["bootstrap", "other", "native", "compact"])
+async def test_s20a_drain_exact_job_token(tmp_path, monkeypatch, last_hold):
     import threading
 
     from memory_server import projection_rebuild as p
@@ -521,7 +522,10 @@ async def test_s20a_drain_exact_job_token(tmp_path, monkeypatch):
             if kwargs.get("kind") == "lancedb-optimize":
                 compact_entered.set()
                 await compact_release.wait()
-            return await original_run(function, *args, **kwargs)
+            result = await original_run(function, *args, **kwargs)
+            for item in (runtime.root / "vector").rglob("*"):
+                item.chmod(0o700 if item.is_dir() else 0o600)
+            return result
 
         def held_native():
             native_entered.set()
@@ -534,6 +538,15 @@ async def test_s20a_drain_exact_job_token(tmp_path, monkeypatch):
         other_ready, other_release = asyncio.Event(), asyncio.Event()
         child_ready, snapshot_done = asyncio.Event(), asyncio.Event()
         observed = {}
+        released, snapshot_calls = set(), []
+        original_snapshot = p.snapshot_owned_projection_records
+
+        async def snapshot_entry(*args, **kwargs):
+            snapshot_calls.append(True)
+            assert released == {"bootstrap", "other", "native", "compact"}, (
+                "S20A_DRAIN: H03 snapshot entered before every real hold was released"
+            )
+            return await original_snapshot(*args, **kwargs)
 
         async def other_operation():
             token = runtime.admit()
@@ -544,10 +557,12 @@ async def test_s20a_drain_exact_job_token(tmp_path, monkeypatch):
                 runtime.release_admitted(token)
 
         async def job():
+            nonlocal parent
             token = runtime.admit()
             try:
                 custody = runtime.begin_maintenance(profile_id="a", canonical_root=runtime.root,
                                                     deadline=time.monotonic() + 20)
+                parent = runtime.spawn_owned_task(worker.run, kind="daemon-worker-parent")
                 observed["custody"] = custody
                 child_ready.set()
                 await runtime.drain_maintenance(custody, worker_task=parent)
@@ -561,37 +576,44 @@ async def test_s20a_drain_exact_job_token(tmp_path, monkeypatch):
         try:
             with monkeypatch.context() as patch:
                 patch.setattr(provider, "_run", held_optimize)
+                patch.setattr(p, "snapshot_owned_projection_records", snapshot_entry)
                 await worker._maybe_compact()
                 await asyncio.wait_for(compact_entered.wait(), 5)
                 compact = worker._compact_task
                 assert worker._active_claim is not None and not compact.done(), "S20A_DRAIN: real compact claim"
                 handle = await runtime.submit_native(held_native, kind="drain-test-held-io")
                 await wait_observed(native_entered.is_set, "S20A_DRAIN: native not entered")
-                parent = runtime.spawn_owned_task(worker.run, kind="daemon-worker-parent")
                 other = asyncio.create_task(other_operation())
                 await other_ready.wait()
                 child = asyncio.create_task(job())
                 await child_ready.wait()
                 await wait_observed(lambda: worker._maintenance_paused, "S20A_DRAIN: not paused")
+                await wait_observed(lambda: worker._maintenance_pause_ack, "S20A_DRAIN: no pause ack")
                 assert observed["custody"].self_task is child and child in runtime._admitted, "S20A_DRAIN: exact token"
                 assert bootstrap in runtime._admitted and other in runtime._admitted, "S20A_DRAIN: real admissions"
                 assert not snapshot_done.is_set(), "S20A_DRAIN: snapshot before compact/native/bootstrap drain"
-                compact_release.set()
-                await compact
-                for item in (runtime.root / "vector").rglob("*"):
-                    item.chmod(0o700 if item.is_dir() else 0o600)
-                assert not snapshot_done.is_set(), "S20A_DRAIN: held native excluded"
-                native_release.set()
-                await handle.result()
-                assert await handle.drain(time.monotonic() + 5), "S20A_DRAIN: native not settled"
-                await asyncio.sleep(0.03)
-                assert not snapshot_done.is_set(), "S20A_DRAIN: bootstrap/other excluded"
-                runtime.release_admitted(bootstrap)
-                await asyncio.sleep(0.03)
-                assert not snapshot_done.is_set(), "S20A_DRAIN: other admitted task excluded"
-                other_release.set()
+                order = [name for name in ("bootstrap", "other", "native", "compact") if name != last_hold]
+                for name in [*order, last_hold]:
+                    await asyncio.sleep(0.03)
+                    assert not snapshot_calls, f"S20A_DRAIN: early snapshot while {name}/{last_hold} held"
+                    released.add(name)
+                    if name == "bootstrap":
+                        runtime.release_admitted(bootstrap)
+                    elif name == "other":
+                        other_release.set()
+                        await other
+                    elif name == "native":
+                        native_release.set()
+                        await handle.result()
+                        assert await handle.drain(time.monotonic() + 5), "S20A_DRAIN: native not settled"
+                    else:
+                        compact_release.set()
+                        await compact
+                        for item in (runtime.root / "vector").rglob("*"):
+                            item.chmod(0o700 if item.is_dir() else 0o600)
                 await asyncio.wait_for(asyncio.gather(other, child), 5)
                 assert snapshot_done.is_set() and not parent.done(), "S20A_DRAIN: self excluded, persistent parent kept"
+                assert snapshot_calls == [True], "S20A_DRAIN: exact real snapshot count"
                 assert worker._maintenance_pause_ack and worker._active_claim is None, "S20A_DRAIN: pause/claim"
                 assert not runtime._live_natives(runtime.owned_snapshot()[2]), "S20A_DRAIN: native registry"
                 assert observed["snapshot"].records == (), "S20A_DRAIN: real H03 snapshot"
@@ -1237,3 +1259,147 @@ async def test_s20a_unavailable_and_network_closed(tmp_path, monkeypatch, case):
                     "S20A_NETWORK: nonselected unavailable vector changed"
                 )
             assert sockets == [] and downloads == [], "S20A_NETWORK: network/download not closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["snapshot-byte-cap", "stage-byte-cap", "deadline", "free-space", "canary"])
+async def test_s20a_limits_and_canary(tmp_path, monkeypatch, caplog, case):
+    import errno
+    import json
+    import logging
+    import os
+    from datetime import UTC, datetime, timedelta
+    from types import MappingProxyType
+    from uuid import uuid4
+
+    from lancedb.table import LanceTable
+    from prometheus_client import REGISTRY, generate_latest
+    from sqlalchemy import text
+
+    from memory_server import projection_rebuild as p
+    from memory_server.control.jobs import JobMetadata, request_digest
+    from memory_server.control.store import ControlStore
+    from memory_server.gateway_contracts import dto as d
+    from memory_server.gateway_contracts.ports import AuditTicket, Principal, ProfileRecord, RequestContext
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
+
+    root = tmp_path / "PATH_CANARY"
+    content, credential, verdict = "CONTENT_CANARY", "CREDENTIAL_CANARY", "RAW_VERDICT_CANARY"
+    now = datetime(2026, 11, 12, tzinfo=UTC)
+    principal = Principal("creator", "subject", None, frozenset({"a"}), frozenset({"index.manage"}),
+                          1, now + timedelta(days=1))
+    ctx = RequestContext("request", principal, "a", uuid4(), time.monotonic() + 60)
+    payload = d.RebuildRequest(reason="synthetic", confirmation=True, targets=["vector"],
+                               selection_digest="d" * 64, expected_count=1, allow_network_embedding=False)
+    with ControlStore(tmp_path / "control") as store:
+        store._configure((ProfileRecord("a", root, True, "a", None, {}, 1),))
+        metadata = JobMetadata(store)
+        reservation = metadata.enqueue(ctx, "vector_rebuild", payload,
+                                       digest=request_digest("vector_rebuild", payload),
+                                       ticket=AuditTicket("ticket", ctx.request_id), now=now)
+        claim = metadata.claim(reservation.job_id, "a", "subject", 0, now=now)
+        assert claim is not None and claim.job.progress is None, "S20A_PRIVACY: initial progress not null"
+        with store.borrow_transaction() as tx:
+            job_before = dict(tx.fetchone("SELECT * FROM jobs WHERE id=?", (claim.job.id,)))
+        async with projection_owner(root, MockEmbeddingProvider()) as (runtime, custody):
+            if case == "snapshot-byte-cap":
+                async with runtime.dependencies.sqlite.engine.begin() as connection:
+                    await connection.execute(text("UPDATE facts SET object=:value WHERE id='f'"),
+                                             {"value": content * 512})
+            snapshot = None if case == "snapshot-byte-cap" else await p.snapshot_owned_projection_records(
+                runtime, custody=custody
+            )
+            before = {name: artifact_identity(root / name) for name in ("vector", "graph.json")}
+            progresses, native_writes, space_checks, renames = [], [], [], []
+            original_progress, original_add = JobMetadata.progress, LanceTable.add
+            original_space, original_rename, original_stage = os.fstatvfs, os.rename, p._owned_stage
+            real_time = time.monotonic
+            expired = False
+
+            def progress(*args, **kwargs):
+                progresses.append((args, kwargs))
+                return original_progress(*args, **kwargs)
+
+            def add(self, *args, **kwargs):
+                result = original_add(self, *args, **kwargs)
+                native_writes.append(True)
+                if case == "canary":
+                    raise OSError(errno.EIO, f"{content} {credential} {verdict}", str(root / "provider-io"))
+                return result
+
+            def free(fd):
+                observed = original_space(fd)
+                space_checks.append(observed.f_bavail * observed.f_frsize)
+                values = list(observed)
+                values[4] = 0  # Actual statvfs result, with injected exhausted quota.
+                return os.statvfs_result(values)
+
+            def stage(*args):
+                nonlocal expired
+                result = original_stage(*args)
+                native_writes.append(True)
+                expired = True  # Deadline elapses only AFTER real staged I/O.
+                return result
+
+            def clock():
+                return custody._identity[-1] + 1 if expired else real_time()
+
+            def rename(*args, **kwargs):
+                renames.append((args, kwargs))
+                return original_rename(*args, **kwargs)
+
+            caught, result = None, None
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG), monkeypatch.context() as patch:
+                patch.setattr(JobMetadata, "progress", progress)
+                patch.setattr(LanceTable, "add", add)
+                patch.setattr(os, "rename", rename)
+                if case in {"snapshot-byte-cap", "stage-byte-cap"}:
+                    patch.setattr(p, "_OWNED_LIMITS", MappingProxyType({**p._OWNED_LIMITS, "chunk_bytes": 1024}))
+                elif case == "deadline":
+                    patch.setattr(p, "time", SimpleNamespace(monotonic=clock))
+                    patch.setattr(p, "_owned_stage", stage)
+                elif case == "free-space":
+                    patch.setattr(os, "fstatvfs", free)
+                try:
+                    if snapshot is None:
+                        await p.snapshot_owned_projection_records(runtime, custody=custody)
+                    else:
+                        result = await p.rebuild_owned_projections(snapshot, custody=custody,
+                                                                  targets=frozenset({"vector"}))
+                except p.MaintenanceError as exc:
+                    caught = exc
+            assert caught is not None and caught.code == ("E_TIMEOUT" if case == "deadline" else "E_STORAGE"), (
+                "S20A_LIMITS: real I/O cap/deadline/free-space/provider failure not rejected"
+            )
+            assert runtime._maintenance_state == "blocked" and runtime.lock is not None, "S20A_LIMITS: retained owner"
+            assert not runtime._live_natives(runtime.owned_snapshot()[2]), "S20A_LIMITS: native not settled"
+            assert renames == [], "S20A_LIMITS: refused operation published"
+            for name in before:
+                assert artifact_identity(root / name) == before[name], "S20A_LIMITS: selected/nonselected changed"
+            runs = list((root / p._OWNED_DIRECTORY).iterdir())
+            assert len(runs) == 1 and (runs[0] / "snapshot.db").is_file(), "S20A_LIMITS: retained snapshot inventory"
+            state = json.loads((runs[0] / "journal.json").read_bytes())
+            expected_phase = {"snapshot-byte-cap": "snapshot", "free-space": "captured"}.get(case, "stage")
+            assert state["phase"] == expected_phase and not list(runs[0].glob("old-*")), "S20A_LIMITS: retained journal"
+            if case in {"deadline", "canary"}:
+                assert native_writes, "S20A_LIMITS: failure did not cross real provider I/O"
+            if case == "free-space":
+                assert space_checks and all(value > 0 for value in space_checks), "S20A_LIMITS: actual statvfs boundary"
+            with pytest.raises(p.MaintenanceError) as denied:
+                runtime.admit()
+            assert denied.value.code == "E_MAINTENANCE_CONFLICT", "S20A_LIMITS: failure opened admission"
+            public = repr(caught.args) + str(caught) + ''.join(traceback.format_exception(caught)) + repr(result)
+            records = repr([record.__dict__ for record in caplog.records])
+            metrics = generate_latest(REGISTRY).decode()
+            job = metadata.get(claim.job.id, "a", "subject")
+            public += job.model_dump_json()
+            for canary in (content, credential, verdict, str(root), "PATH_CANARY"):
+                assert canary not in public + records + metrics, "S20A_PRIVACY: canary/raw verdict leaked"
+            assert caught.__cause__ is None and caught.__context__ is None, "S20A_PRIVACY: provider exception chain"
+            assert progresses == [] and job.progress is None, (
+                "S20A_PRIVACY: progress changed or metadata.progress called"
+            )
+            with store.borrow_transaction() as tx:
+                job_after = dict(tx.fetchone("SELECT * FROM jobs WHERE id=?", (claim.job.id,)))
+            assert job_after == job_before, "S20A_PRIVACY: durable job state changed by owner-only seam"
