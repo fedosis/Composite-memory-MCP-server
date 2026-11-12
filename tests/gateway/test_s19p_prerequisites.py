@@ -2751,7 +2751,11 @@ async def p5_owner_startup(h, monkeypatch):
         observation = daemon.snapshot()[profile_id]
         assert observation.state == "not_started" and observation.retained and not observation.owned
         assert observation.admissions == 0 and not spawned
-        assert custody.dependencies.outbox_worker is not None
+        # S20_RULINGS_009: S20_DETAIL.md:191 moves the configured callback before provider recipes.
+        assert custody.dependencies.outbox_worker is None, "S19P_STARTUP_PREPROVIDER outbox_worker"
+        assert custody.dependencies.sqlite is None, "S19P_STARTUP_PREPROVIDER sqlite"
+        assert custody.dependencies.vector is None, "S19P_STARTUP_PREPROVIDER vector"
+        assert custody.dependencies.graph is None, "S19P_STARTUP_PREPROVIDER graph"
         with pytest.raises(RuntimeNotReadyError):
             custody.admit()
         with pytest.raises(ValueError):
