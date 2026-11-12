@@ -801,6 +801,16 @@ async def test_s20a_finish_x10_no_unlock_or_republish(tmp_path, monkeypatch):
                 worker.stop()
                 await asyncio.gather(parent, return_exceptions=True)
             assert foreign.state == "READY", "S20A_FINISH_NO_UNLOCK: foreign owner changed"
+            # Isolate CLOSING from the separate released-token/stale negative:
+            # this custody is valid and still admitted immediately before close.
+            foreign.check_maintenance(foreign_custody)
+            foreign._begin_close()
+            assert foreign.state == "CLOSING", "S20A_FINISH_NO_UNLOCK: independent closing owner"
+            with pytest.raises(p.MaintenanceError) as valid_closing:
+                foreign.finish_maintenance(foreign_custody)
+            assert valid_closing.value.code == "E_RUNTIME_NOT_READY", (
+                "S20A_FINISH_NO_UNLOCK: CLOSING accepted otherwise-valid admitted custody"
+            )
 
 
 @pytest.mark.asyncio
