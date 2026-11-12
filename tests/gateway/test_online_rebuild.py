@@ -589,3 +589,85 @@ async def test_s20a_drain_exact_job_token(tmp_path, monkeypatch):
                                  return_exceptions=True)
             if handle is not None:
                 await handle.drain(time.monotonic() + 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", ["none", "foreign", "sibling", "done", "exact"])
+async def test_s20a_drain_worker_identity(tmp_path, identity):
+    from storage.outbox_worker import OutboxWorker
+
+    async with started_worker_owner(tmp_path / "a") as runtime:
+        worker = runtime.dependencies.outbox_worker
+        token = runtime.admit()
+        parent = candidate = holder = releaser = None
+        release, entered = asyncio.Event(), asyncio.Event()
+        sibling = None
+
+        async def foreign():
+            await release.wait()
+
+        async def hold_claim():
+            async with worker.claim_scope(deadline=time.monotonic() + 10):
+                entered.set()
+                await release.wait()
+
+        try:
+            assert "job_token" not in inspect.signature(runtime.begin_maintenance).parameters, "S20A_WORKER_IDENTITY"
+            if identity == "exact":
+                holder = runtime.spawn_owned_task(hold_claim, kind="identity-held-claim")
+                await entered.wait()
+            if identity == "done":
+                worker.stop()
+            parent = runtime.spawn_owned_task(worker.run, kind="daemon-worker-parent")
+            if identity == "done":
+                await parent
+            candidate = parent
+            if identity == "none":
+                candidate = None
+            elif identity == "foreign":
+                candidate = runtime.spawn_owned_task(foreign, kind="daemon-worker-parent")
+            elif identity == "sibling":
+                sibling = OutboxWorker(engine=worker._engine, task_spawner=runtime.spawn_owned_task,
+                                       native_submitter=runtime.submit_native, poll_interval_seconds=0.01)
+                await sibling.initialize()
+                candidate = runtime.spawn_owned_task(sibling.run, kind="daemon-worker-parent")
+            custody = runtime.begin_maintenance(profile_id="a", canonical_root=runtime.root,
+                                                deadline=time.monotonic() + (0.2 if identity == "none" else 10))
+            assert custody.self_task is asyncio.current_task() is token, "S20A_WORKER_IDENTITY: admitted current task"
+
+            async def release_after_ack():
+                await wait_observed(lambda: worker._maintenance_pause_ack, "S20A_WORKER_IDENTITY: missing ack")
+                assert worker._active_claim is not None and not holder.done(), "S20A_WORKER_IDENTITY: hold not real"
+                assert runtime._maintenance_state == "draining", "S20A_WORKER_IDENTITY: early active"
+                release.set()
+
+            if identity == "exact":
+                releaser = asyncio.create_task(release_after_ack())
+                await runtime.drain_maintenance(custody, worker_task=candidate)
+                await asyncio.gather(holder, releaser)
+                assert worker._maintenance_pause_ack and not parent.done(), "S20A_WORKER_IDENTITY: persistent parent"
+                assert worker._active_claim is None and not worker._retained_claims, "S20A_WORKER_IDENTITY: claims"
+                assert not worker._claim_lock.locked(), "S20A_WORKER_IDENTITY: claim lock"
+                assert worker._compact_task is None or worker._compact_task.done(), "S20A_WORKER_IDENTITY: compact"
+                assert not runtime._live_natives(runtime.owned_snapshot()[2]), "S20A_WORKER_IDENTITY: native"
+                assert runtime._maintenance_state == "active", "S20A_WORKER_IDENTITY: exact parent did not drain"
+            else:
+                with pytest.raises(Exception) as rejected:
+                    await runtime.drain_maintenance(custody, worker_task=candidate)
+                assert rejected.value.code == ("E_TIMEOUT" if identity == "none" else "E_MAINTENANCE_CONFLICT"), (
+                    "S20A_WORKER_IDENTITY: wrong rejection"
+                )
+                assert runtime._maintenance_state != "active", "S20A_WORKER_IDENTITY: invalid parent excluded"
+                if identity == "none":
+                    assert worker._maintenance_pause_ack and not parent.done(), (
+                        "S20A_WORKER_IDENTITY: None excludes parent"
+                    )
+            assert not (runtime.root / ".projection-rebuild").exists(), "S20A_WORKER_IDENTITY: unexpected snapshot"
+        finally:
+            release.set()
+            worker.stop()
+            if sibling is not None:
+                sibling.stop()
+            await asyncio.gather(*(t for t in (parent, candidate, holder, releaser) if t is not None),
+                                 return_exceptions=True)
+            runtime.release_admitted(token)
