@@ -77,7 +77,11 @@ def test_s20a_owned_reader_no_legacy_observer():
     owned_surface()
     source = (ROOT / P).read_bytes()
     tree = ast.parse(source)
-    owned = [node for node in tree.body if getattr(node, "lineno", 0) > 1049]
+    base = subprocess.check_output(["git", "show", f"{BASE}:{P}"], cwd=ROOT)
+    old_nodes, new_nodes = nodes(base), nodes(source)
+    definitions = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    legacy_names = {node.name for node in ast.parse(base).body if isinstance(node, definitions)}
+    owned = [node for node in tree.body if isinstance(node, definitions) and node.name not in legacy_names]
     forbidden = {"to_thread", "_staged_ids", "_observe_vector_artifact", "rebuild_projections", "to_arrow"}
     calls = {
         call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
@@ -85,9 +89,12 @@ def test_s20a_owned_reader_no_legacy_observer():
         if isinstance(call, ast.Call) and isinstance(call.func, (ast.Name, ast.Attribute))
     }
     assert not (calls & forbidden), "S20A_OWNED_NO_LEGACY_OBSERVER"
-    for start, end in ((496, 561), (840, 866)):
-        base = subprocess.check_output(["git", "show", f"{BASE}:{P}"], cwd=ROOT)
-        assert source.splitlines(keepends=True)[start - 1:end] == base.splitlines(keepends=True)[start - 1:end]
+    for name, start, end in (("_observe_vector_artifact", 496, 561), ("_staged_ids", 840, 866)):
+        old_node, new_node = old_nodes[name], new_nodes[name]
+        assert (old_node.lineno, old_node.end_lineno) == (start, end), "S20A_FROZEN: observer span"
+        expected = base.splitlines(keepends=True)[start - 1:end]
+        actual = source.splitlines(keepends=True)[new_node.lineno - 1:new_node.end_lineno]
+        assert actual == expected, "S20A_FROZEN: observer byte identity"
 
 
 @pytest.mark.asyncio
