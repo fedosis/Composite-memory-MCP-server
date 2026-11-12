@@ -3,11 +3,17 @@
 import ast
 import asyncio
 import hashlib
+import json
+import os
+import selectors
+import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -327,3 +333,194 @@ async def test_s20a_native_cancel_retains_owner(tmp_path, closing):
             owner.release_admitted(custody.self_task)
             assert (await owner.close()).code is None, "S20A_NATIVE: terminal close failed"
         assert owner.state == "CLOSED" and owner.lock is None, "S20A_NATIVE: terminal ownership not released"
+
+
+def recovery_layout(root):
+    return SimpleNamespace(data_root=root, vector=SimpleNamespace(backend="lancedb", local_path=root / "vector"),
+                           graph_snapshot_path=root / "graph.json")
+
+
+def disk_scope(root):
+    """Independent SQL readback, including outbox; never compare mutable WAL bytes."""
+    with sqlite3.connect(root / "memory.db") as db:
+        tables = [row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        rows = {name: sorted(db.execute(f'SELECT * FROM "{name}"').fetchall(), key=repr) for name in tables}
+    vector = [(str(p.relative_to(root)), p.stat().st_ino, p.read_bytes())
+              for p in sorted((root / "vector").rglob("*")) if p.is_file()]
+    graph = root / "graph.json"
+    return rows, vector, graph.read_bytes() if graph.exists() else None
+
+
+async def restart_owner(root, *, callback=None):
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+
+    trace = []
+
+    async def build(owner):
+        assert owner.lock._fh is not None, "S20A_RESTART: recipe without EX"
+        for journal in (root / projections._OWNED_DIRECTORY).glob("*/journal.json"):
+            assert json.loads(journal.read_bytes())["phase"] == "reconciled", "S20A_RESTART: early recipe"
+        trace.append("recipes")
+        provider = SQLiteProvider(url=f"sqlite+aiosqlite:///{root / 'memory.db'}")
+        await provider.initialize()
+        return provider
+
+    owner = CMMSRuntime(recovery_layout(root), profile_id="a",
+                        dependencies=RuntimeDependencies(recipes=(("sqlite", build),)))
+    if callback is not None:
+        owner.configure_startup_recovery(callback, timeout_seconds=5)
+    code = None
+    try:
+        try:
+            await owner.start()
+        except Exception as exc:
+            code = getattr(exc, "code", type(exc).__name__)
+        return code, owner.state, trace
+    finally:
+        assert (await owner.close()).code is None, "S20A_RESTART: cleanup"
+
+
+async def crash_child(root, phase, operation, edge):
+    """Only syscall observers are patched; each observed operation actually executes."""
+    from tests.gateway.test_online_rebuild import projection_owner
+
+    def install(owner):
+        originals = {name: getattr(os, name) for name in ("fsync", "replace", "rename")}
+
+        def wrapper(name):
+            def call(*args, **kwargs):
+                state = None
+                if name == "fsync":
+                    path = Path(os.readlink(f"/proc/self/fd/{args[0]}"))
+                    candidate = path / "journal.json" if path.is_dir() else path
+                    if candidate.name == "journal.json" or candidate.name.startswith("journal-"):
+                        try:
+                            state = json.loads(candidate.read_bytes())
+                        except (ValueError, OSError):
+                            pass
+                    kind = "dir-fsync" if path.is_dir() else "file-fsync"
+                else:
+                    fd = kwargs.get("src_dir_fd")
+                    if fd is None:
+                        return originals[name](*args, **kwargs)
+                    candidate = Path(os.readlink(f"/proc/self/fd/{fd}")) / str(args[0])
+                    if name == "replace":
+                        if not candidate.name.startswith("journal-"):
+                            return originals[name](*args, **kwargs)
+                        state = json.loads(candidate.read_bytes())
+                    else:
+                        for journal in (root / projections._OWNED_DIRECTORY).glob("*/journal.json"):
+                            state = json.loads(journal.read_bytes())
+                    kind = "record" if name == "replace" else "rename"
+                match = state is not None and state["phase"] == phase and kind == operation
+
+                def barrier():
+                    assert owner.lock._fh is not None, "S20A_RESTART: child no EX"
+                    print(json.dumps({"pid": os.getpid(), "phase": phase, "operation": operation,
+                                      "edge": edge}), flush=True)
+                    sys.stdin.buffer.read(1)
+                    raise AssertionError("S20A_RESTART: parent did not kill")
+
+                if match and edge == "before":
+                    barrier()
+                result = originals[name](*args, **kwargs)
+                if match and edge == "after":
+                    barrier()
+                return result
+            return call
+
+        for name in originals:
+            setattr(os, name, wrapper(name))
+        return originals
+
+    if phase in {"rollback", "reconciled"}:
+        owner = CMMSRuntime(recovery_layout(root), profile_id="a")
+        originals = install(owner)
+        try:
+            await owner.start()
+        finally:
+            for name, function in originals.items():
+                setattr(os, name, function)
+            await owner.close()
+    else:
+        async with projection_owner(root) as (owner, custody):
+            from sqlalchemy import text
+
+            async with owner.dependencies.sqlite.engine.begin() as db:
+                await db.execute(text("PRAGMA journal_mode=WAL"))
+            originals = install(owner)
+            try:
+                captured = await projections.snapshot_owned_projection_records(owner, custody=custody)
+                await projections.rebuild_owned_projections(captured, custody=custody, targets=frozenset({"graph"}))
+            finally:
+                for name, function in originals.items():
+                    setattr(os, name, function)
+
+
+def kill_at(root, phase, operation, edge):
+    command = [sys.executable, str(Path(__file__)), "crash", str(root), phase, operation, edge]
+    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            assert selector.select(10), "S20A_RESTART: child barrier timeout"
+            line = child.stdout.readline()
+        if not line:
+            raise AssertionError(f"S20A_RESTART: child exited: {child.communicate(timeout=3)[1].decode()}")
+        event = json.loads(line)
+        assert event == dict(pid=child.pid, phase=phase, operation=operation, edge=edge), "S20A_RESTART: IPC"
+        before = disk_scope(root)
+        contender = subprocess.run(
+            [sys.executable, "-c", "import fcntl,sys\nf=open(sys.argv[1],'rb')\n"
+             "try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+             "except BlockingIOError: print('EX')\n", str(root / ".cmms-storage.lock")],
+            capture_output=True, text=True, timeout=3, check=True,
+        )
+        assert contender.stdout.strip() == "EX", "S20A_RESTART: no actual child EX"
+        child.send_signal(signal.SIGKILL)
+        assert child.wait(timeout=3) == -signal.SIGKILL, "S20A_RESTART: kill/reap"
+        assert not Path(f"/proc/{child.pid}").exists(), "S20A_RESTART: child survives reap"
+        return before
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=3)
+        for stream in (child.stdin, child.stdout, child.stderr):
+            stream.close()
+
+
+RESTART_POINTS = [
+    (phase, operation, edge)
+    for phase in ("snapshot", "captured", "stage", "verified", "publish", "published", "rollback", "reconciled")
+    for operation in ("file-fsync", "record", "dir-fsync")
+    for edge in ("before", "after")
+] + [(phase, "rename", edge) for phase in ("publish", "rollback") for edge in ("before", "after")]
+
+
+@pytest.mark.parametrize("phase,operation,edge", RESTART_POINTS)
+def test_s20a_restart_each_phase(tmp_path, phase, operation, edge):
+    root = tmp_path / "profile"
+    if phase in {"rollback", "reconciled"}:
+        kill_at(root, "published", "dir-fsync", "after")
+    before = kill_at(root, phase, operation, edge)
+    # The graph can be mid-swap; its original generation is independently known.
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    old_path = tmp_path / "old.json"
+    SimpleGraph().save_snapshot(old_path)
+    old_graph = old_path.read_bytes()
+    results = [asyncio.run(restart_owner(root)) for _ in range(2)]
+    assert results[0] == results[1], "S20A_RESTART: second reconciliation not idempotent"
+    code, state, trace = results[1]
+    assert (code, state, trace) in [(None, "READY", ["recipes"]), ("E_STORAGE", "FAILED", [])], "S20A_RESTART"
+    if (phase, operation, edge) == ("snapshot", "dir-fsync", "after"):
+        assert code is None and state == "READY", "S20A_RESTART: partial snapshot blocks restart"
+    after = disk_scope(root)
+    assert after[:2] == before[:2], "S20A_RESTART: canonical/outbox/nonselected mutated"
+    if code is None:
+        assert after[2] == old_graph, "S20A_RESTART: incoherent old graph"
+
+
+if __name__ == "__main__":
+    assert sys.argv[1] == "crash", "S20A_RESTART: invalid child mode"
+    asyncio.run(crash_child(Path(sys.argv[2]), *sys.argv[3:]))
