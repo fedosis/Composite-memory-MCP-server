@@ -425,10 +425,8 @@ class LanceDBProvider:
             )
             return True
         except Exception as exc:
-            logger.warning("Failed to ensure table '%s': %s", name, exc)
-            raise ProviderWriteError(
-                f"failed to ensure lancedb table '{name}': {exc}"
-            ) from exc
+            logger.warning("Failed to ensure table '%s': %s", name, "E_VECTOR_BACKEND")
+            raise ProviderWriteError(f"failed to ensure lancedb table '{name}': E_VECTOR_BACKEND") from exc
 
     async def _run(self, func, *args, kind: str | None = None, **kwargs):
         """Run a blocking LanceDB call in a thread."""
@@ -576,8 +574,8 @@ class LanceDBProvider:
         except ProviderWriteError:
             raise
         except Exception as exc:
-            logger.error("Failed to upsert point %s: %s", pid, exc)
-            raise ProviderWriteError(f"lancedb upsert failed: {exc}") from exc
+            logger.error("Failed to upsert point %s: %s", pid, "E_VECTOR_BACKEND")
+            raise ProviderWriteError("lancedb upsert failed: E_VECTOR_BACKEND") from exc
 
     async def upsert_batch(
         self,
@@ -630,8 +628,8 @@ class LanceDBProvider:
         except ProviderWriteError:
             raise
         except Exception as exc:
-            logger.error("Failed to batch upsert: %s", exc)
-            raise ProviderWriteError(f"lancedb upsert_batch failed: {exc}") from exc
+            logger.error("Failed to batch upsert: %s", "E_VECTOR_BACKEND")
+            raise ProviderWriteError("lancedb upsert_batch failed: E_VECTOR_BACKEND") from exc
 
     async def search(
         self,
@@ -977,8 +975,8 @@ class LanceDBProvider:
         except ProviderWriteError:
             raise
         except Exception as exc:
-            logger.warning("LanceDB optimize failed: %s", exc)
-            raise ProviderWriteError(f"lancedb optimize failed: {exc}") from exc
+            logger.warning("LanceDB optimize failed: %s", "E_VECTOR_BACKEND")
+            raise ProviderWriteError("lancedb optimize failed: E_VECTOR_BACKEND") from exc
 
     async def close(self) -> None:
         """Close the underlying LanceDB database connection."""

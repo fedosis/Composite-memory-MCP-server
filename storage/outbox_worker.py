@@ -14,10 +14,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+from collections.abc import Sequence
+from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from functools import wraps
+from time import monotonic
+from typing import TYPE_CHECKING, AsyncContextManager, Literal
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -28,6 +35,7 @@ if TYPE_CHECKING:
     from memory_server.providers.lancedb_provider import LanceDBProvider
     from memory_server.providers.qdrant_provider import QdrantProvider
     from memory_server.router.graph_router import GraphRouter
+    from memory_server.runtime.runtime import CMMSRuntime, NativeRecord
 
 from storage.base import Base
 from storage.outbox import OutboxEntry, OutboxRepository
@@ -49,6 +57,108 @@ def _provider_write_error(message: str) -> Exception:
     from memory_server.providers.exceptions import ProviderWriteError
 
     return ProviderWriteError(message)
+
+
+class OutboxClaimError(Exception):
+    """Content-free failures of the owned worker's trusted claim API."""
+
+    def __init__(self, code: str):
+        if code not in {"E_VALIDATION", "E_MAINTENANCE_CONFLICT", "E_RUNTIME_NOT_READY", "E_TIMEOUT", "E_STORAGE"}:
+            code = "E_STORAGE"
+        self.code = code
+        super().__init__(code)
+
+
+def _claim_snapshot(entry):
+    names = "id status processed_at record_id record_type operation payload_json retry_count created_at".split()
+    return tuple(getattr(entry, name) for name in names)
+
+
+async def _settled(task):
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+class ActiveClaim:
+    """Opaque per-scope authority; only claim_scope can mint it."""
+
+    worker: OutboxWorker
+    engine: AsyncEngine
+    task: asyncio.Task
+    loop: asyncio.AbstractEventLoop
+    snapshots: dict[str, tuple]
+    used: set[str]
+    sessions: set[AsyncSession]
+    active: bool
+    operation: asyncio.Task
+    owner: CMMSRuntime | None
+    natives: tuple[NativeRecord, ...]
+
+    def __new__(cls):
+        raise TypeError("ActiveClaim is worker-issued")
+
+    def _check(self, session):
+        if (
+            not self.active
+            or self.worker._active_claim is not self
+            or asyncio.current_task() is not self.task
+            or asyncio.get_running_loop() is not self.loop
+        ):
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        if not isinstance(session, AsyncSession) or session.bind is not self.engine:
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        if self.worker._engine is not self.engine:
+            raise OutboxClaimError("E_RUNTIME_NOT_READY")
+
+    def register_claimed(self, session: AsyncSession, entries: Sequence[OutboxEntry]) -> None:
+        self._check(session)
+        if not isinstance(entries, Sequence):
+            raise OutboxClaimError("E_VALIDATION")
+        if any(
+            not isinstance(e, OutboxEntry)
+            or e.status != "processing"
+            or e.processed_at is None
+            or e.id in self.snapshots
+            for e in entries
+        ):
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        self.sessions.add(session)
+        self.snapshots.update((entry.id, _claim_snapshot(entry)) for entry in entries)
+
+
+def _fenced(method):
+    @wraps(method)
+    async def wrapped(self):
+        if self._session_factory is None:
+            return await method(self)
+        async with self.claim_scope(deadline=monotonic() + 30):
+            return await method(self)
+
+    return wrapped
+
+
+def _safe_error(exc):
+    from memory_server.providers.exceptions import ProviderWriteError
+
+    if isinstance(exc, TimeoutError):
+        return "E_TIMEOUT"
+    if type(exc) is OutboxWorker.RelationProjectionError:
+        code = exc.args[0] if exc.args else None
+        return code if type(code) is str and code in exc.CODES else "Relation projection failed"
+    if type(exc) is ProviderWriteError:
+        if exc.args and type(exc.args[0]) is str and exc.args[0].endswith(": E_VECTOR_BACKEND"):
+            return "E_VECTOR_BACKEND"
+    return "E_OUTBOX"
 
 
 class OutboxWorker:
@@ -102,8 +212,21 @@ class OutboxWorker:
         self._native_submitter = native_submitter
         self._compact_task = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        self._claim_lock = asyncio.Lock()
+        self._active_claim = None
+        self._retained_claims = set()
         self._stop_requested = False
+        self._maintenance_paused = False
+        self._maintenance_pause_ack = False
         self._last_compact_at: float = 0.0
+
+    def _pause_for_maintenance(self, *, custody) -> None:
+        from memory_server.runtime.runtime import MaintenanceCustody
+
+        if type(custody) is not MaintenanceCustody:
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        custody._identity[0]._check_maintenance_worker(custody, self)
+        self._maintenance_paused = True
 
     def stop(self) -> None:
         """Signal the run loop to exit after the current iteration.
@@ -154,10 +277,14 @@ class OutboxWorker:
             self._poll_interval_seconds,
         )
         while not self._stop_requested:
+            if self._maintenance_paused:
+                self._maintenance_pause_ack = True
+                await asyncio.sleep(0.05)
+                continue
             try:
                 processed = await self._poll_once()
             except Exception:
-                logger.exception("Outbox worker poll cycle failed")
+                logger.error("Outbox worker poll cycle failed: %s", "E_OUTBOX", exc_info=False, stack_info=False)
                 processed = 0
             # Adaptive backoff: keep draining while there is work, only sleep
             # the full interval when the queue is empty. With a large backlog
@@ -195,6 +322,8 @@ class OutboxWorker:
         """
         import time
 
+        if self._maintenance_paused:
+            return
         if self._qdrant is None:
             return
         optimize = getattr(self._qdrant, "optimize", None)
@@ -204,7 +333,8 @@ class OutboxWorker:
             return
         self._last_compact_at = time.monotonic()
 
-        async def _compact() -> None:
+        @_fenced
+        async def _compact(self) -> None:
             try:
                 ok = await optimize(
                     cleanup_older_than=timedelta(hours=self._compact_cleanup_hours),
@@ -212,13 +342,100 @@ class OutboxWorker:
                 if ok:
                     logger.info("Outbox worker: LanceDB compaction done")
             except Exception:
-                logger.exception("Outbox worker: LanceDB compaction failed")
+                logger.error(
+                    "Outbox worker: LanceDB compaction failed: %s", "E_OUTBOX", exc_info=False, stack_info=False
+                )
 
         if self._task_spawner is None:
-            asyncio.create_task(_compact())
+            asyncio.create_task(_compact(self))
         else:
-            self._compact_task = self._task_spawner(_compact, kind="outbox-compact")
+            self._compact_task = self._task_spawner(lambda: _compact(self), kind="outbox-compact")
 
+    def claim_scope(self, *, deadline: float) -> AsyncContextManager[ActiveClaim]:
+        return self._claim_scope(deadline)
+
+    @asynccontextmanager
+    async def _claim_scope(self, deadline):
+        from memory_server.runtime.runtime import CMMSRuntime
+
+        try:
+            valid = type(deadline) in (int, float) and math.isfinite(deadline) and deadline > 0
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise OutboxClaimError("E_VALIDATION")
+        if deadline <= monotonic():
+            raise OutboxClaimError("E_TIMEOUT")
+        if self._engine is None or self._session_factory is None:
+            raise OutboxClaimError("E_RUNTIME_NOT_READY")
+        task = asyncio.current_task()
+        assert task is not None
+        if self._active_claim is not None and self._active_claim.task is task:
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        if self._maintenance_paused:
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        try:
+            async with asyncio.timeout_at(deadline):
+                await self._claim_lock.acquire()
+        except TimeoutError:
+            raise OutboxClaimError("E_TIMEOUT") from None
+        if self._maintenance_paused:
+            self._claim_lock.release()
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        self._retained_claims.difference_update(
+            retained
+            for retained in tuple(self._retained_claims)
+            if (retained.owner is None or retained.owner.state == "READY")
+            and all(r.state == "TERMINATED" and (r.thread is None or not r.thread.is_alive()) for r in retained.natives)
+        )
+        claim = object.__new__(ActiveClaim)
+        claim.worker, claim.engine = self, self._engine
+        claim.task, claim.loop = task, asyncio.get_running_loop()
+        claim.snapshots, claim.used, claim.sessions = {}, set(), set()
+        owner = getattr(self._task_spawner, "__self__", None)
+        claim.owner = None
+        if isinstance(owner, CMMSRuntime) and owner.dependencies.sqlite is not None:
+            if self._task_spawner == owner.spawn_owned_task and owner.dependencies.sqlite.engine is self._engine:
+                claim.owner = owner
+
+        claim.active = True
+        self._active_claim = claim
+        exceptional = False
+        try:
+            yield claim
+        except BaseException:
+            exceptional = True
+            raise
+        finally:
+            await _settled(asyncio.create_task(self._finish_claim(claim, exceptional)))
+
+    async def _finish_claim(self, claim, exceptional):
+        from storage.outbox import OutboxEntryORM
+
+        try:
+            claim.natives = () if claim.owner is None else claim.owner.owned_snapshot()[2]
+            open_transaction = any(session.in_transaction() for session in claim.sessions)
+            async with asyncio.timeout(5):
+                for session in claim.sessions:
+                    if session.in_transaction():
+                        await session.rollback()
+                async with self._session_factory() as session:
+                    for entry_id in claim.snapshots:
+                        row = await session.get(OutboxEntryORM, entry_id, populate_existing=True)
+                        if row is not None and row.status == "processing":
+                            self._retained_claims.add(claim)
+        except (SQLAlchemyError, TimeoutError):
+            self._retained_claims.add(claim)
+            raise OutboxClaimError("E_STORAGE") from None
+        finally:
+            claim.active = False
+            if self._active_claim is claim:
+                self._active_claim = None
+                self._claim_lock.release()
+        if open_transaction and not exceptional:
+            raise OutboxClaimError("E_STORAGE")
+
+    @_fenced
     async def _poll_once(self) -> int:
         """Single poll cycle: fetch pending entries and process them.
 
@@ -235,16 +452,20 @@ class OutboxWorker:
         Returns:
             Number of entries processed (0 when the queue was empty).
         """
+        from memory_server.runtime.runtime import NativeSettlementTimeout
+
         if self._session_factory is None:
             return 0
 
         async with self._session_factory() as session:
             repo = OutboxRepository(session)
             # Recover entries left in "processing" by a crashed worker.
-            await repo.reset_stale_processing(
-                max_age_seconds=self._stale_processing_seconds
-            )
+            if not self._retained_claims:
+                await repo.reset_stale_processing(
+                    max_age_seconds=self._stale_processing_seconds
+                )
             entries = await repo.claim_pending(limit=self._poll_batch_size)
+            self._active_claim.register_claimed(session, entries)
 
             if not entries:
                 return 0
@@ -264,12 +485,18 @@ class OutboxWorker:
         other_entries = [e for e in entries if e.operation != "index_fact"]
 
         if fact_entries:
-            await self._process_fact_batch(fact_entries)
+            try:
+                await self._process_fact_batch(fact_entries)
+            except NativeSettlementTimeout:
+                return 0
 
         for entry in other_entries:
             async with self._session_factory() as session:
                 repo = OutboxRepository(session)
-                await self._process_entry(session, repo, entry)
+                try:
+                    await self._process_entry(session, repo, entry)
+                except NativeSettlementTimeout:
+                    return 0
                 await session.commit()
 
         return len(entries)
@@ -315,7 +542,7 @@ class OutboxWorker:
                 logger.warning(
                     "Fact chunk of %d entries failed (%s); falling back to per-entry",
                     len(chunk),
-                    exc,
+                    _safe_error(exc),
                 )
                 async with self._session_factory() as session:
                     repo = OutboxRepository(session)
@@ -387,6 +614,49 @@ class OutboxWorker:
                     f"sync_facts_batch returned False for {len(chunk)} facts"
                 )
 
+    async def process_claimed(
+        self,
+        session: AsyncSession,
+        repo: OutboxRepository,
+        entry: OutboxEntry,
+        *,
+        claim: ActiveClaim,
+    ) -> Literal["completed", "failed", "pending"]:
+        from storage.outbox import OutboxEntryORM
+
+        if type(claim) is not ActiveClaim or claim.worker is not self:
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        claim._check(session)
+        if (
+            session not in claim.sessions
+            or not isinstance(repo, OutboxRepository)
+            or repo._session is not session
+            or not isinstance(entry, OutboxEntry)
+        ):
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        snapshot = claim.snapshots.get(entry.id)
+        if snapshot is None or entry.id in claim.used or _claim_snapshot(entry) != snapshot:
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        try:
+            row = await session.get(OutboxEntryORM, entry.id, populate_existing=True)
+        except SQLAlchemyError:
+            raise OutboxClaimError("E_STORAGE") from None
+        if row is None or _claim_snapshot(row) != snapshot:
+            raise OutboxClaimError("E_MAINTENANCE_CONFLICT")
+        if claim.owner is None and any(v is not None for v in (self._embedder, self._graph_router, self._qdrant)):
+            raise OutboxClaimError("E_RUNTIME_NOT_READY")
+        if claim.owner is not None and claim.owner.state != "READY":
+            raise OutboxClaimError("E_RUNTIME_NOT_READY")
+        claim.used.add(entry.id)
+        if self._task_spawner is None:
+            operation = asyncio.create_task(self._process_entry(session, repo, OutboxEntry.from_orm(row)))
+        else:
+            operation = self._task_spawner(
+                lambda: self._process_entry(session, repo, OutboxEntry.from_orm(row)), kind="outbox-claimed"
+            )
+        claim.operation = operation
+        return await _settled(operation)
+
     async def _process_entry(
         self,
         session: AsyncSession,
@@ -419,6 +689,8 @@ class OutboxWorker:
                 await self._process_index_skill(entry)
             elif entry.operation == "index_belief":
                 await self._process_index_belief(entry)
+            elif entry.operation == "relation_sync":
+                return await self._process_relation_sync(session, repo, entry)
             else:
                 raise ValueError(f"Unknown operation: {entry.operation}")
 
@@ -427,7 +699,7 @@ class OutboxWorker:
             return "completed"
 
         except Exception as e:
-            error_msg = str(e)
+            error_msg = _safe_error(e)
             new_retry = await repo.increment_retry(entry.id, error_msg)
 
             if new_retry >= self._max_retries:
@@ -448,6 +720,211 @@ class OutboxWorker:
                     error_msg,
                 )
                 return "pending"
+
+    class RelationProjectionError(Exception):
+        CODES = frozenset(
+            {
+                "RELATION_PAYLOAD_INVALID",
+                "RELATION_INVARIANT_FAILED",
+                "RELATION_GRAPH_UNAVAILABLE",
+                "RELATION_PROJECTION_LIMIT",
+                "RELATION_PROJECTION_TIMEOUT",
+                "RELATION_PERSISTENCE_FAILED",
+                "RELATION_SNAPSHOT_INVALID",
+                "RELATION_READBACK_FAILED",
+            }
+        )
+
+        def __init__(self, code="Relation projection failed"):
+            super().__init__(code if type(code) is str and code in self.CODES else "Relation projection failed")
+
+    @staticmethod
+    def _relation_payload(entry):
+        import json
+        from uuid import UUID
+
+        error = OutboxWorker.RelationProjectionError
+        try:
+            p = entry.payload
+            if type(p) is not dict or set(p) != {
+                "v",
+                "source_id",
+                "target_id",
+                "relation_type",
+                "revision",
+                "event_id",
+            }:
+                raise ValueError
+            s, t, k = p["source_id"], p["target_id"], p["relation_type"]
+            if any(type(v) is not str or not 1 <= len(v) <= 1024 for v in (s, t, k)):
+                raise ValueError
+            if any(v.startswith(("rel_", "ent_", "proj_")) for v in (s, t)):
+                raise ValueError
+            if k not in ("supports", "contradicts", "derives"):
+                raise ValueError
+            if len(json.dumps([s, t, k], ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 1024:
+                raise ValueError
+            if type(p["v"]) is not int or p["v"] != 1:
+                raise ValueError
+            if type(p["revision"]) is not int or not 1 <= p["revision"] <= 9223372036854775807:
+                raise ValueError
+            e = p["event_id"]
+            if type(e) is not str or len(e) != 36 or str(UUID(e)) != e:
+                raise ValueError
+            if entry.record_type not in ("fact", "belief") or entry.record_id != s:
+                raise ValueError
+            return (s, t, k), p["revision"], e
+        except Exception:
+            raise error("RELATION_PAYLOAD_INVALID") from None
+
+    async def _process_relation_sync(self, session, repo, entry) -> str:
+        import time
+
+        error = self.RelationProjectionError
+        key, revision, event_id = self._relation_payload(entry)
+        deadline = time.monotonic() + 30.0
+        cancelled = False
+
+        async def tail():
+            from sqlalchemy import event, text
+
+            from storage.models.relation import ClaimRelationORM
+            from storage.models.relation_revision import RelationRevisionORM
+            from storage.repositories.relation_revision_repo import (
+                RelationRevisionRepository,
+                RelationRevisionStorageError,
+            )
+
+            connection = await session.connection()
+            sync = connection.sync_connection
+            statements = instructions = 0
+            stopped = None
+
+            def checkpoint():
+                if time.monotonic() >= deadline:
+                    raise error("RELATION_PROJECTION_TIMEOUT")
+
+            def before(*_):
+                nonlocal statements
+                statements += 1
+                checkpoint()
+                if statements > 64:
+                    raise error("RELATION_PROJECTION_LIMIT")
+
+            def progress():
+                nonlocal instructions, stopped
+                instructions += 1000
+                if time.monotonic() >= deadline:
+                    stopped = "RELATION_PROJECTION_TIMEOUT"
+                elif instructions >= 2_000_000:
+                    stopped = "RELATION_PROJECTION_LIMIT"
+                return int(stopped is not None)
+
+            async def bridge(callback):
+                return await connection.run_sync(lambda c: c.connection.dbapi_connection.run_async(callback))
+
+            event.listen(sync, "before_cursor_execute", before)
+            try:
+                await bridge(lambda driver: driver.set_progress_handler(progress, 1000))
+                params = dict(s=key[0], t=key[1], k=key[2])
+                reserved = await session.execute(
+                    text(
+                        "UPDATE relation_revisions SET revision=revision "
+                        "WHERE source_id=:s AND target_id=:t AND relation_type=:k AND revision=("
+                        "SELECT revision FROM relation_revisions "
+                        "WHERE source_id=:s AND target_id=:t AND relation_type=:k ORDER BY revision DESC LIMIT 1)"
+                    ),
+                    params,
+                )
+                if reserved.rowcount != 1:
+                    raise error("RELATION_INVARIANT_FAILED")
+                canonical = await session.get(ClaimRelationORM, key, populate_existing=True)
+                state = await RelationRevisionRepository(session).state(
+                    key, canonical.created_at if canonical else None
+                )
+                latest = state.latest
+                queued = await session.get(RelationRevisionORM, (*key, revision), populate_existing=True)
+                if latest is None or queued is None or revision > latest.revision or queued.event_id != event_id:
+                    raise error("RELATION_INVARIANT_FAILED")
+                if revision == latest.revision and latest.event_id != event_id:
+                    raise error("RELATION_INVARIANT_FAILED")
+                kinds = {}
+                for endpoint in dict.fromkeys(key[:2]):
+                    query = " UNION ALL ".join(
+                        f"SELECT '{kind}' AS kind,version FROM {table} WHERE id=:id"
+                        for kind, table in (
+                            ("fact", "facts"),
+                            ("belief", "beliefs"),
+                            ("decision", "decisions"),
+                            ("skill", "skills"),
+                        )
+                    )
+                    matches = (await session.execute(text(query), {"id": endpoint})).all()
+                    if len(matches) != 1 or matches[0].kind not in ("fact", "belief"):
+                        raise error("RELATION_INVARIANT_FAILED")
+                    kinds[endpoint] = matches[0].kind
+                if kinds[key[0]] != entry.record_type:
+                    raise error("RELATION_INVARIANT_FAILED")
+                graph = getattr(self._graph_router, "graph", None)
+                apply = getattr(graph, "reconcile_claim_relation", None)
+                verify = getattr(graph, "verify_claim_relation", None)
+                if not callable(apply) or not callable(verify) or self._native_submitter is None:
+                    raise error("RELATION_GRAPH_UNAVAILABLE")
+                kwargs = dict(
+                    live=not latest.deleted, source_kind=kinds[key[0]], target_kind=kinds[key[1]], deadline=deadline
+                )
+                for function in (apply, verify):
+                    checkpoint()
+                    if cancelled:
+                        return None
+                    handle = await self._native_submitter(function, *key, kind="outbox-relation-sync", **kwargs)
+                    value = await handle.result()
+                    if value is False:
+                        raise error("RELATION_READBACK_FAILED")
+                checkpoint()
+                if cancelled:
+                    return None
+                await repo.mark_completed(entry.id)
+                return "completed"
+            except RelationRevisionStorageError:
+                raise error("RELATION_INVARIANT_FAILED") from None
+            except Exception as exc:
+                from memory_server.providers.graph_provider import SimpleGraph
+
+                if stopped:
+                    raise error(stopped) from None
+                if type(exc) in (error, SimpleGraph.StrictRelationProjectionError):
+                    raise error(exc.args[0]) from None
+                raise error() from None
+            finally:
+                event.remove(sync, "before_cursor_execute", before)
+                try:
+                    await bridge(lambda driver: driver.set_progress_handler(None, 0))
+                except BaseException:
+                    await connection.invalidate()
+                    raise
+
+        async def boundary():
+            try:
+                return await tail()
+            except Exception as exc:
+                raise error(exc.args[0] if type(exc) is error else None) from None
+
+        owned = asyncio.create_task(boundary())
+        while not owned.done():
+            try:
+                await asyncio.shield(owned)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        if cancelled:
+            try:
+                owned.result()
+            except BaseException:
+                pass
+            raise asyncio.CancelledError
+        return owned.result()
 
     async def _process_index_fact(self, entry: OutboxEntry) -> None:
         """Process an index_fact entry: embed + upsert to Qdrant + sync to graph.
@@ -586,6 +1063,7 @@ class OutboxWorker:
 
     # ── utility for server integration ──────────────────────────────
 
+    @_fenced
     async def process_all_pending(self) -> dict:
         """Process all pending entries synchronously (for testing).
 
@@ -596,6 +1074,8 @@ class OutboxWorker:
             ``pending`` (reset by ``increment_retry``) and are counted in
             NEITHER bucket — they are re-picked by the next poll/run.
         """
+        from memory_server.runtime.runtime import NativeSettlementTimeout
+
         processed = 0
         failed = 0
 
@@ -605,10 +1085,14 @@ class OutboxWorker:
         async with self._session_factory() as session:
             repo = OutboxRepository(session)
             entries = await repo.claim_pending(limit=self._process_pending_limit)
+            self._active_claim.register_claimed(session, entries)
             await session.commit()
 
             for entry in entries:
-                status = await self._process_entry(session, repo, entry)
+                try:
+                    status = await self._process_entry(session, repo, entry)
+                except NativeSettlementTimeout:
+                    return {"processed": processed, "failed": failed}
                 if status == "completed":
                     processed += 1
                 elif status == "failed":

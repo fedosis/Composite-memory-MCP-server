@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, Index, String, text
+from sqlalchemy import DateTime, Float, Index, String, literal_column, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from memory_server.models import Fact
@@ -16,6 +16,7 @@ class FactORM(Base):
 
     __tablename__ = "facts"
     __table_args__ = (
+        Index("ix_facts_created_type_id", "created_at", literal_column("CAST('fact' AS TEXT)"), "id"),
         Index(
             "uq_facts_spo_active",
             "dedup_key",

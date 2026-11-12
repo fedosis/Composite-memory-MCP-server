@@ -17,7 +17,7 @@ transport.
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
 from memory_server.application.audit_service import AuditService
 from memory_server.application.belief_service import BeliefService
@@ -32,6 +32,9 @@ from memory_server.application.errors import UnknownDependencyError
 from memory_server.application.graph_service import GraphService
 from memory_server.application.memory_service import MemoryService
 from memory_server.application.retrieval_service import RetrievalService
+
+if TYPE_CHECKING:
+    from memory_server.application.memory_read_service import ReadResources
 
 
 class MemoryApplication:
@@ -63,6 +66,7 @@ class MemoryApplication:
         audit_state: Mapping[str, Any] | None = None,
     ) -> None:
         self._session_factory = session_factory
+        self._read_provider = retrieval_provider
         # Captured once here; MemoryService never re-reads it.
         self._policy = policy if policy is not None else MemoryPolicy.capture()
         self.memory = MemoryService(session_factory, policy=self._policy)
@@ -161,6 +165,14 @@ class MemoryApplication:
             audit_sqlite=provider,
             audit_state=audit_state,
         )
+
+    def read_resources(self) -> ReadResources:
+        """Borrow canonical read dependencies without exposing runtime internals."""
+        from memory_server.application.memory_read_service import ReadResources
+
+        if self._read_provider is None or self._session_factory is None:
+            raise UnknownDependencyError("read resources")
+        return ReadResources(self._read_provider, self._session_factory)
 
     @property
     def policy(self) -> MemoryPolicy:

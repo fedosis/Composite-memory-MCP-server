@@ -8,9 +8,25 @@ versioning with SemVer-like semantics.
 
 ## Unreleased
 
-Branch `refactor/runtime-architecture` only — **not merged, not published**.
-Latest public GitHub release remains `v0.11.0b1`. Package metadata on this
-branch declares `0.12.0`; that version is not a GitHub release.
+Nothing yet.
+
+## 0.12.0 — 2026-11-12
+
+Gateway integration line. This release merges the runtime-architecture refactor
+and the HTTP gateway series (S01–S20) into `main`; package metadata declares
+`0.12.0`, which supersedes the earlier `v0.12.0b1` beta of the profile-isolation
+series.
+
+- **S20A1 owner maintenance substrate** — `CMMSRuntime` gains an EX-owned
+  snapshot/rebuild path with a durable journal, pre-provider recovery, custody
+  fencing, outbox pause/drain, bounded verification and fail-closed publication.
+  Review chain: cross-provider code review APPROVE, independent security review
+  APPROVE, independent crash-recovery review APPROVE, hard-only artifact
+  APPROVE (248/248 target nodes on a tree without the soft services). Known
+  residuals: R6 24h retention cleanup is not implemented; a gateway-wide
+  approved threat-model hash does not exist (per-stage deltas are the record);
+  `tests/test_release_candidate.py` has 6 pre-existing failures inherited from
+  `main` (README/sdist/S405 doc-contract drift, unrelated to this line).
 
 ### Changed
 
@@ -33,7 +49,7 @@ branch declares `0.12.0`; that version is not a GitHub release.
   custody did not settle, the runtime fails closed and retains the storage
   lock.
 
-## 0.12.0 — 2026-09-14
+## 0.12.0b1 — 2026-09-14
 
 Profile isolation series (cards S1..S5 plus the S5 fix loop): storage is
 resolved once per profile and rooted under that profile's own data root, the

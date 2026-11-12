@@ -237,7 +237,11 @@ class FactRepository:
                         raise
                 # Fall through to LIKE
 
-        # Fallback: standard LIKE query (original behavior)
+        # Fallback only for textual intent; punctuation must never mean all rows.
+        if text is not None and not any(char.isalnum() for char in text):
+            return []
+
+        # Fallback: standard LIKE query with literal user text.
         stmt = select(FactORM)
         if subject is not None:
             stmt = stmt.where(FactORM.subject == subject)
@@ -257,11 +261,12 @@ class FactRepository:
             else:
                 stmt = stmt.where(FactORM.lifecycle_state == lifecycle_state)
         if text is not None:
-            pattern = f"%{text}%"
+            escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
             stmt = stmt.where(
-                FactORM.subject.like(pattern)
-                | FactORM.predicate.like(pattern)
-                | FactORM.object.like(pattern)
+                FactORM.subject.like(pattern, escape="\\")
+                | FactORM.predicate.like(pattern, escape="\\")
+                | FactORM.object.like(pattern, escape="\\")
             )
         stmt = stmt.order_by(FactORM.created_at.desc()).limit(limit)
         result = await self._session.execute(stmt)

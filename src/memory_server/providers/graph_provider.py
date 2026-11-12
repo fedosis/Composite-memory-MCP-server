@@ -37,14 +37,16 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import threading
 import time
 import uuid
 from collections import deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,66 @@ GRAPH_LOCK_TIMEOUT = float(os.environ.get("MEMORY_GRAPH_LOCK_TIMEOUT", "30"))
 # leaves substantial headroom over the observed ~14 MiB production snapshot while
 # keeping malformed or hostile inputs from becoming an unbounded read.
 _MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
+
+
+class GraphBudgetExceeded(Exception):  # noqa: N818 - frozen public contract name
+    """Raised when bounded graph traversal exceeds a cumulative budget."""
+
+    def __init__(self, dimension: str, limit: int, attempted: int) -> None:
+        self.dimension = dimension
+        self.limit = limit
+        self.attempted = attempted
+        super().__init__("graph budget exceeded")
+
+
+@dataclass
+class _TraversalBudget:
+    max_nodes: int
+    max_edges: int
+    max_pairs: int
+    max_depth: int
+    nodes: int = 0
+    edges: int = 0
+    pairs: int = 0
+
+
+_TRAVERSAL_BUDGET: ContextVar[_TraversalBudget | None] = ContextVar(
+    "memory_graph_traversal_budget", default=None
+)
+
+
+@contextmanager
+def _bounded_traversal(
+    max_nodes: int, max_edges: int, max_pairs: int, max_depth: int
+) -> Iterator[_TraversalBudget]:
+    budget = _TraversalBudget(max_nodes, max_edges, max_pairs, max_depth)
+    token = _TRAVERSAL_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _TRAVERSAL_BUDGET.reset(token)
+
+
+def _charge(dimension: str, amount: int = 1) -> None:
+    budget = _TRAVERSAL_BUDGET.get()
+    if budget is None:
+        return
+    current = getattr(budget, dimension) + amount
+    limit = getattr(budget, f"max_{dimension}")
+    if current > limit:
+        raise GraphBudgetExceeded(dimension, limit, current)
+    setattr(budget, dimension, current)
+
+
+def _remaining(dimension: str) -> int | None:
+    budget = _TRAVERSAL_BUDGET.get()
+    if budget is None:
+        return None
+    return getattr(budget, f"max_{dimension}") - getattr(budget, dimension)
+
+
+def _charge_pair() -> None:
+    _charge("pairs")
 
 
 @dataclass
@@ -94,6 +156,41 @@ class GraphValidation:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class ReadNode:
+    id: str
+    type: str
+    name: str
+
+
+@dataclass(frozen=True)
+class ReadEdge:
+    source_id: str
+    target_id: str
+
+
+@dataclass(frozen=True)
+class ReadWork:
+    nodes: int
+    edges: int
+    pairs: int
+    bucket_probes: int
+
+
+@dataclass(frozen=True)
+class ReadWindow:
+    nodes: tuple[ReadNode, ...]
+    edges: tuple[ReadEdge, ...]
+    work: ReadWork
+    exhausted: bool
+    soft_stopped: bool
+    depth_frontier: tuple[str, ...]
+
+
+class GraphReadDeadlineExceeded(TimeoutError):  # noqa: N818 - frozen S09 ABI
+    """The hard graph-read deadline was reached before an inspect step."""
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -102,8 +199,299 @@ def _snapshot_lock_path(snapshot_path: Path) -> Path:
     return snapshot_path.with_name(snapshot_path.name + ".lock")
 
 
+def _projection_failure():
+    from memory_server.runtime.runtime_manager import (
+        E_RUNTIME_RESOURCE_IDENTITY_CHANGED,
+        RuntimeManagerError,
+    )
+
+    return RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED)
+
+
+def _identity(info):
+    kind = "regular_file" if stat.S_ISREG(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode) else "special"
+    return (kind, info.st_dev, info.st_ino, info.st_mode, info.st_nlink)
+
+
+def _chains(paths):
+    from memory_server.paths import inspect_component_chain_nofollow
+
+    return {p: inspect_component_chain_nofollow(p, anchor=Path("/"))[:-1] for p in paths}
+
+
+class _PinnedParent:
+    def __init__(self, fd):
+        self.fd = fd
+
+    def fileno(self):
+        return self.fd
+
+    def __index__(self):
+        return self.fd
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def _pin_parent(snapshot_path):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", flags)
+    try:
+        for name in snapshot_path.parent.parts[1:]:
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return _PinnedParent(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _close_publication(receipt):
+    for resource in (receipt.snapshot, receipt.lock):
+        try:
+            resource.close()
+        except Exception:
+            pass
+    try:
+        receipt.parent_fd.close()
+    except OSError:
+        pass
+
+
+class PublicationProof:
+    pass
+
+
+@dataclass(frozen=True, eq=False)
+class _PublicationReceipt:
+    scope: Any
+    before: dict
+    after: dict
+    chains: dict
+    staged: tuple
+    lock_identity: tuple
+    lock_created: bool
+    snapshot: Any
+    lock: Any
+    parent_fd: int
+    proof: PublicationProof
+    pid: int
+    thread: int
+    issued_at: float
+    expires_at: float
+    journal: tuple
+    nodes: Any
+    edges: Any
+
+
+_PROJECTION_CALL = ContextVar("graph_projection_call", default=None)
+_SNAPSHOT_WRITER = ContextVar("graph_snapshot_writer", default=None)
+
+
 @contextmanager
-def _file_lock(lock_path: Path, timeout: float = GRAPH_LOCK_TIMEOUT) -> Iterator[None]:
+def _managed_reader_lock(lock_path, binding):
+    parent_fd = None
+    fh = None
+    try:
+        if _fcntl is None:
+            raise _projection_failure()
+        evidence, chains, _ = binding.state
+        if _chains(evidence) != chains:
+            raise _projection_failure()
+        parent_fd = _pin_parent(lock_path)
+        if _identity(os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)) != evidence[lock_path]:
+            raise _projection_failure()
+        fh = os.fdopen(os.open(lock_path.name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd), "r+b")
+        expected = evidence[lock_path]
+        if expected[0] != "regular_file" or expected[4] != 1 or _identity(os.fstat(fh.fileno())) != expected:
+            raise _projection_failure()
+        with _held_flock(fh):
+            if _identity(os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)) != expected:
+                raise _projection_failure()
+            yield None
+    except Exception:
+        raise _projection_failure() from None
+    finally:
+        if fh is not None:
+            fh.close()
+        if parent_fd is not None:
+            parent_fd.close()
+
+
+@contextmanager
+def _held_flock(fh):
+    deadline = time.monotonic() + GRAPH_LOCK_TIMEOUT
+    while True:
+        try:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise _projection_failure() from None
+            time.sleep(0.01)
+    try:
+        yield
+    finally:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+
+
+class _SnapshotPublication:
+    def __init__(self, graph, snapshot_path, scope):
+        self.graph, self.path, self.scope = graph, snapshot_path, scope
+        self.parent_fd = None
+        self.lock = self.snapshot = None
+        self.receipt = None
+        self.tmp = None
+        self.created = False
+
+    @contextmanager
+    def entered(self):
+        scope = self.scope
+        binding = scope.binding
+        try:
+            if (
+                _fcntl is None
+                or scope.abandoned
+                or scope.sealed
+                or binding.graph is not self.graph
+                or binding.pid != os.getpid()
+                or self.path != binding.path
+                or _PROJECTION_CALL.get() is not scope
+            ):
+                raise _projection_failure()
+            with self.graph._thread_lock:
+                self.before = dict(scope.records[-1].after if scope.records else scope.before)
+                if _chains(self.before) != scope.chains or self.graph._projection_evidence() != self.before:
+                    raise _projection_failure()
+                self.parent_fd = _pin_parent(self.path)
+                lock_before = self.before[binding.lock_path]
+                flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+                if lock_before[0] == "absent":
+                    lock_create_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+                    flags = lock_create_flags
+                    self.created = True
+                self.lock = os.fdopen(os.open(binding.lock_path.name, flags, 0o600, dir_fd=self.parent_fd), "r+b")
+                self.lock_identity = _identity(os.fstat(self.lock.fileno()))
+                if (
+                    self.lock_identity[0] != "regular_file"
+                    or self.lock_identity[4] != 1
+                    or (not self.created and self.lock_identity != lock_before)
+                ):
+                    raise _projection_failure()
+                with _held_flock(self.lock):
+                    self._check_lock()
+                    expected = dict(self.before)
+                    expected[binding.lock_path] = self.lock_identity
+                    if self.graph._projection_evidence() != expected:
+                        raise _projection_failure()
+                    token = _SNAPSHOT_WRITER.set(self)
+                    try:
+                        yield self
+                    finally:
+                        _SNAPSHOT_WRITER.reset(token)
+        except Exception:
+            raise _projection_failure() from None
+        finally:
+            if self.receipt is None:
+                if self.tmp is not None and self.parent_fd is not None:
+                    try:
+                        os.unlink(self.tmp, dir_fd=self.parent_fd)
+                    except OSError:
+                        pass
+                for resource in (self.snapshot, self.lock):
+                    if resource is not None:
+                        resource.close()
+                if self.parent_fd is not None:
+                    self.parent_fd.close()
+
+    def _check_lock(self):
+        binding = self.scope.binding
+        if (
+            _identity(os.stat(binding.lock_path.name, dir_fd=self.parent_fd, follow_symlinks=False))
+            != self.lock_identity
+            or _identity(os.fstat(self.lock.fileno())) != self.lock_identity
+            or _chains(self.before) != self.scope.chains
+        ):
+            raise _projection_failure()
+
+    def read(self):
+        if self.before[self.path][0] == "absent":
+            return None
+        fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.parent_fd)
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            if _identity(os.fstat(fh.fileno())) != self.before[self.path]:
+                raise _projection_failure()
+            return self.graph._build_state_from(json.load(fh))
+
+    def write(self):
+        self.tmp = f".{self.path.name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(
+            self.tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.parent_fd
+        )
+        self.snapshot = os.fdopen(fd, "w+", encoding="utf-8")
+        self.nodes, self.edges = self.graph._nodes, self.graph._edges
+        json.dump(self.graph.to_dict(), self.snapshot, ensure_ascii=False, indent=2)
+        self.snapshot.flush()
+        os.fsync(self.snapshot.fileno())
+        self.staged = _identity(os.fstat(self.snapshot.fileno()))
+        os.replace(self.tmp, self.path.name, src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd)
+        self.tmp = None
+        os.fsync(self.parent_fd)
+        if (
+            _identity(os.stat(self.path.name, dir_fd=self.parent_fd, follow_symlinks=False)) != self.staged
+            or _identity(os.fstat(self.snapshot.fileno())) != self.staged
+        ):
+            raise _projection_failure()
+        self._check_lock()
+        self._mint()
+        return True
+
+    def _mint(self):
+        probe = os.open(
+            self.scope.binding.lock_path.name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.parent_fd
+        )
+        try:
+            try:
+                _fcntl.flock(probe, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                _fcntl.flock(probe, _fcntl.LOCK_UN)
+                raise _projection_failure()
+        finally:
+            os.close(probe)
+        after = dict(self.before)
+        after[self.path] = self.staged
+        after[self.scope.binding.lock_path] = self.lock_identity
+        now = time.monotonic()
+        self.receipt = _PublicationReceipt(
+            self.scope,
+            self.before,
+            after,
+            self.scope.chains,
+            self.staged,
+            self.lock_identity,
+            self.created,
+            self.snapshot,
+            self.lock,
+            self.parent_fd,
+            PublicationProof(),
+            os.getpid(),
+            threading.get_ident(),
+            now,
+            now + 30.0,
+            self.journal,
+            self.nodes,
+            self.edges,
+        )
+        self.scope.records.append(self.receipt)
+
+
+@contextmanager
+def _file_lock(lock_path: Path, timeout: float = GRAPH_LOCK_TIMEOUT, *, managed=None) -> Iterator[None]:
     """Acquire an exclusive advisory lock on *lock_path*.
 
     Blocking-with-timeout: if the lock cannot be acquired within *timeout*
@@ -112,6 +500,10 @@ def _file_lock(lock_path: Path, timeout: float = GRAPH_LOCK_TIMEOUT) -> Iterator
     lock automatically if the process dies, so a crashed writer can never
     deadlock later writers.
     """
+    if managed is not None:
+        with _managed_reader_lock(lock_path, managed):
+            yield None
+        return
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+b")  # noqa: PTH123 - file must be created next to snapshot
     try:
@@ -209,6 +601,7 @@ class SimpleGraph:
         # Serializes transactions on this instance within one process; the
         # file lock serializes across processes.
         self._thread_lock = threading.Lock()
+        self._projection_binding = None
 
     @contextmanager
     def suspend_persistence(self) -> Iterator[None]:
@@ -305,13 +698,191 @@ class SimpleGraph:
             self._journal.append(("delete_node", id))
         self._persist_if_needed()
 
-    def get_all_nodes(self) -> list[GraphNode]:
+    def get_all_nodes(self, *, scan_limit: int | None = None) -> list[GraphNode]:
         """Get all nodes in the graph.
 
         Returns:
             List of all GraphNode objects.
         """
+        if scan_limit is not None or _TRAVERSAL_BUDGET.get() is not None:
+            if scan_limit is not None and len(self._nodes) > scan_limit:
+                budget = _TRAVERSAL_BUDGET.get()
+                used = budget.nodes if budget is not None else 0
+                limit = budget.max_nodes if budget is not None else scan_limit
+                raise GraphBudgetExceeded("nodes", limit, used + len(self._nodes))
+            nodes: list[GraphNode] = []
+            for node in self._nodes.values():
+                if scan_limit is not None and len(nodes) >= scan_limit:
+                    budget = _TRAVERSAL_BUDGET.get()
+                    limit = budget.max_nodes if budget is not None else scan_limit
+                    used = budget.nodes if budget is not None else len(nodes)
+                    raise GraphBudgetExceeded("nodes", limit, used + 1)
+                _charge("nodes")
+                nodes.append(node)
+            return nodes
         return list(self._nodes.values())
+
+    def read_window(
+        self,
+        roots: tuple[str, ...],
+        *,
+        depth: int,
+        direction: Literal["out", "both"],
+        soft_deadline: float,
+        hard_deadline: float,
+        max_nodes: int = 500,
+        max_edges: int = 1000,
+        max_pairs: int = 100,
+        max_depth: int = 4,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> ReadWindow:
+        """Collect a bounded immutable topology window without copying raw data."""
+        if (
+            type(roots) is not tuple
+            or not 1 <= len(roots) <= 6
+            or any(
+                type(root) is not str
+                or not root
+                or len(root) > 8192
+                or len(root.encode("utf-8")) > 8192
+                for root in roots
+            )
+            or direction not in {"out", "both"}
+            or type(depth) is not int
+            or type(max_depth) is not int
+            or not 1 <= depth <= max_depth <= 4
+            or any(
+                type(value) is not int or not 0 <= value <= ceiling
+                for value, ceiling in ((max_nodes, 500), (max_edges, 1000), (max_pairs, 100))
+            )
+            or not callable(clock)
+        ):
+            raise ValueError("invalid graph read window")
+
+        nodes: list[ReadNode] = []
+        edges: list[ReadEdge] = []
+        edge_pairs: set[tuple[str, str]] = set()
+        frontier: list[str] = []
+        queued: deque[tuple[str, int]] = deque()
+        seen: set[str] = set()
+        soft_stopped = False
+        bucket_probes = 0
+
+        def checkpoint() -> bool:
+            nonlocal soft_stopped
+            now = clock()
+            if now >= hard_deadline:
+                raise GraphReadDeadlineExceeded
+            if now >= soft_deadline:
+                soft_stopped = True
+                return False
+            return True
+
+        def admit_node(node_id: str, level: int) -> bool:
+            if node_id in seen:
+                return True
+            if not checkpoint():
+                return False
+            _charge("nodes")
+            node = self._nodes.get(node_id)
+            seen.add(node_id)
+            if (
+                not isinstance(node, GraphNode)
+                or type(node.id) is not str
+                or node.id != node_id
+                or type(node.type) is not str
+                or type(node.name) is not str
+                or not node.id
+                or not node.type
+                or not node.name
+                or len(node.name) > 8192
+            ):
+                return True
+            try:
+                if len(node.name.encode("utf-8")) > 8192:
+                    return True
+            except UnicodeError:
+                return True
+            nodes.append(ReadNode(node.id, node.type, node.name))
+            queued.append((node.id, level))
+            return True
+
+        with _bounded_traversal(max_nodes, max_edges, max_pairs, max_depth) as budget:
+            if len(roots) == 2:
+                if checkpoint():
+                    _charge_pair()
+                else:
+                    return ReadWindow((), (), ReadWork(0, 0, 0, 0), False, True, ())
+            for root in roots:
+                if not admit_node(root, 0):
+                    break
+            while queued and not soft_stopped:
+                current, level = queued.popleft()
+                if level >= depth:
+                    frontier.append(current)
+                    continue
+
+                targets = self._edges.get(current)
+                if targets is not None:
+                    if not checkpoint():
+                        break
+                    _charge("edges")
+                    bucket_probes += 1
+                    for target_id, entries in targets.items():
+                        for entry in entries:
+                            if not checkpoint():
+                                break
+                            _charge("edges")
+                            if (
+                                isinstance(entry, GraphEdge)
+                                and entry.source_id == current
+                                and entry.target_id == target_id
+                                and type(target_id) is str
+                                and target_id
+                            ):
+                                pair = (current, target_id)
+                                if pair not in edge_pairs:
+                                    edge_pairs.add(pair)
+                                    edges.append(ReadEdge(*pair))
+                                if not admit_node(target_id, level + 1):
+                                    break
+                        if soft_stopped:
+                            break
+                if direction == "both" and not soft_stopped:
+                    for source_id, targets in self._edges.items():
+                        if not checkpoint():
+                            break
+                        _charge("edges")
+                        bucket_probes += 1
+                        if source_id == current or current not in targets:
+                            continue
+                        for entry in targets[current]:
+                            if not checkpoint():
+                                break
+                            _charge("edges")
+                            if (
+                                isinstance(entry, GraphEdge)
+                                and entry.source_id == source_id
+                                and entry.target_id == current
+                                and type(source_id) is str
+                                and source_id
+                            ):
+                                pair = (source_id, current)
+                                if pair not in edge_pairs:
+                                    edge_pairs.add(pair)
+                                    edges.append(ReadEdge(*pair))
+                                if not admit_node(source_id, level + 1):
+                                    break
+                        if soft_stopped:
+                            break
+            return ReadWindow(
+                tuple(nodes),
+                tuple(edges),
+                ReadWork(budget.nodes, budget.edges, budget.pairs, bucket_probes),
+                not soft_stopped and not queued and not frontier,
+                soft_stopped,
+                tuple(frontier),
+            )
 
     # --- Edge operations ---
 
@@ -404,12 +975,258 @@ class SimpleGraph:
             self._journal.append(("delete_edge", source_id, target_id))
         self._persist_if_needed()
 
+    class StrictRelationProjectionError(Exception):
+        CODES = frozenset(
+            {
+                "RELATION_PAYLOAD_INVALID",
+                "RELATION_INVARIANT_FAILED",
+                "RELATION_GRAPH_UNAVAILABLE",
+                "RELATION_PROJECTION_LIMIT",
+                "RELATION_PROJECTION_TIMEOUT",
+                "RELATION_PERSISTENCE_FAILED",
+                "RELATION_SNAPSHOT_INVALID",
+                "RELATION_READBACK_FAILED",
+            }
+        )
+
+        def __init__(self, code="Relation projection failed"):
+            super().__init__(code if type(code) is str and code in self.CODES else "Relation projection failed")
+
+    _RELATION_BYTES = 16777216
+
+    def _relation_deadline(self, deadline):
+        if time.monotonic() >= deadline:
+            raise self.StrictRelationProjectionError("RELATION_PROJECTION_TIMEOUT")
+
+    def _relation_arguments(self, s, t, k, live, sk, tk, deadline):
+        import math
+
+        if (
+            any(type(v) is not str or not 1 <= len(v) <= 1024 for v in (s, t, k))
+            or k not in ("supports", "contradicts", "derives")
+            or type(live) is not bool
+            or type(sk) is not str
+            or sk not in ("fact", "belief")
+            or type(tk) is not str
+            or tk not in ("fact", "belief")
+            or (s == t and sk != tk)
+            or type(deadline) not in (float, int)
+            or not math.isfinite(deadline)
+        ):
+            raise self.StrictRelationProjectionError("RELATION_PAYLOAD_INVALID")
+        if (
+            any(v.startswith(("rel_", "ent_", "proj_")) for v in (s, t))
+            or len(json.dumps([s, t, k], ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 1024
+        ):
+            raise self.StrictRelationProjectionError("RELATION_PAYLOAD_INVALID")
+        self._relation_deadline(deadline)
+        if self._projection_binding is None or self._snapshot_path is None or _PROJECTION_CALL.get() is None:
+            raise self.StrictRelationProjectionError("RELATION_GRAPH_UNAVAILABLE")
+
+    def _relation_chunks(self, value, depth=0):
+        import math
+
+        error = self.StrictRelationProjectionError
+        if depth > 64:
+            raise error("RELATION_PROJECTION_LIMIT")
+        if type(value) is str:
+            if len(value) > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+            yield b'"'
+            for i in range(0, len(value), 4096):
+                yield json.dumps(value[i : i + 4096], ensure_ascii=False)[1:-1].encode("utf-8")
+            yield b'"'
+        elif value is None or type(value) is bool or type(value) is int or type(value) is float:
+            if type(value) is int and value.bit_length() > 4096:
+                raise error("RELATION_PROJECTION_LIMIT")
+            if type(value) is float and not math.isfinite(value):
+                raise error("RELATION_SNAPSHOT_INVALID")
+            yield json.dumps(value, allow_nan=False).encode("ascii")
+        elif type(value) in (list, dict):
+            if len(value) > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+            mapping = type(value) is dict
+            yield b"{" if mapping else b"["
+            for i, item in enumerate(value):
+                if i:
+                    yield b","
+                if mapping:
+                    if type(item) is not str:
+                        raise error("RELATION_SNAPSHOT_INVALID")
+                    yield from self._relation_chunks(item, depth + 1)
+                    yield b":"
+                    item = value[item]
+                yield from self._relation_chunks(item, depth + 1)
+            yield b"}" if mapping else b"]"
+        else:
+            raise error("RELATION_SNAPSHOT_INVALID")
+
+    def _relation_size(self, value):
+        total = 0
+        for chunk in self._relation_chunks(value):
+            total += len(chunk)
+            if total > self._RELATION_BYTES:
+                raise self.StrictRelationProjectionError("RELATION_PROJECTION_LIMIT")
+        return total
+
+    def _relation_preflight(self, s, t):
+        error = self.StrictRelationProjectionError
+        if self._suspend_persistence or self._full_publish_pending or self._journal:
+            raise error("RELATION_GRAPH_UNAVAILABLE")
+        if len(self._nodes) > 10000 or len(self._edges) > 10000 or len(self._edges.get(s, {}).get(t, ())) > 16:
+            raise error("RELATION_PROJECTION_LIMIT")
+        count = size = pairs = 0
+        for node in self._nodes.values():
+            size += self._relation_size(vars(node))
+            if size > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+        for targets in self._edges.values():
+            pairs += len(targets)
+            if pairs > 20000:
+                raise error("RELATION_PROJECTION_LIMIT")
+            for bucket in targets.values():
+                count += len(bucket)
+                if count > 20000:
+                    raise error("RELATION_PROJECTION_LIMIT")
+                for edge in bucket:
+                    size += self._relation_size(vars(edge))
+                    if size > self._RELATION_BYTES:
+                        raise error("RELATION_PROJECTION_LIMIT")
+        if len(self._edges.get(s, {}).get(t, ())) > 16:
+            raise error("RELATION_PROJECTION_LIMIT")
+        self._relation_size(self.to_dict())
+
+    def _relation_raw(self, raw, s, t):
+        error = self.StrictRelationProjectionError
+        if (
+            type(raw) is not dict
+            or set(raw) != {"nodes", "edges"}
+            or type(raw["nodes"]) is not dict
+            or type(raw["edges"]) is not list
+        ):
+            raise error("RELATION_SNAPSHOT_INVALID")
+        if len(raw["nodes"]) > 10000 or len(raw["edges"]) > 20000:
+            raise error("RELATION_PROJECTION_LIMIT")
+        pair = 0
+        for edge in raw["edges"]:
+            if type(edge) is not dict:
+                raise error("RELATION_SNAPSHOT_INVALID")
+            if (edge.get("source_id"), edge.get("target_id")) == (s, t):
+                pair += 1
+                if pair > 16:
+                    raise error("RELATION_PROJECTION_LIMIT")
+        self._relation_size(raw)
+        return raw
+
+    @staticmethod
+    def _apply_claim_relation(graph, op):
+        _, s, t, k, live, sk, tk = op
+        error = SimpleGraph.StrictRelationProjectionError
+        for ident, kind in ((s, sk), (t, tk)):
+            node = graph._nodes.get(ident)
+            if node is not None and node.type != kind:
+                raise error("RELATION_INVARIANT_FAILED")
+        bucket = graph._edges.get(s, {}).get(t, ())
+        if len(bucket) > 16:
+            raise error("RELATION_PROJECTION_LIMIT")
+        missing = {ident: kind for ident, kind in ((s, sk), (t, tk)) if ident not in graph._nodes}
+        retained = [edge for edge in bucket if edge.relation != k]
+        count = (
+            sum(len(b) for targets in graph._edges.values() for b in targets.values())
+            - len(bucket)
+            + len(retained)
+            + int(live)
+        )
+        if len(graph._nodes) + (len(missing) if live else 0) > 10000 or count > 20000 or len(retained) + int(live) > 16:
+            raise error("RELATION_PROJECTION_LIMIT")
+        if live:
+            for ident, kind in missing.items():
+                graph._nodes[ident] = GraphNode(ident, kind, "[MASKED]", {})
+            retained.append(GraphEdge(s, t, k, {"canonical": True}))
+        if retained:
+            graph._edges.setdefault(s, {})[t] = retained
+        elif s in graph._edges:
+            graph._edges[s].pop(t, None)
+            if not graph._edges[s]:
+                graph._edges.pop(s)
+
+    def reconcile_claim_relation(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        *,
+        live: bool,
+        source_kind: str,
+        target_kind: str,
+        deadline: float,
+    ) -> None:
+        error = self.StrictRelationProjectionError
+        try:
+            self._relation_arguments(source_id, target_id, relation_type, live, source_kind, target_kind, deadline)
+            op = ("reconcile_claim_relation", source_id, target_id, relation_type, live, source_kind, target_kind)
+            self._persist_relation_snapshot_strict(op, deadline=deadline)
+            self._relation_deadline(deadline)
+        except Exception as exc:
+            raise error(exc.args[0] if type(exc) is error else None) from None
+
+    def verify_claim_relation(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        *,
+        live: bool,
+        source_kind: str,
+        target_kind: str,
+        deadline: float,
+    ) -> None:
+        error = self.StrictRelationProjectionError
+        try:
+            self._relation_arguments(source_id, target_id, relation_type, live, source_kind, target_kind, deadline)
+            binding = self._projection_binding
+            failure = None
+            with self._thread_lock, _managed_reader_lock(binding.lock_path, binding):
+                try:
+                    self._relation_deadline(deadline)
+                    self._relation_preflight(source_id, target_id)
+                    parent = _pin_parent(binding.path)
+                    try:
+                        raw = self._read_relation_snapshot_strict(
+                            parent, binding.path, binding.state[0][binding.path], source_id, target_id
+                        )
+                    finally:
+                        parent.close()
+                    if raw != self.to_dict():
+                        raise error("RELATION_READBACK_FAILED")
+                    self._verify_relation_tuple(
+                        raw, source_id, target_id, relation_type, live, source_kind, target_kind
+                    )
+                except Exception as exc:
+                    failure = error(exc.args[0] if type(exc) is error else None)
+            if failure:
+                raise failure
+            self._relation_deadline(deadline)
+        except Exception as exc:
+            raise error(exc.args[0] if type(exc) is error else None) from None
+
+    def _verify_relation_tuple(self, raw, s, t, k, live, sk, tk):
+        matches = [e for e in raw["edges"] if (e["source_id"], e["target_id"], e["relation"]) == (s, t, k)]
+        if len(matches) != int(live) or (live and matches[0]["attributes"] != {"canonical": True}):
+            raise self.StrictRelationProjectionError("RELATION_READBACK_FAILED")
+        for ident, kind in ((s, sk), (t, tk)):
+            node = raw["nodes"].get(ident)
+            if (live and node is None) or (node is not None and node["type"] != kind):
+                raise self.StrictRelationProjectionError("RELATION_INVARIANT_FAILED")
+
     # --- Neighbor traversal ---
 
     def get_neighbors(
         self,
         node_id: str,
         relation: str | None = None,
+        *,
+        edge_limit: int | None = None,
     ) -> list[tuple[GraphNode, GraphEdge]]:
         """Get all neighbors of a node, optionally filtered by relation.
 
@@ -420,6 +1237,8 @@ class SimpleGraph:
         Returns:
             List of (neighbor_node, edge) tuples.
         """
+        if edge_limit is not None or _TRAVERSAL_BUDGET.get() is not None:
+            return self._get_neighbors_bounded(node_id, relation, edge_limit)
         if node_id not in self._nodes:
             return []
 
@@ -445,6 +1264,46 @@ class SimpleGraph:
 
         return neighbors
 
+    def _get_neighbors_bounded(
+        self,
+        node_id: str,
+        relation: str | None,
+        edge_limit: int | None,
+    ) -> list[tuple[GraphNode, GraphEdge]]:
+        if node_id not in self._nodes:
+            return []
+        neighbors: list[tuple[GraphNode, GraphEdge]] = []
+        inspected = 0
+
+        def inspect(edge: GraphEdge, neighbor_id: str) -> None:
+            nonlocal inspected
+            inspected += 1
+            if edge_limit is not None and inspected > edge_limit:
+                budget = _TRAVERSAL_BUDGET.get()
+                used = budget.edges if budget is not None else inspected - 1
+                limit = budget.max_edges if budget is not None else edge_limit
+                raise GraphBudgetExceeded("edges", limit, used + 1)
+            _charge("edges")
+            if not isinstance(edge, GraphEdge):
+                return
+            if relation is not None and edge.relation != relation:
+                return
+            neighbor_node = self._nodes.get(neighbor_id)
+            if neighbor_node is not None:
+                neighbors.append((neighbor_node, edge))
+
+        if node_id in self._edges:
+            for target_id, edges in self._edges[node_id].items():
+                for edge in edges:
+                    inspect(edge, target_id)
+        for source_id, targets in self._edges.items():
+            if source_id == node_id:
+                continue
+            if node_id in targets:
+                for edge in targets[node_id]:
+                    inspect(edge, source_id)
+        return neighbors
+
     # --- Pathfinding ---
 
     def find_path(
@@ -452,6 +1311,8 @@ class SimpleGraph:
         source_id: str,
         target_id: str,
         max_depth: int = 4,
+        *,
+        node_limit: int | None = None,
     ) -> list[list[GraphNode]]:
         """Find all simple paths between two nodes up to max_depth.
 
@@ -472,6 +1333,9 @@ class SimpleGraph:
             List of simple paths, where each path is a list of GraphNode
             objects ordered from source to target.
         """
+        if node_limit is not None or _TRAVERSAL_BUDGET.get() is not None:
+            return self._find_path_bounded(source_id, target_id, max_depth, node_limit)
+
         if source_id not in self._nodes or target_id not in self._nodes:
             return []
 
@@ -498,6 +1362,56 @@ class SimpleGraph:
                 elif len(new_path) - 1 < max_depth:
                     queue.append((target_id_candidate, new_path))
 
+        return paths
+
+    def _find_path_bounded(
+        self,
+        source_id: str,
+        target_id: str,
+        max_depth: int,
+        node_limit: int | None,
+    ) -> list[list[GraphNode]]:
+        if source_id not in self._nodes or target_id not in self._nodes:
+            return []
+        budget = _TRAVERSAL_BUDGET.get()
+        if budget is None:
+            with _bounded_traversal(node_limit, 1000, 100, max_depth):
+                return self._find_path_bounded(source_id, target_id, max_depth, node_limit)
+
+        local_nodes = 0
+
+        def charge_node() -> None:
+            nonlocal local_nodes
+            if node_limit is not None and local_nodes >= node_limit:
+                raise GraphBudgetExceeded("nodes", budget.max_nodes, budget.nodes + 1)
+            local_nodes += 1
+            _charge("nodes")
+
+        charge_node()
+        if source_id == target_id:
+            return [[self._nodes[source_id]]]
+        queue: deque[tuple[str, tuple[str, ...]]] = deque([(source_id, (source_id,))])
+        paths: list[list[GraphNode]] = []
+        while queue:
+            current, path = queue.popleft()
+            depth = len(path) - 1
+            for candidate, entries in self._edges.get(current, {}).items():
+                eligible = candidate not in path and candidate in self._nodes
+                charged_node = False
+                for _edge in entries:
+                    if eligible and not charged_node:
+                        charge_node()
+                        charged_node = True
+                    _charge("edges")
+                    if eligible and depth >= max_depth:
+                        raise GraphBudgetExceeded("depth", max_depth, max_depth + 1)
+                if not charged_node:
+                    continue
+                new_path = path + (candidate,)
+                if candidate == target_id:
+                    paths.append([self._nodes[nid] for nid in new_path])
+                else:
+                    queue.append((candidate, new_path))
         return paths
 
     # --- Search ---
@@ -597,6 +1511,8 @@ class SimpleGraph:
             return
         if not snapshot_path.exists():
             return
+        if self._same_projection_path(snapshot_path):
+            return self._managed_read(self._projection_binding.path)
         lock_path = _snapshot_lock_path(snapshot_path)
         try:
             with _file_lock(lock_path):
@@ -659,6 +1575,75 @@ class SimpleGraph:
             return
         self._persist_snapshot()
 
+    def _same_projection_path(self, snapshot_path):
+        binding = self._projection_binding
+        return binding is not None and Path(os.path.abspath(snapshot_path)) == binding.path
+
+    def _projection_evidence(self):
+        from memory_server.runtime.runtime_manager import _evidence
+
+        return _evidence(tuple(self._projection_binding.state[0]))
+
+    def _managed_read(self, snapshot_path):
+        try:
+            binding = self._projection_binding
+            with _file_lock(_snapshot_lock_path(snapshot_path), managed=binding):
+                parent = _pin_parent(snapshot_path)
+                try:
+                    fd = os.open(
+                        snapshot_path.name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=parent,
+                    )
+                    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                        if _identity(os.fstat(fh.fileno())) != binding.state[0][snapshot_path]:
+                            raise _projection_failure()
+                        nodes, edges = self._build_state_from(json.load(fh))
+                finally:
+                    parent.close()
+            self._swap_state(nodes, edges)
+        except Exception:
+            raise _projection_failure() from None
+
+    def _snapshot_publication(self, snapshot_path, *, call_scope):
+        return _SnapshotPublication(self, snapshot_path, call_scope).entered()
+
+    def _managed_persist(self, snapshot_path, *, export=False):
+        binding = self._projection_binding
+        snapshot_path = binding.path
+        scope = _PROJECTION_CALL.get()
+        direct = scope is None
+        token = None
+        if direct:
+            if threading.get_ident() != binding.loop_thread:
+                raise _projection_failure()
+            scope = binding.manager._prepare_projection_call(binding, native=False)
+            token = _PROJECTION_CALL.set(scope)
+        try:
+            with self._snapshot_publication(snapshot_path, call_scope=scope) as publication:
+                publication.journal = tuple(self._journal)
+                if not export and not self._full_publish_pending:
+                    fresh = publication.read()
+                    merged = SimpleGraph()
+                    if fresh is not None:
+                        merged._nodes, merged._edges = fresh
+                    for op in publication.journal:
+                        self._replay_op(merged, op)
+                    self._nodes, self._edges = merged._nodes, merged._edges
+                self._write_snapshot(snapshot_path)
+            if direct:
+                receipt = scope.records[-1]
+                binding.manager.refresh_projection_identity(
+                    binding.descriptor, receipt=receipt, proof=scope.proof or receipt.proof
+                )
+        except BaseException:
+            if direct:
+                binding.manager._abort_projection_call(scope)
+            raise
+        finally:
+            if token is not None:
+                _PROJECTION_CALL.reset(token)
+
     def _persist_snapshot(self) -> None:
         """Flush this graph to its snapshot path (locked transaction).
 
@@ -675,6 +1660,13 @@ class SimpleGraph:
         if snapshot_path is None:
             return
 
+        if self._projection_binding is not None:
+            if self._full_publish_pending or self._journal:
+                return self._managed_persist(snapshot_path)
+            if snapshot_path.exists():
+                return self._managed_read(snapshot_path)
+            return
+
         if self._full_publish_pending:
             self._full_publish_pending = False
             try:
@@ -683,7 +1675,7 @@ class SimpleGraph:
                         _cleanup_stale_tmp(snapshot_path)
                         self._write_snapshot(snapshot_path)
             except Exception:
-                logger.exception("Failed to publish graph snapshot to %s", snapshot_path)
+                logger.error("Failed to publish graph snapshot to %s: %s", snapshot_path, "E_GRAPH_BACKEND")
             return
 
         if not self._journal:
@@ -699,10 +1691,11 @@ class SimpleGraph:
                         except _MalformedSnapshotError:
                             # Never clobber a corrupt file with a rebase that
                             # silently drops its content.
-                            logger.exception(
+                            logger.error(
                                 "Refusing to overwrite malformed snapshot %s — "
-                                "keeping file and pending mutations for retry",
+                                "keeping file and pending mutations for retry: %s",
                                 snapshot_path,
+                                "E_GRAPH_BACKEND",
                             )
                             return
                     else:
@@ -725,12 +1718,14 @@ class SimpleGraph:
                     if self._write_snapshot(snapshot_path) is not False:
                         self._journal = []
         except Exception:
-            logger.exception("Failed to persist graph snapshot to %s", snapshot_path)
+            logger.error("Failed to persist graph snapshot to %s: %s", snapshot_path, "E_GRAPH_BACKEND")
 
     def _resync_from_disk(self, snapshot_path: Path) -> None:
         """Refresh in-memory state from disk when nothing local is pending."""
         if not snapshot_path.exists():
             return
+        if self._projection_binding is not None:
+            return self._managed_read(snapshot_path)
         try:
             with _file_lock(_snapshot_lock_path(snapshot_path)):
                 try:
@@ -741,10 +1736,12 @@ class SimpleGraph:
             self._swap_state(nodes, edges)
             self._journal = []
         except Exception:
-            logger.exception("Failed to resync graph state from %s", snapshot_path)
+            logger.error("Failed to resync graph state from %s: %s", snapshot_path, "E_GRAPH_BACKEND")
 
     def _export_snapshot(self, snapshot_path: Path) -> None:
         """Atomic export of the current in-memory state to *snapshot_path*."""
+        if self._same_projection_path(snapshot_path):
+            return self._managed_persist(snapshot_path, export=True)
         try:
             with self._thread_lock:
                 with _file_lock(_snapshot_lock_path(snapshot_path)):
@@ -813,7 +1810,7 @@ class SimpleGraph:
         except _MalformedSnapshotError:
             raise
         except Exception as exc:
-            raise _MalformedSnapshotError(f"{snapshot_path}: {exc}") from exc
+            raise _MalformedSnapshotError(f"{snapshot_path}: E_GRAPH_BACKEND") from exc
 
     @staticmethod
     def _build_state_from(data: Any) -> tuple[dict[str, GraphNode], dict[str, dict[str, list[GraphEdge]]]]:
@@ -938,6 +1935,8 @@ class SimpleGraph:
             _, source_id, target_id = op
             if source_id in graph._edges and target_id in graph._edges[source_id]:
                 graph.delete_edge(source_id, target_id)
+        elif kind == "reconcile_claim_relation":
+            self._apply_claim_relation(graph, op)
 
     def _write_snapshot(self, snapshot_path: Path) -> bool:
         """Atomically write the current state to *snapshot_path*.
@@ -952,6 +1951,11 @@ class SimpleGraph:
             True on success, False on failure (failure is logged, never
             raised — persistence is best-effort for producers).
         """
+        if self._same_projection_path(snapshot_path):
+            publication = _SNAPSHOT_WRITER.get()
+            if publication is None or publication.graph is not self:
+                raise _projection_failure()
+            return publication.write()
         try:
             payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -968,5 +1972,99 @@ class SimpleGraph:
                     pass
             return True
         except Exception:
-            logger.exception("Failed to persist graph snapshot to %s", snapshot_path)
+            logger.error("Failed to persist graph snapshot to %s: %s", snapshot_path, "E_GRAPH_BACKEND")
             return False
+
+    def _read_relation_snapshot_strict(self, parent, path, expected, s, t):
+        error = self.StrictRelationProjectionError
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or _identity(info) != expected:
+                raise error("RELATION_SNAPSHOT_INVALID")
+            if info.st_size > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+            data = stream.read(self._RELATION_BYTES + 1)
+        if len(data) > self._RELATION_BYTES:
+            raise error("RELATION_PROJECTION_LIMIT")
+        try:
+            raw = json.loads(data)
+        except (ValueError, UnicodeError, RecursionError):
+            raise error("RELATION_SNAPSHOT_INVALID") from None
+        return self._relation_raw(raw, s, t)
+
+    def _persist_relation_snapshot_strict(self, op: tuple, *, deadline: float) -> None:
+        error = self.StrictRelationProjectionError
+        _, s, t, k, live, sk, tk = op
+        self._relation_deadline(deadline)
+        self._relation_preflight(s, t)
+        failure = None
+        with self._snapshot_publication(self._snapshot_path, call_scope=_PROJECTION_CALL.get()) as publication:
+            try:
+                self._relation_deadline(deadline)
+                self._relation_preflight(s, t)
+                if publication.before[publication.path][0] == "absent":
+                    if self._nodes or self._edges:
+                        raise error("RELATION_SNAPSHOT_INVALID")
+                    raw = {"nodes": {}, "edges": []}
+                else:
+                    raw = self._read_relation_snapshot_strict(
+                        publication.parent_fd, publication.path, publication.before[publication.path], s, t
+                    )
+                staging = SimpleGraph()
+                try:
+                    staging._nodes, staging._edges = self._build_state_from(raw)
+                except ValueError:
+                    raise error("RELATION_SNAPSHOT_INVALID") from None
+                # Ruling 002: no mutation may start late; once started, settle atomically.
+                self._relation_deadline(deadline)
+                self._replay_op(staging, op)
+                state = staging.to_dict()
+                self._relation_raw(state, s, t)
+                self._verify_relation_tuple(state, s, t, k, live, sk, tk)
+                if self._write_relation_snapshot_strict(publication, state, deadline=deadline) is not True:
+                    raise error("RELATION_PERSISTENCE_FAILED")
+                self._nodes, self._edges = staging._nodes, staging._edges
+                publication.nodes, publication.edges = self._nodes, self._edges
+                publication.journal = ()
+                publication._check_lock()
+                publication._mint()
+            except Exception as exc:
+                # The frozen P context sanitizes exceptions itself. Preserve only a
+                # closed typed code outside it; never carry the original exception.
+                failure = error(exc.args[0] if type(exc) is error else None)
+        if failure:
+            raise failure from None
+
+    def _write_relation_snapshot_strict(self, publication, state, *, deadline: float) -> bool:
+        error = self.StrictRelationProjectionError
+        self._relation_size(state)
+        publication.tmp = f".{publication.path.name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(
+            publication.tmp,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=publication.parent_fd,
+        )
+        publication.snapshot = os.fdopen(fd, "w+b")
+        total = 0
+        for chunk in self._relation_chunks(state):
+            total += len(chunk)
+            if total > self._RELATION_BYTES:
+                raise error("RELATION_PROJECTION_LIMIT")
+            publication.snapshot.write(chunk)
+        publication.snapshot.flush()
+        os.fsync(publication.snapshot.fileno())
+        publication.staged = _identity(os.fstat(publication.snapshot.fileno()))
+        os.replace(
+            publication.tmp, publication.path.name, src_dir_fd=publication.parent_fd, dst_dir_fd=publication.parent_fd
+        )
+        publication.tmp = None
+        os.fsync(publication.parent_fd)
+        # Full logical readback under the same managed writer lock, before mint.
+        observed = self._read_relation_snapshot_strict(
+            publication.parent_fd, publication.path, publication.staged, "", ""
+        )
+        if observed != state:
+            raise error("RELATION_READBACK_FAILED")
+        return True

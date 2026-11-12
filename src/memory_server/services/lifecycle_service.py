@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from storage.repositories import (
     BeliefRepository,
@@ -32,6 +33,18 @@ _INVALIDATING_STATES = {
 }
 
 _VALID_MEMORY_TYPES = {"fact", "belief"}
+
+
+class InvalidLifecycleTransitionError(ValueError):
+    pass
+
+
+class LifecycleMemoryNotFoundError(KeyError):
+    pass
+
+
+class LifecyclePropagationLimitError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -95,9 +108,10 @@ class LifecycleService:
         session: AsyncSession,
         request: LifecycleTransitionRequest,
         graph: SimpleGraph | None = None,
+        *, strict_remote: bool = False,
     ) -> LifecycleTransitionResult:
         """Use the caller's UOW; caller must commit or roll back on any error."""
-        results = await self.transition_many_in_session(session, [request], graph=graph)
+        results = await self.transition_many_in_session(session, [request], graph=graph, strict_remote=strict_remote)
         return results[0]
 
     async def transition_many_in_session(
@@ -105,6 +119,7 @@ class LifecycleService:
         session: AsyncSession,
         requests: list[LifecycleTransitionRequest],
         graph: SimpleGraph | None = None,
+        *, strict_remote: bool = False,
     ) -> list[LifecycleTransitionResult]:
         """Stage a batch; caller owns commit/rollback of the entire UOW.
 
@@ -124,6 +139,7 @@ class LifecycleService:
                     belief_repo=belief_repo,
                     request=request,
                     graph=graph,
+                    strict_remote=strict_remote,
                 )
             )
         return results
@@ -151,17 +167,21 @@ class LifecycleService:
         belief_repo: BeliefRepository,
         request: LifecycleTransitionRequest,
         graph: SimpleGraph | None,
+        *, strict_remote: bool = False,
     ) -> LifecycleTransitionResult:
         memory_type = request.memory_type.strip().lower()
         if memory_type not in _VALID_MEMORY_TYPES:
-            raise ValueError("memory_type must be one of: fact, belief")
-        target_state = self._normalize_state(request.to_state)
+            raise InvalidLifecycleTransitionError("memory_type must be one of: fact, belief")
+        try:
+            target_state = self._normalize_state(request.to_state)
+        except ValueError as exc:
+            raise InvalidLifecycleTransitionError(*exc.args) from None
         if target_state not in {state.value for state in LifecycleState}:
-            raise ValueError(f"Unsupported lifecycle state: {request.to_state}")
+            raise InvalidLifecycleTransitionError(f"Unsupported lifecycle state: {request.to_state}")
 
         memory, repo = await self._load_memory(session, fact_repo, belief_repo, request.memory_id, memory_type)
         if memory is None or repo is None:
-            raise KeyError(f"{memory_type} '{request.memory_id}' not found")
+            raise LifecycleMemoryNotFoundError(f"{memory_type} '{request.memory_id}' not found")
 
         current_state = self._normalize_state(memory.lifecycle_state)
         self._validate_expected_version(memory.version, request.expected_version, request.memory_id)
@@ -192,6 +212,7 @@ class LifecycleService:
                 reason="parent_invalidated",
                 triggered_by=request.triggered_by,
                 graph=graph,
+                strict_remote=strict_remote,
             )
 
         return LifecycleTransitionResult(
@@ -219,23 +240,36 @@ class LifecycleService:
         reason: str,
         triggered_by: str,
         graph: SimpleGraph | None,
+        *, strict_remote: bool = False,
     ) -> list[dict[str, Any]]:
         dependent_ids: list[str] = []
         seen: set[str] = set()
 
-        try:
-            relation_repo = RelationRepository(session)
-            for dependent_id in await relation_repo.get_dependents(
-                target_id=invalidated_id,
-                relation_type="derived_from",
-            ):
+        if strict_remote:
+            rows = (await session.execute(text("""
+                SELECT source_id FROM claim_relations
+                WHERE target_id = :parent_id AND relation_type = 'derived_from'
+                ORDER BY source_id COLLATE BINARY LIMIT 513
+            """), {"parent_id": invalidated_id})).scalars().all()
+            if len(rows) > 512:
+                raise LifecyclePropagationLimitError("Lifecycle propagation limit exceeded")
+            for dependent_id in rows:
                 if dependent_id not in seen:
                     dependent_ids.append(dependent_id)
                     seen.add(dependent_id)
-        except Exception:
-            logger.exception("Lifecycle propagation SQL lookup failed")
+        else:
+            try:
+                relation_repo = RelationRepository(session)
+                for dependent_id in await relation_repo.get_dependents(
+                    target_id=invalidated_id, relation_type="derived_from"
+                ):
+                    if dependent_id not in seen:
+                        dependent_ids.append(dependent_id)
+                        seen.add(dependent_id)
+            except Exception:
+                logger.exception("Lifecycle propagation SQL lookup failed")
 
-        if not dependent_ids and graph is not None:
+        if not strict_remote and not dependent_ids and graph is not None:
             try:
                 edges = graph.search_by_relation("derived_from")
             except Exception:
@@ -330,14 +364,17 @@ class LifecycleService:
         if self._normalize_version(current_version) != self._normalize_version(expected_version):
             raise LifecycleConflictError(
                 f"expected_version mismatch for {memory_id}: "
-                f"expected {expected_version}, got {current_version}"
+                f"expected {expected_version}, got {current_version}",
+                memory_id=memory_id,
+                expected=self._normalize_version(expected_version),
+                actual=self._normalize_version(current_version),
             )
 
     def _validate_transition(self, current_state: str, target_state: str) -> None:
         normalized_current = normalize_lifecycle_state(self._normalize_state(current_state))
         normalized_target = normalize_lifecycle_state(self._normalize_state(target_state))
         if not is_valid_transition(normalized_current, normalized_target):
-            raise ValueError(
+            raise InvalidLifecycleTransitionError(
                 f"Invalid lifecycle transition: {normalized_current} -> {normalized_target}"
             )
 

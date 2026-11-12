@@ -16,15 +16,24 @@ return value is still never the thing the gate trusts.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
+import logging
+import math
 import os
+import re
+import sqlite3
+import stat
+import time
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
+from types import MappingProxyType
 from typing import AbstractSet, Any, Literal, Mapping, Sequence
-from uuid import NAMESPACE_DNS, uuid5
+from uuid import NAMESPACE_DNS, uuid4, uuid5
 
 import prometheus_client
 from sqlalchemy.engine import make_url
@@ -33,6 +42,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from memory_server.evaluation.metrics import metrics_registry
 from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.router.graph_router import GraphRouter
+from memory_server.runtime.runtime import MaintenanceError
 
 _projection_verification_failures = prometheus_client.Counter(
     "cmms_projection_verification_failures_total",
@@ -346,16 +356,13 @@ def _held_verification_handle(label: str):
         _OPEN_VERIFICATION_HANDLES.remove(label)
 
 
-_SHARED_NODE_ID_ROUTER = GraphRouter()
-
-
 def _normalized_node_id(value: object) -> str:
     """The pinned A.3.2 node-id normalization (``GraphRouter._to_node_id``)."""
-    return _SHARED_NODE_ID_ROUTER._to_node_id(str(value))
+    return GraphRouter._to_node_id(str(value))
 
 
 def _prefixed_node_id(prefix: str, value: object) -> str:
-    return _SHARED_NODE_ID_ROUTER._to_node_id(f"{prefix}{value}")
+    return GraphRouter._to_node_id(f"{prefix}{value}")
 
 
 def expected_projection(records: Sequence[CanonicalProjectionRecord]) -> ExpectedProjection:
@@ -1050,3 +1057,562 @@ async def verify_published_projections(
         expected_vector_size=expected_vector_size,
         batch_size=batch_size,
     )
+
+
+# S20A1: owner-only, additive maintenance substrate. Legacy observers stay frozen.
+_OWNED_LIMITS = MappingProxyType({
+    "reserve": 5 * 1024**3, "rows": 2000, "chunk_bytes": 64 * 1024**2,
+    "snapshot": 900, "stage": 900, "verify": 300, "job": 3600,
+    "generations": 2, "retention": 24 * 3600, "journal_bytes": 4096,
+    "overhead": 64 * 1024 * 16})
+_OWNED_TABLES = (("belief", "beliefs"), ("decision", "decisions"), ("fact", "facts"), ("skill", "skills"))
+_OWNED_DIRECTORY = ".projection-rebuild"
+_OWNED_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+@dataclass(frozen=True, init=False)
+class SnapshotRecord:
+    run_id: str
+    profile_id: str
+    snapshot_url: str
+    snapshot_digest: str
+    records: tuple[CanonicalProjectionRecord, ...]
+    content_digest: str
+
+
+class _FrozenProjectionList(list):
+    def _deny(self, *args, **kwargs):
+        raise TypeError("immutable snapshot")
+
+    __setitem__ = __delitem__ = __iadd__ = __imul__ = append = clear = extend = _deny
+    insert = pop = remove = reverse = sort = _deny
+
+
+def _owned_freeze(value):
+    if isinstance(value, dict):
+        return MappingProxyType({key: _owned_freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return _FrozenProjectionList(_owned_freeze(item) for item in value)
+    return value
+
+
+def _owned_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _owned_check_time(end):
+    if time.monotonic() >= end:
+        raise MaintenanceError("E_TIMEOUT")
+
+
+def _owned_free(fd, required=0):
+    space = os.fstatvfs(fd)
+    free = space.f_bavail * space.f_frsize
+    if free < _OWNED_LIMITS["reserve"] + required:
+        raise MaintenanceError("E_STORAGE")
+    return free
+
+
+@contextlib.contextmanager
+def _owned_dir(name, *, parent=None):
+    fd = os.open(name, _OWNED_FLAGS | os.O_DIRECTORY, dir_fd=parent)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise MaintenanceError("E_STORAGE")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _owned_file(fd, name, flags=os.O_RDONLY):
+    opened = os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=fd)
+    info = os.fstat(opened)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+        os.close(opened)
+        raise MaintenanceError("E_STORAGE")
+    return opened
+
+
+def _owned_inventory(fd, name, *, sync=False):
+    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    digest, size = hashlib.sha256(), 0
+    if stat.S_ISDIR(info.st_mode):
+        with _owned_dir(name, parent=fd) as child:
+            for entry in sorted(os.listdir(child)):
+                identity = _owned_inventory(child, entry, sync=sync)
+                digest.update(_owned_json((entry, identity)))
+                size += identity[3]
+            if sync:
+                os.fsync(child)
+    else:
+        with os.fdopen(_owned_file(fd, name), "rb") as stream:
+            while block := stream.read(_OWNED_LIMITS["chunk_bytes"]):
+                digest.update(block)
+                size += len(block)
+            if sync:
+                os.fsync(stream.fileno())
+    return [info.st_dev, info.st_ino, digest.hexdigest(), size]
+
+
+def _owned_sanitize(function, args):
+    try:
+        return True, function(*args)
+    except MaintenanceError as exc:
+        code = exc.code
+    except Exception:
+        code = "E_STORAGE"
+    return False, code
+
+
+async def _owned_native(runtime, custody, end, function, *args):
+    runtime.check_maintenance(custody)
+    _owned_check_time(end)
+    handle = await runtime.submit_native(_owned_sanitize, function, args, kind="projection-rebuild")
+    async with asyncio.timeout_at(end):
+        ok, value = await handle.result()
+        if not await handle.drain(end):
+            raise MaintenanceError("E_TIMEOUT")
+    runtime.check_maintenance(custody)
+    if not ok:
+        raise MaintenanceError(value)
+    return value
+
+
+def _owned_paths(runtime):
+    layout = runtime.layout
+    vector = getattr(layout, "vector", None)
+    paths = {"vector": getattr(vector, "local_path", None), "graph": getattr(layout, "graph_snapshot_path", None)}
+    if getattr(vector, "backend", None) != "lancedb":
+        raise MaintenanceError("E_PROJECTION_UNAVAILABLE")
+    for target, path in paths.items():
+        if not isinstance(path, Path) or path.parent != runtime.root or path.name in {"", ".", ".."}:
+            raise MaintenanceError("E_STORAGE")
+        paths[target] = path.name
+    return paths
+
+
+def _owned_read_records(path, end):
+    records, canonical = [], hashlib.sha256()
+    with sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise MaintenanceError("E_STORAGE")
+        for kind, table in _OWNED_TABLES:
+            cursor = connection.execute(f"SELECT * FROM {table} ORDER BY id")
+            while rows := cursor.fetchmany(_OWNED_LIMITS["rows"]):
+                chunk, chunk_bytes = [], 0
+                for row in rows:
+                    _owned_check_time(end)
+                    payload = dict(row)
+                    for key in ("steps", "tags"):
+                        if isinstance(payload.get(key), str):
+                            payload[key] = json.loads(payload[key])
+                    key = str(payload.pop("id"))
+                    raw = _owned_json((kind, key, payload))
+                    if len(raw) > _OWNED_LIMITS["chunk_bytes"]:
+                        raise MaintenanceError("E_STORAGE")
+                    if chunk_bytes + len(raw) > _OWNED_LIMITS["chunk_bytes"]:
+                        records.extend(chunk)
+                        chunk, chunk_bytes = [], 0
+                    canonical.update(raw)
+                    chunk_bytes += len(raw)
+                    chunk.append(CanonicalProjectionRecord(kind, key, f"index_{kind}", _owned_freeze(payload)))
+                records.extend(chunk)
+    return tuple(records), canonical.hexdigest()
+
+
+def _owned_journal(fd, state):
+    state["free_after"] = _owned_free(fd)
+    raw = _owned_json(state)
+    if len(raw) > _OWNED_LIMITS["journal_bytes"]:
+        raise MaintenanceError("E_STORAGE")
+    name = f"journal-{uuid4().hex}.tmp"
+    opened = _owned_file(fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    with os.fdopen(opened, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(name, "journal.json", src_dir_fd=fd, dst_dir_fd=fd)
+    os.fsync(fd)
+
+
+def _owned_errors(function):
+    @wraps(function)
+    async def boundary(*args, custody, **kwargs):
+        try:
+            return await function(*args, custody=custody, **kwargs)
+        except OSError as exc:
+            code = "E_TIMEOUT" if isinstance(exc, TimeoutError) else "E_STORAGE"
+            logging.getLogger(__name__).warning("owned I/O failure errno=%s", exc.errno)
+        custody._identity[0]._maintenance_state = "blocked"
+        # Raise outside the handler: no path-bearing exception context escapes.
+        raise MaintenanceError(code)
+    return boundary
+
+
+@_owned_errors
+async def snapshot_owned_projection_records(runtime, *, custody) -> SnapshotRecord:
+    runtime.check_maintenance(custody)
+    if runtime._maintenance_state != "active" or runtime.dependencies.sqlite is None:
+        raise MaintenanceError("E_MAINTENANCE_CONFLICT")
+    paths = _owned_paths(runtime)
+    end, run_id = min(custody._identity[-1], time.monotonic() + _OWNED_LIMITS["snapshot"]), uuid4().hex
+    with _owned_dir(runtime.root) as root:
+        old = {target: _owned_inventory(root, name) for target, name in paths.items()}
+        required = math.ceil(1.25 * sum(value[3] for value in old.values())) + _OWNED_LIMITS["overhead"]
+        free = _owned_free(root, required)
+        if _OWNED_DIRECTORY not in os.listdir(root):
+            os.mkdir(_OWNED_DIRECTORY, 0o700, dir_fd=root)
+            os.fsync(root)
+        with _owned_dir(_OWNED_DIRECTORY, parent=root) as parent:
+            if len(os.listdir(parent)) >= _OWNED_LIMITS["generations"]:
+                raise MaintenanceError("E_STORAGE")
+            os.mkdir(run_id, 0o700, dir_fd=parent)
+            os.fsync(parent)
+            with _owned_dir(run_id, parent=parent) as run:
+                os.close(_owned_file(run, "snapshot.db", os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+                state = {"version": 1, "run": run_id,
+                         "profile": hashlib.sha256(runtime.profile_id.encode()).hexdigest(),
+                         "root": [os.fstat(root).st_dev, os.fstat(root).st_ino],
+                         "config": hashlib.sha256(repr(runtime.config).encode()).hexdigest(),
+                         "paths": paths, "old": old, "staged": {},
+                         "targets": [], "phase": "snapshot", "intent": None, "snapshot": None,
+                         "bytes_written": 0, "bytes_verified": 0, "free_before": free, "free_after": free}
+                _owned_journal(run, state)
+    destination = runtime.root / _OWNED_DIRECTORY / run_id / "snapshot.db"
+
+    async def backup():
+        error = None
+        try:
+            async with runtime.dependencies.sqlite.engine.connect() as connection:
+                raw = await connection.get_raw_connection()
+                with sqlite3.connect(destination, check_same_thread=False) as target:
+                    def progress(status, remaining, total):
+                        _owned_check_time(end)
+                        with _owned_dir(runtime.root) as root:
+                            _owned_free(root)
+
+                    pending = runtime.spawn_owned_task(lambda: raw.driver_connection.backup(
+                        target, pages=256, progress=progress), kind="projection-backup-driver")
+                    cancelled = False
+                    while not pending.done():
+                        try:
+                            await asyncio.shield(pending)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    pending.result()
+                    if cancelled:
+                        raise asyncio.CancelledError()
+        except Exception:
+            error = "E_TIMEOUT" if time.monotonic() >= end else "E_STORAGE"
+        if error:
+            raise MaintenanceError(error)
+
+    task = runtime.spawn_owned_task(backup, kind="projection-backup")
+    try:
+        async with asyncio.timeout_at(end):
+            await asyncio.shield(task)
+        runtime.check_maintenance(custody)
+        records, content_digest = await _owned_native(runtime, custody, end, _owned_read_records, destination, end)
+        observed, errors = _ProjectionObservation(), []
+        await _owned_native(runtime, custody, end, _observe_snapshot,
+                            f"sqlite+aiosqlite:///{destination}", observed, errors)
+        if errors:
+            raise MaintenanceError("E_STORAGE")
+        with _owned_dir(destination.parent) as run:
+            identity = _owned_inventory(run, "snapshot.db", sync=True)
+            os.fsync(run)
+            state.update(snapshot=identity, bytes_written=identity[3], bytes_verified=identity[3], phase="captured")
+            _owned_journal(run, state)
+        snapshot = object.__new__(SnapshotRecord)
+        vars(snapshot).update(run_id=run_id, profile_id=runtime.profile_id,
+                              snapshot_url=f"sqlite+aiosqlite:///{destination}", snapshot_digest=identity[2],
+                              records=records, content_digest=content_digest)
+        registry = vars(runtime).setdefault("_projection_snapshots", {})
+        registry[id(snapshot)] = (snapshot, custody, state, time.monotonic())
+        return snapshot
+    except BaseException:
+        runtime._maintenance_state = "blocked"
+        raise
+
+
+def _owned_vector_read(path, records, dimension, end):
+    import lancedb
+    import pyarrow as pa
+
+    from memory_server.providers.lancedb_provider import _payload_error
+
+    expected = {map_projection_record(record).point_id: dict(map_projection_record(record).payload)
+                for record in records if is_eligible(record) and record.record_type in {"fact", "belief"}}
+    database = lancedb.connect(str(path))
+    table = database.open_table("memories")
+    if not {"id", "vector", "_metadata"}.issubset(table.schema.names):
+        raise MaintenanceError("E_VECTOR_BACKEND")
+    vector = table.schema.field("vector").type
+    if not pa.types.is_fixed_size_list(vector) or vector.list_size != dimension:
+        raise MaintenanceError("E_VECTOR_BACKEND")
+    seen, verified = set(), 0
+    with table.search().limit(None).to_batches(batch_size=1) as reader:
+        for batch in reader:
+            _owned_check_time(end)
+            if batch.num_rows > _OWNED_LIMITS["rows"] or batch.nbytes > _OWNED_LIMITS["chunk_bytes"]:
+                raise MaintenanceError("E_STORAGE")
+            verified += batch.nbytes
+            for row in batch.to_pylist():
+                payload, key = json.loads(row["_metadata"]), row["id"]
+                if key in seen or key not in expected or _payload_error(payload) or payload != expected[key]:
+                    raise MaintenanceError("E_VECTOR_BACKEND")
+                if len(row["vector"]) != dimension or any(not math.isfinite(v) for v in row["vector"]):
+                    raise MaintenanceError("E_VECTOR_BACKEND")
+                seen.add(key)
+    if seen != set(expected):
+        raise MaintenanceError("E_VECTOR_BACKEND")
+    return verified
+
+
+def _owned_verify(path, targets, records, dimension, end):
+    expected, verified = expected_projection(records), 0
+    if "vector" in targets:
+        verified += _owned_vector_read(path / "vector", records, dimension, end)
+    if "graph" in targets:
+        observed, errors = _ProjectionObservation(), []
+        _observe_graph_artifact(expected, path / "graph", observed, errors)
+        if errors:
+            raise MaintenanceError("E_GRAPH_BACKEND")
+        verified += (path / "graph").stat().st_size
+    _owned_check_time(end)
+    return verified
+
+
+def _owned_stage(path, records, targets, embedder, dimension, end):
+    if "vector" in targets:
+        import lancedb
+        import pyarrow as pa
+
+        database = lancedb.connect(str(path / "vector"))
+        schema = pa.schema([("id", pa.string()), ("vector", pa.list_(pa.float32(), dimension)),
+                            ("_metadata", pa.string())])
+        table = database.create_table("memories", schema=schema)
+        batch, size = [], 0
+
+        def write():
+            _owned_check_time(end)
+            vectors = embedder.embed_batch([item.vector_text for item in batch])
+            if len(vectors) != len(batch) or any(len(vector) != dimension for vector in vectors):
+                raise MaintenanceError("E_VECTOR_BACKEND")
+            table.add([{"id": item.point_id, "vector": vector, "_metadata": _owned_json(dict(item.payload)).decode()}
+                       for item, vector in zip(batch, vectors)])
+
+        for record in records:
+            if not is_eligible(record) or record.record_type not in {"fact", "belief"}:
+                continue
+            item = map_projection_record(record)
+            item_size = len(_owned_json(dict(item.payload))) + len(item.vector_text.encode()) + dimension * 8
+            if item_size > _OWNED_LIMITS["chunk_bytes"]:
+                raise MaintenanceError("E_STORAGE")
+            if batch and (len(batch) >= _OWNED_LIMITS["rows"] or size + item_size > _OWNED_LIMITS["chunk_bytes"]):
+                write()
+                batch, size = [], 0
+            batch.append(item)
+            size += item_size
+        if batch:
+            write()
+    if "graph" in targets:
+        _owned_check_time(end)
+        build_shared_projection_graph(records).save_snapshot(path / "graph")
+    for parent, directories, files in os.walk(path, followlinks=False):
+        for name in directories:
+            os.chmod(Path(parent) / name, 0o700, follow_symlinks=False)
+        for name in files:
+            os.chmod(Path(parent) / name, 0o600, follow_symlinks=False)
+    _owned_check_time(end)
+
+
+@_owned_errors
+async def rebuild_owned_projections(snapshot, *, custody, targets, allow_network_embedding=False) -> RebuildResult:
+    runtime = custody._identity[0]
+    runtime.check_maintenance(custody)
+    registered = getattr(runtime, "_projection_snapshots", {}).get(id(snapshot))
+    if not registered or registered[0] is not snapshot or registered[1] is not custody:
+        raise MaintenanceError("E_MAINTENANCE_CONFLICT")
+    if not isinstance(targets, frozenset) or not targets or not targets <= {"vector", "graph"}:
+        raise MaintenanceError("E_VALIDATION")
+    if type(allow_network_embedding) is not bool:
+        raise MaintenanceError("E_VALIDATION")
+    if targets & getattr(runtime.layout, "unavailable_projections", frozenset()):
+        raise MaintenanceError("E_PROJECTION_UNAVAILABLE")
+    if any(getattr(runtime.dependencies, target) is not None for target in targets):
+        raise MaintenanceError("E_MAINTENANCE_CONFLICT")
+    embedder = runtime.dependencies.embedder
+    if "vector" in targets:
+        from memory_server.providers import embedding_provider as embedding
+
+        if embedder is None or not callable(getattr(embedder, "embed_batch", None)):
+            raise MaintenanceError("E_PROJECTION_UNAVAILABLE")
+        local = type(embedder) is embedding.MockEmbeddingProvider or (
+            type(embedder) is embedding.SentenceTransformerEmbeddingProvider and embedder._model is not None)
+        if not allow_network_embedding and not local:
+            raise MaintenanceError("E_CAPABILITY_UNAVAILABLE")
+    _, _, state, started = registered
+    if state["phase"] != "captured":
+        raise MaintenanceError("E_MAINTENANCE_CONFLICT")
+    end = min(custody._identity[-1], started + _OWNED_LIMITS["job"])
+    run_path, dimension = runtime.root / _OWNED_DIRECTORY / snapshot.run_id, getattr(runtime.config, "vector_size", 384)
+    try:
+        records, digest = await _owned_native(runtime, custody, end, _owned_read_records, run_path / "snapshot.db", end)
+        if digest != snapshot.content_digest:
+            raise MaintenanceError("E_STORAGE")
+        with _owned_dir(runtime.root) as root, _owned_dir(run_path) as run:
+            if _owned_inventory(run, "snapshot.db") != state["snapshot"]:
+                raise MaintenanceError("E_STORAGE")
+            if any(_owned_inventory(root, name) != state["old"][target] for target, name in state["paths"].items()):
+                raise MaintenanceError("E_STORAGE")
+            _owned_free(root, math.ceil(1.25 * sum(item[3] for item in state["old"].values()))
+                        + _OWNED_LIMITS["overhead"])
+            os.mkdir("stage", 0o700, dir_fd=run)
+            os.fsync(run)
+            state.update(targets=sorted(targets), phase="stage")
+            _owned_journal(run, state)
+        stage_end = min(end, time.monotonic() + _OWNED_LIMITS["stage"])
+        await _owned_native(runtime, custody, stage_end, _owned_stage, run_path / "stage", records,
+                            targets, embedder, dimension, stage_end)
+        verify_end = min(end, time.monotonic() + _OWNED_LIMITS["verify"])
+        verified = await _owned_native(runtime, custody, verify_end, _owned_verify, run_path / "stage",
+                                      targets, records, dimension, verify_end)
+        with _owned_dir(runtime.root) as root, _owned_dir(run_path) as run:
+            with _owned_dir("stage", parent=run) as stage:
+                state["staged"] = {target: _owned_inventory(stage, target, sync=True) for target in targets}
+                state.update(phase="verified", bytes_verified=state["bytes_verified"] + verified,
+                             bytes_written=state["bytes_written"] + sum(item[3] for item in state["staged"].values()))
+                _owned_journal(run, state)
+                for target in sorted(targets):
+                    runtime.check_maintenance(custody)
+                    _owned_check_time(end)
+                    name = state["paths"][target]
+                    if _owned_inventory(root, name) != state["old"][target]:
+                        raise MaintenanceError("E_STORAGE")
+                    state.update(phase="publish", intent=target)
+                    _owned_journal(run, state)
+                    os.rename(name, f"old-{target}", src_dir_fd=root, dst_dir_fd=run)
+                    os.fsync(root)
+                    os.fsync(run)
+                    os.rename(target, name, src_dir_fd=stage, dst_dir_fd=root)
+                    os.fsync(stage)
+                    os.fsync(root)
+                    if _owned_inventory(root, name) != state["staged"][target]:
+                        raise MaintenanceError("E_STORAGE")
+                    state.update(intent=None)
+                    _owned_journal(run, state)
+            state.update(phase="published")
+            _owned_journal(run, state)
+        runtime._maintenance_state = "blocked"
+        expected = expected_projection(records)
+        nodes_digest, edges_digest = expected_graph_digests(expected)
+        return RebuildResult(expected.eligible_counts, id_digest(expected.vector_ids), nodes_digest, edges_digest, 1)
+    except BaseException:
+        runtime._maintenance_state = "blocked"
+        raise
+
+
+def _owned_load_journal(fd, runtime, run_id, root):
+    opened = _owned_file(fd, "journal.json")
+    with os.fdopen(opened, "rb") as stream:
+        raw = stream.read(_OWNED_LIMITS["journal_bytes"] + 1)
+    if len(raw) > _OWNED_LIMITS["journal_bytes"]:
+        raise MaintenanceError("E_STORAGE")
+
+    def unique(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise MaintenanceError("E_STORAGE")
+        return result
+
+    state = json.loads(raw, object_pairs_hook=unique)
+    keys = {"version", "run", "profile", "root", "config", "paths", "old", "staged", "targets", "phase",
+            "intent", "snapshot", "bytes_written", "bytes_verified", "free_before", "free_after"}
+    if (not isinstance(state, dict) or set(state) != keys or type(state["version"]) is not int
+        or state["version"] != 1 or state["run"] != run_id
+        or state["profile"] != hashlib.sha256(runtime.profile_id.encode()).hexdigest()
+        or state["config"] != hashlib.sha256(repr(runtime.config).encode()).hexdigest()
+        or state["root"] != [os.fstat(root).st_dev, os.fstat(root).st_ino]
+        or state["paths"] != _owned_paths(runtime)
+        or state["phase"] not in {"snapshot", "captured", "stage", "verified", "publish", "published",
+                                  "rollback", "reconciled"}
+        or not isinstance(state["targets"], list) or state["targets"] != sorted(set(state["targets"]))
+        or not set(state["targets"]) <= {"vector", "graph"}
+        or state["intent"] not in [None, *state["targets"]]
+        or any(type(state[key]) is not int or state[key] < 0
+               for key in ("bytes_written", "bytes_verified", "free_before", "free_after"))):
+        raise MaintenanceError("E_STORAGE")
+    if (not isinstance(state["old"], dict) or set(state["old"]) != {"vector", "graph"}
+        or not isinstance(state["staged"], dict) or not set(state["staged"]) <= {"vector", "graph"}):
+        raise MaintenanceError("E_STORAGE")
+    snapshots = ([] if state["snapshot"] is None and state["phase"] in {"snapshot", "reconciled"}
+                 else [state["snapshot"]])
+    for identity in [*state["old"].values(), *state["staged"].values(), *snapshots]:
+        if (not isinstance(identity, list) or len(identity) != 4
+            or any(type(identity[index]) is not int or identity[index] < 0 for index in (0, 1, 3))
+            or not isinstance(identity[2], str) or not re.fullmatch("[0-9a-f]{64}", identity[2])):
+            raise MaintenanceError("E_STORAGE")
+    return state
+
+
+def _reconcile_owned_projections(runtime):
+    """Called under the newly acquired EX, before the first provider recipe."""
+    error = None
+    try:
+        if not os.path.lexists(runtime.root / _OWNED_DIRECTORY):
+            return
+        if runtime.state != "STARTING" or runtime.lock is None or runtime.lock._fh is None:
+            raise MaintenanceError("E_RUNTIME_NOT_READY")
+        if any(getattr(runtime.dependencies, target) is not None for target in ("vector", "graph")):
+            raise MaintenanceError("E_STORAGE")
+        end = runtime._clock() + _OWNED_LIMITS["verify"]
+        with _owned_dir(runtime.root) as root, _owned_dir(_OWNED_DIRECTORY, parent=root) as parent:
+            generations = os.listdir(parent)
+            if len(generations) > _OWNED_LIMITS["generations"]:
+                raise MaintenanceError("E_STORAGE")
+            for run_id in sorted(generations):
+                _owned_check_time(end)
+                if len(run_id) != 32 or any(char not in "0123456789abcdef" for char in run_id):
+                    raise MaintenanceError("E_STORAGE")
+                with _owned_dir(run_id, parent=parent) as run:
+                    state = _owned_load_journal(run, runtime, run_id, root)
+                    for target, name in state["paths"].items():
+                        _owned_check_time(end)
+                        old = state["old"][target]
+                        quarantine = f"old-{target}"
+                        live = _owned_inventory(root, name) if name in os.listdir(root) else None
+                        if quarantine not in os.listdir(run):
+                            if live != old:
+                                raise MaintenanceError("E_STORAGE")
+                            continue
+                        if target not in state["targets"] or _owned_inventory(run, quarantine) != old:
+                            raise MaintenanceError("E_STORAGE")
+                        state.update(phase="rollback", intent=target)
+                        _owned_journal(run, state)
+                        with _owned_dir("stage", parent=run) as stage:
+                            if live is not None:
+                                if live != state["staged"].get(target) or target in os.listdir(stage):
+                                    raise MaintenanceError("E_STORAGE")
+                                os.rename(name, target, src_dir_fd=root, dst_dir_fd=stage)
+                                os.fsync(root)
+                                os.fsync(stage)
+                            elif target not in os.listdir(stage):
+                                raise MaintenanceError("E_STORAGE")
+                            os.rename(quarantine, name, src_dir_fd=run, dst_dir_fd=root)
+                            os.fsync(run)
+                            os.fsync(root)
+                            if _owned_inventory(root, name) != old:
+                                raise MaintenanceError("E_STORAGE")
+                        state.update(intent=None)
+                        _owned_journal(run, state)
+                    state.update(phase="reconciled", intent=None)
+                    _owned_journal(run, state)
+    except MaintenanceError as exc:
+        error = exc.code
+    except Exception:
+        error = "E_STORAGE"
+    if error:
+        raise MaintenanceError(error)

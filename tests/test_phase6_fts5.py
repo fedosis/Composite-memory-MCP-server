@@ -11,6 +11,7 @@ Tests cover:
 import pytest
 
 from memory_server.models import Fact
+from memory_server.providers.graph_provider import SimpleGraph
 from memory_server.providers.sqlite_provider import SQLiteProvider
 from memory_server.router.ranking import RankMerger, RankResult
 
@@ -382,6 +383,7 @@ class TestFTS5RouteIntegration:
             vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
+            graph=SimpleGraph(),
         )
         router.fts_provider = provider
 
@@ -406,6 +408,7 @@ class TestFTS5RouteIntegration:
             vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
+            graph=SimpleGraph(),
         )
         router.fts_provider = provider
 
@@ -429,6 +432,7 @@ class TestFTS5RouteIntegration:
             vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
+            graph=SimpleGraph(),
         )
         router.fts_provider = provider
 
@@ -454,6 +458,7 @@ class TestFTS5RouteIntegration:
             vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
+            graph=SimpleGraph(),
         )
         router.fts_provider = provider
 
@@ -476,7 +481,7 @@ class TestFTS5RouteIntegration:
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
         embedder = MockEmbeddingProvider(vector_size=384)
 
-        router = HybridRouter(vector_provider=qdrant, embedder=embedder)
+        router = HybridRouter(vector_provider=qdrant, embedder=embedder, graph=SimpleGraph())
         router.fts_provider = provider
 
         result = await router.route("")
@@ -492,7 +497,7 @@ class TestFTS5RouteIntegration:
         qdrant = QdrantProvider(location=":memory:", prefer_grpc=False)
         embedder = MockEmbeddingProvider(vector_size=384)
 
-        router = HybridRouter(vector_provider=qdrant, embedder=embedder)
+        router = HybridRouter(vector_provider=qdrant, embedder=embedder, graph=SimpleGraph())
         router.fts_provider = provider
 
         result = await router.route("xyznonexistentquerythatmatchesnothing12345!")
@@ -514,6 +519,7 @@ class TestFTS5RouteIntegration:
             vector_provider=qdrant,
             embedder=embedder,
             rules=rules,
+            graph=SimpleGraph(),
         )
         router.fts_provider = provider
 

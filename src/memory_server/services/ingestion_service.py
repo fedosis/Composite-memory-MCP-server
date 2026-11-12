@@ -11,8 +11,9 @@ main transaction, using a separate session for belief CRUD.
 import asyncio
 import logging
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -30,6 +31,7 @@ from storage.repositories import (
     RelationRepository,
     SkillRepository,
 )
+from storage.repositories.lifecycle_repo import normalize_version
 
 from memory_server.extractors.belief_extractor import BeliefExtractor
 from memory_server.extractors.decision_extractor import DecisionExtractor
@@ -46,6 +48,9 @@ from memory_server.models import (
     Skill,
     VerificationStatus,
 )
+
+if TYPE_CHECKING:
+    from memory_server.application.remote_ingestion import LearnPlan
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +277,17 @@ async def reinforce_belief_item(
     return fresh_belief, fresh_receipt
 
 
+def _validate_remember_inputs(subject, predicate, object, confidence) -> None:
+    if not subject:
+        raise ValueError("'subject' is required and cannot be empty")
+    if not predicate:
+        raise ValueError("'predicate' is required and cannot be empty")
+    if not object:
+        raise ValueError("'object' is required and cannot be empty")
+    if confidence < 0.0 or confidence > 1.0:
+        raise ValueError(f"'confidence' must be between 0.0 and 1.0, got {confidence}")
+
+
 class MemoryIngestionService:
     """Transactional service for memory ingestion (remember + learn).
 
@@ -329,123 +345,128 @@ class MemoryIngestionService:
             ValueError: If subject, predicate, or object are empty, or
                         confidence is outside [0, 1].
         """
-        if not subject:
-            raise ValueError("'subject' is required and cannot be empty")
-        if not predicate:
-            raise ValueError("'predicate' is required and cannot be empty")
-        if not object:
-            raise ValueError("'object' is required and cannot be empty")
-        if confidence < 0.0 or confidence > 1.0:
-            raise ValueError(
-                f"'confidence' must be between 0.0 and 1.0, got {confidence}"
-            )
-
+        _validate_remember_inputs(subject, predicate, object, confidence)
         async with self._session_factory() as session:
             async with session.begin():
-                now = datetime.now(timezone.utc)
-                fact_id = str(uuid4())
-
-                fact_repo = FactRepository(session)
-                existing = await fact_repo.find_existing(subject, predicate, object)
-                if existing is not None:
-                    stored_fact, stored_receipt = await reinforce_memory_item(
-                        session,
-                        memory_type="fact",
-                        item_id=existing.id,
-                        new_confidence=confidence,
-                        source=source,
-                        previous_confidence=existing.confidence,
-                    )
-                    return {"receipt": stored_receipt, "fact": stored_fact}
-
-                # Create fact. The savepoint makes a concurrent duplicate
-                # recoverable without aborting the caller's outer UoW.
-                fact = Fact(
-                    id=fact_id,
+                return await self.remember_in_session(
+                    session,
                     subject=subject,
                     predicate=predicate,
                     object=object,
-                    dedup_key=fact_dedup_key(subject, predicate, object),
                     confidence=confidence,
                     source=source,
-                    created_at=now,
-                )
-                try:
-                    async with session.begin_nested():
-                        stored_fact = await fact_repo.create(fact)
-                except IntegrityError:
-                    keeper = await fact_repo.find_existing(subject, predicate, object)
-                    if keeper is None:
-                        raise
-                    stored_fact, stored_receipt = await reinforce_memory_item(
-                        session,
-                        memory_type="fact",
-                        item_id=keeper.id,
-                        new_confidence=confidence,
-                        source=source,
-                        previous_confidence=keeper.confidence,
-                    )
-                    return {"receipt": stored_receipt, "fact": stored_fact}
-
-                # Create receipt
-                receipt_history: list[dict[str, Any]] = []
-                if metadata:
-                    receipt_history.append(
-                        {"metadata": metadata, "timestamp": now.isoformat()}
-                    )
-                receipt = MemoryReceipt(
-                    id=fact_id,
-                    memory_type="fact",
-                    source=source,
-                    created_by="user",
-                    timestamp=now,
-                    confidence=confidence,
-                    verification_status=VerificationStatus.CANDIDATE,
-                    history=receipt_history,
-                )
-                receipt_repo = ReceiptRepository(session)
-                stored_receipt = await receipt_repo.create(receipt)
-
-                relation_entries: list[dict[str, Any]] = []
-                evidence_metadata = metadata.get("evidence") if metadata else None
-                derived_from = (
-                    evidence_metadata.get("derived_from")
-                    if isinstance(evidence_metadata, dict)
-                    else None
-                )
-                if derived_from:
-                    relation_entries = [
-                        {
-                            "source_id": fact_id,
-                            "target_id": parent_id,
-                            "relation_type": "derived_from",
-                        }
-                        for parent_id in derived_from
-                    ]
-                    relation_repo = RelationRepository(session)
-                    for entry in relation_entries:
-                        await relation_repo.create(
-                            source_id=entry["source_id"],
-                            target_id=entry["target_id"],
-                            relation_type=entry["relation_type"],
-                        )
-
-                # Write outbox entry (same transaction!)
-                outbox_repo = OutboxRepository(session)
-                await outbox_repo.add_entry(
-                    record_type="fact",
-                    record_id=fact_id,
-                    operation="index_fact",
-                    payload={
-                        "subject": subject,
-                        "predicate": predicate,
-                        "object": object,
-                        "source": source,
-                    },
+                    metadata=metadata,
                 )
 
-            # Transaction committed here by session.begin() context manager
+    async def remember_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        subject: str,
+        predicate: str,
+        object: str,
+        confidence: float = 1.0,
+        source: str = "user",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict:
+        """Write using only the caller's session, without commit or external effects."""
+        _validate_remember_inputs(subject, predicate, object, confidence)
+        now = datetime.now(timezone.utc)
+        fact_id = str(uuid4())
+
+        fact_repo = FactRepository(session)
+        existing = await fact_repo.find_existing(subject, predicate, object)
+        if existing is not None:
+            stored_fact, stored_receipt = await reinforce_memory_item(
+                session,
+                memory_type="fact",
+                item_id=existing.id,
+                new_confidence=confidence,
+                source=source,
+                previous_confidence=existing.confidence,
+            )
             return {"receipt": stored_receipt, "fact": stored_fact}
+
+        # Create fact. The savepoint makes a concurrent duplicate
+        # recoverable without aborting the caller's outer UoW.
+        fact = Fact(
+            id=fact_id,
+            subject=subject,
+            predicate=predicate,
+            object=object,
+            dedup_key=fact_dedup_key(subject, predicate, object),
+            confidence=confidence,
+            source=source,
+            created_at=now,
+        )
+        try:
+            async with session.begin_nested():
+                stored_fact = await fact_repo.create(fact)
+        except IntegrityError:
+            keeper = await fact_repo.find_existing(subject, predicate, object)
+            if keeper is None:
+                raise
+            stored_fact, stored_receipt = await reinforce_memory_item(
+                session,
+                memory_type="fact",
+                item_id=keeper.id,
+                new_confidence=confidence,
+                source=source,
+                previous_confidence=keeper.confidence,
+            )
+            return {"receipt": stored_receipt, "fact": stored_fact}
+
+        # Create receipt
+        receipt_history: list[dict[str, Any]] = []
+        if metadata:
+            receipt_history.append({"metadata": metadata, "timestamp": now.isoformat()})
+        receipt = MemoryReceipt(
+            id=fact_id,
+            memory_type="fact",
+            source=source,
+            created_by="user",
+            timestamp=now,
+            confidence=confidence,
+            verification_status=VerificationStatus.CANDIDATE,
+            history=receipt_history,
+        )
+        receipt_repo = ReceiptRepository(session)
+        stored_receipt = await receipt_repo.create(receipt)
+
+        relation_entries: list[dict[str, Any]] = []
+        evidence_metadata = metadata.get("evidence") if metadata else None
+        derived_from = evidence_metadata.get("derived_from") if isinstance(evidence_metadata, dict) else None
+        if derived_from:
+            relation_entries = [
+                {
+                    "source_id": fact_id,
+                    "target_id": parent_id,
+                    "relation_type": "derived_from",
+                }
+                for parent_id in derived_from
+            ]
+            relation_repo = RelationRepository(session)
+            for entry in relation_entries:
+                await relation_repo.create(
+                    source_id=entry["source_id"],
+                    target_id=entry["target_id"],
+                    relation_type=entry["relation_type"],
+                )
+
+        # Write outbox entry (same transaction!)
+        outbox_repo = OutboxRepository(session)
+        await outbox_repo.add_entry(
+            record_type="fact",
+            record_id=fact_id,
+            operation="index_fact",
+            payload={
+                "subject": subject,
+                "predicate": predicate,
+                "object": object,
+                "source": source,
+            },
+        )
+        return {"receipt": stored_receipt, "fact": stored_fact}
 
     async def learn(
         self,
@@ -1092,3 +1113,365 @@ def _find_exact_match(beliefs: list, proposition: str):
         if b.proposition.strip().lower() == norm and b.lifecycle_state == "active":
             return b
     return None
+
+
+@dataclass
+class RemoteLearnWrite:
+    """Raw persisted models and IDs produced by one remote learn call.
+
+    Lists contain only rows touched by this invocation; no historical rows are queried.
+    """
+
+    facts: list[Fact]
+    decisions: list[Decision]
+    skills: list[Skill]
+    beliefs: list[Belief]
+    receipts: list[MemoryReceipt]
+    outbox_ids: list[str]
+    reinforced_ids: list[str]
+
+
+async def _outbox(
+    session: AsyncSession, ids: list[str], kind: str, record_id: str, operation: str, payload: dict[str, Any]
+) -> None:
+    """Record the exact outbox row emitted by this UoW."""
+    entry = await OutboxRepository(session).add_entry(
+        record_type=kind, record_id=record_id, operation=operation, payload=payload
+    )
+    ids.append(str(entry.id))
+
+
+class FactVersionError(Exception):
+    """A fact CAS failure independent of the remote error adapter."""
+
+    code: str
+    details: dict[str, Any]
+
+    def __init__(self, code: str, *, details: dict[str, Any]) -> None:
+        self.code = code
+        self.details = details
+        super().__init__(code)
+
+
+def check_fact_version(row: Fact, expected_versions: Mapping[str, int]) -> None:
+    """Reject missing or stale remote preconditions before a write."""
+    item_id = str(row.id)
+    if item_id not in expected_versions:
+        raise FactVersionError("E_PRECONDITION_REQUIRED", details={"id": item_id})
+    actual = normalize_version(row.version)
+    expected = expected_versions[item_id]
+    if actual != expected:
+        raise FactVersionError("E_VERSION_CONFLICT", details={"expected": expected, "actual": actual})
+
+
+async def _checked_fact(session: AsyncSession, s: str, p: str, o: str, expected: Mapping[str, int]) -> Fact | None:
+    """Find an active duplicate and apply its fact-version precondition."""
+    row = await FactRepository(session).find_existing(s, p, o)
+    if row is not None:
+        check_fact_version(row, expected)
+    return row
+
+
+def _belief_confidence(old: float, old_version: int, incoming: float) -> float:
+    """Apply the legacy weighted-average reinforcement formula."""
+    return max(0.0, min(1.0, (old * old_version + incoming) / (old_version + 1)))
+
+
+def _reinforcement_history(receipt: MemoryReceipt | None, confidence: float, source: str) -> list[dict[str, Any]]:
+    """Append a small remote reinforcement event to an existing receipt."""
+    history = list(receipt.history) if receipt is not None else []
+    history.append({"kind": "reinforce", "confidence": confidence, "source": source})
+    return history
+
+
+async def _create_evidence(
+    session: AsyncSession, belief_id: str, source_ids: list[str], weight: float, contributor: str
+) -> None:
+    """Persist all fact links for one belief in the caller transaction."""
+    repo = EvidenceRepository(session)
+    for source_id in source_ids:
+        await repo.create(
+            Evidence(
+                belief_id=belief_id, source_type="fact", source_id=source_id, weight=weight, contributor=contributor
+            )
+        )
+
+
+async def _receipt(
+    session: AsyncSession,
+    item_id: str,
+    kind: str,
+    source: str,
+    confidence: float,
+    now: datetime,
+    admission: dict[str, Any] | None = None,
+) -> MemoryReceipt:
+    """Create the common candidate receipt without committing the session."""
+    return await ReceiptRepository(session).create(
+        MemoryReceipt(
+            id=item_id,
+            memory_type=kind,
+            history=[{"metadata": {"admission": admission}, "timestamp": now.isoformat()}] if admission else [],
+            source=source,
+            created_by="learn",
+            timestamp=now,
+            confidence=confidence,
+            verification_status=VerificationStatus.CANDIDATE,
+        )
+    )
+
+
+async def _remote_fact(
+    session: AsyncSession,
+    candidate: Mapping[str, Any],
+    source: str,
+    now: datetime,
+    expected: Mapping[str, int],
+    outbox: list[str],
+    reinforced: list[str],
+) -> tuple[Fact, MemoryReceipt]:
+    """Persist one admitted fact, including the race-safe CAS recovery path."""
+    s, p, o = (candidate.get(k, "") for k in ("subject", "predicate", "object"))
+    confidence = _safe_confidence(candidate.get("confidence", 0.5))
+    repo = FactRepository(session)
+    existing = await _checked_fact(session, s, p, o, expected)
+    if existing is not None:
+        item, receipt = await reinforce_memory_item(
+            session,
+            memory_type="fact",
+            item_id=existing.id,
+            new_confidence=confidence,
+            source=source,
+            previous_confidence=existing.confidence,
+        )
+        reinforced.append(str(item.id))
+        return item, receipt
+    fact = Fact(
+        id=str(uuid4()),
+        subject=s,
+        predicate=p,
+        object=o,
+        dedup_key=fact_dedup_key(s, p, o),
+        confidence=confidence,
+        source=source,
+        creator=source,
+        created_at=now,
+    )
+    try:
+        async with session.begin_nested():
+            item = await repo.create(fact)
+    except IntegrityError:
+        keeper = await repo.find_existing(s, p, o)
+        if keeper is None:
+            raise
+        check_fact_version(keeper, expected)
+        item, receipt = await reinforce_memory_item(
+            session,
+            memory_type="fact",
+            item_id=keeper.id,
+            new_confidence=confidence,
+            source=source,
+            previous_confidence=keeper.confidence,
+        )
+        reinforced.append(str(item.id))
+        return item, receipt
+    receipt = await _receipt(session, item.id, "fact", source, confidence, now, candidate.get("_admission"))
+    await _outbox(
+        session, outbox, "fact", item.id, "index_fact", {"subject": s, "predicate": p, "object": o, "source": source}
+    )
+    return item, receipt
+
+
+async def _remote_decision(
+    session: AsyncSession, candidate: Mapping[str, Any], source: str, now: datetime, outbox: list[str]
+) -> tuple[Decision, MemoryReceipt] | None:
+    """Persist a non-duplicate decision and skip concurrent duplicate losers."""
+    context, choice = (candidate.get("context") or "").strip(), candidate.get("choice") or ""
+    repo = DecisionRepository(session)
+    if await repo.find_existing(context=context, choice=choice) is not None:
+        return None
+    item = Decision(
+        id=str(uuid4()),
+        context=context,
+        choice=choice,
+        rejected_alternatives=candidate.get("alternatives", []),
+        reason=candidate.get("reason", ""),
+        source=source,
+        creator=source,
+        confidence=_safe_confidence(candidate.get("confidence", 0.5)),
+        created_at=now,
+    )
+    try:
+        async with session.begin_nested():
+            item = await repo.create(item)
+    except IntegrityError:
+        return None
+    receipt = await _receipt(session, item.id, "decision", source, item.confidence, now, candidate.get("_admission"))
+    await _outbox(
+        session,
+        outbox,
+        "decision",
+        item.id,
+        "index_decision",
+        {"choice": choice, "reason": candidate.get("reason", ""), "context": context},
+    )
+    return item, receipt
+
+
+async def _remote_skill(
+    session: AsyncSession, candidate: Mapping[str, Any], source: str, now: datetime, outbox: list[str]
+) -> tuple[Skill, MemoryReceipt] | None:
+    """Validate the admitted skill before constructing its constrained model."""
+    purpose, steps = _valid_skill_purpose(candidate.get("purpose")), _valid_skill_steps(candidate.get("steps"))
+    if not purpose or not steps:
+        return None
+    item = Skill(
+        id=str(uuid4()),
+        name="",
+        version="1.0.0",
+        purpose=purpose,
+        steps=steps,
+        constraints=_valid_skill_steps(candidate.get("constraints")),
+        validation=[],
+        success_rate=0.0,
+        source=source,
+        creator=source,
+        confidence=_safe_confidence(candidate.get("confidence", 0.5)),
+        created_at=now,
+    )
+    item = await SkillRepository(session).create(item)
+    receipt = await _receipt(session, item.id, "skill", source, item.confidence, now, candidate.get("_admission"))
+    await _outbox(session, outbox, "skill", item.id, "index_skill", {"purpose": purpose, "steps": steps})
+    return item, receipt
+
+
+async def _extract_and_store_beliefs_in_session(
+    session: AsyncSession,
+    *,
+    text: str,
+    source: str,
+    min_belief_confidence: float,
+    created_facts: list[Fact],
+    max_active_beliefs: int | None = None,
+    outbox_ids: list[str] | None = None,
+) -> list[tuple[Belief, MemoryReceipt | None, bool]]:
+    """Run belief extraction and CRUD inside the caller's transaction only."""
+    from memory_server.settings import get_settings
+
+    if max_active_beliefs is None:
+        max_active_beliefs = get_settings().max_active_beliefs
+    belief_repo = BeliefRepository(session)
+    if len(await belief_repo.search(lifecycle_state="active", limit=0)) >= max_active_beliefs:
+        return []
+    outbox_ids = outbox_ids if outbox_ids is not None else []
+    links = {f"{f.subject} {f.predicate} {f.object}": f.id for f in created_facts}
+    receipt_repo = ReceiptRepository(session)
+    result: list[tuple[Belief, MemoryReceipt | None, bool]] = []
+    for eb in await BeliefExtractor(llm_extractor=None).extract(text):
+        if eb.confidence < min_belief_confidence:
+            continue
+        matches = await belief_repo.search(proposition=eb.proposition, lifecycle_state="active", limit=100)
+        match = _find_exact_match(matches, eb.proposition)
+        source_ids = [links[r] for r in eb.source_refs if r in links]
+        if match is None:
+            belief = await belief_repo.create(
+                Belief(
+                    proposition=eb.proposition, confidence=eb.confidence, source=source, tags=eb.tags, creator=source
+                )
+            )
+            await _create_evidence(session, belief.id, source_ids, eb.confidence, source)
+            receipt = await _receipt(session, belief.id, "belief", source, eb.confidence, datetime.now(timezone.utc))
+            await _outbox(
+                session,
+                outbox_ids,
+                "belief",
+                belief.id,
+                "index_belief",
+                {
+                    "proposition": belief.proposition,
+                    "confidence": belief.confidence,
+                    "tags": belief.tags,
+                    "source": source,
+                },
+            )
+            result.append((belief, receipt, False))
+            continue
+        confidence = _belief_confidence(match.confidence, match.version, eb.confidence)
+        await belief_repo.update_confidence(match.id, confidence)
+        await belief_repo.update_reinforced_at(match.id)
+        await belief_repo.increment_version(match.id)
+        receipt = await receipt_repo.get(match.id)
+        history = _reinforcement_history(receipt, confidence, source)
+        if receipt is None:
+            receipt = await _receipt(session, match.id, "belief", source, confidence, datetime.now(timezone.utc))
+        receipt = await receipt_repo.update(
+            match.id, confidence=confidence, source=source, updated_at=datetime.now(timezone.utc), history=history
+        )
+        await _create_evidence(session, match.id, source_ids, eb.confidence, source)
+        await _outbox(
+            session,
+            outbox_ids,
+            "belief",
+            match.id,
+            "index_belief",
+            {"proposition": match.proposition, "confidence": confidence, "tags": match.tags, "source": source},
+        )
+        fresh = await belief_repo.get_by_id(match.id)
+        if fresh is None or receipt is None:
+            raise RuntimeError(f"belief reinforcement reload failed: {match.id}")
+        result.append((fresh, receipt, True))
+    return result
+
+
+async def remote_learn_in_session(
+    session: AsyncSession,
+    *,
+    text: str,
+    source: str,
+    admitted: "LearnPlan",
+    extract_beliefs: bool,
+    min_belief_confidence: float,
+    expected_versions: Mapping[str, int],
+    max_active_beliefs: int | None = None,
+) -> RemoteLearnWrite:
+    """Store admitted candidates and optional beliefs on the injected session."""
+    now = datetime.now(timezone.utc)
+    facts: list[Fact] = []
+    decisions: list[Decision] = []
+    skills: list[Skill] = []
+    beliefs: list[Belief] = []
+    receipts: list[MemoryReceipt] = []
+    outbox_ids: list[str] = []
+    reinforced_ids: list[str] = []
+    for candidate in admitted.facts:
+        item, receipt = await _remote_fact(
+            session, candidate, source, now, expected_versions, outbox_ids, reinforced_ids
+        )
+        facts.append(item)
+        receipts.append(receipt)
+    for candidate in admitted.decisions:
+        stored = await _remote_decision(session, candidate, source, now, outbox_ids)
+        if stored is not None:
+            item, receipt = stored
+            decisions.append(item)
+            receipts.append(receipt)
+    for candidate in admitted.skills:
+        stored = await _remote_skill(session, candidate, source, now, outbox_ids)
+        if stored is not None:
+            item, receipt = stored
+            skills.append(item)
+            receipts.append(receipt)
+    if extract_beliefs:
+        for belief, receipt, _ in await _extract_and_store_beliefs_in_session(
+            session,
+            text=text,
+            source=source,
+            min_belief_confidence=min_belief_confidence,
+            created_facts=facts,
+            max_active_beliefs=max_active_beliefs,
+            outbox_ids=outbox_ids,
+        ):
+            beliefs.append(belief)
+            if receipt is not None:
+                receipts.append(receipt)
+    return RemoteLearnWrite(facts, decisions, skills, beliefs, receipts, outbox_ids, reinforced_ids)

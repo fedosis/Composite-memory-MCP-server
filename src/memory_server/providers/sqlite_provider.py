@@ -8,11 +8,17 @@ v0.6: Refactored to delegate to the new storage layer
 duplicate inline ORM models.
 """
 
+import asyncio
 import json
+import re
+import sqlite3
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional, TypeVar
+from time import monotonic
+from typing import Any, Awaitable, Callable, Literal, Optional, TypeVar
 
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from storage.base import Base
 from storage.models.decision import DecisionORM
@@ -43,6 +49,126 @@ from memory_server.models import (
 T = TypeVar("T")
 
 
+RESOLVER_INACTIVE_PER_TRIPLE = 8
+Triple = tuple[str, str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class FactRow:
+    id: str
+    subject: str
+    predicate: str
+    object: str
+    lifecycle_state: str
+    confidence: float
+    created_at: datetime
+
+
+DiagnosticTable = Literal["facts", "beliefs", "decisions", "skills", "receipts"]
+DiagnosticCheck = Literal[
+    "invalid_lifecycle",
+    "receipt_state",
+    "confidence",
+    "confidence_low",
+    "consistency",
+    "receipt_missing",
+    "receipt_type",
+    "receipt_orphan",
+    "relation_endpoints",
+    "relation_type",
+]
+_DIAGNOSTIC_TABLES = {"facts", "beliefs", "decisions", "skills", "receipts"}
+_CANONICAL_TABLES = {"facts": "fact", "beliefs": "belief", "decisions": "decision", "skills": "skill"}
+_LIFECYCLE = (
+    "candidate",
+    "validated",
+    "active",
+    "stale",
+    "archived",
+    "forgotten",
+    "superseded",
+    "contradicted",
+    "discarded",
+)
+_VERIFICATION = ("unverified", "candidate", "validated", "trusted", "deprecated", "archived")
+_DIAGNOSTICS_PROGRESS_INTERVAL = 1000
+
+
+class DiagnosticsWorkExceeded(RuntimeError):  # noqa: N818 - frozen S10 ABI
+    pass
+
+
+class DiagnosticsDeadlineExceeded(TimeoutError):  # noqa: N818 - paired S10 ABI
+    pass
+
+
+@dataclass
+class DiagnosticsReadWork:
+    statement_vm_limit: int = 8_000_000
+    operation_vm_limit: int = 40_000_000
+    statements_max: int = 256
+    soft_deadline: float = 0.0
+    hard_deadline: float = 0.0
+    statements: int = 0
+    statement_vm: int = 0
+    operation_vm: int = 0
+    stop: str | None = None
+
+    def _fail(self, cause: str) -> None:
+        self.stop = self.stop or cause
+        if self.stop == "timeout":
+            raise DiagnosticsDeadlineExceeded
+        raise DiagnosticsWorkExceeded(self.stop)
+
+    def check(self, *, statement: bool = False, vm_steps: int = 0) -> None:
+        if self.stop is not None:
+            self._fail(self.stop)
+        if (self.soft_deadline and monotonic() >= self.soft_deadline) or (
+            self.hard_deadline and monotonic() >= self.hard_deadline
+        ):
+            self._fail("timeout")
+        if statement:
+            self.statements += 1
+            self.statement_vm = 0
+            vm_steps += _DIAGNOSTICS_PROGRESS_INTERVAL
+        self.statement_vm += vm_steps
+        self.operation_vm += vm_steps
+        if self.statements > self.statements_max:
+            self._fail("statements")
+        if self.statement_vm > self.statement_vm_limit:
+            self._fail("statement_vm")
+        if self.operation_vm > self.operation_vm_limit:
+            self._fail("operation_vm")
+
+    def raise_stopped(self) -> None:
+        if self.stop is not None:
+            self._fail(self.stop)
+
+
+@dataclass(frozen=True)
+class AuditRecord:
+    fact_id: str
+    memory_type: str
+    status: str | None
+    confidence: float | None
+    lifecycle_state: str | None
+    verification_status: str | None
+    has_receipt: bool
+    receipt_id: str | None
+
+
+@dataclass(frozen=True)
+class AuditSnapshot:
+    records: tuple[AuditRecord, ...]
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class BeliefWindow:
+    rows: tuple[Belief, ...]
+    truncated: bool
+
+
 class SQLiteProvider:
     """Async SQLite provider for CRUD operations on facts and receipts.
 
@@ -63,6 +189,7 @@ class SQLiteProvider:
         self._busy_timeout_ms = validate_busy_timeout_ms(busy_timeout_ms)
         self._engine = None
         self._session_factory = None
+        self._read_index_capable = False
 
     @property
     def engine(self):
@@ -178,6 +305,10 @@ class SQLiteProvider:
                     "INSERT INTO beliefs_fts(beliefs_fts) VALUES ('rebuild')"
                 )
 
+        # Immutable for this provider lifetime; external migration requires reopen.
+        async with self._engine.connect() as conn:
+            self._read_index_capable = await self._check_read_index_capability(conn)
+
         self._session_factory = async_sessionmaker(
             self._engine,
             class_=AsyncSession,
@@ -209,6 +340,722 @@ class SQLiteProvider:
 
     async def _get_evidence_repo(self, session: AsyncSession) -> EvidenceRepository:
         return EvidenceRepository(session)
+
+    @staticmethod
+    def _utc(value: Any) -> str:
+        if isinstance(value, datetime):
+            dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        else:
+            raw = str(value).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+    @staticmethod
+    def _storage_bind(value: Any) -> str:
+        """Convert a wire timestamp to SQLite DateTime's canonical UTC text."""
+        return datetime.fromisoformat(SQLiteProvider._utc(value)).replace(tzinfo=None).strftime(
+            "%Y-%m-%d %H:%M:%S.%f"
+        )
+
+    async def _check_read_index_capability(self, conn) -> bool:
+        """Check all four indexes and stream all timestamps once at startup.
+
+        A revision stamp does not prove canonical data. External writers must preserve
+        the storage format for the lifetime of this provider (no mixed UNION).
+        """
+        for kind in ("fact", "belief", "decision", "skill"):
+            table = f"{kind}s"
+            name = f"ix_{table}_created_type_id"
+            expected = f"CREATE INDEX {name} ON {table} (created_at, CAST('{kind}' AS TEXT), id)"
+            row = (await conn.exec_driver_sql(
+                "SELECT type, tbl_name, sql FROM sqlite_master WHERE name=?", (name,)
+            )).first()
+            if row is None or row[0] != "index" or row[1] != table or row[2] is None:
+                return False
+            if (re.findall(r"'[^']*'", row[2]) != [f"'{kind}'"]
+                    or re.sub(r"\s+", "", row[2]).lower() != re.sub(r"\s+", "", expected).lower()):
+                return False
+            keys = (await conn.exec_driver_sql(f"PRAGMA index_xinfo('{name}')")).all()
+            if [(r[0], r[2], r[3], r[4]) for r in keys if r[5]] != [
+                (0, "created_at", 0, "BINARY"), (1, None, 0, "BINARY"), (2, "id", 0, "BINARY")
+            ]:
+                return False
+        for table in ("facts", "beliefs", "decisions", "skills"):
+            async with conn.stream(text(f"SELECT created_at,updated_at FROM {table}")) as result:
+                async for batch in result.partitions(1000):
+                    for row in batch:
+                        for value in row:
+                            try:
+                                if not isinstance(value, str) or value != self._storage_bind(value):
+                                    return False
+                            except (ValueError, TypeError, OverflowError):
+                                return False
+        return True
+
+    @staticmethod
+    def _record(kind: str, row: Any) -> dict[str, Any]:
+        data = dict(row._mapping)
+        data["memory_type"] = kind
+        data["created_at"] = SQLiteProvider._utc(data["created_at"])
+        data["updated_at"] = SQLiteProvider._utc(data["updated_at"])
+        return data
+
+    async def read_memory(self, session: AsyncSession, memory_id: str, memory_type: str | None = None):
+        """Read raw storage columns; an untyped collision is a validation error."""
+        from memory_server.application.memory_read_service import ReadRecord
+        from memory_server.transports.http.errors import HttpError
+
+        tables = (("fact", "facts"), ("belief", "beliefs"), ("decision", "decisions"), ("skill", "skills"))
+        hits: list[tuple[str, dict[str, Any]]] = []
+        for kind, table in tables:
+            if memory_type is not None and memory_type != kind:
+                continue
+            result = await session.execute(text(f"SELECT * FROM {table} WHERE id=:id LIMIT 1"), {"id": memory_id})
+            row = result.first()
+            if row is not None:
+                hits.append((kind, self._record(kind, row)))
+        if len(hits) == 0:
+            raise HttpError("E_NOT_FOUND")
+        if len(hits) > 1:
+            raise HttpError("E_VALIDATION")
+        kind, memory = hits[0]
+        receipt = await self.read_receipt_metadata(session, memory_id, kind)
+        return ReadRecord(memory=memory, memory_type=kind, receipt=receipt)
+
+    def _key_clause(
+        self, prefix: str, key: Any, op: str, *, kind: str | None = None
+    ) -> tuple[str, dict[str, Any]]:
+        if key is None:
+            return "", {}
+        memory_type = f"CAST('{kind}' AS TEXT)" if kind is not None else "memory_type"
+        return (
+            f" AND (created_at,{memory_type},id) {op} (:{prefix}created_at,:{prefix}memory_type,:{prefix}id)",
+            {f"{prefix}created_at": self._storage_bind(key.created_at) if self._read_index_capable else key.created_at,
+             f"{prefix}memory_type": key.memory_type, f"{prefix}id": key.id},
+        )
+
+    async def read_memory_page(self, session: AsyncSession, query: Any, *, after: Any = None, upper: Any = None):
+        """Read a metadata-filtered UNION page, with a fixed creation-key upper bound."""
+        from memory_server.application.memory_read_service import MemorySlice, ReadKey, ReadRecord
+        from memory_server.transports.http.errors import HttpError
+
+        if type(query.limit) is not int or not 1 <= query.limit <= 200:
+            raise HttpError("E_VALIDATION")
+        conn = await session.connection()
+        await conn.run_sync(
+            lambda c: c.connection.dbapi_connection.run_async(
+                lambda a: a.create_function("s07_timestamp", 1, self._utc, deterministic=True)
+            )
+        )
+        tables = (("fact", "facts"), ("belief", "beliefs"), ("decision", "decisions"), ("skill", "skills"))
+        allowed = set(query.memory_types or ())
+        params: dict[str, Any] = {}
+        selects = []
+        for kind, table in tables:
+            if allowed and kind not in allowed:
+                continue
+            clauses = ["1=1"]
+            if query.lifecycle_states:
+                placeholders = ','.join(':' + kind + '_ls' + str(i) for i in range(len(query.lifecycle_states)))
+                clauses.append(f'lifecycle_state IN ({placeholders})')
+                params.update({f"{kind}_ls{i}": v for i, v in enumerate(query.lifecycle_states)})
+            for field, op, value in (
+                ("confidence", ">=", query.min_confidence),
+                ("confidence", "<=", query.max_confidence),
+
+                ("created_at", ">=", query.created_from),
+                ("created_at", "<=", query.created_to),
+                ("updated_at", ">=", query.updated_from),
+                ("updated_at", "<=", query.updated_to),
+            ):
+                if value is not None:
+                    name = f"{kind}_{field}_{len(params)}"
+                    column = (
+                        f"s07_timestamp({field})" if field.endswith("_at") and not self._read_index_capable else field
+                    )
+                    clauses.append(f"{column} {op} :{name}")
+                    if field.endswith("_at") and self._read_index_capable:
+                        params[name] = self._storage_bind(value)
+                    else:
+                        params[name] = self._utc(value) if isinstance(value, datetime) else value
+            if query.valid_at is not None:
+                # Validity is receipt admission metadata, not a new schema field.
+                # Missing bounds are open; use the latest stored admission entry.
+                params["valid_at"] = self._utc(query.valid_at)
+                for field, op in (("valid_from", "<="), ("valid_to", ">")):
+                    expr = f"""(SELECT json_extract(j.value,'$.metadata.admission.{field}')
+                      FROM receipts r, json_each(CASE WHEN json_valid(r.history) THEN
+                        CASE WHEN json_type(r.history)='array' THEN r.history ELSE '[]' END ELSE '[]' END) j
+                      WHERE r.id={table}.id AND r.memory_type='{kind}' AND j.type='object'
+                        AND json_type(j.value,'$.metadata.admission')='object'
+                      ORDER BY CAST(j.key AS INTEGER) DESC LIMIT 1)"""
+                    clauses.append(f"({expr} IS NULL OR s07_timestamp({expr}) {op} :valid_at)")
+            common = (
+                "id confidence source creator created_at updated_at verification_status lifecycle_state version".split()
+            )
+            variants = {
+                "fact": "subject predicate object dedup_key",
+                "belief": "proposition source_ids tags",
+                "decision": "context choice rejected_alternatives reason",
+                "skill": "name purpose steps constraints validation success_rate",
+            }
+            columns = common + " ".join(variants.values()).split()
+            present = set(common + variants[kind].split())
+            fields = ",".join(
+                f"s07_timestamp({col}) AS {col}"
+                if col in ("created_at", "updated_at") and not self._read_index_capable
+                else col
+                if col in present
+                else f"NULL AS {col}"
+                for col in columns
+            )
+            memory_type = f"CAST('{kind}' AS TEXT)" if self._read_index_capable else f"'{kind}'"
+            selects.append((
+                kind, f"SELECT {fields}, {memory_type} AS memory_type FROM {table} WHERE {' AND '.join(clauses)}"
+            ))
+
+        def build(bound):
+            # Push both key predicates into EVERY arm, not just the last arm.
+            # The legacy wrapper and ISO normalization remain intact as a unit.
+            if self._read_index_capable:
+                arms = []
+                for kind, arm in selects:
+                    low, lowp = self._key_clause("a_", after, ">", kind=kind)
+                    high, highp = self._key_clause("u_", bound, "<=", kind=kind)
+                    params.update(lowp)
+                    params.update(highp)
+                    arms.append(arm + low + high)
+                return " UNION ALL ".join(arms)
+            union = " UNION ALL ".join(arm for _, arm in selects)
+            low, lowp = self._key_clause("a_", after, ">")
+            high, highp = self._key_clause("u_", bound, "<=")
+            params.update(lowp)
+            params.update(highp)
+            return f"SELECT * FROM ({union}) AS memories WHERE 1=1" + low + high
+
+        sql = build(upper)
+        if upper is None:
+            maxrow = (
+                await session.execute(
+                    text(sql + " ORDER BY created_at DESC, memory_type DESC, id DESC LIMIT 1"), params
+                )
+            ).first()
+            upper = None if maxrow is None else ReadKey(self._utc(maxrow.created_at), maxrow.memory_type, maxrow.id)
+            sql = build(upper)
+        rows = (
+            await session.execute(
+                text(sql + " ORDER BY created_at ASC, memory_type ASC, id ASC LIMIT :page_limit"),
+                {**params, "page_limit": int(query.limit) + 1},
+            )
+        ).all()
+        page_rows = rows[: query.limit]
+        receipts = await self._read_receipt_metadata_batch(
+            session, tuple((r.id, r.memory_type) for r in page_rows)
+        )
+        records = tuple(
+            ReadRecord(self._record(r.memory_type, r), r.memory_type, receipts.get((r.id, r.memory_type)))
+            for r in page_rows
+        )
+        return MemorySlice(records, len(rows) > query.limit, upper)
+
+    async def _read_receipt_metadata_batch(self, session: AsyncSession, keys: tuple):
+        """One bounded receipt query for returned records, never lookahead."""
+        if len(keys) > 200 or len(set(keys)) != len(keys):
+            raise ValueError("invalid receipt batch")
+        if not keys:
+            return {}
+        pairs = ",".join(f"(:id{i},:type{i})" for i in range(len(keys)))
+        params = {f"id{i}": key[0] for i, key in enumerate(keys)}
+        params.update({f"type{i}": key[1] for i, key in enumerate(keys)})
+        params["receipt_limit"] = len(keys)
+        rows = await session.execute(
+            text(
+                "SELECT id,memory_type,source,created_by,timestamp,confidence,"
+                "verification_status,lifecycle_state,version FROM receipts "
+                f"WHERE (id,memory_type) IN ({pairs}) LIMIT :receipt_limit"
+            ), params,
+        )
+        receipts = {}
+        for row in rows:
+            data = dict(row._mapping)
+            data["timestamp"] = self._utc(data["timestamp"])
+            receipts[(row.id, row.memory_type)] = data
+        return receipts
+
+    async def resolve_fact_rows(
+        self, session: AsyncSession, triples: tuple[Triple, ...], *, include_inactive: bool,
+    ) -> tuple[FactRow, ...]:
+        if (type(triples) is not tuple or len(triples) > 100 or type(include_inactive) is not bool
+                or any(type(t) is not tuple or len(t) != 3
+                       or any(type(v) is not str or not v for v in t) for t in triples)):
+            raise ValueError("invalid resolver input")
+        triples = tuple(dict.fromkeys(triples))
+        if not triples:
+            return ()
+        params = {f"{name}{i}": value for i, triple in enumerate(triples)
+                  for name, value in zip(("s", "p", "o"), triple, strict=True)}
+
+        def terms(prefix):
+            return " OR ".join(
+                f"({prefix}subject=:s{i} AND {prefix}predicate=:p{i} AND {prefix}object=:o{i})"
+                for i in range(len(triples))
+            )
+
+        columns = "id, subject, predicate, object, lifecycle_state, confidence, created_at"
+        active = "('candidate','validated','active')"
+        a = f"SELECT {columns} FROM facts WHERE ({terms('')}) AND lifecycle_state IN {active}"
+        rows = list((await session.execute(text(a + " ORDER BY created_at DESC, id ASC"), params)).mappings())
+        if include_inactive:
+            b = (
+                f"SELECT {columns} FROM ("
+                "SELECT f.id, f.subject, f.predicate, f.object, f.lifecycle_state, f.confidence, f.created_at, "
+                "ROW_NUMBER() OVER (PARTITION BY f.subject, f.predicate, f.object "
+                "ORDER BY f.created_at DESC, f.id ASC) AS rn "
+                f"FROM facts f WHERE ({terms('f.')}) AND f.lifecycle_state NOT IN {active}"
+                ") WHERE rn <= :k ORDER BY created_at DESC, id ASC"
+            )
+            rows.extend((await session.execute(text(b), {**params, "k": RESOLVER_INACTIVE_PER_TRIPLE})).mappings())
+        result = [FactRow(
+            id=row["id"], subject=row["subject"], predicate=row["predicate"], object=row["object"],
+            lifecycle_state=row["lifecycle_state"], confidence=row["confidence"],
+            created_at=datetime.fromisoformat(self._utc(row["created_at"])),
+        ) for row in rows]
+        # Stable global A union B order; identity and eligibility stay separate.
+        result.sort(key=lambda row: row.id)
+        result.sort(key=lambda row: row.created_at, reverse=True)
+        return tuple(result)
+
+    async def read_fact_records(self, session: AsyncSession, ids: tuple[str, ...]):
+        """Hydrate a bounded ordered hit list in the caller's existing snapshot."""
+        from memory_server.application.memory_read_service import ReadRecord
+
+        if len(ids) > 100 or len(set(ids)) != len(ids) or any(type(i) is not str or not i for i in ids):
+            raise ValueError("invalid fact batch")
+        if not ids:
+            return ()
+        binds = ",".join(f":id{i}" for i in range(len(ids)))
+        params = {f"id{i}": ident for i, ident in enumerate(ids)}
+        rows = (await session.execute(
+            text(f"SELECT * FROM facts WHERE id IN ({binds}) LIMIT :fact_limit"),
+            {**params, "fact_limit": len(ids)},
+        )).all()
+        receipts = await self._read_receipt_metadata_batch(session, tuple((i, "fact") for i in ids))
+        records = {r.id: ReadRecord(self._record("fact", r), "fact", receipts.get((r.id, "fact"))) for r in rows}
+        return tuple(records[i] for i in ids if i in records)
+
+    async def search_facts_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        text: str,
+        limit: int,
+        include_inactive: bool,
+        memory_types: tuple[str, ...] = (),
+        lifecycle_states: tuple[str, ...] = (),
+        min_confidence: float | None = None,
+    ) -> list[Fact]:
+        """Apply gateway metadata predicates in SQL, on the caller's session."""
+        from sqlalchemy import text as sql_text
+        from sqlalchemy.exc import OperationalError
+
+        if not memory_types and not lifecycle_states and min_confidence is None:
+            repo = await self._get_fact_repo(session)
+            return await repo.search(text=text, limit=limit, lifecycle_state=None if include_inactive else "active")
+        if memory_types and "fact" not in memory_types:
+            return []
+        clauses = []
+        params: dict[str, Any] = {"limit": limit}
+        if not include_inactive:
+            clauses.append("f.lifecycle_state IN ('candidate','validated','active')")
+        if lifecycle_states:
+            placeholders = ",".join(f":ls{i}" for i in range(len(lifecycle_states)))
+            clauses.append(f"f.lifecycle_state IN ({placeholders})")
+            params.update({f"ls{i}": value for i, value in enumerate(lifecycle_states)})
+        if min_confidence is not None:
+            clauses.append("f.confidence >= :min_confidence")
+            params["min_confidence"] = min_confidence
+        terms = [f'"{term.replace(chr(34), chr(34) * 2)}"*' for term in text.strip().split()]
+        params["query"] = " AND ".join(terms)
+        where = " AND ".join(clauses) or "1=1"
+        rows = []
+        try:
+            exists = await session.execute(
+                sql_text("SELECT 1 FROM sqlite_master WHERE type='table' AND name='facts_fts'")
+            )
+            if terms and exists.first() is not None:
+                result = await session.execute(
+                    sql_text(
+                        "SELECT f.* FROM facts_fts JOIN facts f ON facts_fts.rowid=f.rowid "
+                        f"WHERE facts_fts MATCH :query AND {where} ORDER BY rank LIMIT :limit"
+                    ), params,
+                )
+                rows = result.mappings().all()
+        except (OperationalError, sqlite3.OperationalError) as exc:
+            # Same narrow failure classification as fact_repo; never log SQL/parameters.
+            messages = (str(exc), str(getattr(exc, "orig", "")))
+            if not any(marker in message for message in messages for marker in (
+                "no such table: facts_fts", "malformed MATCH expression",
+                "unable to use function MATCH in the requested context", "no such module: fts5",
+            )):
+                raise
+        if not rows:
+            if not any(char.isalnum() for char in text):
+                return []
+            escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params["like"] = f"%{escaped}%"
+            result = await session.execute(
+                sql_text(
+                    "SELECT f.* FROM facts f WHERE "
+                    "(f.subject LIKE :like ESCAPE '\\' "
+                    "OR f.predicate LIKE :like ESCAPE '\\' "
+                    "OR f.object LIKE :like ESCAPE '\\') "
+                    f"AND {where} ORDER BY f.created_at DESC LIMIT :limit"
+                ), params,
+            )
+            rows = result.mappings().all()
+        return [Fact(**dict(row)) for row in rows]
+
+    async def read_memory_records(self, session: AsyncSession, keys):
+        """Hydrate typed fact/decision keys in one transaction and stable order."""
+        from memory_server.application.memory_read_service import ReadRecord
+
+        if type(keys) is not tuple or len(keys) > 200:
+            raise ValueError("invalid typed key batch")
+        if any(
+            type(k) is not tuple or len(k) != 2 or type(k[0]) is not str
+            or k[0] not in ("fact", "decision") or type(k[1]) is not str or not k[1]
+            for k in keys
+        ) or len(set(keys)) != len(keys):
+            raise ValueError("invalid typed key")
+        if not keys:
+            return ()
+        by_type = {kind: [ident for k, ident in keys if k == kind] for kind in ("fact", "decision")}
+        found = {}
+        for kind, ids in by_type.items():
+            if not ids:
+                continue
+            binds = ",".join(f":{kind}{i}" for i in range(len(ids)))
+            params = {f"{kind}{i}": ident for i, ident in enumerate(ids)}
+            result = await session.execute(
+                text(f"SELECT * FROM {kind}s WHERE id IN ({binds}) LIMIT :n"), {**params, "n": len(ids)}
+            )
+            for row in result:
+                found[(kind, row._mapping["id"])] = ReadRecord(self._record(kind, row), kind, None)
+        receipts = await self._read_receipt_metadata_batch(session, tuple((ident, kind) for kind, ident in keys))
+        found = {
+            key: ReadRecord(record.memory, record.memory_type, receipts.get((key[1], key[0])))
+            for key, record in found.items()
+        }
+        return tuple(found[key] for key in keys if key in found)
+
+    async def read_receipt_metadata(self, session: AsyncSession, memory_id: str, memory_type: str):
+        result = await session.execute(
+            text(
+                "SELECT id,memory_type,source,created_by,timestamp,confidence,"
+                "verification_status,lifecycle_state,version FROM receipts "
+                "WHERE id=:id AND memory_type=:memory_type LIMIT 1"
+            ),
+            {"id": memory_id, "memory_type": memory_type},
+        )
+        row = result.first()
+        if row is None:
+            return None
+        data = dict(row._mapping)
+        data["timestamp"] = self._utc(data["timestamp"])
+        return data
+
+    async def read_history_page(
+        self,
+        session: AsyncSession,
+        memory_id: str,
+        memory_type: str,
+        *,
+        limit: int,
+        after: Any = None,
+        upper: Any = None,
+    ):
+        from storage.repositories.lifecycle_repo import LifecycleRepository
+
+        return await LifecycleRepository(session).get_events_page(
+            memory_id, memory_type, limit=limit, after=after, upper=upper
+        )
+
+    @asynccontextmanager
+    async def diagnostics_window(self, session: AsyncSession, *, work: DiagnosticsReadWork):
+        """Apply operation-local statement, VM, and deadline limits."""
+        active = session.info.get("s10_diagnostics_work")
+        if active is not None:
+            if active is not work:
+                raise ValueError("diagnostics window mismatch")
+            yield
+            return
+        connection = await session.connection()
+        sync = connection.sync_connection
+
+        async def bridge(function):
+            return await connection.run_sync(lambda conn: conn.connection.dbapi_connection.run_async(function))
+
+        def before(*_args):
+            work.check(statement=True)
+
+        def progress():
+            try:
+                work.check(vm_steps=_DIAGNOSTICS_PROGRESS_INTERVAL)
+                return 0
+            except (DiagnosticsWorkExceeded, DiagnosticsDeadlineExceeded):
+                return 1
+
+        session.info["s10_diagnostics_work"] = work
+        event.listen(sync, "before_cursor_execute", before)
+        try:
+            await bridge(lambda driver: driver.set_progress_handler(progress, _DIAGNOSTICS_PROGRESS_INTERVAL))
+            try:
+                yield
+                work.check()
+            except Exception:
+                work.raise_stopped()
+                raise
+        finally:
+            event.remove(sync, "before_cursor_execute", before)
+
+            async def reset():
+                try:
+                    await bridge(lambda driver: driver.set_progress_handler(None, 0))
+                except BaseException:
+                    await connection.invalidate()
+                    raise
+
+            cleanup = asyncio.create_task(reset())
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    work.stop = work.stop or "timeout"
+            session.info.pop("s10_diagnostics_work", None)
+            cleanup.result()
+
+    @staticmethod
+    def _diagnostics_require(session: AsyncSession, work: DiagnosticsReadWork) -> None:
+        if session.info.get("s10_diagnostics_work") is not work:
+            raise ValueError("diagnostics operation requires its active borrowed window")
+        work.check()
+
+    async def diagnostics_count(
+        self, session: AsyncSession, table: DiagnosticTable, *, work: DiagnosticsReadWork
+    ) -> int:
+        self._diagnostics_require(session, work)
+        if table not in _DIAGNOSTIC_TABLES:
+            raise ValueError("invalid diagnostics table")
+        result = await session.execute(text(f"SELECT COUNT(*) FROM {table}"))
+        work.check()
+        return int(result.scalar_one())
+
+    async def diagnostics_lifecycle_counts(
+        self, session: AsyncSession, table: DiagnosticTable, *, work: DiagnosticsReadWork
+    ) -> dict[str, int]:
+        self._diagnostics_require(session, work)
+        if table not in _DIAGNOSTIC_TABLES:
+            raise ValueError("invalid diagnostics table")
+        known = ",".join(repr(value) for value in _LIFECYCLE)
+        result = await session.execute(
+            text(
+                f"SELECT CASE WHEN lifecycle_state IN ({known}) THEN lifecycle_state ELSE 'unknown' END AS state,"
+                f"COUNT(*) AS count FROM {table} GROUP BY state"
+            )
+        )
+        work.check()
+        return {str(row.state): int(row.count) for row in result}
+
+    async def diagnostics_check_count(
+        self,
+        session: AsyncSession,
+        check: DiagnosticCheck,
+        *,
+        table: DiagnosticTable | None,
+        work: DiagnosticsReadWork,
+    ) -> int:
+        self._diagnostics_require(session, work)
+        known_lc = ",".join(repr(value) for value in _LIFECYCLE)
+        known_vs = ",".join(repr(value) for value in _VERIFICATION)
+        if check in {
+            "invalid_lifecycle",
+            "confidence",
+            "confidence_low",
+            "consistency",
+            "receipt_state",
+            "receipt_missing",
+            "receipt_type",
+        }:
+            if table not in _DIAGNOSTIC_TABLES:
+                raise ValueError("invalid diagnostics table")
+        if check == "invalid_lifecycle":
+            sql = (
+                f"SELECT COUNT(*) FROM {table} WHERE lifecycle_state IS NULL OR lifecycle_state NOT IN ({known_lc}) "
+                f"OR verification_status IS NULL OR verification_status NOT IN ({known_vs})"
+            )
+            params = {}
+        elif check == "confidence":
+            sql, params = f"SELECT COUNT(*) FROM {table} WHERE confidence IS NULL OR confidence<0 OR confidence>1", {}
+        elif check == "confidence_low":
+            sql, params = f"SELECT COUNT(*) FROM {table} WHERE confidence>=0 AND confidence<0.3", {}
+        elif check == "consistency" and table in _CANONICAL_TABLES:
+            sql = (
+                f"SELECT COUNT(*) FROM {table} WHERE "
+                "(confidence=0 AND lifecycle_state NOT IN ('stale','archived','forgotten')) "
+                "OR (lifecycle_state='stale' AND confidence>=0.5)"
+            )
+            params = {}
+        elif check in {"receipt_state", "receipt_missing", "receipt_type"} and table in _CANONICAL_TABLES:
+            kind = _CANONICAL_TABLES[table]
+            if check == "receipt_state":
+                sql = (
+                    f"SELECT COUNT(*) FROM {table} c JOIN receipts r ON r.id=c.id AND r.memory_type=:kind "
+                    "WHERE c.lifecycle_state IS NOT r.lifecycle_state "
+                    "OR c.verification_status IS NOT r.verification_status"
+                )
+            elif check == "receipt_missing":
+                sql = (
+                    f"SELECT COUNT(*) FROM {table} c WHERE NOT EXISTS "
+                    "(SELECT 1 FROM receipts r WHERE r.id=c.id AND r.memory_type=:kind)"
+                )
+            else:
+                sql = f"SELECT COUNT(*) FROM {table} c JOIN receipts r ON r.id=c.id WHERE r.memory_type<>:kind"
+            params = {"kind": kind}
+        elif check == "receipt_orphan" and table is None:
+            sql = """SELECT COUNT(*) FROM receipts r WHERE NOT (
+                (r.memory_type='fact' AND EXISTS(SELECT 1 FROM facts c WHERE c.id=r.id)) OR
+                (r.memory_type='belief' AND EXISTS(SELECT 1 FROM beliefs c WHERE c.id=r.id)) OR
+                (r.memory_type='decision' AND EXISTS(SELECT 1 FROM decisions c WHERE c.id=r.id)) OR
+                (r.memory_type='skill' AND EXISTS(SELECT 1 FROM skills c WHERE c.id=r.id)))"""
+            params = {}
+        elif check == "relation_endpoints" and table is None:
+            def hits(column):
+                return " + ".join(
+                    f"(SELECT COUNT(*) FROM {name} WHERE id=cr.{column})" for name in _CANONICAL_TABLES
+                )
+
+            sql = f"SELECT COUNT(*) FROM claim_relations cr WHERE ({hits('source_id')})<>1 OR ({hits('target_id')})<>1"
+            params = {}
+        elif check == "relation_type" and table is None:
+            sql = (
+                "SELECT COUNT(*) FROM claim_relations WHERE relation_type NOT IN "
+                "('supports','contradicts','derives','derived_from')"
+            )
+            params = {}
+        else:
+            raise ValueError("invalid diagnostics check")
+        result = await session.execute(text(sql), params)
+        work.check()
+        return int(result.scalar_one())
+
+    async def diagnostics_audit_snapshot(
+        self, session: AsyncSession, *, per_type_limit: int, work: DiagnosticsReadWork
+    ) -> AuditSnapshot:
+        self._diagnostics_require(session, work)
+        if type(per_type_limit) is not int or not 1 <= per_type_limit <= 200:
+            raise ValueError("invalid snapshot limit")
+        records, truncated = [], False
+        for table, kind in _CANONICAL_TABLES.items():
+            result = await session.execute(
+                text(
+                    f"SELECT c.id,c.confidence,c.lifecycle_state,c.verification_status,"
+                    f"EXISTS(SELECT 1 FROM receipts r WHERE r.id=c.id AND r.memory_type=:kind) AS has_receipt "
+                    f"FROM {table} c ORDER BY c.id LIMIT :limit"
+                ),
+                {"kind": kind, "limit": per_type_limit + 1},
+            )
+            rows = result.all()
+            truncated = truncated or len(rows) > per_type_limit
+            records.extend(
+                AuditRecord(
+                    fact_id=row.id,
+                    memory_type=kind,
+                    status=row.lifecycle_state,
+                    confidence=row.confidence,
+                    lifecycle_state=row.lifecycle_state,
+                    verification_status=row.verification_status,
+                    has_receipt=bool(row.has_receipt),
+                    receipt_id=row.id if row.has_receipt else None,
+                )
+                for row in rows[:per_type_limit]
+            )
+        work.check()
+        return AuditSnapshot(tuple(records), truncated)
+
+    async def diagnostics_unresolved_conflict_count(
+        self, session: AsyncSession, *, work: DiagnosticsReadWork
+    ) -> int:
+        self._diagnostics_require(session, work)
+        result = await session.execute(
+            text(
+                """SELECT COUNT(*) FROM (
+                SELECT MIN(cr.source_id,cr.target_id),MAX(cr.source_id,cr.target_id)
+                FROM claim_relations cr JOIN beliefs a ON a.id=cr.source_id
+                JOIN beliefs b ON b.id=cr.target_id
+                WHERE cr.relation_type='contradicts' AND cr.source_id<>cr.target_id
+                AND a.lifecycle_state='contradicted' AND b.lifecycle_state='contradicted'
+                AND NOT EXISTS(SELECT 1 FROM facts WHERE id=a.id)
+                AND NOT EXISTS(SELECT 1 FROM decisions WHERE id=a.id)
+                AND NOT EXISTS(SELECT 1 FROM skills WHERE id=a.id)
+                AND NOT EXISTS(SELECT 1 FROM facts WHERE id=b.id)
+                AND NOT EXISTS(SELECT 1 FROM decisions WHERE id=b.id)
+                AND NOT EXISTS(SELECT 1 FROM skills WHERE id=b.id)
+                GROUP BY MIN(cr.source_id,cr.target_id),MAX(cr.source_id,cr.target_id))"""
+            )
+        )
+        work.check()
+        return int(result.scalar_one())
+
+    async def diagnostics_reflect_beliefs(
+        self,
+        session: AsyncSession,
+        *,
+        topic: str | None,
+        min_confidence: float,
+        limit: int,
+        work: DiagnosticsReadWork,
+    ) -> BeliefWindow:
+        self._diagnostics_require(session, work)
+        if type(limit) is not int or not 1 <= limit <= 100 or not isinstance(min_confidence, (int, float)):
+            raise ValueError("invalid reflection bounds")
+        result = await session.execute(
+            text(
+                """SELECT id,proposition,confidence,source,creator,source_ids,tags,created_at,updated_at,
+                last_reinforced_at,version,verification_status,lifecycle_state FROM beliefs
+                WHERE confidence>=:confidence AND (:topic IS NULL OR EXISTS(
+                SELECT 1 FROM json_each(CASE WHEN json_valid(tags) THEN tags ELSE '[]' END) j
+                WHERE j.type='text' AND j.value=:topic)) ORDER BY id LIMIT :limit"""
+            ),
+            {"confidence": float(min_confidence), "topic": topic or None, "limit": limit + 1},
+        )
+        rows = result.mappings().all()
+        beliefs = []
+        for row in rows[:limit]:
+            values = dict(row)
+            values["source_ids"] = json.loads(values["source_ids"] or "[]")
+            values["tags"] = json.loads(values["tags"] or "[]")
+            beliefs.append(Belief.model_validate(values))
+        work.check()
+        return BeliefWindow(tuple(beliefs), len(rows) > limit)
+
+    async def diagnostics_schema_revision(
+        self, session: AsyncSession, *, work: DiagnosticsReadWork
+    ) -> str | None:
+        self._diagnostics_require(session, work)
+        exists = await session.execute(
+            text("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='alembic_version'")
+        )
+        if int(exists.scalar_one()) == 0:
+            work.check()
+            return None
+        result = await session.execute(text("SELECT version_num FROM alembic_version LIMIT 2"))
+        rows = result.scalars().all()
+        work.check()
+        if len(rows) > 1:
+            raise ValueError("ambiguous schema revision")
+        return str(rows[0]) if rows else None
 
     # --- Fact CRUD ---
 

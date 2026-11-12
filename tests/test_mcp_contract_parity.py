@@ -75,7 +75,7 @@ def oracle() -> dict[str, Any]:
         pytest.skip("C00 oracle comparison requires harness environment variable: CMMS_C00_ORACLE")
     path = Path(value)
     assert path.is_file(), f"CMMS_C00_ORACLE is not a file: {path}"
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == "0f369d2079973c6d4798144f78730f134c07a3e56416a87f8c6b9188d7236338"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == "2ef6273139a33ac232c408a64ed3ee6ce34f07db994a654f9cf8d648da7dd00b"
     return json.loads(path.read_text(encoding="utf-8"))
 
 

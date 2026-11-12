@@ -162,9 +162,7 @@ class Settings(BaseSettings):
 
     # --- Embeddings --------------------------------------------------------
 
-    embedding_provider: Literal["sentence-transformers", "openai"] = (
-        "sentence-transformers"
-    )
+    embedding_provider: Literal["sentence-transformers", "openai"] = "sentence-transformers"
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_device: str | None = None
     embedding_batch_size: int = 32
@@ -202,6 +200,31 @@ class Settings(BaseSettings):
     max_contradiction_pairs: int = 100_000
     reflect_belief_cap: int = 10000
     graph_max_path_depth: int = 4
+
+    trace_ttl_seconds: int = 900
+    trace_max_per_profile: int = 200
+    trace_max_payload_bytes: int = 65536
+    trace_max_contributions: int = 100
+
+    @field_validator("trace_ttl_seconds")
+    @classmethod
+    def _trace_ttl(cls, value: int) -> int:
+        return min(3600, max(60, value))
+
+    @field_validator("trace_max_per_profile")
+    @classmethod
+    def _trace_cap(cls, value: int) -> int:
+        return min(10000, max(1, value))
+
+    @field_validator("trace_max_payload_bytes")
+    @classmethod
+    def _trace_payload(cls, value: int) -> int:
+        return min(1048576, max(4096, value))
+
+    @field_validator("trace_max_contributions")
+    @classmethod
+    def _trace_contrib(cls, value: int) -> int:
+        return min(1000, max(1, value))
 
     # --- Decay engine -------------------------------------------------------
 

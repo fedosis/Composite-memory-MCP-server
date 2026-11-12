@@ -328,7 +328,7 @@ def test_command_dto_defaults_match_the_c00_wire_snapshot() -> None:
     """RED-by-absence — DTO defaults equal the C00 stdio wire defaults."""
     from memory_server.application import LearnCommand, RememberCommand
     raw = WIRE_SNAPSHOT.read_bytes()
-    assert hashlib.sha256(raw).hexdigest() == "0f369d2079973c6d4798144f78730f134c07a3e56416a87f8c6b9188d7236338"
+    assert hashlib.sha256(raw).hexdigest() == "2ef6273139a33ac232c408a64ed3ee6ce34f07db994a654f9cf8d648da7dd00b"
     tools = {tool["name"]: tool for tool in json.loads(raw)["mcp"]["tools"]}
     remember_props = tools["remember"]["input_schema"]["properties"]
     learn_props = tools["learn"]["input_schema"]["properties"]

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import threading
+import time
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -34,6 +36,37 @@ class RuntimeManagerError(CMMSRuntimeError):
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
+
+
+class LeaseProof:
+    pass
+
+
+@dataclass(frozen=True, eq=False)
+class _ProjectionBinding:
+    manager: Any
+    descriptor: Any
+    graph: Any
+    path: Path
+    lock_path: Path
+    lease_probe: Any
+    loop: Any
+    loop_thread: int
+    pid: int
+    state: list
+
+
+@dataclass(eq=False)
+class _ProjectionCall:
+    binding: _ProjectionBinding
+    before: dict
+    chains: dict
+    generation: int
+    proof: Any
+    native: bool
+    records: list
+    abandoned: bool = False
+    sealed: bool = False
 
 
 @dataclass(frozen=True)
@@ -221,6 +254,9 @@ class RuntimeManager:
         self._admission_closed = False
         self._close_all_task: asyncio.Task | None = None
         self._terminal_close_all: CloseAllReport | None = None
+        self._projection_bindings = []
+        self._projection_calls = set()
+        self._projection_leases = {}
 
     def _check_loop(self) -> None:
         try:
@@ -269,6 +305,252 @@ class RuntimeManager:
         if current != (entry.evidence or {}):
             raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED)
         _reject_unsafe(current)
+
+    def _projection_entry(self, descriptor):
+        self._check_loop()
+        entry = next((e for e in self._entries if e.descriptor == descriptor), None)
+        if entry is None or entry.state != "READY" or self._admission_closed:
+            raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+        return entry
+
+    def bind_projection_publisher(self, descriptor, *, graph, lease_probe):
+        try:
+            from memory_server.providers.graph_provider import _chains, _snapshot_lock_path
+
+            entry = self._projection_entry(descriptor)
+            path = _lexical(entry.layout.graph_snapshot_path)
+            lock_path = _lexical(entry.layout.graph_lock_path)
+            if (
+                graph is not entry.factory.runtime.dependencies.graph
+                or graph._snapshot_path is None
+                or _lexical(graph._snapshot_path) != path
+                or _snapshot_lock_path(path) != lock_path
+                or path not in entry.evidence
+                or lock_path not in entry.evidence
+            ):
+                raise RuntimeManagerError(E_RUNTIME_DESCRIPTOR_CONFLICT) from None
+            previous = getattr(graph, "_projection_binding", None)
+            if previous is not None:
+                if (
+                    previous.manager is self
+                    and previous.descriptor == descriptor
+                    and previous.lease_probe is lease_probe
+                ):
+                    return previous
+                raise RuntimeManagerError(E_RUNTIME_DESCRIPTOR_CONFLICT) from None
+            self._check_identity(entry)
+            binding = _ProjectionBinding(
+                self,
+                descriptor,
+                graph,
+                path,
+                lock_path,
+                lease_probe,
+                self._loop,
+                threading.get_ident(),
+                os.getpid(),
+                [dict(entry.evidence), _chains(entry.evidence), 0],
+            )
+            self._projection_bindings.append(binding)
+            graph._projection_binding = binding
+            return binding
+        except RuntimeManagerError as exc:
+            raise RuntimeManagerError(exc.code) from None
+        except Exception:
+            raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+
+    def _issue_lease_proof(self, descriptor, *, owner, held, validate):
+        self._projection_entry(descriptor)
+        proof = LeaseProof()
+        self._projection_leases[proof] = (descriptor, owner, held, validate)
+        return proof
+
+    def _revoke_lease_proof(self, proof):
+        self._projection_leases.pop(proof, None)
+
+    def _live_projection_lease(self, proof, descriptor):
+        record = self._projection_leases.get(proof)
+        return (
+            record is not None
+            and record[0] == descriptor
+            and record[1] is asyncio.current_task()
+            and not record[1].done()
+            and record[3]()
+        )
+
+    def _prepare_projection_call(self, binding, *, native):
+        try:
+            from memory_server.providers.graph_provider import _chains
+
+            entry = self._projection_entry(binding.descriptor)
+            if not any(b is binding for b in self._projection_bindings):
+                raise RuntimeManagerError(E_RUNTIME_DESCRIPTOR_CONFLICT) from None
+            self._check_identity(entry)
+            proof = None if native else binding.lease_probe()
+            if proof is not None and not self._live_projection_lease(proof, binding.descriptor):
+                raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+            scope = _ProjectionCall(
+                binding, dict(entry.evidence), _chains(entry.evidence), binding.state[2], proof, native, []
+            )
+            self._projection_calls.add(scope)
+            return scope
+        except RuntimeManagerError as exc:
+            raise RuntimeManagerError(exc.code) from None
+        except Exception:
+            raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+
+    def _proof_valid(self, entry, proof, receipt):
+        from memory_server.providers.graph_provider import PublicationProof
+
+        scope = receipt.scope
+        registered = scope in self._projection_calls and any(r is receipt for r in scope.records)
+        if not registered or not isinstance(receipt.proof, PublicationProof) or receipt.pid != os.getpid():
+            return False
+        if scope.proof is not None:
+            return proof is scope.proof and self._live_projection_lease(proof, entry.descriptor)
+        return proof is receipt.proof
+
+    def _publication_matches(self, entry, receipt):
+        binding = receipt.scope.binding
+        return (
+            any(b is binding for b in self._projection_bindings)
+            and binding.manager is self
+            and binding.descriptor == entry.descriptor
+            and binding.graph is entry.factory.runtime.dependencies.graph
+            and binding.path == _lexical(entry.layout.graph_snapshot_path)
+            and binding.lock_path == _lexical(entry.layout.graph_lock_path)
+        )
+
+    def _receipt_fresh(self, receipt):
+        scope = receipt.scope
+        now = time.monotonic()
+        if now >= receipt.expires_at:
+            return False
+        if scope not in self._projection_calls or scope.abandoned:
+            return False
+        return scope.generation == scope.binding.state[2]
+
+    def _publication_lock_matches(self, entry, receipt):
+        from memory_server.providers.graph_provider import _chains, _identity
+
+        binding = receipt.scope.binding
+        before = receipt.before[binding.lock_path]
+        current = _evidence((binding.lock_path,))[binding.lock_path]
+        return (
+            current == receipt.lock_identity == _identity(os.fstat(receipt.lock.fileno()))
+            and current[0] == "regular_file"
+            and current[4] == 1
+            and (receipt.lock_created if before[0] == "absent" else before == current)
+            and _chains(receipt.before) == receipt.chains
+        )
+
+    def _publication_evidence(self, entry, receipt):
+        from memory_server.providers.graph_provider import _chains
+
+        scope = receipt.scope
+        current = _evidence(tuple(entry.evidence))
+        _reject_unsafe(current)
+        if entry.evidence != scope.before or _chains(current) != receipt.chains:
+            raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+        for path, identity in scope.before.items():
+            if path not in (scope.binding.path, scope.binding.lock_path) and current[path] != identity:
+                raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+        return current
+
+    def _same_published_fd(self, receipt):
+        from memory_server.providers.graph_provider import _chains, _identity
+
+        binding = receipt.scope.binding
+        return (
+            receipt.pid == os.getpid()
+            and receipt.staged[0] == "regular_file"
+            and receipt.staged[4] == 1
+            and _identity(os.fstat(receipt.snapshot.fileno())) == receipt.staged
+            and _evidence((binding.path,))[binding.path] == receipt.staged
+            and _identity(os.fstat(receipt.parent_fd))[:4] == _evidence((binding.path.parent,))[binding.path.parent][:4]
+            and _chains(receipt.before) == receipt.chains
+        )
+
+    def _check_publication_aliases(self, entry, current):
+        for other in self._entries:
+            if other is entry or other.state == "CLOSED":
+                continue
+            for left, identity in current.items():
+                for right, reserved in (other.evidence or {}).items():
+                    if _overlap(left, right) or (identity[0] != "absent" and identity == reserved):
+                        raise RuntimeManagerError(E_RUNTIME_RESOURCE_ALIAS) from None
+
+    def refresh_projection_identity(self, descriptor, *, receipt, proof=None):
+        from memory_server.providers.graph_provider import _PublicationReceipt
+
+        self._check_loop()
+        try:
+            if not isinstance(receipt, _PublicationReceipt):
+                raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+            entry = self._projection_entry(descriptor)
+            if not self._proof_valid(entry, proof, receipt):
+                raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+            if not self._publication_matches(entry, receipt):
+                raise RuntimeManagerError(E_RUNTIME_DESCRIPTOR_CONFLICT) from None
+            chain = receipt.scope.records
+            if not chain or chain[-1] is not receipt:
+                raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+            before = receipt.scope.before
+            for item in chain:
+                item_proof = item.scope.proof or item.proof
+                if (
+                    (item is not receipt and not self._proof_valid(entry, item_proof, item))
+                    or not self._receipt_fresh(item)
+                    or item.before != before
+                    or not self._publication_lock_matches(entry, item)
+                ):
+                    raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+                before = item.after
+            if not self._receipt_fresh(receipt):
+                raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+            if not self._publication_lock_matches(entry, receipt):
+                raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+            current = self._publication_evidence(entry, receipt)
+            if not self._same_published_fd(receipt):
+                raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+            self._check_publication_aliases(entry, current)
+            entry.evidence = current
+            self._consume_publication(receipt)
+        except RuntimeManagerError as exc:
+            raise RuntimeManagerError(exc.code) from None
+        except Exception:
+            raise RuntimeManagerError(E_RUNTIME_RESOURCE_IDENTITY_CHANGED) from None
+
+    def _consume_publication(self, receipt):
+        from memory_server.providers.graph_provider import _close_publication
+
+        scope = receipt.scope
+        binding = scope.binding
+        graph = binding.graph
+        binding.state[:] = [dict(receipt.after), receipt.chains, binding.state[2] + 1]
+        if tuple(graph._journal[: len(receipt.journal)]) == receipt.journal:
+            del graph._journal[: len(receipt.journal)]
+        if graph._nodes is receipt.nodes and graph._edges is receipt.edges:
+            graph._full_publish_pending = False
+        self._projection_calls.discard(scope)
+        for item in scope.records:
+            _close_publication(item)
+
+    def abort_projection_publication(self, receipt):
+        from memory_server.providers.graph_provider import _PublicationReceipt
+
+        self._check_loop()
+        if isinstance(receipt, _PublicationReceipt) and receipt.scope in self._projection_calls:
+            self._abort_projection_call(receipt.scope)
+
+    def _abort_projection_call(self, scope):
+        from memory_server.providers.graph_provider import _close_publication
+
+        if scope in self._projection_calls:
+            self._projection_calls.discard(scope)
+            scope.abandoned = True
+            for receipt in scope.records:
+                _close_publication(receipt)
 
     async def _start(self, entry: _Entry) -> CMMSRuntime:
         try:
