@@ -380,15 +380,18 @@ async def restart_owner(root, *, callback=None):
         assert (await owner.close()).code is None, "S20A_RESTART: cleanup"
 
 
-async def crash_child(root, phase, operation, edge):
+async def crash_child(root, phase, operation, edge, inventory="graph"):
     """Only syscall observers are patched; each observed operation actually executes."""
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
     from tests.gateway.test_online_rebuild import projection_owner
 
     def install(owner):
         originals = {name: getattr(os, name) for name in ("fsync", "replace", "rename")}
+        last_move = None
 
         def wrapper(name):
             def call(*args, **kwargs):
+                nonlocal last_move
                 state = None
                 if name == "fsync":
                     path = Path(os.readlink(f"/proc/self/fd/{args[0]}"))
@@ -399,6 +402,13 @@ async def crash_child(root, phase, operation, edge):
                         except (ValueError, OSError):
                             pass
                     kind = "dir-fsync" if path.is_dir() else "file-fsync"
+                    if ":" in operation and not operation.startswith("intent:") and path.is_dir():
+                        for journal in (root / projections._OWNED_DIRECTORY).glob("*/journal.json"):
+                            state = json.loads(journal.read_bytes())
+                        parent = "root" if path == root else "stage" if path.name == "stage" else "run"
+                        if last_move is not None:
+                            move, target = last_move
+                            kind = f"{move}:{parent}:{target}"
                 else:
                     fd = kwargs.get("src_dir_fd")
                     if fd is None:
@@ -414,6 +424,15 @@ async def crash_child(root, phase, operation, edge):
                     kind = "record" if name == "replace" else "rename"
                     if name == "rename" and operation == "swap" and str(args[0]) in {"graph", "vector"}:
                         kind = "swap"
+                    if name == "rename" and ":" in operation and state is not None:
+                        target = state["intent"]
+                        if state["phase"] == "publish":
+                            move = "quarantine" if str(args[1]).startswith("old-") else "swap"
+                        else:
+                            move = "restore" if str(args[0]).startswith("old-") else "unpublish"
+                        kind = f"{move}:{target}"
+                if operation.startswith("intent:") and state is not None and state["intent"] is not None:
+                    kind = f"intent:{kind}:{state['intent']}"
                 match = state is not None and state["phase"] == phase and kind == operation
 
                 def barrier():
@@ -426,6 +445,8 @@ async def crash_child(root, phase, operation, edge):
                 if match and edge == "before":
                     barrier()
                 result = originals[name](*args, **kwargs)
+                if name == "rename" and ":" in kind:
+                    last_move = tuple(kind.split(":"))
                 if match and edge == "after":
                     barrier()
                 return result
@@ -445,22 +466,28 @@ async def crash_child(root, phase, operation, edge):
                 setattr(os, name, function)
             await owner.close()
     else:
-        async with projection_owner(root) as (owner, custody):
+        embedder = MockEmbeddingProvider() if inventory == "both" else None
+        async with projection_owner(root, embedder) as (owner, custody):
             from sqlalchemy import text
 
+            (root / "vector" / "canary").write_bytes(b"retained old vector generation")
+            (root / "vector" / "canary").chmod(0o600)
             async with owner.dependencies.sqlite.engine.begin() as db:
-                await db.execute(text("PRAGMA journal_mode=WAL"))
+                mode = (await db.execute(text("PRAGMA journal_mode=WAL"))).scalar()
+                assert mode == "wal", "S20A_RESTART: file SQLite not WAL"
             originals = install(owner)
             try:
                 captured = await projections.snapshot_owned_projection_records(owner, custody=custody)
-                await projections.rebuild_owned_projections(captured, custody=custody, targets=frozenset({"graph"}))
+                targets = frozenset({"graph", "vector"} if inventory == "both" else {"graph"})
+                await projections.rebuild_owned_projections(captured, custody=custody, targets=targets)
             finally:
                 for name, function in originals.items():
                     setattr(os, name, function)
 
 
-def kill_at(root, phase, operation, edge):
-    command = [sys.executable, str(Path(__file__)), "crash", str(root), phase, operation, edge]
+def kill_at(root, phase, operation, edge, *, both=False):
+    inventory = "both" if both or ":" in operation else "graph"
+    command = [sys.executable, str(Path(__file__)), "crash", str(root), phase, operation, edge, inventory]
     child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         with selectors.DefaultSelector() as selector:
@@ -472,6 +499,10 @@ def kill_at(root, phase, operation, edge):
         event = json.loads(line)
         assert event == dict(pid=child.pid, phase=phase, operation=operation, edge=edge), "S20A_RESTART: IPC"
         before = disk_scope(root)
+        for old_vector in (root / projections._OWNED_DIRECTORY).glob("*/old-vector"):
+            vector = [("vector/" + str(path.relative_to(old_vector)), path.stat().st_ino, path.read_bytes())
+                      for path in sorted(old_vector.rglob("*")) if path.is_file()]
+            before = before[0], vector, before[2]
         contender = subprocess.run(
             [sys.executable, "-c", "import fcntl,sys\nf=open(sys.argv[1],'rb')\n"
              "try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
@@ -497,13 +528,26 @@ RESTART_POINTS = [
     for operation in ("file-fsync", "record", "dir-fsync")
     for edge in ("before", "after")
 ] + [(phase, "rename", edge) for phase in ("publish", "rollback") for edge in ("before", "after")]
+RESTART_POINTS += [
+    (phase, operation, edge)
+    for phase, move, parents in (("publish", "quarantine", ("root", "run")),
+                                 ("publish", "swap", ("stage", "root")),
+                                 ("rollback", "unpublish", ("root", "stage")),
+                                 ("rollback", "restore", ("run", "root")))
+    for target in ("graph", "vector")
+    for operation in (f"{move}:{target}", *(f"{move}:{parent}:{target}" for parent in parents))
+    for edge in ("before", "after")
+]
+RESTART_POINTS += [(phase, f"intent:{operation}:{target}", edge)
+                   for phase in ("publish", "rollback") for target in ("graph", "vector")
+                   for operation in ("file-fsync", "record", "dir-fsync") for edge in ("before", "after")]
 
 
 @pytest.mark.parametrize("phase,operation,edge", RESTART_POINTS)
 def test_s20a_restart_each_phase(tmp_path, phase, operation, edge):
     root = tmp_path / "profile"
     if phase in {"rollback", "reconciled"}:
-        kill_at(root, "published", "dir-fsync", "after")
+        kill_at(root, "published", "dir-fsync", "after", both=":" in operation)
     before = kill_at(root, phase, operation, edge)
     # The graph can be mid-swap; its original generation is independently known.
     from memory_server.providers.graph_provider import SimpleGraph
