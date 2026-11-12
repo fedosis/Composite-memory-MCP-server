@@ -155,3 +155,73 @@ async def test_s20a_startup_preprovider_rejects_unsafe_journal(tmp_path, manifes
         assert trace == [], "S20A_STARTUP: provider constructed before reconciliation"
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot,phase,allowed", [
+    pytest.param({"unknown": 1}, "captured", False, id="unknown-object"),
+    pytest.param([], "captured", False, id="empty-list"),
+    pytest.param([1, 2], "captured", False, id="short-list"),
+    pytest.param([1, 2, "ZZ", 4], "captured", False, id="bad-digest"),
+    pytest.param([True, 2, "a" * 64, 4], "captured", False, id="bool-device"),
+    pytest.param("x", "captured", False, id="string"),
+    pytest.param(None, "captured", False, id="null-captured"),
+    pytest.param([1, True, "a" * 64, 4], "captured", False, id="bool-inode"),
+    pytest.param([1, 2, "a" * 64, True], "captured", False, id="bool-size"),
+    pytest.param([-1, 2, "a" * 64, 4], "captured", False, id="negative-device"),
+    pytest.param([1, -2, "a" * 64, 4], "captured", False, id="negative-inode"),
+    pytest.param([1, 2, "a" * 64, -4], "captured", False, id="negative-size"),
+    pytest.param([1.0, 2, "a" * 64, 4], "captured", False, id="float-device"),
+    pytest.param([1, 2, "A" * 64, 4], "captured", False, id="uppercase-digest"),
+    pytest.param([1, 2, "a" * 63, 4], "captured", False, id="short-digest"),
+    pytest.param([1, 2, "a" * 64 + "\n", 4], "captured", False, id="digest-newline"),
+    pytest.param([1, 2, 3, 4], "captured", False, id="nonstring-digest"),
+    pytest.param([1, 2, "a" * 64, 4, 5], "captured", False, id="long-list"),
+    pytest.param({"unknown": 1}, "snapshot", False, id="object-before-capture"),
+    pytest.param(None, "snapshot", True, id="partial-snapshot-control"),
+    pytest.param("captured-identity", "captured", True, id="captured-control"),
+])
+async def test_s20a_journal_snapshot_schema(tmp_path, snapshot, phase, allowed):
+    import json
+
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+    from tests.gateway.test_online_rebuild import projection_owner
+
+    root = tmp_path / "profile"
+    async with projection_owner(root) as (owner, custody):
+        captured = await projections.snapshot_owned_projection_records(owner, custody=custody)
+        layout, config = owner.layout, owner.config
+    run_path = root / projections._OWNED_DIRECTORY / captured.run_id
+    state = json.loads((run_path / "journal.json").read_bytes())
+    state.update(snapshot=state["snapshot"] if allowed and phase == "captured" else snapshot, phase=phase)
+    with projections._owned_dir(run_path) as run:
+        projections._owned_journal(run, state)
+    before = (run_path / "journal.json").read_bytes()
+    calls = 0
+
+    async def build(owner):
+        nonlocal calls
+        calls += 1
+        provider = SQLiteProvider(url=f"sqlite+aiosqlite:///{root / 'memory.db'}")
+        await provider.initialize()
+        return provider
+
+    runtime = CMMSRuntime(layout, profile_id="a", config=config,
+                          dependencies=RuntimeDependencies(recipes=(("sqlite", build),)))
+    try:
+        rejected = None
+        try:
+            await runtime.start()
+        except Exception as exc:
+            rejected = getattr(exc, "code", None)
+        if allowed:
+            assert rejected is None and runtime.state == "READY", "S20A_JOURNAL: valid state blocked"
+            assert calls == 1, "S20A_JOURNAL: valid state did not construct provider once"
+            assert json.loads((run_path / "journal.json").read_bytes())["phase"] == "reconciled", "S20A_JOURNAL"
+        else:
+            assert rejected == "E_STORAGE", "S20A_JOURNAL: malformed snapshot schema admitted"
+            assert calls == 0, "S20A_JOURNAL: provider constructed before rejection"
+            assert runtime.state != "READY", "S20A_JOURNAL: malformed journal reached READY"
+            assert (run_path / "journal.json").read_bytes() == before, "S20A_JOURNAL: journal mutated"
+    finally:
+        assert (await runtime.close()).code is None, "S20A_JOURNAL: close failed"

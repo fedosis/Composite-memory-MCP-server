@@ -1545,16 +1545,15 @@ def _owned_load_journal(fd, runtime, run_id, root):
         or any(type(state[key]) is not int or state[key] < 0
                for key in ("bytes_written", "bytes_verified", "free_before", "free_after"))):
         raise MaintenanceError("E_STORAGE")
-    for key in ("old", "staged"):
-        if not isinstance(state[key], dict) or not set(state[key]) <= {"vector", "graph"}:
-            raise MaintenanceError("E_STORAGE")
-        for identity in state[key].values():
-            if (not isinstance(identity, list) or len(identity) != 4
-                or any(type(identity[index]) is not int or identity[index] < 0 for index in (0, 1, 3))
-                or not isinstance(identity[2], str) or not re.fullmatch("[0-9a-f]{64}", identity[2])):
-                raise MaintenanceError("E_STORAGE")
-    if set(state["old"]) != {"vector", "graph"}:
+    if (not isinstance(state["old"], dict) or set(state["old"]) != {"vector", "graph"}
+        or not isinstance(state["staged"], dict) or not set(state["staged"]) <= {"vector", "graph"}):
         raise MaintenanceError("E_STORAGE")
+    snapshots = [] if state["snapshot"] is None and state["phase"] == "snapshot" else [state["snapshot"]]
+    for identity in [*state["old"].values(), *state["staged"].values(), *snapshots]:
+        if (not isinstance(identity, list) or len(identity) != 4
+            or any(type(identity[index]) is not int or identity[index] < 0 for index in (0, 1, 3))
+            or not isinstance(identity[2], str) or not re.fullmatch("[0-9a-f]{64}", identity[2])):
+            raise MaintenanceError("E_STORAGE")
     return state
 
 
