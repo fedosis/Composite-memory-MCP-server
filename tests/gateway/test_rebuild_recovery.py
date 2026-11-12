@@ -1,8 +1,12 @@
 """S20A1 recovery and frozen-source assertions against concrete owner APIs."""
 
 import ast
+import asyncio
 import hashlib
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -225,3 +229,101 @@ async def test_s20a_journal_snapshot_schema(tmp_path, snapshot, phase, allowed):
             assert (run_path / "journal.json").read_bytes() == before, "S20A_JOURNAL: journal mutated"
     finally:
         assert (await runtime.close()).code is None, "S20A_JOURNAL: close failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closing", [False, True], ids=["retained-block", "closing-priority"])
+async def test_s20a_native_cancel_retains_owner(tmp_path, closing):
+    from sqlalchemy import text
+
+    from tests.gateway.test_online_rebuild import projection_owner
+
+    async with projection_owner(tmp_path / "profile") as (owner, custody):
+        loop = asyncio.get_running_loop()
+        entered, release = asyncio.Event(), threading.Event()
+        lock = owner.lock
+        provider = owner.dependencies.sqlite
+        old_graph = (owner.root / "graph.json").read_bytes()
+        wrappers = []
+
+        def held():
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(10):
+                raise AssertionError("S20A_NATIVE: parent did not release thread")
+            return "drained"
+
+        handle = await owner.submit_native(held, kind="s20a-held-native")
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            for _ in range(2):
+                wrapper = asyncio.create_task(handle.result())
+                wrappers.append(wrapper)
+                # An IPC-independent loop barrier lets result() enter its shield.
+                await asyncio.wait({wrapper}, timeout=0.01)
+                wrapper.cancel()
+                await asyncio.gather(wrapper, return_exceptions=True)
+                assert wrapper.cancelled(), "S20A_NATIVE: wrapper not cancelled"
+                assert handle.thread.is_alive() and not handle.terminated, "S20A_NATIVE: false termination"
+                assert not await handle.drain(time.monotonic()), "S20A_NATIVE: expired drain succeeded"
+                try:
+                    async with asyncio.timeout(0.02):
+                        await owner.drain_maintenance(custody)
+                except TimeoutError:
+                    pass
+                else:
+                    pytest.fail("S20A_NATIVE: maintenance drained live native")
+                assert owner._maintenance_state == "blocked", "S20A_NATIVE: cancellation opened gate"
+
+            if closing:
+                owner.release_admitted(custody.self_task)
+                for _ in range(2):
+                    waiter = asyncio.create_task(owner.close())
+                    wrappers.append(waiter)
+                    await asyncio.wait({waiter}, timeout=0.02)
+                    assert not waiter.done(), "S20A_NATIVE: close completed while thread live"
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
+                assert owner.state == "CLOSING", "S20A_NATIVE: close lost lifecycle priority"
+
+            assert owner.lock is lock and lock._fh is not None, "S20A_NATIVE: EX released early"
+            assert not owner._closed, "S20A_NATIVE: provider closed before native exit"
+            assert owner.dependencies.sqlite is provider, "S20A_NATIVE: provider replaced"
+            async with provider.engine.connect() as connection:
+                value = (await connection.execute(text("SELECT id FROM facts"))).scalar()
+                assert value == "f", "S20A_NATIVE: SQL closed"
+            assert (owner.root / "graph.json").read_bytes() == old_graph, "S20A_NATIVE: early publication"
+            assert not (owner.root / projections._OWNED_DIRECTORY).exists(), "S20A_NATIVE: early journal/rename"
+            contender = subprocess.run(
+                [sys.executable, "-c", "import fcntl,sys\n"
+                 "with open(sys.argv[1], 'rb') as f:\n"
+                 " try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                 " except BlockingIOError: print('REFUSED')\n"
+                 " else: print('ACQUIRED')\n", str(owner.root / ".cmms-storage.lock")],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            assert contender.returncode == 0, "S20A_NATIVE: OS contender failed"
+            assert contender.stdout.strip() == "REFUSED", "S20A_NATIVE: OS contender acquired EX"
+            release.set()
+            assert await handle.drain(time.monotonic() + 3), "S20A_NATIVE: actual drain timed out"
+            assert not handle.thread.is_alive() and handle.terminated, "S20A_NATIVE: reaper not terminal"
+            assert owner._maintenance_state == "blocked", "S20A_NATIVE: drain unlocked retained block"
+            try:
+                owner.finish_maintenance(custody)
+            except Exception as exc:
+                assert getattr(exc, "code", None) in {
+                    "E_RUNTIME_NOT_READY", "E_MAINTENANCE_CONFLICT",
+                }, "S20A_NATIVE: wrong finish rejection"
+            else:
+                pytest.fail("S20A_NATIVE: finish reopened retained owner")
+            if closing:
+                assert owner.state in {"CLOSING", "CLOSED"}, "S20A_NATIVE: lifecycle reopened"
+            else:
+                assert owner.lock is lock and lock._fh is not None, "S20A_NATIVE: drain released EX"
+                assert owner.state == "READY", "S20A_NATIVE: retained owner lost lifecycle"
+        finally:
+            release.set()
+            await asyncio.gather(*wrappers, return_exceptions=True)
+            assert await handle.drain(time.monotonic() + 3), "S20A_NATIVE: cleanup native leak"
+            owner.release_admitted(custody.self_task)
+            assert (await owner.close()).code is None, "S20A_NATIVE: terminal close failed"
+        assert owner.state == "CLOSED" and owner.lock is None, "S20A_NATIVE: terminal ownership not released"
