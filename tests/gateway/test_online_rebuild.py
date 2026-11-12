@@ -671,3 +671,95 @@ async def test_s20a_drain_worker_identity(tmp_path, identity):
             await asyncio.gather(*(t for t in (parent, candidate, holder, releaser) if t is not None),
                                  return_exceptions=True)
             runtime.release_admitted(token)
+
+
+def artifact_identity(path):
+    import hashlib
+
+    return {
+        str(item.relative_to(path)): (
+            item.stat().st_dev, item.stat().st_ino,
+            hashlib.sha256(item.read_bytes()).hexdigest() if item.is_file() else None,
+        ) for item in [path, *sorted(path.rglob("*"))]
+    }
+
+
+@pytest.mark.asyncio
+async def test_s20a_finish_x10_no_unlock_or_republish(tmp_path, monkeypatch):
+    import json
+    import os
+
+    from memory_server import projection_rebuild as p
+
+    async with started_worker_owner(tmp_path / "a") as runtime:
+        async with projection_owner(tmp_path / "b") as (foreign, foreign_custody):
+            worker = runtime.dependencies.outbox_worker
+            token = runtime.admit()
+            parent = runtime.spawn_owned_task(worker.run, kind="daemon-worker-parent")
+            custody = runtime.begin_maintenance(profile_id="a", canonical_root=runtime.root,
+                                                deadline=time.monotonic() + 20)
+            lock, fh = runtime.lock, runtime.lock._fh
+            lock_identity = os.fstat(fh)
+            renames = []
+            original_rename = os.rename
+
+            def observed_rename(*args, **kwargs):
+                renames.append((args, kwargs))
+                return original_rename(*args, **kwargs)
+
+            try:
+                await runtime.drain_maintenance(custody, worker_task=parent)
+                snapshot = await p.snapshot_owned_projection_records(runtime, custody=custody)
+                run = runtime.root / p._OWNED_DIRECTORY / snapshot.run_id
+                with monkeypatch.context() as patch:
+                    patch.setattr(os, "rename", observed_rename)
+                    await p.rebuild_owned_projections(snapshot, custody=custody, targets=frozenset({"graph"}))
+                    assert len(renames) == 2, "S20A_FINISH_NO_UNLOCK: real publication renames"
+                    journal = (run / "journal.json").read_bytes()
+                    assert json.loads(journal)["phase"] == "published", "S20A_FINISH_NO_UNLOCK: publication"
+                    before = artifact_identity(runtime.root / "graph.json")
+                    for _ in range(10):
+                        with pytest.raises(p.MaintenanceError) as rejected:
+                            runtime.finish_maintenance(custody)
+                        assert rejected.value.code == "E_MAINTENANCE_CONFLICT", "S20A_FINISH_NO_UNLOCK: finish"
+                        with pytest.raises(p.MaintenanceError) as admission:
+                            runtime.admit()
+                        assert admission.value.code == "E_MAINTENANCE_CONFLICT", "S20A_FINISH_NO_UNLOCK: admission"
+                        assert worker._maintenance_paused and not parent.done(), "S20A_FINISH_NO_UNLOCK: worker"
+                        assert runtime.lock is lock and lock._fh is fh, "S20A_FINISH_NO_UNLOCK: EX replaced"
+                        assert os.fstat(fh) == lock_identity, "S20A_FINISH_NO_UNLOCK: EX identity"
+                        assert (run / "journal.json").read_bytes() == journal, "S20A_FINISH_NO_UNLOCK: journal mutation"
+                        assert artifact_identity(runtime.root / "graph.json") == before, "S20A_FINISH_NO_UNLOCK: live"
+                        assert len(renames) == 2, "S20A_FINISH_NO_UNLOCK: republished"
+                    with pytest.raises(p.MaintenanceError):
+                        runtime.finish_maintenance(foreign_custody)
+
+                    async def wrong_task():
+                        with pytest.raises(p.MaintenanceError) as rejected:
+                            runtime.finish_maintenance(custody)
+                        assert rejected.value.code == "E_RUNTIME_NOT_READY", "S20A_FINISH_NO_UNLOCK: foreign task"
+
+                    await asyncio.create_task(wrong_task())
+                    with monkeypatch.context() as clock_patch:
+                        clock_patch.setattr(runtime, "_clock", lambda: custody._identity[-1] + 1)
+                        with pytest.raises(p.MaintenanceError) as expired:
+                            runtime.finish_maintenance(custody)
+                        assert expired.value.code == "E_TIMEOUT", "S20A_FINISH_NO_UNLOCK: expired"
+                    runtime.release_admitted(token)
+                    with pytest.raises(p.MaintenanceError) as stale:
+                        runtime.finish_maintenance(custody)
+                    assert stale.value.code == "E_RUNTIME_NOT_READY", "S20A_FINISH_NO_UNLOCK: released custody"
+                    runtime._begin_close()
+                    assert runtime.state == "CLOSING", "S20A_FINISH_NO_UNLOCK: real closing"
+                    with pytest.raises(p.MaintenanceError) as closing:
+                        runtime.finish_maintenance(custody)
+                    assert closing.value.code == "E_RUNTIME_NOT_READY", "S20A_FINISH_NO_UNLOCK: CLOSING"
+                    assert len(renames) == 2 and (run / "journal.json").read_bytes() == journal, (
+                        "S20A_FINISH_NO_UNLOCK: invalid custody caused publication"
+                    )
+                    assert worker._maintenance_paused and runtime.lock is lock, "S20A_FINISH_NO_UNLOCK: fence lost"
+            finally:
+                runtime.release_admitted(token)
+                worker.stop()
+                await asyncio.gather(parent, return_exceptions=True)
+            assert foreign.state == "READY", "S20A_FINISH_NO_UNLOCK: foreign owner changed"
