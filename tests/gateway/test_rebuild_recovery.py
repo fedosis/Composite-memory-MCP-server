@@ -1016,6 +1016,96 @@ def test_s20a_manifest_durability_identity(tmp_path, monkeypatch, case):
     assert disk_scope(root) == before, "S20A_JOURNAL: canonical/outbox/nonselected/live mutation"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "vector-only-empty", "missing-id", "missing-metadata", "canonical-empty-nonempty-expected",
+    "canonical-rows", "canonical-empty",
+])
+async def test_s20a_vector_artifact_schema_identity(tmp_path, monkeypatch, case):
+    import lancedb
+    import pyarrow as pa
+    from sqlalchemy import text
+
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
+    from tests.gateway.test_online_rebuild import projection_owner
+
+    def disk_tree(path):
+        return {
+            str(item.relative_to(path)): (
+                item.stat().st_dev, item.stat().st_ino,
+                hashlib.sha256(item.read_bytes()).hexdigest() if item.is_file() else None,
+            )
+            for item in [path, *sorted(path.rglob("*"))]
+        }
+
+    original_stage, original_reader = projections._owned_stage, projections._owned_vector_read
+    events, staged = [], {}
+    valid = case in {"canonical-rows", "canonical-empty"}
+    empty = case in {"vector-only-empty", "canonical-empty"}
+
+    def stage(path, records, targets, embedder, dimension, end):
+        original_stage(path, records, targets, embedder, dimension, end)
+        database = lancedb.connect(str(path / "vector"))
+        table = database.open_table("memories")
+        rows = table.to_arrow().to_pylist()
+        fields = [field for field in table.schema if not (
+            (case == "vector-only-empty" and field.name != "vector")
+            or (case == "missing-id" and field.name == "id")
+            or (case == "missing-metadata" and field.name == "_metadata")
+        )]
+        if not valid:
+            database.drop_table("memories")
+            table = database.create_table("memories", schema=pa.schema(fields))
+            if case in {"missing-id", "missing-metadata"}:
+                table.add([{field.name: row[field.name] for field in fields} for row in rows])
+        for item in (path / "vector").rglob("*"):
+            item.chmod(0o700 if item.is_dir() else 0o600)
+        staged.update(path=path / "vector", tree=disk_tree(path / "vector"), rows=rows)
+        events.append("real-stage")
+
+    def reader(*args):
+        events.append("bounded-owner-vector-reader")
+        return original_reader(*args)
+
+    async def forbidden_legacy(*args, **kwargs):
+        pytest.fail("S20A_VERIFY: legacy vector observer called")
+
+    async with projection_owner(tmp_path / "profile", MockEmbeddingProvider()) as (owner, custody):
+        if empty:
+            async with owner.dependencies.sqlite.engine.begin() as connection:
+                await connection.execute(text("DELETE FROM facts"))
+        snapshot = await projections.snapshot_owned_projection_records(owner, custody=custody)
+        assert bool(snapshot.records) != empty, "S20A_VERIFY: real SQL corpus"
+        live = owner.root / "vector"
+        before = disk_tree(live)
+        with monkeypatch.context() as patch:
+            patch.setattr(projections, "_owned_stage", stage)
+            patch.setattr(projections, "_owned_vector_read", reader)
+            patch.setattr(projections, "_observe_vector_artifact", forbidden_legacy)
+            caught = None
+            try:
+                await projections.rebuild_owned_projections(snapshot, custody=custody, targets=frozenset({"vector"}))
+            except Exception as exc:
+                caught = exc
+        run = owner.root / projections._OWNED_DIRECTORY / snapshot.run_id
+        journal = json.loads((run / "journal.json").read_bytes())
+        assert events == ["real-stage", "bounded-owner-vector-reader"], "S20A_VERIFY: production boundary"
+        assert owner._maintenance_state == "blocked", "S20A_VERIFY: retained fence"
+        if valid:
+            assert caught is None and journal["phase"] == "published", "S20A_VERIFY: canonical rejected"
+            table = lancedb.connect(str(live)).open_table("memories")
+            assert set(table.schema.names) == {"id", "vector", "_metadata"}, "S20A_VERIFY: live schema"
+            assert table.to_arrow().to_pylist() == staged["rows"], "S20A_VERIFY: independent live rows"
+            assert disk_tree(live) != before and (run / "old-vector").exists(), "S20A_VERIFY: real publish"
+        else:
+            assert journal["phase"] == "stage", f"S20A_VERIFY: corrupt artifact published: {journal['phase']}"
+            assert isinstance(caught, projections.MaintenanceError), "S20A_VERIFY: stable error type"
+            assert caught.code == "E_VECTOR_BACKEND", "S20A_VERIFY: stable backend error"
+            assert disk_tree(live) == before, "S20A_VERIFY: live bytes/identity changed"
+            assert disk_tree(staged["path"]) == staged["tree"], "S20A_VERIFY: verifier mutated stage"
+            assert not (run / "old-vector").exists(), "S20A_VERIFY: publication effect"
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "scope":
         asyncio.run(scope_child(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]))
