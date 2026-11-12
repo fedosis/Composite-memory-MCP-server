@@ -1262,7 +1262,8 @@ async def snapshot_owned_projection_records(runtime, *, custody) -> SnapshotReco
             os.fsync(parent)
             with _owned_dir(run_id, parent=parent) as run:
                 os.close(_owned_file(run, "snapshot.db", os.O_WRONLY | os.O_CREAT | os.O_EXCL))
-                state = {"version": 1, "run": run_id, "profile": hashlib.sha256(runtime.profile_id.encode()).hexdigest(),
+                state = {"version": 1, "run": run_id,
+                         "profile": hashlib.sha256(runtime.profile_id.encode()).hexdigest(),
                          "root": [os.fstat(root).st_dev, os.fstat(root).st_ino],
                          "config": hashlib.sha256(repr(runtime.config).encode()).hexdigest(),
                          "paths": paths, "old": old, "staged": {},
@@ -1304,7 +1305,8 @@ async def snapshot_owned_projection_records(runtime, *, custody) -> SnapshotReco
         runtime.check_maintenance(custody)
         records, content_digest = await _owned_native(runtime, custody, end, _owned_read_records, destination, end)
         observed, errors = _ProjectionObservation(), []
-        await _owned_native(runtime, custody, end, _observe_snapshot, f"sqlite+aiosqlite:///{destination}", observed, errors)
+        await _owned_native(runtime, custody, end, _observe_snapshot,
+                            f"sqlite+aiosqlite:///{destination}", observed, errors)
         if errors:
             raise MaintenanceError("E_STORAGE")
         with _owned_dir(destination.parent) as run:
@@ -1452,7 +1454,8 @@ async def rebuild_owned_projections(snapshot, *, custody, targets, allow_network
                 raise MaintenanceError("E_STORAGE")
             if any(_owned_inventory(root, name) != state["old"][target] for target, name in state["paths"].items()):
                 raise MaintenanceError("E_STORAGE")
-            _owned_free(root, math.ceil(1.25 * sum(item[3] for item in state["old"].values())) + _OWNED_LIMITS["overhead"])
+            _owned_free(root, math.ceil(1.25 * sum(item[3] for item in state["old"].values()))
+                        + _OWNED_LIMITS["overhead"])
             os.mkdir("stage", 0o700, dir_fd=run)
             os.fsync(run)
             state.update(targets=sorted(targets), phase="stage")
