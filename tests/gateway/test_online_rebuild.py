@@ -1126,3 +1126,114 @@ async def test_s20a_selected_verification_real_artifacts(tmp_path, monkeypatch, 
                 assert artifact_identity(path) == before[target], "S20A_VERIFY: rejected artifact changed live bytes"
         if live_target is None:
             assert runtime._maintenance_state == "blocked", "S20A_VERIFY: verifier/publication lost fence"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "selected-vector-unavailable", "selected-graph-unavailable", "nonselected-vector-unavailable",
+    "remote-false", "cold-local-false", "remote-true",
+])
+async def test_s20a_unavailable_and_network_closed(tmp_path, monkeypatch, case):
+    import json
+    import socket
+    import sys
+
+    from memory_server import projection_rebuild as p
+    from memory_server.providers.embedding_provider import (
+        MockEmbeddingProvider,
+        OpenAIEmbeddingProvider,
+        SentenceTransformerEmbeddingProvider,
+    )
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    endpoint = "https://captured-embedding.invalid/v1"
+    embedder = (SentenceTransformerEmbeddingProvider() if case == "cold-local-false" else
+                OpenAIEmbeddingProvider(base_url=endpoint, api_key="synthetic-test-key", vector_size=384))
+    selected = "graph" if "graph-unavailable" in case or case == "nonselected-vector-unavailable" else "vector"
+    unavailable = frozenset({"graph" if case == "selected-graph-unavailable" else "vector"}) if (
+        "unavailable" in case
+    ) else frozenset()
+    remote, downloads, sockets, stages, closes = [], [], [], [], []
+    vectors = MockEmbeddingProvider()
+
+    # This is the permitted external embedder fake, not a fake owner/verifier.
+    # The real OpenAIEmbeddingProvider._get_client/embed_batch chooses and passes
+    # the endpoint, model and texts; no SDK installation or network is required.
+    def client(*, base_url, api_key):
+        remote.append(("client", base_url, api_key))
+
+        def create(*, model, input):
+            remote.append(("request", base_url, model, list(input)))
+            return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=v) for i, v in
+                                         enumerate(vectors.embed_batch(input))])
+        return SimpleNamespace(embeddings=SimpleNamespace(create=create))
+
+    def no_download(*args, **kwargs):
+        downloads.append(True)
+        pytest.fail("S20A_NETWORK: cold local model/download invoked with network disabled")
+
+    def no_socket(*args, **kwargs):
+        sockets.append(True)
+        pytest.fail("S20A_NETWORK: fixture attempted real network")
+
+    original_stage, original_close = p._owned_stage, LanceDBProvider.close
+
+    def stage(*args):
+        stages.append(True)
+        return original_stage(*args)
+
+    async def close(*args):
+        closes.append(True)
+        return await original_close(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=client))
+        patch.setattr(SentenceTransformerEmbeddingProvider, "_get_model", no_download)
+        patch.setattr(socket.socket, "connect", no_socket)
+        patch.setattr(socket.socket, "connect_ex", no_socket)
+        patch.setattr(p, "_owned_stage", stage)
+        patch.setattr(LanceDBProvider, "close", close)
+        async with projection_owner(tmp_path / "a", embedder, unavailable=unavailable) as (runtime, custody):
+            captured = runtime.layout.unavailable_projections
+            snapshot = await p.snapshot_owned_projection_records(runtime, custody=custody)
+            run = runtime.root / p._OWNED_DIRECTORY / snapshot.run_id
+            before = {name: artifact_identity(runtime.root / name) for name in ("vector", "graph.json")}
+            patch.setenv("OPENAI_BASE_URL", "https://ambient-not-authorized.invalid/v1")
+            caught = None
+            try:
+                await p.rebuild_owned_projections(snapshot, custody=custody, targets=frozenset({selected}),
+                                                 allow_network_embedding=case == "remote-true")
+            except p.MaintenanceError as exc:
+                caught = exc
+            negative = case.startswith("selected-") or case in {"remote-false", "cold-local-false"}
+            if negative:
+                assert caught is not None and caught.code == (
+                    "E_PROJECTION_UNAVAILABLE" if case.startswith("selected-") else "E_CAPABILITY_UNAVAILABLE"
+                ), "S20A_NETWORK: unavailable/disabled embedding not rejected"
+                assert stages == [] and closes == [] and not (run / "stage").exists(), (
+                    "S20A_NETWORK: selected unavailable must fail before stage or close"
+                )
+                for name in before:
+                    assert artifact_identity(runtime.root / name) == before[name], "S20A_NETWORK: refused live mutation"
+                assert json.loads((run / "journal.json").read_bytes())["phase"] == "captured", "S20A_NETWORK"
+            else:
+                assert caught is None and stages == [True], "S20A_NETWORK: selected available rebuild failed"
+                assert json.loads((run / "journal.json").read_bytes())["phase"] == "published", "S20A_NETWORK"
+            assert runtime.layout.unavailable_projections is captured is unavailable, (
+                "S20A_NETWORK: frozen unavailable selection changed"
+            )
+            assert runtime.dependencies.embedder is embedder, "S20A_NETWORK: captured embedder replaced"
+            if case == "remote-true":
+                assert len(remote) == 2 and remote[0] == ("client", endpoint, "synthetic-test-key"), (
+                    "S20A_NETWORK: True used endpoint other than captured provider endpoint"
+                )
+                assert remote[1][0:3] == ("request", endpoint, embedder._model), "S20A_NETWORK: remote request endpoint"
+                assert remote[1][3] == ["subject predicate object"], "S20A_NETWORK: real stage embedding input"
+            else:
+                assert remote == [], "S20A_NETWORK: False/graph-only performed remote call"
+            if selected == "graph":
+                assert embedder._client is None, "S20A_NETWORK: graph-only constructed remote embedder client"
+                assert artifact_identity(runtime.root / "vector") == before["vector"], (
+                    "S20A_NETWORK: nonselected unavailable vector changed"
+                )
+            assert sockets == [] and downloads == [], "S20A_NETWORK: network/download not closed"
