@@ -1257,8 +1257,7 @@ async def snapshot_owned_projection_records(runtime, *, custody) -> SnapshotReco
     if runtime._maintenance_state != "active" or runtime.dependencies.sqlite is None:
         raise MaintenanceError("E_MAINTENANCE_CONFLICT")
     paths = _owned_paths(runtime)
-    end = min(custody._identity[-1], time.monotonic() + _OWNED_LIMITS["snapshot"])
-    run_id = uuid4().hex
+    end, run_id = min(custody._identity[-1], time.monotonic() + _OWNED_LIMITS["snapshot"]), uuid4().hex
     with _owned_dir(runtime.root) as root:
         old = {target: _owned_inventory(root, name) for target, name in paths.items()}
         required = math.ceil(1.25 * sum(value[3] for value in old.values())) + _OWNED_LIMITS["overhead"]
@@ -1348,6 +1347,8 @@ def _owned_vector_read(path, records, dimension, end):
                 for record in records if is_eligible(record) and record.record_type in {"fact", "belief"}}
     database = lancedb.connect(str(path))
     table = database.open_table("memories")
+    if not {"id", "vector", "_metadata"}.issubset(table.schema.names):
+        raise MaintenanceError("E_VECTOR_BACKEND")
     vector = table.schema.field("vector").type
     if not pa.types.is_fixed_size_list(vector) or vector.list_size != dimension:
         raise MaintenanceError("E_VECTOR_BACKEND")
@@ -1457,8 +1458,7 @@ async def rebuild_owned_projections(snapshot, *, custody, targets, allow_network
     if state["phase"] != "captured":
         raise MaintenanceError("E_MAINTENANCE_CONFLICT")
     end = min(custody._identity[-1], started + _OWNED_LIMITS["job"])
-    run_path = runtime.root / _OWNED_DIRECTORY / snapshot.run_id
-    dimension = getattr(runtime.config, "vector_size", 384)
+    run_path, dimension = runtime.root / _OWNED_DIRECTORY / snapshot.run_id, getattr(runtime.config, "vector_size", 384)
     try:
         records, digest = await _owned_native(runtime, custody, end, _owned_read_records, run_path / "snapshot.db", end)
         if digest != snapshot.content_digest:
