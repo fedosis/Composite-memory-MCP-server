@@ -434,3 +434,158 @@ async def test_s20a_drain_exact_admitted_self(tmp_path):
             ready.cancel()
         await asyncio.gather(prior, job, ready, return_exceptions=True)
         assert (await runtime.close()).code is None
+
+
+@asynccontextmanager
+async def started_worker_owner(root):
+    from sqlalchemy import text
+    from storage.outbox_worker import OutboxWorker
+
+    from memory_server.providers.graph_provider import SimpleGraph
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+    from memory_server.runtime.dependencies import RuntimeDependencies
+
+    async def sqlite(owner):
+        provider = SQLiteProvider(url=f"sqlite+aiosqlite:///{root / 'memory.db'}")
+        await provider.initialize()
+        async with provider.engine.begin() as connection:
+            await connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+            await connection.execute(text("INSERT INTO alembic_version VALUES ('0007')"))
+        return provider
+
+    async def worker(owner):
+        vector = LanceDBProvider(db_path=str(root / "vector"), native_submitter=owner.submit_native)
+        result = OutboxWorker(engine=owner.dependencies.sqlite.engine, qdrant=vector,
+                              task_spawner=owner.spawn_owned_task, native_submitter=owner.submit_native,
+                              poll_interval_seconds=0.01, compact_interval_seconds=0)
+        await result.initialize()
+        return result
+
+    layout = SimpleNamespace(data_root=root, vector=SimpleNamespace(backend="lancedb", local_path=root / "vector"),
+                             graph_snapshot_path=root / "graph.json")
+    runtime = CMMSRuntime(layout, profile_id="a", dependencies=RuntimeDependencies(
+        recipes=(("sqlite", sqlite), ("outbox_worker", worker)),
+    ))
+    await runtime.start()
+    root.chmod(0o700)
+    (root / "vector").mkdir(mode=0o700)
+    SimpleGraph().save_snapshot(root / "graph.json")
+    (root / "graph.json").chmod(0o600)
+    try:
+        yield runtime
+    finally:
+        runtime.dependencies.outbox_worker.stop()
+        assert (await runtime.close()).code is None, "S20A_DRAIN: terminal cleanup"
+
+
+async def wait_observed(predicate, marker):
+    async with asyncio.timeout(5):
+        while not predicate():
+            await asyncio.sleep(0.005)
+    assert predicate(), marker
+
+
+@pytest.mark.asyncio
+async def test_s20a_drain_exact_job_token(tmp_path, monkeypatch):
+    import threading
+
+    from memory_server import projection_rebuild as p
+
+    async with started_worker_owner(tmp_path / "a") as runtime:
+        worker = runtime.dependencies.outbox_worker
+        provider = worker._qdrant
+        # The actual provider constructs a real Lance table before the hold.
+        table = await provider._get_table()
+        compact_entered, compact_release = asyncio.Event(), asyncio.Event()
+        native_entered, native_release = threading.Event(), threading.Event()
+        original_run = provider._run
+
+        async def held_optimize(function, *args, **kwargs):
+            if kwargs.get("kind") == "lancedb-optimize":
+                compact_entered.set()
+                await compact_release.wait()
+            return await original_run(function, *args, **kwargs)
+
+        def held_native():
+            native_entered.set()
+            assert native_release.wait(10), "S20A_DRAIN: native release timeout"
+            return table.count_rows()
+
+        # A bootstrap host and another admitted operation must both drain;
+        # neither may be confused with the admitted maintenance child itself.
+        bootstrap = runtime.admit()
+        other_ready, other_release = asyncio.Event(), asyncio.Event()
+        child_ready, snapshot_done = asyncio.Event(), asyncio.Event()
+        observed = {}
+
+        async def other_operation():
+            token = runtime.admit()
+            other_ready.set()
+            try:
+                await other_release.wait()
+            finally:
+                runtime.release_admitted(token)
+
+        async def job():
+            token = runtime.admit()
+            try:
+                custody = runtime.begin_maintenance(profile_id="a", canonical_root=runtime.root,
+                                                    deadline=time.monotonic() + 20)
+                observed["custody"] = custody
+                child_ready.set()
+                await runtime.drain_maintenance(custody, worker_task=parent)
+                observed["snapshot"] = await p.snapshot_owned_projection_records(runtime, custody=custody)
+                snapshot_done.set()
+            finally:
+                runtime.release_admitted(token)
+
+        parent = other = child = None
+        handle = None
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(provider, "_run", held_optimize)
+                await worker._maybe_compact()
+                await asyncio.wait_for(compact_entered.wait(), 5)
+                compact = worker._compact_task
+                assert worker._active_claim is not None and not compact.done(), "S20A_DRAIN: real compact claim"
+                handle = await runtime.submit_native(held_native, kind="drain-test-held-io")
+                await wait_observed(native_entered.is_set, "S20A_DRAIN: native not entered")
+                parent = runtime.spawn_owned_task(worker.run, kind="daemon-worker-parent")
+                other = asyncio.create_task(other_operation())
+                await other_ready.wait()
+                child = asyncio.create_task(job())
+                await child_ready.wait()
+                await wait_observed(lambda: worker._maintenance_paused, "S20A_DRAIN: not paused")
+                assert observed["custody"].self_task is child and child in runtime._admitted, "S20A_DRAIN: exact token"
+                assert bootstrap in runtime._admitted and other in runtime._admitted, "S20A_DRAIN: real admissions"
+                assert not snapshot_done.is_set(), "S20A_DRAIN: snapshot before compact/native/bootstrap drain"
+                compact_release.set()
+                await compact
+                for item in (runtime.root / "vector").rglob("*"):
+                    item.chmod(0o700 if item.is_dir() else 0o600)
+                assert not snapshot_done.is_set(), "S20A_DRAIN: held native excluded"
+                native_release.set()
+                await handle.result()
+                assert await handle.drain(time.monotonic() + 5), "S20A_DRAIN: native not settled"
+                await asyncio.sleep(0.03)
+                assert not snapshot_done.is_set(), "S20A_DRAIN: bootstrap/other excluded"
+                runtime.release_admitted(bootstrap)
+                await asyncio.sleep(0.03)
+                assert not snapshot_done.is_set(), "S20A_DRAIN: other admitted task excluded"
+                other_release.set()
+                await asyncio.wait_for(asyncio.gather(other, child), 5)
+                assert snapshot_done.is_set() and not parent.done(), "S20A_DRAIN: self excluded, persistent parent kept"
+                assert worker._maintenance_pause_ack and worker._active_claim is None, "S20A_DRAIN: pause/claim"
+                assert not runtime._live_natives(runtime.owned_snapshot()[2]), "S20A_DRAIN: native registry"
+                assert observed["snapshot"].records == (), "S20A_DRAIN: real H03 snapshot"
+        finally:
+            native_release.set()
+            compact_release.set()
+            other_release.set()
+            runtime.release_admitted(bootstrap)
+            worker.stop()
+            await asyncio.gather(*(t for t in (other, child, parent, worker._compact_task) if t is not None),
+                                 return_exceptions=True)
+            if handle is not None:
+                await handle.drain(time.monotonic() + 5)
