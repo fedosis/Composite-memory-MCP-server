@@ -857,3 +857,119 @@ async def test_s20a_snapshot_owner_wal(tmp_path, monkeypatch):
         assert hashlib.sha256(canonical).hexdigest() == snapshot.content_digest, (
             "S20A_SNAPSHOT: independent content digest"
         )
+
+
+async def seed_projection_corpus(runtime):
+    from sqlalchemy import insert
+    from storage.models.belief import BeliefORM
+    from storage.models.decision import DecisionORM
+    from storage.models.skill import SkillORM
+
+    async with runtime.dependencies.sqlite.engine.begin() as connection:
+        await connection.execute(insert(BeliefORM), [
+            dict(id="b", proposition="belief content", lifecycle_state="active"),
+            dict(id="bad-b", proposition="excluded belief", lifecycle_state="archived"),
+        ])
+        await connection.execute(insert(DecisionORM), [
+            dict(id="d", choice="choose", reason="because", context="subject", dedup_key="d"),
+            dict(id="bad-d", choice="", reason="because", context="subject", dedup_key="bad-d"),
+        ])
+        await connection.execute(insert(SkillORM), [
+            dict(id="s", purpose="purpose", steps='["step"]'),
+            dict(id="bad-s", purpose="excluded skill", steps='[]'),
+        ])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["vector", "graph", "both", "empty"])
+async def test_s20a_target_selective_native(tmp_path, monkeypatch, selection):
+    import json
+
+    import lancedb
+    from sqlalchemy import text
+
+    from memory_server import projection_rebuild as p
+    from memory_server.providers.embedding_provider import MockEmbeddingProvider
+    from memory_server.providers.lancedb_provider import LanceDBProvider
+
+    embedder = MockEmbeddingProvider()
+    targets = frozenset({selection}) if selection in {"vector", "graph"} else frozenset({"vector", "graph"})
+    async with projection_owner(tmp_path / "a", embedder) as (runtime, custody):
+        await seed_projection_corpus(runtime)
+        if selection == "empty":
+            async with runtime.dependencies.sqlite.engine.begin() as connection:
+                for table in ("beliefs", "decisions", "facts", "skills"):
+                    await connection.execute(text(f"DELETE FROM {table}"))
+        snapshot = await p.snapshot_owned_projection_records(runtime, custody=custody)
+        assert len(snapshot.records) == (0 if selection == "empty" else 7), "S20A_TARGETS: real SQL corpus"
+        expected = p.expected_projection(snapshot.records)
+        assert expected.eligible_counts == ({} if selection == "empty" else
+                                           {"belief": 1, "decision": 1, "fact": 1, "skill": 1}), (
+            "S20A_TARGETS: ineligible rows included"
+        )
+        if selection != "empty":
+            async with runtime.dependencies.sqlite.engine.begin() as connection:
+                await connection.execute(text("UPDATE facts SET object='changed only payload' WHERE id='f'"))
+            changed = await p.snapshot_owned_projection_records(runtime, custody=custody)
+            assert [(r.record_type, r.record_id) for r in changed.records] == [
+                (r.record_type, r.record_id) for r in snapshot.records
+            ], "S20A_TARGETS: payload-only control IDs changed"
+            assert changed.content_digest != snapshot.content_digest, "S20A_TARGETS: content digest ignores payload"
+        paths = {"vector": runtime.root / "vector", "graph": runtime.root / "graph.json"}
+        before = {key: artifact_identity(path) for key, path in paths.items()}
+        calls, vector_constructors, mappings = [], [], []
+        original_embed, original_connect = embedder.embed_batch, lancedb.connect
+        original_init, original_map = LanceDBProvider.__init__, p.map_projection_record
+
+        def embed(texts):
+            calls.append(list(texts))
+            return original_embed(texts)
+
+        def connect(*args, **kwargs):
+            vector_constructors.append("lancedb.connect")
+            return original_connect(*args, **kwargs)
+
+        def provider_init(self, *args, **kwargs):
+            vector_constructors.append("LanceDBProvider")
+            original_init(self, *args, **kwargs)
+
+        def mapping(record):
+            mappings.append((record.record_type, record.record_id))
+            return original_map(record)
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("S20A_TARGETS: legacy rebuild/embedding-plan digest used")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(embedder, "embed_batch", embed)
+            patch.setattr(lancedb, "connect", connect)
+            patch.setattr(LanceDBProvider, "__init__", provider_init)
+            patch.setattr(p, "map_projection_record", mapping)
+            patch.setattr(p, "rebuild_projections", forbidden)
+            patch.setattr(p, "embedding_plan_digest", forbidden)
+            result = await p.rebuild_owned_projections(snapshot, custody=custody, targets=targets)
+        for key in paths.keys() - targets:
+            assert artifact_identity(paths[key]) == before[key], "S20A_TARGETS: nonselected bytes/identity changed"
+        if selection == "graph":
+            assert calls == [] and vector_constructors == [], "S20A_TARGETS: graph-only embed/vector constructor"
+        if "vector" in targets:
+            rows = original_connect(str(paths["vector"])).open_table("memories").to_arrow().to_pylist()
+            wanted = {original_map(r).point_id: dict(original_map(r).payload) for r in snapshot.records
+                      if p.is_eligible(r) and r.record_type in {"fact", "belief"}}
+            assert {row["id"]: json.loads(row["_metadata"]) for row in rows} == wanted, (
+                "S20A_TARGETS: actual additive stage does not match frozen mapping"
+            )
+            assert len(rows) == len(wanted), "S20A_TARGETS: duplicate vector rows"
+            assert set(mappings) == ({("belief", "b"), ("fact", "f")} if wanted else set()), (
+                "S20A_TARGETS: frozen vector mapping boundary not crossed"
+            )
+        if "graph" in targets:
+            graph = json.loads(paths["graph"].read_bytes())
+            assert {(n["id"], n["type"]) for n in graph["nodes"].values()} == set(expected.graph_nodes), (
+                "S20A_TARGETS: disk graph node/type mapping"
+            )
+            assert {(e["source_id"], e["target_id"], e["relation"]) for e in graph["edges"]} == set(
+                expected.graph_edges
+            ), "S20A_TARGETS: disk graph edge mapping"
+        assert result.eligible_counts == expected.eligible_counts, "S20A_TARGETS: result counts"
+        assert runtime._maintenance_state == "blocked", "S20A_TARGETS: publication unlocked owner"
