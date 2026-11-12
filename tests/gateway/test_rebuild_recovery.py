@@ -412,6 +412,8 @@ async def crash_child(root, phase, operation, edge):
                         for journal in (root / projections._OWNED_DIRECTORY).glob("*/journal.json"):
                             state = json.loads(journal.read_bytes())
                     kind = "record" if name == "replace" else "rename"
+                    if name == "rename" and operation == "swap" and str(args[0]) in {"graph", "vector"}:
+                        kind = "swap"
                 match = state is not None and state["phase"] == phase and kind == operation
 
                 def barrier():
@@ -519,6 +521,51 @@ def test_s20a_restart_each_phase(tmp_path, phase, operation, edge):
     assert after[:2] == before[:2], "S20A_RESTART: canonical/outbox/nonselected mutated"
     if code is None:
         assert after[2] == old_graph, "S20A_RESTART: incoherent old graph"
+
+
+async def rebuild_existing(root):
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+
+    async def build(owner):
+        provider = SQLiteProvider(url=f"sqlite+aiosqlite:///{root / 'memory.db'}")
+        await provider.initialize()
+        return provider
+
+    owner = CMMSRuntime(recovery_layout(root), profile_id="a",
+                        dependencies=RuntimeDependencies(recipes=(("sqlite", build),)))
+    token = None
+    try:
+        await owner.start()
+        token = owner.admit()
+        custody = owner.begin_maintenance(profile_id="a", canonical_root=root, deadline=time.monotonic() + 20)
+        await owner.drain_maintenance(custody)
+        snapshot = await projections.snapshot_owned_projection_records(owner, custody=custody)
+        await projections.rebuild_owned_projections(snapshot, custody=custody, targets=frozenset({"graph"}))
+        assert owner._maintenance_state == "blocked", "S20A_KILL9: publication reopened gate"
+        # Reopen actual disk through the frozen graph observer, not RebuildResult.
+        expected = projections.expected_projection(snapshot.records)
+        observed, errors = projections._ProjectionObservation(), []
+        projections._observe_graph_artifact(expected, root / "graph.json", observed, errors)
+        assert not errors, "S20A_KILL9: independent disk verification failed"
+    finally:
+        if token is not None:
+            owner.release_admitted(token)
+        assert (await owner.close()).code is None, "S20A_KILL9: close"
+
+
+def test_s20a_kill9_mid_publish_then_rebuild(tmp_path):
+    root = tmp_path / "profile"
+    before = kill_at(root, "publish", "swap", "after")
+    assert before[2] is not None, "S20A_KILL9: barrier was not after target swap"
+    code, state, recipes = asyncio.run(restart_owner(root))
+    assert (code, state, recipes) == (None, "READY", ["recipes"]), "S20A_KILL9: recovery blocked"
+    from memory_server.providers.graph_provider import SimpleGraph
+
+    old_path = tmp_path / "old.json"
+    SimpleGraph().save_snapshot(old_path)
+    assert disk_scope(root) == (*before[:2], old_path.read_bytes()), "S20A_KILL9: old generation not restored"
+    asyncio.run(rebuild_existing(root))
+    assert disk_scope(root)[:2] == before[:2], "S20A_KILL9: canonical/outbox/nonselected mutated"
 
 
 if __name__ == "__main__":
