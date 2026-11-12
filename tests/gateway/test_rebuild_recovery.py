@@ -646,6 +646,131 @@ def test_s20a_startup_preprovider_single_callback(tmp_path, monkeypatch, case):
     asyncio.run(exercise())
 
 
+def metadata_rows(store, profile):
+    with store.borrow_transaction() as tx:
+        return tuple((table, tuple(tuple(sorted(dict(row).items())) for row in tx.fetchmany(
+            f"SELECT * FROM {table} WHERE profile_id=? ORDER BY "
+            + ("id" if table == "jobs" else "subject,route_operation,key") + " LIMIT ?", (profile, 100), limit=100)))
+                     for table in ("jobs", "job_requests"))
+
+
+async def scope_child(root, control, job_id):
+    from memory_server.control.jobs import JobMetadata
+    from memory_server.control.store import ControlStore
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+    from tests.gateway.test_jobs import NOW
+
+    async def build(owner):
+        provider = SQLiteProvider(url=f"sqlite+aiosqlite:///{root / 'memory.db'}")
+        await provider.initialize()
+        return provider
+
+    owner = CMMSRuntime(root, profile_id="b", dependencies=RuntimeDependencies(recipes=(("sqlite", build),)))
+    await owner.start()
+    token = owner.admit()
+    try:
+        with ControlStore(control) as store:
+            metadata = JobMetadata(store)
+            claim = metadata.claim(job_id, "b", "subject", 0, now=NOW)
+            assert claim is not None and claim.job.status == "running", "S20A_SCOPE: B not running"
+            (root / "canary").write_bytes(b"B-owned")
+            print("B-RUNNING", flush=True)
+            assert sys.stdin.buffer.read(1) == b"G", "S20A_SCOPE: release protocol"
+            job = metadata.fail(claim, "E_INTERNAL", now=NOW)
+            assert job.status == "failed", "S20A_SCOPE: B did not progress"
+            async with owner.dependencies.sqlite.engine.connect() as db:
+                from sqlalchemy import text
+
+                assert (await db.execute(text("SELECT 1"))).scalar() == 1, "S20A_SCOPE: B engine closed"
+            print("B-CONTINUED", flush=True)
+    finally:
+        owner.release_admitted(token)
+        assert (await owner.close()).code is None, "S20A_SCOPE: B close"
+
+
+def test_s20a_recovery_scope_and_rollback(tmp_path):
+    from dataclasses import replace
+
+    from memory_server.application.job_runner import JobCoordinator
+    from memory_server.control.jobs import JobMetadata
+    from memory_server.control.store import ControlStore
+    from memory_server.gateway_contracts.ports import ProfileRecord
+    from tests.gateway.test_jobs import NOW, context, enqueue, final
+
+    root, other, control = (tmp_path / name for name in ("a", "b", "control"))
+    kill_at(root, "published", "dir-fsync", "after")
+    with ControlStore(control) as store:
+        store._configure(tuple(ProfileRecord(name, path, True, name, None, {}, 1)
+                               for name, path in (("a", root), ("b", other))))
+        metadata = JobMetadata(store)
+        a = final(store, enqueue(store, replace(context(), profile_id="a")))
+        b = final(store, enqueue(store, replace(context(), profile_id="b")))
+        assert metadata.claim(a.job_id, "a", "subject", 0, now=NOW) is not None, "S20A_SCOPE: A claim"
+        child = subprocess.Popen([sys.executable, str(Path(__file__)), "scope", str(other), str(control), b.job_id],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ)
+                assert selector.select(8), "S20A_SCOPE: B barrier timeout"
+                assert child.stdout.readline() == b"B-RUNNING\n", "S20A_SCOPE: B failed before barrier"
+            before = metadata_rows(store, "b")
+            artifacts = (other / "canary").stat().st_ino, (other / "canary").read_bytes()
+            journal = next((root / projections._OWNED_DIRECTORY).glob("*/journal.json"))
+            old_journal = journal.read_bytes()
+
+            async def recover():
+                active = None
+
+                def custody(runtime, *, profile_id):
+                    assert runtime is active, "S20A_SCOPE: wrong runtime admitted"
+                    runtime.check_startup_custody(profile_id=profile_id, canonical_root=root)
+
+                coordinator = JobCoordinator(metadata, None, authorize=None, startup_custody=custody)
+
+                async def callback(runtime, *, deadline):
+                    nonlocal active
+                    active = runtime
+                    for wrong_runtime, profile in ((CMMSRuntime(root, profile_id="a"), "a"), (runtime, "b")):
+                        with pytest.raises(Exception):
+                            custody(wrong_runtime, profile_id=profile)
+
+                    async def wrong_task():
+                        with pytest.raises(Exception):
+                            custody(runtime, profile_id="a")
+
+                    await asyncio.create_task(wrong_task())
+                    assert await coordinator.reconcile_startup(
+                        profile_id="a", custody=runtime, deadline=deadline) == 1, "S20A_SCOPE: scoped count"
+
+                no_ex = CMMSRuntime(root, profile_id="a")
+                with pytest.raises(Exception):
+                    no_ex.check_startup_custody(profile_id="a", canonical_root=root)
+                assert await restart_owner(root, callback=callback) == (None, "READY", ["recipes"]), "S20A_SCOPE"
+                assert not coordinator._attachments, "S20A_SCOPE: redispatch"
+                await coordinator.close(deadline=time.monotonic() + 2)
+
+            asyncio.run(recover())
+            assert journal.read_bytes() != old_journal, "S20A_SCOPE: A journal not reconciled"
+            assert metadata.get(a.job_id, "a", "subject").status == "interrupted", "S20A_SCOPE: A not interrupted"
+            assert metadata_rows(store, "b") == before, "S20A_SCOPE: B ordered metadata changed"
+            assert ((other / "canary").stat().st_ino, (other / "canary").read_bytes()) == artifacts, "S20A_SCOPE"
+            assert child.poll() is None, "S20A_SCOPE: B did not retain process/EX"
+            child.stdin.write(b"G")
+            child.stdin.flush()
+            stdout, stderr = child.communicate(timeout=8)
+            assert child.returncode == 0 and stdout == b"B-CONTINUED\n", f"S20A_SCOPE: {stderr.decode()}"
+            assert metadata.get(b.job_id, "b", "subject").status == "failed", "S20A_SCOPE: B did not continue"
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=3)
+            for stream in (child.stdin, child.stdout, child.stderr):
+                stream.close()
+
+
 if __name__ == "__main__":
-    assert sys.argv[1] == "crash", "S20A_RESTART: invalid child mode"
-    asyncio.run(crash_child(Path(sys.argv[2]), *sys.argv[3:]))
+    if sys.argv[1] == "scope":
+        asyncio.run(scope_child(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]))
+    else:
+        assert sys.argv[1] == "crash", "S20A_RESTART: invalid child mode"
+        asyncio.run(crash_child(Path(sys.argv[2]), *sys.argv[3:]))
