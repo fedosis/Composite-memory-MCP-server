@@ -155,7 +155,10 @@ def test_ci_python_versions_are_aligned():
 
     assert "python -m build" in ci
     assert "pip install dist/*.whl" in ci
-    assert "python -c \"import memory_server, storage; assert memory_server.__version__ == '0.12.0b1'\"" in ci
+    assert (
+        "python -c \"import memory_server, storage; assert memory_server.__version__ == "
+        f"'{RELEASE_VERSION}'\"" in ci
+    )
     assert "memory-server --help" in ci
 
 
