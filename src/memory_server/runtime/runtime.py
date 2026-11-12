@@ -382,6 +382,9 @@ class CMMSRuntime:
                 for n in ("sqlite", "graph", "embedder", "vector")
                 if getattr(self.dependencies, n) is not None
             ]
+            from memory_server.projection_rebuild import _reconcile_owned_projections
+
+            _reconcile_owned_projections(self)
             if self._startup_recovery is not None:
                 self._startup_deadline = self._clock() + self._startup_timeout
                 self._startup_window = True
