@@ -16,7 +16,8 @@ class RelationRevisionORM(Base):
         ),
         CheckConstraint("deleted IN (0, 1)", name="s16_deleted_bool"),
         CheckConstraint(
-            "relation_type IN ('supports', 'contradicts', 'derives', 'derived_from')", name="s16_relation_vocabulary"
+            "relation_type IN ('supports', 'contradicts', 'derives', 'derived_from', 'superseded_by')",
+            name="s16_relation_vocabulary"
         ),
         UniqueConstraint("event_id", name="s16_event_unique"),
     )

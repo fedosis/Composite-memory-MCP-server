@@ -233,6 +233,22 @@ class RelationRepository:
             key, before=before, deleted=True, relation_created_at=before.canonical_created_at, event=event
         )
 
+    async def _superseded_targets(self, source_ids: list[str]) -> dict[str, str]:
+        """Private canonical successor lookup; never synthesizes revision history."""
+        targets: dict[str, str] = {}
+        for start in range(0, len(source_ids), 128):
+            rows = await self._session.execute(
+                select(ClaimRelationORM.source_id, ClaimRelationORM.target_id)
+                .where(
+                    ClaimRelationORM.source_id.in_(source_ids[start : start + 128]),
+                    ClaimRelationORM.relation_type == "superseded_by",
+                )
+                .order_by(ClaimRelationORM.source_id, ClaimRelationORM.target_id)
+            )
+            for source_id, target_id in rows:
+                targets.setdefault(source_id, target_id)
+        return targets
+
     async def get_dependents(
         self,
         target_id: str,

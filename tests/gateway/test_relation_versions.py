@@ -30,6 +30,98 @@ TYPES = ("supports", "contradicts", "derives", "derived_from")
 MAX = 9223372036854775807
 
 
+async def test_create_all_adds_only_expected_runtime_tables(tmp_path):
+    from sqlalchemy import create_engine, inspect
+    from storage.models import Base
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'schema.sqlite'}")
+    expected = {"relation_revisions", "http_request_journal"}
+    try:
+        with engine.begin() as connection:
+            Base.metadata.create_all(connection, tables=[
+                t for t in Base.metadata.sorted_tables if t.name not in expected
+            ])
+            before = dict(connection.exec_driver_sql(
+                "SELECT name,sql FROM sqlite_master WHERE type='table'"
+            ).all())
+            Base.metadata.create_all(connection)
+            after = dict(connection.exec_driver_sql(
+                "SELECT name,sql FROM sqlite_master WHERE type='table'"
+            ).all())
+            assert set(after) - set(before) == expected
+            assert all(after[name] == ddl for name, ddl in before.items())
+            assert set(inspect(connection).get_table_names()) == set(after)
+    finally:
+        engine.dispose()
+
+
+async def test_private_revision_check_and_occupied_schema_fail_closed(tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.schema import CreateTable
+    from storage.models import Base, RelationRevisionORM
+    from storage.repositories.relation_revision_repo import (
+        RelationRevisionStorageError,
+        validate_occupied_relation_revisions,
+    )
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'checks.sqlite'}")
+    ddl = str(CreateTable(RelationRevisionORM.__table__).compile(dialect=engine.dialect))
+    try:
+        with engine.begin() as connection:
+            Base.metadata.create_all(connection)
+            validate_occupied_relation_revisions(connection)
+            values = dict(source_id="a", target_id="b", relation_type="superseded_by", revision=1,
+                          deleted=0, relation_created_at=datetime.now(UTC), changed_at=datetime.now(UTC),
+                          event_id=str(uuid4()))
+            connection.execute(RelationRevisionORM.__table__.insert().values(**values))
+            with pytest.raises(IntegrityError), connection.begin_nested():
+                connection.execute(RelationRevisionORM.__table__.insert().values(**{
+                    **values, "relation_type": "unknown", "event_id": str(uuid4()),
+                }))
+            assert connection.exec_driver_sql(
+                "SELECT relation_type FROM relation_revisions"
+            ).all() == [("superseded_by",)]
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE relation_revisions")
+            old = ddl.replace(", 'superseded_by'", "")
+            connection.exec_driver_sql(old)
+            with pytest.raises(RelationRevisionStorageError):
+                Base.metadata.create_all(connection)
+            assert connection.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='relation_revisions'"
+            ).scalar_one().strip() == old.strip()
+    finally:
+        engine.dispose()
+
+
+async def test_private_successor_versioned_ledger_preserves_public_vocabulary(tmp_path):
+    from storage.models.relation import ClaimRelationORM
+    from storage.repositories.relation_repo import _TYPES, RelationReadWork, RelationRepository
+
+    from memory_server.api.invalidate import invalidate
+    from memory_server.providers.sqlite_provider import SQLiteProvider
+    from tests.test_invalidate import seed
+
+    provider = SQLiteProvider(f"sqlite+aiosqlite:///{tmp_path / 'private.sqlite'}")
+    await provider.initialize()
+    try:
+        await seed(provider)
+        await seed(provider, ident="new")
+        await invalidate(provider, "old", reason="why", to_state="superseded", superseded_by="new")
+        async with await provider._get_session() as session:
+            repo = RelationRepository(session)
+            assert "superseded_by" not in _TYPES
+            assert await repo.get_by_tuple("old", "new", "superseded_by", work=RelationReadWork()) is None
+            assert await session.get(ClaimRelationORM, ("old", "new", "superseded_by")) is not None
+            assert (await session.execute(text(
+                "SELECT r.event_id=e.id AND r.changed_at=e.timestamp "
+                "FROM relation_revisions r JOIN lifecycle_events e ON r.event_id=e.id"
+            ))).scalar_one() == 1
+    finally:
+        await provider.close()
+
+
 def foundation():
     from memory_server.application import remote_relations
 

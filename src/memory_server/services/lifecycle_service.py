@@ -15,6 +15,7 @@ from storage.repositories import (
     RelationRepository,
 )
 from storage.repositories.lifecycle_repo import LifecycleConflictError, normalize_version
+from storage.repositories.relation_revision_repo import RelationEventContext
 
 from memory_server.evaluation.validator import (
     is_valid_transition,
@@ -109,10 +110,14 @@ class LifecycleService:
         request: LifecycleTransitionRequest,
         graph: SimpleGraph | None = None,
         *, strict_remote: bool = False,
+        event_context: RelationEventContext | None = None,
     ) -> LifecycleTransitionResult:
         """Use the caller's UOW; caller must commit or roll back on any error."""
-        results = await self.transition_many_in_session(session, [request], graph=graph, strict_remote=strict_remote)
-        return results[0]
+        return await self._transition_in_session(
+            session, LifecycleRepository(session), FactRepository(session),
+            BeliefRepository(session), request, graph,
+            strict_remote=strict_remote, event_context=event_context,
+        )
 
     async def transition_many_in_session(
         self,
@@ -168,7 +173,10 @@ class LifecycleService:
         request: LifecycleTransitionRequest,
         graph: SimpleGraph | None,
         *, strict_remote: bool = False,
+        event_context: RelationEventContext | None = None,
     ) -> LifecycleTransitionResult:
+        if event_context is not None:
+            event_context.validate()
         memory_type = request.memory_type.strip().lower()
         if memory_type not in _VALID_MEMORY_TYPES:
             raise InvalidLifecycleTransitionError("memory_type must be one of: fact, belief")
@@ -199,6 +207,7 @@ class LifecycleService:
             expected_version=expected_version,
             reason=request.reason or "lifecycle transition",
             triggered_by=request.triggered_by,
+            event_context=event_context,
         )
 
         propagated: list[dict[str, Any]] = []

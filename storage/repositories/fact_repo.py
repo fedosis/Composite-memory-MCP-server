@@ -156,6 +156,13 @@ class FactRepository:
         result = await self._session.get(FactORM, fact_id)
         return result.to_pydantic() if result else None
 
+    async def non_active_ids(self) -> set[str]:
+        """Select only IDs positively known to be retired."""
+        result = await self._session.execute(
+            select(FactORM.id).where(FactORM.lifecycle_state.notin_(ACTIVE_LIFECYCLE_STATES))
+        )
+        return set(result.scalars().all())
+
     async def find_existing(
         self, subject: str, predicate: str, object: str
     ) -> Optional[Fact]:

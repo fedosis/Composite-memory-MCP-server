@@ -15,6 +15,7 @@
   "input": {
     "type": "object",
     "properties": {
+      "include_inactive": { "type": "boolean", "default": false },
       "query": {
         "type": "string",
         "description": "Natural language query text",

@@ -941,7 +941,7 @@ class SQLiteProvider:
         elif check == "relation_type" and table is None:
             sql = (
                 "SELECT COUNT(*) FROM claim_relations WHERE relation_type NOT IN "
-                "('supports','contradicts','derives','derived_from')"
+                "('supports','contradicts','derives','derived_from','superseded_by')"
             )
             params = {}
         else:

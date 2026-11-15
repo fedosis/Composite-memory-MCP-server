@@ -43,7 +43,14 @@ async def search(
         include_inactive=include_inactive,
     )
 
-    return {
-        "results": [f.model_dump(mode="json") for f in facts],
-        "total": len(facts),
-    }
+    from storage.repositories.relation_repo import RelationRepository
+
+    async with await provider._get_session() as session:
+        targets = await RelationRepository(session)._superseded_targets([f.id for f in facts])
+    results = []
+    for fact in facts:
+        item = fact.model_dump(mode="json")
+        if fact.id in targets:
+            item["superseded_by"] = targets[fact.id]
+        results.append(item)
+    return {"results": results, "total": len(results)}

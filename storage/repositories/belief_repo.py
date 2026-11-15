@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import String
 
 from memory_server.models.belief import Belief
+from storage.dedup import ACTIVE_LIFECYCLE_STATES
 from storage.models.belief import BeliefORM, EvidenceORM
 from storage.repositories.lifecycle_repo import _cas_transition
 
@@ -143,6 +144,13 @@ class BeliefRepository:
         """Get a belief by ID."""
         result = await self._session.get(BeliefORM, belief_id)
         return result.to_pydantic() if result else None
+
+    async def non_active_ids(self) -> set[str]:
+        """Select only IDs positively known to be retired."""
+        result = await self._session.execute(
+            select(BeliefORM.id).where(BeliefORM.lifecycle_state.notin_(ACTIVE_LIFECYCLE_STATES))
+        )
+        return set(result.scalars().all())
 
     async def search(
         self,

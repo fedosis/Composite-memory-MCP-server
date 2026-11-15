@@ -157,7 +157,7 @@ class TestHermesProviderToolSchemas:
     EXPECTED_TOOLS = {
         "ping", "search", "remember", "get_context", "learn",
         "semantic_search", "graph_search", "route", "audit", "metrics",
-        "set_belief", "get_belief", "resolve_conflict", "reflect",
+        "set_belief", "get_belief", "resolve_conflict", "reflect", "invalidate",
     }
 
     def test_get_tool_schemas_returns_list(self):
@@ -1391,9 +1391,46 @@ def test_combined_provider_layout_missing_home_lifecycle_and_tools(synthetic_sto
         assert {schema["name"] for schema in provider.get_tool_schemas()} == {
             "ping", "search", "remember", "get_context", "learn", "semantic_search",
             "graph_search", "route", "audit", "metrics", "set_belief", "get_belief",
-            "resolve_conflict", "reflect",
+            "resolve_conflict", "reflect", "invalidate",
         }
         assert provider.is_available() is True
     finally:
         provider.shutdown()
     assert provider.is_available() is False
+
+
+@pytest.mark.parametrize("failure", ["lock", "resources", "code"])
+def test_initialize_rollback_consumes_retained_shutdown_report(synthetic_storage_env, monkeypatch, failure):
+    """C1: a returned cleanup error retains initialize's references and guard."""
+    from memory_server.plugins.hermes import provider as module
+    from memory_server.runtime import ShutdownReport
+    from memory_server.transports.hermes import HermesRuntimeBridge
+
+    home = synthetic_storage_env.root / "rollback-report"
+    home.mkdir()
+    provider = HermesProvider()
+    close = HermesRuntimeBridge.close
+
+    async def reported(bridge):
+        clean = await close(bridge)
+        assert clean.code is None
+        return ShutdownReport(
+            lock_retained=failure == "lock",
+            retained_resources=("writer",) if failure == "resources" else (),
+            code="E_RUNTIME_CLEANUP_FAILED" if failure == "code" else None,
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(HermesRuntimeBridge, "close", reported)
+        patch.setattr(module, "serialize_layout_redacted", lambda _: (_ for _ in ()).throw(ValueError("binding")))
+        with pytest.raises(ValueError, match="binding"):
+            provider.initialize("failed-binding", hermes_home=str(home))
+    assert provider._cleanup_failed
+    assert not provider._initialized
+    assert provider._settings is not None
+    assert provider._provider is not None
+    assert provider._bridge is not None
+    assert not provider.is_available()
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        provider.initialize("retry", hermes_home=str(home))
+    provider.shutdown()

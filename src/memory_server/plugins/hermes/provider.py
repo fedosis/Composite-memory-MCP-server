@@ -436,13 +436,16 @@ class HermesProvider:
             logger.exception("HermesProvider: initialization failed — rolling back")
             try:
                 if getattr(self, "_bridge", None) is not None:
-                    _run_async(self._bridge.close(), timeout=30.0)
+                    report = _run_async(self._bridge.close(), timeout=30.0)
+                    if report.lock_retained or report.retained_resources or report.code is not None:
+                        self._cleanup_failed = True
+                self._initialized = False
             except Exception:
                 self._cleanup_failed = True
                 self._initialized = False
             else:
                 runtime = getattr(getattr(self, "_bridge", None), "runtime", None)
-                if runtime is None or runtime.lock is None:
+                if not self._cleanup_failed and (runtime is None or runtime.lock is None):
                     self._extractor_runtime = None
                     self._llm_extractor = None
                     self._settings = None
@@ -844,13 +847,32 @@ class HermesProvider:
     # ------------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return all 14 CMMS tools as native Hermes tool schemas.
+        """Return all 15 CMMS tools as native Hermes tool schemas.
 
         Each schema follows the OpenAI function calling format.
         Tools are exposed WITHOUT the ``mcp_`` prefix — they are
         first-class Hermes tools.
         """
         return [
+            {
+                "name": "invalidate",
+                "description": "Retire a fact or belief, optionally naming its active successor",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string"},
+                        "memory_type": {"type": "string", "enum": ["fact", "belief"], "default": "fact"},
+                        "reason": {"type": "string"},
+                        "to_state": {
+                            "type": "string", "enum": ["discarded", "superseded", "stale"],
+                            "default": "discarded",
+                        },
+                        "superseded_by": {"type": "string", "default": ""},
+                        "expected_version": {"type": "string", "default": ""},
+                    },
+                    "required": ["memory_id", "reason"],
+                },
+            },
             {
                 "name": "ping",
                 "description": "Connectivity check — returns OK if CMMS is alive",
@@ -866,6 +888,7 @@ class HermesProvider:
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "include_inactive": {"type": "boolean", "default": False},
                         "query": {
                             "type": "string",
                             "description": "Free-text keyword to search across subject/predicate/object",
@@ -977,6 +1000,7 @@ class HermesProvider:
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "include_inactive": {"type": "boolean", "default": False},
                         "query": {
                             "type": "string",
                             "description": "Natural language query text",
@@ -1027,6 +1051,7 @@ class HermesProvider:
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "include_inactive": {"type": "boolean", "default": False},
                         "query": {
                             "type": "string",
                             "description": "Natural language query text",
@@ -1262,6 +1287,7 @@ class HermesProvider:
         """Return the async handler function for a given tool name."""
         handlers = {
             "ping": self._handle_ping,
+            "invalidate": self._handle_invalidate,
             "search": self._handle_search,
             "remember": self._handle_remember,
             "get_context": self._handle_get_context,
@@ -1285,12 +1311,32 @@ class HermesProvider:
     async def _handle_ping(self) -> str:
         return json.dumps({"status": "ok"})
 
+    async def _handle_invalidate(
+        self,
+        memory_id: str,
+        reason: str,
+        memory_type: str = "fact",
+        to_state: str = "discarded",
+        superseded_by: str = "",
+        expected_version: str = "",
+    ) -> str:
+        from memory_server.api.invalidate import invalidate
+
+        result = await invalidate(
+            self._require_provider(), memory_id, memory_type=memory_type,
+            reason=reason, to_state=to_state, superseded_by=superseded_by,
+            expected_version=expected_version or None, triggered_by="agent",
+            graph=await _get_graph(self),
+        )
+        return json.dumps(result)
+
     async def _handle_search(
         self,
         query: str = "",
         subject: str = "",
         predicate: str = "",
         limit: int = get_settings().search_default_limit,
+        include_inactive: bool = False,
     ) -> str:
         from memory_server.api.search import search as search_fn
         provider = self._require_provider()
@@ -1300,6 +1346,7 @@ class HermesProvider:
             subject=subject if subject else None,
             predicate=predicate if predicate else None,
             limit=limit,
+            include_inactive=include_inactive,
         )
         return json.dumps(result)
 
@@ -1368,6 +1415,7 @@ class HermesProvider:
         query: str = "",
         top_k: int = get_settings().semantic_top_k,
         score_threshold: float = get_settings().semantic_score_threshold,
+        include_inactive: bool = False,
     ) -> str:
         from memory_server.router.embedding_router import EmbeddingRouter
 
@@ -1383,6 +1431,10 @@ class HermesProvider:
             top_k=top_k,
             score_threshold=score_threshold,
         )
+        from memory_server.api.retrieval_filter import load_retired, rebuild_semantic_payload
+
+        retired = set() if include_inactive else await load_retired(self._require_provider())
+        results = rebuild_semantic_payload(results, retired, include_inactive)
         return _serialize_route_result(results)
 
     async def _handle_graph_search(
@@ -1460,6 +1512,7 @@ class HermesProvider:
         query: str = "",
         top_k: int = get_settings().semantic_top_k,
         score_threshold: float = get_settings().semantic_score_threshold,
+        include_inactive: bool = False,
     ) -> str:
         from memory_server.router.hybrid_router import HybridRouter
 
@@ -1477,6 +1530,15 @@ class HermesProvider:
             top_k=top_k,
             score_threshold=score_threshold,
         )
+        from memory_server.api.retrieval_filter import (
+            load_retired,
+            rebuild_route_payload,
+            rebuild_semantic_payload,
+        )
+
+        retired = set() if include_inactive else await load_retired(self._require_provider())
+        result = rebuild_semantic_payload(result, retired, include_inactive)
+        result = rebuild_route_payload(result, retired, include_inactive)
         return _serialize_route_result(result)
 
     async def _handle_audit(

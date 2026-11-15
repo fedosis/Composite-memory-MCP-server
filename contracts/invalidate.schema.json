@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-server.nousresearch.com/contracts/invalidate.schema.json",
+  "title": "invalidate — MCP Tool Schema",
+  "description": "Retire a fact or belief with atomic successor provenance. Native memory_type defaults to fact; MCP requires it.",
+  "version": "0.12.0",
+  "api_version": "0.6.0",
+  "schema_version": "1.0.0",
+  "tool": {"name": "invalidate", "description": "Retire a fact or belief"},
+  "input": {
+    "type": "object",
+    "properties": {
+      "memory_id": {"type": "string"},
+      "memory_type": {"type": "string", "enum": ["fact", "belief"], "default": "fact"},
+      "reason": {"type": "string", "pattern": "\\S"},
+      "expected_version": {"type": "string", "default": ""},
+      "to_state": {"type": "string", "enum": ["discarded", "superseded", "stale"], "default": "discarded"},
+      "superseded_by": {"type": "string", "default": ""}
+    },
+    "required": ["memory_id", "memory_type", "reason"],
+    "additionalProperties": false
+  },
+  "output": {
+    "type": "object",
+    "properties": {
+      "memory": {"oneOf": [
+        {"$ref": "common.schema.json#/definitions/fact_response"},
+        {"$ref": "common.schema.json#/definitions/belief_response"}
+      ]},
+      "event": {
+        "type": "object",
+        "properties": {
+          "memory_id": {"type": "string"},
+          "memory_type": {"type": "string", "enum": ["fact", "belief"]},
+          "from_state": {"type": "string"},
+          "to_state": {"type": "string", "enum": ["discarded", "superseded", "stale"]},
+          "reason": {"type": "string"},
+          "triggered_by": {"type": "string"}
+        },
+        "required": ["memory_id", "memory_type", "from_state", "to_state", "reason", "triggered_by"],
+        "additionalProperties": false
+      },
+      "propagated": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "memory_id": {"type": "string"},
+            "memory_type": {"type": "string", "enum": ["fact", "belief"]},
+            "confidence": {"type": "number"},
+            "version": {"type": ["string", "integer", "null"]},
+            "reason": {"type": "string"}
+          },
+          "required": ["memory_id", "memory_type", "confidence", "version", "reason"],
+          "additionalProperties": false
+        }
+      },
+      "superseded_by": {"type": ["string", "null"]}
+    },
+    "required": ["memory", "event", "propagated", "superseded_by"],
+    "additionalProperties": false
+  },
+  "errors": {"$ref": "common.schema.json#/definitions/error_envelope"}
+}

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from storage.base import utcnow
 from storage.models.lifecycle import LifecycleEventORM, LifecycleStateORM
+from storage.repositories.relation_revision_repo import RelationEventContext
 
 
 class LifecycleConflictError(ValueError):
@@ -105,6 +106,7 @@ class LifecycleRepository:
         reason: str = "",
         triggered_by: str = "system",
         confidence: float | None = None,
+        event_context: RelationEventContext | None = None,
     ) -> Any:
         """CAS + state history + event in this session; the UOW owner commits.
 
@@ -113,11 +115,16 @@ class LifecycleRepository:
         """
         if repository._session is not self._session:
             raise ValueError("Lifecycle repositories must share the UOW session")
+        if event_context is not None:
+            event_context.validate()
         updated = await repository.transition_lifecycle_state(
             memory_id, to_state, from_state, expected_version, confidence=confidence
         )
         await self.set_state(memory_id, memory_type, to_state, from_state, updated.confidence)
-        await self.record_event(memory_id, memory_type, from_state, to_state, reason, triggered_by)
+        await self.record_event(
+            memory_id, memory_type, from_state, to_state, reason, triggered_by,
+            event_context=event_context,
+        )
         return updated
 
     async def get_state(self, memory_id: str) -> Optional[str]:
@@ -159,16 +166,20 @@ class LifecycleRepository:
         to_state: str,
         reason: str = "",
         triggered_by: str = "system",
+        *,
+        event_context: RelationEventContext | None = None,
     ) -> None:
+        if event_context is not None:
+            event_context.validate()
         event = LifecycleEventORM(
-            id=str(uuid4()),
+            id=event_context.event_id if event_context is not None else str(uuid4()),
             memory_id=memory_id,
             memory_type=memory_type,
             from_state=from_state,
             to_state=to_state,
             reason=reason,
             triggered_by=triggered_by,
-            timestamp=utcnow(),
+            timestamp=event_context.changed_at if event_context is not None else utcnow(),
         )
         self._session.add(event)
         await self._session.flush()

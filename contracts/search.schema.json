@@ -15,6 +15,7 @@
   "input": {
     "type": "object",
     "properties": {
+      "include_inactive": { "type": "boolean", "default": false },
       "query": {
         "type": "string",
         "description": "Free-text keyword to search across subject, predicate, object",
@@ -46,7 +47,12 @@
     "properties": {
       "results": {
         "type": "array",
-        "items": { "$ref": "common.schema.json#/definitions/fact_response" }
+        "items": {
+          "allOf": [
+            { "$ref": "common.schema.json#/definitions/fact_response" },
+            { "type": "object", "properties": { "superseded_by": { "type": "string" } } }
+          ]
+        }
       },
       "total": {
         "type": "integer",

@@ -39,6 +39,31 @@ the runtime-ownership refactor: implemented and independently verified, but
 **not merged** and **not released**. Do not treat this branch as a published
 GitHub release.
 
+## Lifecycle retirement and retrieval
+
+Native Hermes and MCP expose `invalidate` for facts and beliefs. Supply a
+non-blank `reason`; `to_state` is `discarded` (default), `superseded`, or `stale`.
+`superseded` requires `superseded_by`, a distinct active successor of the same
+memory type in this store. Optional string `expected_version` provides CAS.
+Native defaults to `memory_type="fact"` and actor `agent`; MCP requires
+`memory_type` and uses actor `system`. Responses contain exactly `memory`,
+`event`, `propagated`, and nullable `superseded_by`.
+
+New successor links and their revisions commit atomically with the lifecycle
+transition and share its real event identity. Existing canonical successor links
+are preserved without synthesized history. `superseded_by` is private: it does
+not expand public relation creation or S09 relation reads. Incompatible occupied
+revision schemas fail closed; this change does not rebuild tables.
+
+`search`, `semantic_search`, and `route` default to active-only retrieval on both
+surfaces. Pass `include_inactive=true` to opt in to retired memories. Vector
+filtering drops only positively known retired IDs, retaining graph and unknown
+IDs. Keyword search adds `superseded_by` only to facts with canonical links.
+
+Transport package exports `mcp` and `run` load stdio lazily; the native import
+path does not require MCP. Requesting either export still requires the stdio
+optional dependencies. This is not a claim of MCP 2 stdio compatibility.
+
 ## First-run install
 
 ### Prerequisites

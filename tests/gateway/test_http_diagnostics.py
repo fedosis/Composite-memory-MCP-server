@@ -16,6 +16,25 @@ AT = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 IDS = tuple(f"00000000-0000-4000-8000-{n:012d}" for n in range(1, 1401))
 
 
+@pytest.mark.asyncio
+async def test_relation_type_diagnostics_private_allowed_unknown_flagged(database):
+    from storage.models.relation import ClaimRelationORM
+
+    from memory_server.providers.sqlite_provider import DiagnosticsReadWork
+
+    async with await database._get_session() as session:
+        session.add(ClaimRelationORM(source_id="old", target_id="new", relation_type="superseded_by"))
+        await session.commit()
+        work = DiagnosticsReadWork()
+        async with database.diagnostics_window(session, work=work):
+            assert await database.diagnostics_check_count(session, "relation_type", table=None, work=work) == 0
+        session.add(ClaimRelationORM(source_id="old", target_id="new", relation_type="unknown"))
+        await session.commit()
+        work = DiagnosticsReadWork()
+        async with database.diagnostics_window(session, work=work):
+            assert await database.diagnostics_check_count(session, "relation_type", table=None, work=work) == 1
+
+
 def _principal(subject="b1-reader"):
     from memory_server.gateway_contracts.ports import Principal
 

@@ -25,8 +25,14 @@ from storage.outbox_worker import OutboxWorker
 
 from memory_server.api.add_relation import add_relation as add_relation_fn
 from memory_server.api.get_context import get_context as get_context_fn
+from memory_server.api.invalidate import invalidate as invalidate_fn
 from memory_server.api.learn import learn as learn_fn
 from memory_server.api.remember import remember as remember_fn
+from memory_server.api.retrieval_filter import (
+    load_retired,
+    rebuild_route_payload,
+    rebuild_semantic_payload,
+)
 from memory_server.api.search import search as search_fn
 from memory_server.application.application import MemoryApplication
 from memory_server.application.contracts import (
@@ -34,7 +40,6 @@ from memory_server.application.contracts import (
     BeliefPolicy,
     GraphPolicy,
     GraphSearchCommand,
-    LifecycleCommand,
     MemoryPolicy,
     ReflectionPolicy,
     RetrievalPolicy,
@@ -548,6 +553,7 @@ async def search_tool(
     subject: str = "",
     predicate: str = "",
     limit: int = get_settings().search_default_limit,
+    include_inactive: bool = False,
 ) -> str:
     """Search stored facts by keyword text with optional filters.
 
@@ -566,6 +572,7 @@ async def search_tool(
             subject=subject if subject else None,
             predicate=predicate if predicate else None,
             limit=limit,
+            include_inactive=include_inactive,
         )
         return json.dumps(result)
 
@@ -706,6 +713,7 @@ async def semantic_search_tool(
     query: str = "",
     top_k: int = get_settings().semantic_top_k,
     score_threshold: float = get_settings().semantic_score_threshold,
+    include_inactive: bool = False,
 ) -> str:
     """Semantic search — embed a query and find similar facts via vector similarity.
 
@@ -726,6 +734,8 @@ async def semantic_search_tool(
             top_k=top_k,
             score_threshold=score_threshold,
         )
+        retired = set() if include_inactive else await load_retired(await _get_provider())
+        results = rebuild_semantic_payload(results, retired, include_inactive)
         return _serialize_route_result(results)
 
 
@@ -806,19 +816,25 @@ async def invalidate_tool(
     memory_type: str,
     reason: str,
     expected_version: str = "",
+    to_state: str = "discarded",
+    superseded_by: str = "",
 ) -> str:
     """Invalidate a fact or belief and demote dependent confidence."""
     collector = get_collector()
     with collector.tool_call("invalidate") as _ctx:
-        lifecycle_service = await _get_lifecycle_service()
-        result = await lifecycle_service.transition(LifecycleCommand(
+        provider = await _get_provider()
+        router = await _get_graph_router()
+        result = await invalidate_fn(
+            provider,
             memory_id=memory_id,
             memory_type=memory_type,
-            to_state="discarded",
+            to_state=to_state,
+            superseded_by=superseded_by,
             reason=reason,
             triggered_by="system",
             expected_version=expected_version or None,
-        ))
+            graph=router.graph,
+        )
         return json.dumps(result)
 
 
@@ -829,6 +845,7 @@ async def route_tool(
     query: str = "",
     top_k: int = get_settings().semantic_top_k,
     score_threshold: float = get_settings().semantic_score_threshold,
+    include_inactive: bool = False,
 ) -> str:
     """Route a query through the 4-stage hybrid router (rules -> embeddings -> graph -> LLM).
 
@@ -848,6 +865,9 @@ async def route_tool(
             top_k=top_k,
             score_threshold=score_threshold,
         )
+        retired = set() if include_inactive else await load_retired(await _get_provider())
+        result = rebuild_semantic_payload(result, retired, include_inactive)
+        result = rebuild_route_payload(result, retired, include_inactive)
         return _serialize_route_result(result)
 
 
