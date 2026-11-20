@@ -1,13 +1,15 @@
 # Composite Memory MCP Server — Architecture Overview
 
-> **Current status:** GitHub's latest published prerelease is `v0.11.0b1`.
-> PyPI, the official MCP Registry, Smithery, and Glama are not published.
-> Branch `refactor/runtime-architecture` adds a transport-independent
-> runtime/factory/application layer and an optional in-process Hermes native
-> provider; that work is implemented and verified here but **not merged or
-> released**. This document describes MCP stdio as the external transport plus
-> that optional `[hermes]` path. There is no remote HTTP/SSE implementation.
-> Neo4j is not wired into the v0.11 runtime.
+> **Current status:** latest published GitHub release is `v0.12.0`
+> (2026-11-12), default branch `cmms-upgrade-v0.12.0`. PyPI, the official MCP
+> Registry, Smithery, and Glama are not published. v0.12.0 merges the
+> transport-independent runtime/factory/application layer, the optional
+> in-process Hermes native provider, and the gateway series (S01–S20).
+> `CMMSRuntime` owns lifecycle and resources; MCP stdio and the in-process
+> `[hermes]` path are adapters. An optional **loopback-only** HTTP shell is
+> available as `memory-server daemon` (requires the `gateway` extra); there is
+> no remote/public HTTP/SSE deployment. Neo4j is not wired into the v0.12
+> runtime.
 
 ```mermaid
 flowchart TB
@@ -29,7 +31,7 @@ flowchart TB
             APP["Application services"]
         end
 
-        subgraph Tools["MCP Tools (14)"]
+        subgraph Tools["MCP Tools (16; native 15)"]
             PING["ping 🔊"]
             REM["remember 💾"]
             SRCH["search 🔍"]
@@ -115,13 +117,15 @@ flowchart TB
     DECAY --> AI_DECAY
 ```
 
-## Runtime and transports (this branch)
+## Runtime and transports (v0.12.0)
 
 `CMMSRuntime` owns lifecycle, the storage lock, and resources. Adapters reach
 it through `RuntimeFactory` (Hermes also uses `RuntimeManager`). MCP stdio is
-the external transport. The Hermes native provider is an optional in-process
-integration, not a new network transport and not a remote HTTP/SSE endpoint.
-MCP and Hermes are separate compositions; they do not share one runtime object.
+the default external transport. The Hermes native provider is an optional
+in-process integration, not a new network transport. An optional loopback-only
+HTTP shell (`memory-server daemon`, `gateway` extra) serves the profile routes
+from a local registry and does not replace MCP stdio. MCP and Hermes are
+separate compositions; a process does not hold two runtime owners for one root.
 
 ## Data Model (ADR-006)
 

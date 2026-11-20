@@ -7,37 +7,40 @@ provenance receipts, audit data, optional vector retrieval, and graph lookup.
 
 CMMS is meant for agents that need more than a generic vector-only memory layer:
 explicit facts remain queryable in SQLite, receipts preserve provenance, vector
-and graph retrieval are separate optional layers, and v0.11 adds deterministic
-memory admission plus LongMemEval-S benchmark tooling.
+and graph retrieval are separate optional layers, and v0.12.0 merges the
+transport-independent runtime ownership plus the optional HTTP gateway line.
 
 [![Hermes Native Provider](https://img.shields.io/badge/Hermes-Native_MemoryProvider-blueviolet)](docs/INTEGRATION.md)
-[![version](https://img.shields.io/badge/version-0.11.0b1-blue)]()
+[![version](https://img.shields.io/badge/version-0.12.0-blue)]()
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue)]()
 
-## Publication status and channel order
+## Publication status
 
-Current public source of truth: the GitHub repository and the GitHub prerelease
-tag `v0.11.0b1`.
+Current source of truth: this GitHub repository, default branch
+`cmms-upgrade-v0.12.0`; latest GitHub release `v0.12.0` (2026-11-12).
 
-Publication boundary for `v0.11.0b1`:
-
-1. **GitHub** — published source and prerelease artifacts.
-2. **PyPI** — not published yet; add package-manager install instructions only
-   after verifying package publication.
+1. **GitHub** — published source and release artifacts (`v0.12.0`).
+2. **PyPI** — not published; install from source until publication is verified.
 3. **Official MCP Registry** — not published; `server.json` is conservative
-   metadata for future submission, not a registry listing.
+   metadata for a future submission, not a registry listing.
 4. **Smithery / Glama** — not published; `docs/DIRECTORY_SUBMISSIONS.md` is
    draft copy only.
-5. **Hermes community** — optional integration documentation only; not a
-   distribution channel for this release.
 
-### This branch (unreleased)
+### What v0.12.0 contains
 
-The latest public GitHub release remains `v0.11.0b1`. Branch
-`refactor/runtime-architecture` declares package version `0.12.0` and contains
-the runtime-ownership refactor: implemented and independently verified, but
-**not merged** and **not released**. Do not treat this branch as a published
-GitHub release.
+- **Transport-independent runtime ownership** — `CMMSRuntime` is the single
+  lifecycle and resource owner (root lock, storage, outbox, maintenance). MCP
+  stdio (`MCPComposition` + `RuntimeFactory`) and the in-process Hermes bridge
+  (`HermesRuntimeBridge` + `RuntimeManager`) are adapters, not parallel owners.
+- **Optional loopback HTTP gateway** — `memory-server daemon` serves the
+  six-route HTTP shell from a local JSON profile registry, with local control
+  tokens (`memory-server token`). It is loopback-only and requires the
+  `gateway` extra; MCP stdio remains the default external transport.
+- **Lifecycle retrieval** — `invalidate`, `include_inactive`, and
+  `superseded_by` are available on both the MCP and the native Hermes surface.
+- **Owner maintenance substrate** — EX-owned snapshot/rebuild with a durable
+  journal, pre-provider recovery, custody fencing, and fail-closed publication.
+
 
 ## Lifecycle retirement and retrieval
 
@@ -102,8 +105,15 @@ vector database. `semantic_search` and secondary fact indexing require the
 ### Run the server
 
 ```bash
-# Start the MCP server (stdio transport)
+# Start the MCP server (stdio transport) — default external surface
 memory-server serve
+
+# Optional: loopback HTTP gateway (needs the gateway extra)
+memory-server daemon --help
+memory-server token --help
+
+# Inspect the effective storage layout without opening stores
+memory-server doctor
 ```
 
 ### Use the tools
@@ -229,12 +239,14 @@ memory-server --help
 - [LongMemEval Harness](docs/longmemeval-harness.md) — v0.11 raw/source/canonical retrieval scoring
 - [Comparative Analysis](docs/comparative-metrics.md) — Comparative analysis with ChromaDB/SQLite
 - [Drift Matrix](docs/drift-matrix.md) — Contract audit
-- [Development Plans](docs/plans/) — runtime architecture refactor is complete on this branch (not merged/released); HTTP Gateway / Neural Studio remain proposals
+- [Development Plans](docs/plans/) — runtime architecture refactor shipped in v0.12.0; HTTP gateway shell available as the optional loopback `daemon`; Neural Studio remains a proposal
 - [Contracts](contracts/) — JSON Schema 2020-12 tool contracts
 
 ## API Reference
 
-The server exposes fourteen MCP tools in v0.11.0b1:
+The MCP stdio surface exposes sixteen tools in v0.12.0 (`add_relation` and
+`invalidate` included); the native Hermes provider exposes the fifteen CMMS
+tools without `add_relation`:
 
 | # | Tool | v0.7 | Description |
 |---|------|------|-------------|
@@ -245,13 +257,15 @@ The server exposes fourteen MCP tools in v0.11.0b1:
 | 5 | `semantic_search` | — | Vector similarity search |
 | 6 | `learn` | ✓ | Extract knowledge; optionally extract beliefs |
 | 7 | `graph_search` | — | Entity lookup + pathfinding |
-| 8 | `route` | — | 4-stage hybrid router |
-| 9 | `audit` | — | Memory health report |
-| 10 | `metrics` | — | Prometheus metrics |
-| 11 | `set_belief` | ✓ | Create, reinforce, or supersede a belief |
-| 12 | `get_belief` | ✓ | Search beliefs with filters |
-| 13 | `resolve_conflict` | ✓ | Resolve belief conflicts (manual + auto) |
-| 14 | `reflect` | ✓ | 6-mode belief store analysis |
+| 8 | `add_relation` | — | Typed `supports`/`contradicts`/`derives` relation (MCP only) |
+| 9 | `invalidate` | — | Discard a fact/belief and demote derived dependents |
+| 10 | `route` | — | 4-stage hybrid router |
+| 11 | `audit` | — | Memory health report |
+| 12 | `metrics` | — | Prometheus metrics |
+| 13 | `set_belief` | ✓ | Create, reinforce, or supersede a belief |
+| 14 | `get_belief` | ✓ | Search beliefs with filters |
+| 15 | `resolve_conflict` | ✓ | Resolve belief conflicts (manual + auto) |
+| 16 | `reflect` | ✓ | 6-mode belief store analysis |
 
 ### v0.7 New Features
 
@@ -726,7 +740,7 @@ FTS5 enables the `search` tool's full-text capabilities with ranking, prefix que
 
 ### Outbox Pattern for Reliable Indexing
 
-Facts are written to the SQLite store first, then queued through an **outbox pattern** for background indexing. In v0.11.0b1 the server keeps the SQLite write durable even if optional vector indexing or in-memory SimpleGraph indexing is unavailable:
+Facts are written to the SQLite store first, then queued through an **outbox pattern** for background indexing. In v0.12.0 the server keeps the SQLite write durable even if optional vector indexing or in-memory SimpleGraph indexing is unavailable:
 
 1. Fact is inserted into SQLite (single write transaction)
 2. An outbox record is created in a dedicated table or queue

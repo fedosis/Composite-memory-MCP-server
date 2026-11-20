@@ -2,7 +2,7 @@
 
 Prepared copy for downstream MCP/server directories. This file is a drafting aid only; it does not publish CMMS anywhere.
 
-Publication status for `v0.11.0b1`: GitHub prerelease is published; PyPI, the official MCP Registry, Smithery, and Glama are not published. Use this copy only after explicit maintainer approval and channel-specific verification. Channel order is GitHub source/release → PyPI after verified package publication → official MCP Registry → Smithery/Glama → Hermes community documentation.
+Publication status for `v0.12.0`: GitHub release is published (2026-11-12); PyPI, the official MCP Registry, Smithery, and Glama are not published. Use this copy only after explicit maintainer approval and channel-specific verification. Channel order is GitHub source/release → PyPI after verified package publication → official MCP Registry → Smithery/Glama → Hermes community documentation.
 
 ## Short description
 
@@ -58,7 +58,7 @@ memory-server serve
 - License: no license file detected in the repository at the time of drafting
 - Runtime: Python 3.11+
 - Transport: stdio
-- Package status: PyPI package not published for v0.11.0b1; use source install until package publication is verified
+- Package status: PyPI package not published for v0.12.0; use source install until package publication is verified
 - Environment variables: optional `MEMORY_VECTOR_BACKEND=qdrant` to use Qdrant instead of the default LanceDB vector path
 
 ## Glama-style summary
@@ -68,7 +68,7 @@ CMMS is a beta local-first MCP memory server. It exposes tools for storing and s
 ## Limitations to include in listings
 
 - Beta release for early integration testing.
-- MCP transport implemented as stdio only; no remote HTTP/SSE endpoint in v0.11.0b1.
+- MCP transport implemented as stdio; an optional loopback-only HTTP gateway exists (`memory-server daemon`, `gateway` extra). No remote HTTP/SSE endpoint.
 - PyPI package is not published at the time of drafting; do not advertise package-manager install until verified.
 - LongMemEval-S dataset is external and not bundled.
 - Some integration/e2e/benchmark workflows require external services or data.

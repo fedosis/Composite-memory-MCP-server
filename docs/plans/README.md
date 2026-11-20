@@ -6,9 +6,11 @@
 релизы сохранены.
 
 Текущий код на момент добавления раздела: `bdebd4e` (release 0.12.0).
-На ветке `refactor/runtime-architecture` рефакторинг runtime-архитектуры
-**реализован и независимо integration-verified**, но **не влит и не
-опубликован**. HTTP Gateway и Neural Studio по-прежнему proposals.
+Релиз `v0.12.0` (2026-11-12) влит в основную ветку `cmms-upgrade-v0.12.0`:
+рефакторинг runtime-архитектуры и серия HTTP Gateway (S01–S20) включены в
+релиз. Операционный HTTP-шелл доступен как `memory-server daemon` (шесть
+loopback-маршрутов, локальный registry JSON, локальные control-токены);
+Neural Studio и удалённое развёртывание остаются proposals.
 
 ## Статусы
 
@@ -24,8 +26,8 @@
 
 | План | Целевой релиз | Статус | Зависит от |
 |---|---|---|---|
-| [CMMS Runtime Architecture Refactor](CMMS_Runtime_Architecture_Refactor_Plan.md) | `v0.13.x` | implemented on `refactor/runtime-architecture` (not merged/released) | — |
-| [HTTP Gateway и Neural Studio](CMMS_HTTP_Gateway_Neural_Studio_Spec.md) | после `v0.13.x` | `proposal` | Runtime Architecture Refactor |
+| [CMMS Runtime Architecture Refactor](CMMS_Runtime_Architecture_Refactor_Plan.md) | `v0.12.0` | `done` — merged and released in 0.12.0 | — |
+| [HTTP Gateway и Neural Studio](CMMS_HTTP_Gateway_Neural_Studio_Spec.md) | после `v0.12.x` | `in progress` — loopback `daemon` + local tokens shipped in 0.12.0; Neural Studio / remote hardening are `proposal` | Runtime Architecture Refactor |
 
 ## Порядок реализации
 

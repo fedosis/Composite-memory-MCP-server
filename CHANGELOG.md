@@ -8,7 +8,12 @@ versioning with SemVer-like semantics.
 
 ## Unreleased
 
-Nothing yet.
+### Documentation
+
+- README, architecture, integration, discovery and usage guides refreshed for
+  `0.12.0`: release and default-branch status, sixteen MCP tools versus fifteen
+  native tools, `daemon`/`token` commands, and the optional loopback HTTP
+  gateway. No code, contract, or runtime changes.
 
 ## 0.12.0 — 2026-11-12
 

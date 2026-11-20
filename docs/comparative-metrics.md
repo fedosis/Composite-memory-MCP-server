@@ -1,6 +1,6 @@
 # Comparative Benchmark Framework: CMMS vs External Memory Providers
 
-> Historical v0.5.3 benchmark baseline. For v0.11.0b1, read CMMS backend
+> Historical v0.5.3 benchmark baseline. For v0.12.0, read CMMS backend
 > references as SQLite/FTS5 plus optional LanceDB/Qdrant vectors and in-memory
 > SimpleGraph unless a scenario explicitly initializes Qdrant.
 

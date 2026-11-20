@@ -555,13 +555,13 @@ Hermes already has a solved pattern: the native `MemoryProvider` ABC. Three prov
 CMMS supports **two access paths**:
 
 ### Path 1: MCP (for external agents) — ADR-004 preserved
-- MCP transport at `src/memory_server/server.py`
-- All 14 tools available over stdio/HTTP MCP
+- MCP transport at `src/memory_server/transports/mcp_stdio.py`
+- All 16 tools available over stdio MCP (an optional loopback HTTP gateway is a separate surface, not a remote MCP endpoint)
 - JSON Schema 2020-12 contract validation (`contracts/`)
 
 ### Path 2: Hermes MemoryProvider (v0.8)
 - Native `MemoryProvider` plugin at `plugins/hermes/provider.py`
-- Same 14 tools as first-class Hermes tools (no `mcp_` prefix)
+- The 15 native CMMS tools as first-class Hermes tools (no `mcp_` prefix; `add_relation` is MCP-only)
 - Lifecycle: `initialize`, `prefetch`, `queue_prefetch`, `sync_turn`, `on_session_end`, `on_session_switch`, `shutdown`
 - Background writer queue for non-blocking writes
 - Single storage engine shared between both paths
@@ -590,7 +590,7 @@ server.py                  plugins/hermes/provider.py
 | `prefetch(query)` | `get_context()` | Fast cached recall |
 | `queue_prefetch(query)` | Queue next-turn context load | Background |
 | `sync_turn(user, asst, *, messages)` | `learn()` via writer queue | Async batch |
-| `get_tool_schemas()` | All 14 CMMS tools | No `mcp_` prefix |
+| `get_tool_schemas()` | All 15 CMMS tools | No `mcp_` prefix |
 | `handle_tool_call(name, args, **kwargs)` | Route to service layer | In-process |
 | `on_session_end(messages)` | Flush writer queue | Cleanup |
 | `on_session_switch(new_id, *, ...)` | Flush + update cache | Rotation |
@@ -612,7 +612,7 @@ server.py                  plugins/hermes/provider.py
 
 Advantages:
 - Hermes gains auto-recall, auto-retain, session hooks
-- All 14 tools become first-class Hermes tools
+- All 15 CMMS tools become first-class Hermes tools
 - No MCP transport overhead for Hermes-to-CMMS calls
 
 Disadvantages:
@@ -893,9 +893,9 @@ unchanged.
 
 ## Status
 
-Accepted on branch `refactor/runtime-architecture`. Implemented and
-independently verified on this branch; **not merged and not released**.
-Latest public GitHub release remains `v0.11.0b1`.
+Accepted. Merged and released in `v0.12.0` (2026-11-12); package metadata and
+the default branch `cmms-upgrade-v0.12.0` reflect it. Original wording recorded
+the pre-merge state on `refactor/runtime-architecture`.
 
 Grounded in `docs/plans/CMMS_Runtime_Architecture_Refactor_Plan.md` §78
 and the implemented source (`runtime/runtime.py`, `runtime_factory.py`,

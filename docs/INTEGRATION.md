@@ -1,12 +1,12 @@
 # Hermes Integration Guide
 
-> **Latest public GitHub release:** `v0.11.0b1` — optional `[hermes]` Native
-> MemoryProvider Plugin. Hermes v0.19 provider discovery compatibility is
-> documented in the changelog.
-> **This branch:** `refactor/runtime-architecture` implements the
-> transport-independent runtime ownership below. That work is implemented and
-> independently verified, but **not merged and not released**. Package metadata
-> on this branch is `0.12.0`; it is not a published GitHub release.
+> **Latest public GitHub release:** `v0.12.0` (2026-11-12), default branch
+> `cmms-upgrade-v0.12.0` — optional `[hermes]` Native MemoryProvider Plugin.
+> Hermes provider discovery compatibility is documented in the changelog.
+> **Runtime ownership:** `HermesProvider` now reaches storage through
+> `HermesRuntimeBridge` + `RuntimeManager` over `CMMSRuntime`; MCP stdio is a
+> separate composition over the same runtime layer. Both are adapters, not
+> parallel owners.
 > **ADR:** [ADR-013](ADR.md#adr-013-hermes-memoryprovider-integration--dual-access-path),
 > [ADR-017](ADR.md#adr-017-transport-independent-runtime-ownership)
 
@@ -27,7 +27,7 @@ stdio does not provide — it enables:
 - **Auto-recall** — Hermes calls `prefetch()` before every turn to inject relevant context
 - **Auto-retain** — Hermes calls `sync_turn()` after every turn to persist observations
 - **Session lifecycle hooks** — `on_session_end()` / `on_session_switch()` flush the writer queue
-- **First-class tools** — All 14 CMMS tools are available without the `mcp_` prefix
+- **First-class tools** — All 15 CMMS tools are available without the `mcp_` prefix
 - **No MCP transport overhead** — Tool calls are in-process, not over HTTP/stdio
 
 ## Quick Start
@@ -291,7 +291,7 @@ Session Start
 | `prefetch(query)` | `get_context()` | Fast cached recall |
 | `queue_prefetch(query)` | Queue next-turn context load | Runtime-owned background task |
 | `sync_turn(user, asst, *, messages)` | `learn()` via writer queue | Async batch; native extraction uses `submit_native` |
-| `get_tool_schemas()` | All 14 CMMS tools | No `mcp_` prefix |
+| `get_tool_schemas()` | All 15 CMMS tools | No `mcp_` prefix |
 | `handle_tool_call(name, args, **kwargs)` | Route to service layer | In-process |
 | `on_session_end(messages)` | Flush writer queue | Cleanup |
 | `on_session_switch(new_id, *, ...)` | Flush + update cache | Rotation |
@@ -316,24 +316,27 @@ hooks and writer config are unchanged.
 
 ## Tools
 
-All 14 CMMS tools are available as native Hermes tools via the MemoryProvider:
+All 15 CMMS tools are available as native Hermes tools via the MemoryProvider:
 
 | # | Tool | Description |
 |---|------|-------------|
 | 1 | `ping` | Health check |
-| 2 | `search` | Keyword search over facts |
-| 3 | `remember` | Store a fact with provenance |
-| 4 | `get_context` | Retrieve context for a task |
-| 5 | `semantic_search` | Vector similarity search |
-| 6 | `learn` | Extract knowledge (facts, decisions, skills, beliefs) |
-| 7 | `graph_search` | Entity lookup + pathfinding |
-| 8 | `route` | 4-stage hybrid router (rules → embeddings → graph → LLM) |
-| 9 | `audit` | Memory health report |
-| 10 | `metrics` | Prometheus metrics |
-| 11 | `set_belief` | Create, reinforce, or supersede a belief |
-| 12 | `get_belief` | Search beliefs with filters |
-| 13 | `resolve_conflict` | Resolve belief conflicts |
-| 14 | `reflect` | 6-mode belief store analysis |
+| 2 | `invalidate` | Discard a fact/belief and demote derived dependents |
+| 3 | `search` | Keyword search over facts |
+| 4 | `remember` | Store a fact with provenance |
+| 5 | `get_context` | Retrieve context for a task |
+| 6 | `semantic_search` | Vector similarity search |
+| 7 | `learn` | Extract knowledge (facts, decisions, skills, beliefs) |
+| 8 | `graph_search` | Entity lookup + pathfinding |
+| 9 | `route` | 4-stage hybrid router (rules → embeddings → graph → LLM) |
+| 10 | `audit` | Memory health report |
+| 11 | `metrics` | Prometheus metrics |
+| 12 | `set_belief` | Create, reinforce, or supersede a belief |
+| 13 | `get_belief` | Search beliefs with filters |
+| 14 | `resolve_conflict` | Resolve belief conflicts |
+| 15 | `reflect` | 6-mode belief store analysis |
+
+`add_relation` is MCP-only; the native provider does not expose it.
 
 ## Profile Isolation
 

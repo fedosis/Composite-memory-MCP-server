@@ -2,15 +2,17 @@
 
 ## Agent Implementation Specification
 
-> **Status note for v0.11.0b1:** this file is an implementation specification
-> plus historical roadmap. Current public facts: GitHub prerelease is published;
-> PyPI, official MCP Registry, Smithery, and Glama are not published. Current
-> runtime uses SQLite/FTS5 as the durable and keyword-search base, LanceDB by
-> default or Qdrant optionally for semantic search, and in-memory SimpleGraph
-> for graph lookup. Neo4j remains future/optional and is not wired in v0.11.
-> Hermes support is an optional `[hermes]` integration; see `docs/INTEGRATION.md`.
+> **Status note for v0.12.0:** this file is an implementation specification
+> plus historical roadmap. Current public facts: GitHub release `v0.12.0` is
+> published (2026-11-12); PyPI, official MCP Registry, Smithery, and Glama are
+> not published. Current runtime uses SQLite/FTS5 as the durable and
+> keyword-search base, LanceDB by default or Qdrant optionally for semantic
+> search, and in-memory SimpleGraph for graph lookup. `CMMSRuntime` owns
+> lifecycle and resources. Neo4j remains future/optional and is not wired in
+> v0.12. Hermes support is an optional `[hermes]` integration; see
+> `docs/INTEGRATION.md`.
 
-> **Status:** Historical/spec reference document. Core architectural principles are current; the Required Stack and Storage Mapping have been updated for v0.11 (LanceDB by default, Qdrant optional, SimpleGraph in-memory graph). Development Roadmap reflects original planned milestones with current-technology annotations.
+> **Status:** Historical/spec reference document. Core architectural principles are current; the Required Stack and Storage Mapping have been updated for v0.12 (LanceDB by default, Qdrant optional, SimpleGraph in-memory graph). Development Roadmap reflects original planned milestones with current-technology annotations.
 
 ## Mission
 

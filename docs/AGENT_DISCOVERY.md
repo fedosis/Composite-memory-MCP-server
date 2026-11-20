@@ -6,15 +6,20 @@ This document is intentionally concise and machine-readable by agents and direct
 
 ## Current release
 
-- Version: `0.11.0b1`
+- Version: `0.12.0` (2026-11-12)
 - Stage: beta / early integration testing
 - Source repository: `https://github.com/fedosis/Composite-memory-MCP-server`
-- GitHub release: `https://github.com/fedosis/Composite-memory-MCP-server/releases/tag/v0.11.0b1`
-- PyPI package: not published at the time this metadata was written; install from source or an explicit release artifact only.
+- Default branch: `cmms-upgrade-v0.12.0`
+- GitHub release: `https://github.com/fedosis/Composite-memory-MCP-server/releases/tag/v0.12.0`
+- PyPI package: not published; install from source or an explicit release artifact only.
 - Official MCP Registry: not published; root `server.json` is schema-valid draft metadata only.
 - Smithery / Glama: not published; submission copy is drafted in `docs/DIRECTORY_SUBMISSIONS.md` only.
 
-Development branch `refactor/runtime-architecture` contains the runtime-ownership refactor (package metadata `0.12.0`). It is implemented and independently verified, but **not merged or released**. The Hermes provider remains an in-process integration, not a new transport. Latest public GitHub release remains `v0.11.0b1`.
+v0.12.0 ships transport-independent runtime ownership (`CMMSRuntime` owns
+lifecycle and resources; MCP stdio and the in-process Hermes path are adapters),
+lifecycle retrieval (`invalidate`, `include_inactive`, `superseded_by`), and an
+optional loopback-only HTTP shell (`memory-server daemon`, `gateway` extra).
+The Hermes provider remains an in-process integration, not a new transport.
 
 Publication channel order for public docs is: GitHub source/release first, PyPI only after verified package publication, official MCP Registry only after accepted registry submission, Smithery/Glama only after explicit directory publication, then Hermes community documentation for optional Hermes users.
 
@@ -24,7 +29,8 @@ Publication channel order for public docs is: GitHub source/release first, PyPI 
 |------|--------|-------|
 | MCP stdio | Implemented | `memory-server serve` runs `mcp.run(transport="stdio")`. |
 | Hermes native MemoryProvider | Implemented | `memory-server install-hermes-plugin` registers an in-process Hermes provider. This is not an MCP transport. |
-| Remote HTTP/SSE MCP server | Not implemented in v0.11.0b1 | Do not advertise `remotes` in registry metadata until a remote endpoint exists. |
+| Loopback HTTP gateway | Implemented (optional) | `memory-server daemon` + `memory-server token`; requires the `gateway` extra; binds loopback only and is not exposed remotely. |
+| Remote HTTP/SSE MCP server | Not implemented | Do not advertise `remotes` in registry metadata until a remote endpoint exists. |
 
 ## Install from source
 
@@ -84,7 +90,7 @@ Hermes native mode provides lifecycle hooks (`prefetch`, `sync_turn`, session bo
 
 ## Tool inventory
 
-CMMS v0.11.0b1 registers these 14 MCP tools in `src/memory_server/server.py`:
+CMMS v0.12.0 registers sixteen MCP tools in `src/memory_server/transports/mcp_stdio.py`; the native Hermes provider exposes fifteen of them (`add_relation` is MCP-only):
 
 | Tool | Purpose |
 |------|---------|
@@ -95,6 +101,8 @@ CMMS v0.11.0b1 registers these 14 MCP tools in `src/memory_server/server.py`:
 | `learn` | Extract facts, decisions, skills, and optionally beliefs from text. |
 | `semantic_search` | Vector similarity retrieval through the configured vector backend. |
 | `graph_search` | Entity lookup, neighbor traversal, and pathfinding through the graph layer. |
+| `add_relation` | Create a typed relation (`supports` / `contradicts` / `derives`); MCP only. |
+| `invalidate` | Discard a fact/belief and demote derived dependents; supports `superseded_by`. |
 | `route` | Four-stage routing: rules, semantic, graph, then LLM fallback placeholder. |
 | `audit` | Memory health/audit report. |
 | `metrics` | Prometheus-formatted metrics snapshot. |
@@ -111,7 +119,7 @@ CMMS v0.11.0b1 registers these 14 MCP tools in `src/memory_server/server.py`:
 - Vector backend: LanceDB is the default code path in server mode; Qdrant remains optional/configurable with `MEMORY_VECTOR_BACKEND=qdrant`.
 - Graph backend: current server graph path uses the in-memory `SimpleGraph` implementation.
 - Indexing: remember/learn write durably to SQL and enqueue best-effort secondary indexing work; current outbox vector indexing is Qdrant-path-specific when initialized, while semantic search can use the configured vector backend.
-- Admission/retention: v0.11 adds deterministic memory admission tags (`EPHEMERAL`, `DURABLE`, `IMPORTANT`) and TTL-aware pruning.
+- Admission/retention: deterministic memory admission tags (`EPHEMERAL`, `DURABLE`, `IMPORTANT`) and TTL-aware pruning; v0.12 adds `invalidate` lifecycle transitions on both surfaces.
 - Benchmarking: v0.11 adds a lineage-aware LongMemEval-S harness with `raw`, `source`, and `canonical` scoring targets plus a deterministic built-in lexical baseline.
 
 ## Limitations and boundaries
@@ -119,7 +127,7 @@ CMMS v0.11.0b1 registers these 14 MCP tools in `src/memory_server/server.py`:
 - Beta release: suitable for early integration testing, not a compatibility guarantee for all clients.
 - PyPI package metadata is intentionally omitted from `server.json` until package publication is verified.
 - LongMemEval-S data is external and not bundled; users must provide the cleaned dataset.
-- Remote HTTP/SSE MCP endpoints are not implemented in v0.11.0b1.
+- Remote HTTP/SSE MCP endpoints are not implemented; the optional loopback-only HTTP gateway (`memory-server daemon`) is not a remote MCP endpoint.
 - Some integration/e2e/benchmark tests require external services such as Qdrant or benchmark data.
 - The LLM fallback route exists as a routing stage placeholder; do not claim a configured LLM fallback unless one is added.
 - Comparisons should be framed against generic vector-only memory architectures, not as unverified claims about specific vendors.

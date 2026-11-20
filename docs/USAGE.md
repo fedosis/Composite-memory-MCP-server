@@ -387,7 +387,7 @@ archive(fact_id)
 ~/memory-server/
 ├── src/memory_server/
 │   ├── __init__.py
-│   ├── server.py        # FastMCP server + 14 tools
+│   ├── server.py        # FastMCP server + 16 tools
 │   ├── cli.py            # Typer CLI entry point
 │   ├── models/          # Pydantic data models
 │   │   ├── entity.py, fact.py, decision.py, skill.py, receipt.py

@@ -1,7 +1,7 @@
 # Composite Memory MCP Server — Metrics & Benchmark Suite
 
 > **Version:** 1.0
-> **Applies to:** Historical CMMS v0.5 baseline. For v0.11.0b1, treat Qdrant
+> **Applies to:** Historical CMMS v0.5 baseline. For v0.12.0, treat Qdrant
 > examples as optional vector-backend scenarios; current server mode uses
 > SQLite/FTS5 as the base, LanceDB by default or Qdrant optionally for semantic
 > search, and in-memory SimpleGraph for graph lookup.
@@ -261,7 +261,7 @@ async def bench_auto_index():
     fact_id = result["fact"].id
 
     # Check provider-specific secondary indexes only when initialized.
-    # Qdrant vector indexing is optional in v0.11.0b1 server wiring.
+    # Qdrant vector indexing is optional in v0.12.0 server wiring.
     in_vector = None
 
     # Check graph
@@ -330,10 +330,10 @@ async def bench_remember_latency(N: int, warm_up: bool = True):
 | Property | Detail |
 |----------|--------|
 | **What** | SQLite keyword search latency as the fact table grows |
-| **Why** | Historical v0.5 `search()` used SQL `LIKE` across three text columns; v0.11.0b1 also maintains SQLite FTS5 indexes for fact and belief search paths. Performance still needs volume checks because broad substring searches can degrade when they cannot use FTS5 effectively. |
+| **Why** | Historical v0.5 `search()` used SQL `LIKE` across three text columns; v0.12.0 also maintains SQLite FTS5 indexes for fact and belief search paths. Performance still needs volume checks because broad substring searches can degrade when they cannot use FTS5 effectively. |
 | **How** | Pre-populate SQLite with N facts (N = {10, 100, 1000, 5000}). Measure `search()` latency with a query that matches *every* row (worst-case scan) and one that matches 1 row (best-case). |
 | **Expected baseline** | With SQLite in-memory (no disk I/O): p50 < 10ms at N=1000, p50 < 50ms at N=5000 for exact matches. FULL TABLE SCAN at N=5000: p50 < 200ms. |
-| **Threshold** | p50 < 100ms at N=5000 for exact match; if >500ms on v0.11.0b1, verify the SQLite FTS5 tables/triggers are populated and inspect the query plan. |
+| **Threshold** | p50 < 100ms at N=5000 for exact match; if >500ms on v0.12.0, verify the SQLite FTS5 tables/triggers are populated and inspect the query plan. |
 | **Python pattern** | ```python
 async def bench_search_latency(N: int):
     # Pre-populate N facts
@@ -506,7 +506,7 @@ async def bench_startup_time():
 | Property | Detail |
 |----------|--------|
 | **What** | Document the stdio transport limitation: MCP stdio is a single-client, single-process protocol. The server reads from stdin and writes to stdout — only one client can be connected at a time. |
-| **Why** | This is not a bug; it's a design constraint of the MCP stdio transport chosen for CMMS. Multiple concurrent clients require the HTTP/SSE transport or a gateway. |
+| **Why** | This is not a bug; it's a design constraint of the MCP stdio transport chosen for CMMS. Multiple concurrent clients require a gateway or separate per-client instances; CMMS ships an optional loopback-only gateway (`memory-server daemon`), and remote MCP HTTP/SSE is not implemented. |
 | **How** | Attempt to connect two client processes to the same server process. Verify the second connection fails or blocks (document the failure mode). |
 | **Expected baseline** | Second client receives broken pipe / EOF. Or stdin is consumed by the first client and the second never gets responses. |
 | **Threshold** | N/A — document as known limitation |
@@ -522,9 +522,9 @@ def test_single_client_limitation():
     # First client works
     proc.stdin.write(b'{"jsonrpc":"2.0","method":"tools/call","params":...}')
     # Second client can't connect (same stdin/stdout)
-    # Document: use MCP HTTP/SSE transport for multi-client
+    # Document: use the loopback gateway (`memory-server daemon`) or per-client instances for multi-client
 ``` |
-| **Interpretation** | For multi-client scenarios, the project should add MCP SSE/HTTP transport or use Hermes Agent's process manager to spawn per-client server instances. |
+| **Interpretation** | For multi-client scenarios, use the optional loopback gateway (`memory-server daemon`) or Hermes Agent's process manager to spawn per-client server instances. |
 
 ---
 
