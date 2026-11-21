@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import os
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -389,3 +388,72 @@ async def test_start_rollback_closes_adapter_and_unlinks(tmp_path, monkeypatch):
     assert closed.get("adapter") is True
     assert owner.state == native_service.STATE_CLOSED
     assert not config.socket_path.exists()
+
+
+async def test_slot_budget_expiry_returns_timeout(tmp_path, monkeypatch):
+    """Semaphore wait expiry is an authoritative refusal and must be E_TIMEOUT (§6.2)."""
+    from memory_server.native.schema_v1 import schema_hash
+
+    config = load_service_config(
+        make_service_config(tmp_path, store_id=str(uuid.uuid4()), limits={"max_operations": 1})
+    )
+    monkeypatch.setattr(native_service, "preflight_layout", lambda config, settings: None)
+    monkeypatch.setattr(native_service, "get_settings", lambda: None)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Adapter:
+        async def start(self):
+            pass
+
+        async def pending_snapshot(self):
+            return SimpleNamespace(live_pending=0, terminal_failed=0)
+
+        async def enqueue_turn_async(self, messages, session_id=""):
+            entered.set()
+            await release.wait()
+
+        async def close(self):
+            return ShutdownReport()
+
+    owner = native_service.NativeOwnerService(config, cast(NativeBackendAdapter, Adapter()))
+    monkeypatch.setattr(owner, "_slot_budget", lambda op: 0.05)
+    await owner.start()
+    assert owner.state == native_service.STATE_READY
+
+    async def connect():
+        reader, writer = await asyncio.open_unix_connection(str(config.socket_path))
+        greeting = hello(config.allow_homes[0])
+        greeting["payload"]["store_id"] = config.store_id
+        greeting["payload"]["schema_hash"] = schema_hash()
+        writer.write(encode_frame(greeting))
+        await writer.drain()
+        assert (await read_frame(reader))["state"] == "READY"
+        return reader, writer
+
+    envelope = {
+        "v": 1,
+        "op": "enqueue_turn",
+        "session_id": "s",
+        "payload": {"user_content": "a", "assistant_content": "b"},
+    }
+    first_reader, first_writer = await connect()
+    first_writer.write(encode_frame({**envelope, "correlation_id": "slot-a"}))
+    await first_writer.drain()
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+    second_reader, second_writer = await connect()
+    second_writer.write(encode_frame({**envelope, "correlation_id": "slot-b"}))
+    await second_writer.drain()
+    reply = await asyncio.wait_for(read_frame(second_reader), timeout=3.0)
+    assert reply["ok"] is False and reply["code"] == "E_TIMEOUT", reply
+
+    release.set()
+    first_reply = await asyncio.wait_for(read_frame(first_reader), timeout=3.0)
+    assert first_reply["ok"] is True, first_reply
+
+    for writer in (first_writer, second_writer):
+        writer.close()
+        await writer.wait_closed()
+    await owner.stop()

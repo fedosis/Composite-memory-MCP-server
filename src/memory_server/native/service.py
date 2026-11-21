@@ -308,9 +308,10 @@ class NativeOwnerService:
                 await asyncio.wait_for(self._operations.acquire(), timeout=self._slot_budget(op))
             except TimeoutError:
                 # Admission slot not acquired within the op deadline: the op was
-                # never dispatched, so a retry-safe code is correct (§6.2/§6.3).
+                # never dispatched, so §6.2 mandates E_TIMEOUT here (mutations
+                # surface as E_UNCERTAIN on the client side, see §6.3).
                 self.stats.errors += 1
-                await self._best_effort(writer, response_error(cid, "E_UNAVAILABLE"))
+                await self._best_effort(writer, response_error(cid, "E_TIMEOUT"))
                 return
             try:
                 result = await self._dispatch(op, cid, session_id, fields)

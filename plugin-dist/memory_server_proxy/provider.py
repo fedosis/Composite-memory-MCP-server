@@ -273,8 +273,9 @@ class MemoryServerProxyProvider(MemoryProvider):
     @staticmethod
     def _is_uncertain(resp: dict) -> bool:
         """True when a mutation's outcome is unknown even though a frame arrived."""
-        return resp.get("code") == "E_UNCERTAIN" or (
-            resp.get("code") == "E_FRAME" and resp.get("detail_code") == "result_too_large"
+        code = resp.get("code")
+        return code in ("E_UNCERTAIN", "E_TIMEOUT") or (
+            code == "E_FRAME" and resp.get("detail_code") == "result_too_large"
         )
 
     def _record_mutation_outcome(self, outcome: str, resp: dict | None) -> None:
