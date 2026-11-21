@@ -1,0 +1,22 @@
+[Unit]
+Description=CMMS native memory service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python -m memory_server native-serve --config /srv/cmms/service.json
+WorkingDirectory=/srv/cmms
+EnvironmentFile=/etc/cmms/native.env
+Restart=on-failure
+RestartPreventExitStatus=3
+KillSignal=SIGTERM
+TimeoutStopSec=45
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/cmms/store
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

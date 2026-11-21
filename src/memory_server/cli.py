@@ -804,6 +804,58 @@ def install_hermes_plugin(
         sys.exit(_do_install(resolved, dry_run, out=typer.echo))
 
 
+@app.command("native-provision")
+def native_provision_cmd(
+    config: Path = typer.Option(..., "--config", help="Path to the native service JSON"),
+) -> None:
+    """Provision the stable store_id in a native service JSON."""
+    from memory_server.native.cli import native_provision
+
+    native_provision(config)
+
+
+@app.command("native-serve")
+def native_serve_cmd(
+    config: Path = typer.Option(..., "--config", help="Path to the native service JSON"),
+) -> None:
+    """Run the single-owner native AF_UNIX service."""
+    from memory_server.native.cli import native_serve
+
+    native_serve(config)
+
+
+@app.command("native-status")
+def native_status_cmd(
+    config: Path = typer.Option(..., "--config", help="Path to the native service JSON"),
+) -> None:
+    """Hello the running native service and verify READY."""
+    from memory_server.native.cli import native_status
+
+    native_status(config)
+
+
+@app.command("install-hermes-proxy")
+def install_hermes_proxy_cmd(
+    hermes_home: str = typer.Option(..., "--hermes-home", help="Hermes config directory"),
+    socket_path: Path = typer.Option(..., "--socket", help="Absolute AF_UNIX socket path"),
+    expected_store_id: str = typer.Option(..., "--expected-store-id", help="Canonical store_id UUID"),
+    activate: bool = typer.Option(False, "--activate", help="Set memory.provider in config.yaml"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the plan without writing"),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Remove the plugin and sidecar"),
+) -> None:
+    """Install the standalone memory_server_proxy plugin into a Hermes home."""
+    from memory_server.native.cli import install_hermes_proxy
+
+    install_hermes_proxy(
+        hermes_home,
+        str(socket_path),
+        expected_store_id,
+        activate=activate,
+        dry_run=dry_run,
+        uninstall=uninstall,
+    )
+
+
 @app.command("benchmark-longmemeval")
 def benchmark_longmemeval(
     dataset: Path = typer.Argument(..., help="Path to longmemeval_s_cleaned.json"),

@@ -1,4 +1,4 @@
-.PHONY: install test lint all migrate build install-plugin test-plugin
+.PHONY: install test lint all migrate build install-plugin test-plugin schema-artifacts test-native
 
 # Standard targets
 install:
@@ -27,3 +27,13 @@ install-plugin:
 # Run all plugin-related tests
 test-plugin:
 	python3 -m pytest tests/test_hermes_plugin_registration.py -v
+
+# Native transport targets (AF_UNIX owner/service/client)
+
+# Regenerate the canonical schema artifacts shipped with the plugin
+schema-artifacts:
+	python -m memory_server.native.gen_schema --out plugin-dist/memory_server_proxy
+
+# Run the native transport and proxy plugin test suites
+test-native:
+	python -m pytest tests/test_native_*.py tests/test_proxy_*.py -q
