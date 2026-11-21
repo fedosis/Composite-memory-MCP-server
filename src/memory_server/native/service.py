@@ -225,11 +225,9 @@ class NativeOwnerService:
                     os.unlink(self.config.socket_path)
                 else:
                     # Foreign/substituted pathname: leave it, still a clean close (§9.3).
-                    print(
-                        f"native-serve: socket pathname no longer ours, left in place: "
-                        f"{self.config.socket_path}",
-                        file=sys.stderr,
-                    )
+                    # §6.4: service-owned diagnostics stay constant, no paths.
+                    print("native-serve: socket pathname no longer ours, left in place",
+                          file=sys.stderr)
         self._state = STATE_CLOSED
         self.exit_code = 0
         return report
@@ -257,7 +255,10 @@ class NativeOwnerService:
                         "terminal_failed": snapshot.terminal_failed},
         }
 
-    async def _send(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
+    PRE_HELLO_REJECT_S = 0.1  # DETAIL §5.7.1: best-effort refusal budget
+
+    async def _send(self, writer: asyncio.StreamWriter, payload: dict[str, Any],
+                    *, budget: float | None = None) -> None:
         try:
             frame = encode_frame(payload)
         except ProtocolError as exc:
@@ -267,16 +268,19 @@ class NativeOwnerService:
             cid = payload.get("correlation_id") if isinstance(payload, dict) else None
             frame = encode_frame(response_error(cid, "E_FRAME", detail_code="result_too_large"))
         writer.write(frame)
-        # A 0.1s drain budget aborted the connection on any slow write; use the
-        # configured idle budget instead (same knob that bounds reads).
-        await asyncio.wait_for(writer.drain(), timeout=self.config.limits.read_idle_s)
+        # Normal responses get the idle budget; pre-hello refusals keep the tight
+        # §5.7.1 deadline so a silent peer cannot hold an accepted connection.
+        if budget is None:
+            budget = self.config.limits.read_idle_s
+        await asyncio.wait_for(writer.drain(), timeout=budget)
 
     async def _handle_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
         if self.stats.active >= self.config.limits.max_connections:
             self.stats.rejected += 1
             try:
-                await self._send(writer, response_error(None, "E_CONNECTION_LIMIT"))
+                await self._send(writer, response_error(None, "E_CONNECTION_LIMIT"),
+                                 budget=self.PRE_HELLO_REJECT_S)
             except (Exception, asyncio.CancelledError):
                 pass
             writer.close()
@@ -324,7 +328,8 @@ class NativeOwnerService:
         except PeerCredentialError:
             self.stats.rejected += 1
             cid = None
-            await self._best_effort(writer, response_error(None, "E_PROFILE_DENIED"))
+            await self._best_effort(writer, response_error(None, "E_PROFILE_DENIED"),
+                                    budget=self.PRE_HELLO_REJECT_S)
         except FrameRejectedError:
             # Amplification guard: zero/over-cap frame, close without a reply (§5.2 p.1).
             self.stats.rejected += 1
@@ -336,7 +341,10 @@ class NativeOwnerService:
             else:
                 code = "E_TIMEOUT"
                 detail_code = None
-            await self._best_effort(writer, response_error(cid, code, detail_code=detail_code))
+            # Unknown correlation_id means the refusal happened before hello: §5.7.1
+            # grants only a 100 ms best-effort window for such frames.
+            await self._best_effort(writer, response_error(cid, code, detail_code=detail_code),
+                                    budget=None if cid is not None else self.PRE_HELLO_REJECT_S)
         except Exception:
             self.stats.errors += 1
             await self._best_effort(writer, response_error(cid, "E_INTERNAL"))
@@ -350,9 +358,10 @@ class NativeOwnerService:
             if task is not None:
                 self._connections.discard(task)
 
-    async def _best_effort(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
+    async def _best_effort(self, writer: asyncio.StreamWriter, payload: dict[str, Any],
+                           *, budget: float | None = None) -> None:
         try:
-            await self._send(writer, payload)
+            await self._send(writer, payload, budget=budget)
         except (Exception, asyncio.CancelledError):
             pass
 

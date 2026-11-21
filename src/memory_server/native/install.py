@@ -61,7 +61,8 @@ def _plugin_files(source_dir: Path) -> list[Path]:
         raise InstallError("E_PLUGIN_SOURCE", f"plugin source directory is missing: {source}")
     files: list[Path] = []
     for path in sorted(source.rglob("*")):
-        if not path.is_file():
+        # lstat: never copy through a symlink planted in the plugin source tree.
+        if path.is_symlink() or not path.is_file():
             continue
         relative = path.relative_to(source)
         if "__pycache__" in relative.parts or path.suffix == ".pyc":
