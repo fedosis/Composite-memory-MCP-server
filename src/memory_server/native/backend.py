@@ -93,10 +93,33 @@ class NativeBackendAdapter:
 
     def _start_sync(self) -> None:
         provider = HermesProvider()
+        # HermesProvider.initialize() ожидает dict (внутри HermesPluginConfig.from_dict).
+        # asdict() здесь неприменим: HermesPluginConfig содержит mappingproxy.
+        backend = self._config.backend
+        plugin_config: dict[str, Any] = {
+            "storage_mode": backend.storage_mode,
+            "data_root": str(self._config.data_root),
+            "vector_backend": backend.vector_backend,
+            "vector_collection": backend.vector_collection,
+            "extraction_mode": backend.extraction_mode,
+            "llm_model": backend.llm_model,
+            "llm_base_url": backend.llm_base_url,
+            "max_facts": backend.max_facts,
+            "writer": {
+                "flush_interval": backend.writer.flush_interval,
+                "max_batch": backend.writer.max_batch,
+            },
+        }
+        if backend.db_url is not None:
+            plugin_config["db_url"] = backend.db_url
+        if backend.lancedb_path is not None:
+            plugin_config["lancedb_path"] = backend.lancedb_path
+        if backend.graph_snapshot_path is not None:
+            plugin_config["graph_snapshot_path"] = backend.graph_snapshot_path
         provider.initialize(
             "native-service",
             hermes_home=str(self._config.storage_context_home),
-            config=build_plugin_config(self._config),
+            config=plugin_config,
         )
         self._provider = provider
 
