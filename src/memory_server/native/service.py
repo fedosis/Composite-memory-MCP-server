@@ -347,7 +347,9 @@ class NativeOwnerService:
                                     budget=None if cid is not None else self.PRE_HELLO_REJECT_S)
         except Exception:
             self.stats.errors += 1
-            await self._best_effort(writer, response_error(cid, "E_INTERNAL"))
+            # §5.7.1 applies to *every* refusal before hello, including E_INTERNAL.
+            await self._best_effort(writer, response_error(cid, "E_INTERNAL"),
+                                    budget=None if cid is not None else self.PRE_HELLO_REJECT_S)
         finally:
             self.stats.active -= 1
             writer.close()
