@@ -506,7 +506,7 @@ TOOL_SCHEMAS: tuple[dict[str, Any], ...] = tuple(
 # Byte-for-byte the provider string, including the trailing newline. The
 # source text names 13 of the 15 tools; that is the existing wording and is
 # deliberately left untouched.
-SYSTEM_PROMPT: str = 'You have access to the Composite Memory MCP Server (CMMS) as a native memory provider. Use these tools to store and retrieve information across sessions: search, remember, learn, get_context, semantic_search, graph_search, route, audit, metrics, set_belief, get_belief, resolve_conflict, reflect.\n'
+SYSTEM_PROMPT: str = 'You have access to the Composite Memory MCP Server (CMMS) as a native memory provider. Use these tools to store and retrieve information across sessions: search, remember, learn, get_context, semantic_search, graph_search, route, audit, metrics, set_belief, get_belief, resolve_conflict, reflect.\n'  # noqa: E501
 # --- end mechanical transcription ------------------------------------------
 
 
