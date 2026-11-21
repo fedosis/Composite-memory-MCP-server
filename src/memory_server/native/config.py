@@ -74,7 +74,7 @@ _BACKEND_KEYS: frozenset[str] = frozenset(
     }
 )
 _WRITER_KEYS: frozenset[str] = frozenset({"flush_interval", "max_batch"})
-_VECTOR_BACKENDS: frozenset[str] = frozenset({"lancedb", "qdrant", "none"})
+_VECTOR_BACKENDS: frozenset[str] = frozenset({"lancedb", "qdrant"})
 _EXTRACTION_MODES: frozenset[str] = frozenset({"llm", "none"})
 _SQLITE_PREFIX = "sqlite+aiosqlite://"
 _MAX_SOCKET_BYTES = 107

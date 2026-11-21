@@ -22,12 +22,15 @@ from memory_server.native.protocol import (
     OP_RECALL,
     OP_STATUS,
     OP_TOOL_CALL,
+    FrameRejectedError,
     ProtocolError,
     encode_frame,
     read_frame,
     response_error,
     response_ok,
+    validate_enqueue,
     validate_hello,
+    validate_recall,
     validate_request,
     validate_tool_call,
 )
@@ -86,6 +89,13 @@ class NativeOwnerService:
         self._layout = preflight_layout(self.config, get_settings())
         await self.adapter.start()
         try:
+            await self._bind_and_ready()
+        except BaseException:
+            await self._rollback_start()
+            raise
+
+    async def _bind_and_ready(self) -> None:
+        try:
             os.lstat(self.config.socket_path)
         except FileNotFoundError:
             pass
@@ -94,6 +104,10 @@ class NativeOwnerService:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             listener.bind(str(self.config.socket_path))
+            # Record identity immediately after bind so rollback can reclaim
+            # our own inode even if chmod/start_unix_server later fails.
+            info = os.lstat(self.config.socket_path)
+            self._socket_identity = (info.st_dev, info.st_ino)
             kwargs: dict[str, Any] = {"sock": listener, "backlog": 16}
             # Since Python 3.13 asyncio otherwise unlinks the socket on close,
             # including FAILED_CLOSING where the pathname must be retained.
@@ -105,14 +119,34 @@ class NativeOwnerService:
             raise
         try:
             os.chmod(self.config.socket_path, 0o600)
-            info = os.lstat(self.config.socket_path)
-            self._socket_identity = (info.st_dev, info.st_ino)
         except BaseException:
             self._server.close()
             await self._server.wait_closed()
             raise
         self._epoch = str(uuid.uuid4())
         self._state = STATE_READY
+
+    async def _rollback_start(self) -> None:
+        """Undo a partially-started owner after ``adapter.start()`` succeeded."""
+        if self._server is not None:
+            self._server.close()
+            try:
+                await self._server.wait_closed()
+            except Exception:
+                pass
+            self._server = None
+        if self._socket_identity is not None:
+            try:
+                info = os.lstat(self.config.socket_path)
+                if stat.S_ISSOCK(info.st_mode) and (info.st_dev, info.st_ino) == self._socket_identity:
+                    os.unlink(self.config.socket_path)
+            except (FileNotFoundError, OSError):
+                pass
+        try:
+            await self.adapter.close()
+        except Exception:
+            pass
+        self._state = STATE_CLOSED
 
     async def run(self) -> int:
         try:
@@ -122,7 +156,6 @@ class NativeOwnerService:
             return self.exit_code
         except StaleSocketError:
             self.exit_code = 4
-            await self.adapter.close()
             return self.exit_code
         except StorageOwnershipError:
             self.exit_code = 5
@@ -181,14 +214,22 @@ class NativeOwnerService:
         if self._socket_identity is not None:
             try:
                 info = os.lstat(self.config.socket_path)
-                if stat.S_ISSOCK(info.st_mode) and (info.st_dev, info.st_ino) == self._socket_identity:
-                    os.unlink(self.config.socket_path)
             except FileNotFoundError:
-                pass
+                info = None
             except OSError:
                 self._state = STATE_FAILED_CLOSING
                 self.exit_code = 3
                 return report
+            if info is not None:
+                if stat.S_ISSOCK(info.st_mode) and (info.st_dev, info.st_ino) == self._socket_identity:
+                    os.unlink(self.config.socket_path)
+                else:
+                    # Foreign/substituted pathname: leave it, still a clean close (§9.3).
+                    print(
+                        f"native-serve: socket pathname no longer ours, left in place: "
+                        f"{self.config.socket_path}",
+                        file=sys.stderr,
+                    )
         self._state = STATE_CLOSED
         self.exit_code = 0
         return report
@@ -209,11 +250,23 @@ class NativeOwnerService:
 
     async def _status_payload(self) -> dict[str, Any]:
         snapshot = await self.adapter.pending_snapshot()
-        return {**self.status(), "pending": {"live_pending": snapshot.live_pending,
-                                               "terminal_failed": snapshot.terminal_failed}}
+        return {
+            **self.status(),
+            "rejected": self.stats.rejected,
+            "pending": {"live_pending": snapshot.live_pending,
+                        "terminal_failed": snapshot.terminal_failed},
+        }
 
     async def _send(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
-        writer.write(encode_frame(payload))
+        try:
+            frame = encode_frame(payload)
+        except ProtocolError as exc:
+            if exc.code != "E_FRAME":
+                raise
+            # Oversized response (tool result > frame cap): E_FRAME/result_too_large.
+            cid = payload.get("correlation_id") if isinstance(payload, dict) else None
+            frame = encode_frame(response_error(cid, "E_FRAME", detail_code="result_too_large"))
+        writer.write(frame)
         await asyncio.wait_for(writer.drain(), timeout=0.1)
 
     async def _handle_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -251,18 +304,36 @@ class NativeOwnerService:
             cid = request.get("correlation_id") if isinstance(request.get("correlation_id"), str) else None
             op, cid, fields = validate_request(request)
             session_id = request["session_id"]
-            async with self._operations:
+            try:
+                await asyncio.wait_for(self._operations.acquire(), timeout=self._slot_budget(op))
+            except TimeoutError:
+                # Admission slot not acquired within the op deadline: the op was
+                # never dispatched, so a retry-safe code is correct (§6.2/§6.3).
+                self.stats.errors += 1
+                await self._best_effort(writer, response_error(cid, "E_UNAVAILABLE"))
+                return
+            try:
                 result = await self._dispatch(op, cid, session_id, fields)
+            finally:
+                self._operations.release()
             await self._send(writer, result)
             self.stats.accepted += 1
         except PeerCredentialError:
             self.stats.rejected += 1
             cid = None
             await self._best_effort(writer, response_error(None, "E_PROFILE_DENIED"))
+        except FrameRejectedError:
+            # Amplification guard: zero/over-cap frame, close without a reply (§5.2 p.1).
+            self.stats.rejected += 1
         except (ProtocolError, TimeoutError) as exc:
             self.stats.rejected += 1
-            code = exc.code if isinstance(exc, ProtocolError) else "E_TIMEOUT"
-            await self._best_effort(writer, response_error(cid, code))
+            if isinstance(exc, ProtocolError):
+                code = exc.code
+                detail_code = exc.detail_code
+            else:
+                code = "E_TIMEOUT"
+                detail_code = None
+            await self._best_effort(writer, response_error(cid, code, detail_code=detail_code))
         except Exception:
             self.stats.errors += 1
             await self._best_effort(writer, response_error(cid, "E_INTERNAL"))
@@ -282,6 +353,19 @@ class NativeOwnerService:
         except (Exception, asyncio.CancelledError):
             pass
 
+    def _slot_budget(self, op: str) -> float:
+        """Per-operation deadline for the ``max_operations`` admission slot (§5.6)."""
+        limits = self.config.limits
+        if op == OP_TOOL_CALL:
+            return limits.tool_timeout_s
+        if op == OP_RECALL:
+            return limits.recall_timeout_s
+        if op == OP_ENQUEUE:
+            return limits.enqueue_timeout_s
+        if op == OP_FLUSH:
+            return limits.flush_timeout_s
+        return limits.read_idle_s
+
     async def _dispatch(self, op: str, cid: str, session_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         try:
             if op == OP_STATUS:
@@ -290,17 +374,12 @@ class NativeOwnerService:
                 name, args = validate_tool_call(fields)
                 return response_ok(cid, result=await self.adapter.execute_tool_async(name, args))
             if op == OP_RECALL:
-                if set(fields) - {"query", "max_results"} or not isinstance(fields.get("query"), str):
-                    raise ProtocolError("E_VALIDATION")
-                count = fields.get("max_results", 5)
-                if type(count) is not int or count < 1:
-                    raise ProtocolError("E_VALIDATION")
+                query, count = validate_recall(fields)
                 return response_ok(cid, result=await self.adapter.recall_context_async(
-                    fields["query"], session_id=session_id, max_results=count))
+                    query, session_id=session_id, max_results=count))
             if op == OP_ENQUEUE:
-                if set(fields) != {"messages"} or not isinstance(fields["messages"], list):
-                    raise ProtocolError("E_VALIDATION")
-                await self.adapter.enqueue_turn_async(fields["messages"], session_id=session_id)
+                messages = validate_enqueue(fields)
+                await self.adapter.enqueue_turn_async(messages, session_id=session_id)
                 return response_ok(cid, accepted=True)
             if op == OP_FLUSH:
                 if fields:
@@ -308,15 +387,10 @@ class NativeOwnerService:
                 return response_ok(cid, **await self.adapter.flush_observations_async())
             raise ProtocolError("E_VALIDATION")
         except WriterBacklogError as exc:
-            detail = "terminal_limit" if exc.code in ("terminal_limit", "E_TERMINAL_LIMIT") else "live_limit"
-            if exc.code == "E_BACKLOG":
-                try:
-                    snapshot = await self.adapter.pending_snapshot()
-                    if snapshot.terminal_failed >= self.config.limits.terminal_failed:
-                        detail = "terminal_limit"
-                except Exception:
-                    pass
-            return {**response_error(cid, "E_BACKLOG"), "detail_code": detail}
+            # The sub-reason was captured from the same snapshot that rejected the
+            # enqueue; do not re-read pending_snapshot() here (§6.1).
+            detail = exc.detail_code or "live_limit"
+            return {**response_error(cid, "E_BACKLOG"), "detail_code": detail, "accepted": False}
         except TimeoutError:
             uncertain = op in (OP_ENQUEUE, OP_FLUSH) or (
                 op == OP_TOOL_CALL and fields.get("name") in _MUTATING_TOOLS

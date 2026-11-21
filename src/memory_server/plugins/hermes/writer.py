@@ -67,9 +67,10 @@ class QueueCustodySnapshot:
 class WriterBacklogError(RuntimeError):
     """Admission rejected because the writer backlog reached its configured cap."""
 
-    def __init__(self, code: str = "E_BACKLOG") -> None:
+    def __init__(self, code: str = "E_BACKLOG", detail_code: str | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.detail_code = detail_code
 
 
 @dataclass(frozen=True, slots=True)

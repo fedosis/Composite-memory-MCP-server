@@ -2079,8 +2079,10 @@ class HermesProvider:
     ) -> None:
         """Enqueue one turn, gated on the writer's pending-snapshot backlog."""
         snap = self._writer.pending_snapshot()
-        if snap.live_pending >= live_limit or snap.terminal_failed >= terminal_limit:
-            raise WriterBacklogError("E_BACKLOG")
+        if snap.live_pending >= live_limit:
+            raise WriterBacklogError("E_BACKLOG", detail_code="live_limit")
+        if snap.terminal_failed >= terminal_limit:
+            raise WriterBacklogError("E_BACKLOG", detail_code="terminal_limit")
         await self._writer.add_turn(messages, turn_id=session_id or "unknown")
 
     async def flush_observations_async(self) -> dict[str, int]:
