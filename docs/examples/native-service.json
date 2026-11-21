@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "data_root": "/srv/cmms/store",
+  "storage_context_home": "/srv/cmms/context",
+  "socket_path": "/run/cmms-native/memory.sock",
+  "allow_homes": [
+    "/home/shtorm/.hermes",
+    "/home/shtorm/.hermes/profiles/coder"
+  ],
+  "backend": {
+    "storage_mode": "shared",
+    "db_url": "sqlite+aiosqlite:////srv/cmms/store/memory.db",
+    "vector_backend": "lancedb",
+    "lancedb_path": "/srv/cmms/store/lancedb",
+    "graph_snapshot_path": "/srv/cmms/store/graph.json",
+    "vector_collection": "memories",
+    "extraction_mode": "llm",
+    "llm_model": "deepseek-v4-flash",
+    "llm_base_url": "https://api.deepseek.com/v1",
+    "max_facts": 5,
+    "writer": {
+      "flush_interval": 5.0,
+      "max_batch": 50
+    }
+  },
+  "limits": {
+    "frame_bytes": 4194304,
+    "max_connections": 16,
+    "max_operations": 16,
+    "hello_timeout_s": 5.0,
+    "read_idle_s": 5.0,
+    "connect_timeout_s": 2.0,
+    "tool_timeout_s": 60.0,
+    "recall_timeout_s": 10.0,
+    "enqueue_timeout_s": 5.0,
+    "flush_timeout_s": 30.0,
+    "live_turns": 64,
+    "terminal_failed": 64,
+    "pre_drain_s": 8.0
+  }
+}
