@@ -1,0 +1,458 @@
+{
+  "v": 1,
+  "tools": [
+    {
+      "name": "invalidate",
+      "description": "Retire a fact or belief, optionally naming its active successor",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "memory_id": {
+            "type": "string"
+          },
+          "memory_type": {
+            "type": "string",
+            "enum": [
+              "fact",
+              "belief"
+            ],
+            "default": "fact"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "to_state": {
+            "type": "string",
+            "enum": [
+              "discarded",
+              "superseded",
+              "stale"
+            ],
+            "default": "discarded"
+          },
+          "superseded_by": {
+            "type": "string",
+            "default": ""
+          },
+          "expected_version": {
+            "type": "string",
+            "default": ""
+          }
+        },
+        "required": [
+          "memory_id",
+          "reason"
+        ]
+      }
+    },
+    {
+      "name": "ping",
+      "description": "Connectivity check — returns OK if CMMS is alive",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "search",
+      "description": "Search stored facts by keyword text with optional subject/predicate filters",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "include_inactive": {
+            "type": "boolean",
+            "default": false
+          },
+          "query": {
+            "type": "string",
+            "description": "Free-text keyword to search across subject/predicate/object"
+          },
+          "subject": {
+            "type": "string",
+            "description": "Optional exact subject filter"
+          },
+          "predicate": {
+            "type": "string",
+            "description": "Optional exact predicate filter"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum number of results (default 50)",
+            "default": 50
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "remember",
+      "description": "Store a fact with provenance receipt. Writes to SQL and queues async indexing",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "The subject of the fact"
+          },
+          "predicate": {
+            "type": "string",
+            "description": "The predicate/relation"
+          },
+          "object": {
+            "type": "string",
+            "description": "The object of the fact"
+          },
+          "confidence": {
+            "type": "number",
+            "description": "Confidence score 0.0-1.0 (default 1.0)",
+            "default": 1.0
+          },
+          "source": {
+            "type": "string",
+            "description": "Source identifier (default 'user')",
+            "default": "user"
+          }
+        },
+        "required": [
+          "subject",
+          "predicate",
+          "object"
+        ]
+      }
+    },
+    {
+      "name": "get_context",
+      "description": "Retrieve structured context about a task — facts and decisions relevant to the turn",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "The task description or search query"
+          },
+          "subject": {
+            "type": "string",
+            "description": "Optional subject filter"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum number of facts to return (default 10)",
+            "default": 10
+          }
+        },
+        "required": [
+          "task"
+        ]
+      }
+    },
+    {
+      "name": "learn",
+      "description": "Extract and store facts, decisions, skills, and optionally beliefs from text",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Natural language text to extract knowledge from"
+          },
+          "source": {
+            "type": "string",
+            "description": "Source identifier (default 'user')",
+            "default": "user"
+          },
+          "extract_beliefs": {
+            "type": "boolean",
+            "description": "If True, also extract and store beliefs",
+            "default": false
+          },
+          "min_belief_confidence": {
+            "type": "number",
+            "description": "Minimum confidence to create a belief (default 0.6)",
+            "default": 0.6
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "semantic_search",
+      "description": "Semantic search — embed a query and find similar facts by vector similarity",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "include_inactive": {
+            "type": "boolean",
+            "default": false
+          },
+          "query": {
+            "type": "string",
+            "description": "Natural language query text"
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "Maximum number of results (default 10)",
+            "default": 10
+          },
+          "score_threshold": {
+            "type": "number",
+            "description": "Minimum similarity score 0.0-1.0 (default 0.0)",
+            "default": 0.0
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "graph_search",
+      "description": "Search the knowledge graph for entities/relations by node lookup, pathfinding, or text",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Text to extract entity references from"
+          },
+          "entity_id": {
+            "type": "string",
+            "description": "Direct node ID lookup"
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Source entity for pathfinding"
+          },
+          "target_id": {
+            "type": "string",
+            "description": "Target entity for pathfinding"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "route",
+      "description": "Route query through 4-stage router (rules->embeddings->graph->LLM) per ADR-005",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "include_inactive": {
+            "type": "boolean",
+            "default": false
+          },
+          "query": {
+            "type": "string",
+            "description": "Natural language query text"
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "Maximum semantic search results (default 10)",
+            "default": 10
+          },
+          "score_threshold": {
+            "type": "number",
+            "description": "Minimum similarity score 0.0-1.0 (default 0.0)",
+            "default": 0.0
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "audit",
+      "description": "Run a memory audit for consistency, orphans, confidence distribution, and drift",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "audit_type": {
+            "type": "string",
+            "description": "One of 'full', 'consistency', 'orphans', or 'confidence'",
+            "default": "full",
+            "enum": [
+              "full",
+              "consistency",
+              "orphans",
+              "confidence"
+            ]
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "metrics",
+      "description": "Return a Prometheus-formatted snapshot of observability metrics",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "set_belief",
+      "description": "Create/reinforce/supersede a belief with evidence. Matching beliefs get reinforced",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "proposition": {
+            "type": "string",
+            "description": "The belief proposition text"
+          },
+          "confidence": {
+            "type": "number",
+            "description": "Confidence score 0.0-1.0 (default 0.5)",
+            "default": 0.5
+          },
+          "sources": {
+            "type": "string",
+            "description": "JSON array of evidence source dicts with source_type/source_id/weight",
+            "default": "[]"
+          },
+          "tags": {
+            "type": "string",
+            "description": "JSON array of tag strings",
+            "default": "[]"
+          },
+          "source": {
+            "type": "string",
+            "description": "Source identifier (default 'system')",
+            "default": "system"
+          },
+          "replace_belief_id": {
+            "type": "string",
+            "description": "If set, supersede the referenced belief and link this new one"
+          }
+        },
+        "required": [
+          "proposition"
+        ]
+      }
+    },
+    {
+      "name": "get_belief",
+      "description": "Search beliefs — filter by proposition, lifecycle, confidence, tags, source, creator",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "proposition": {
+            "type": "string",
+            "description": "Search proposition text (FTS5 full-text search)"
+          },
+          "lifecycle_state": {
+            "type": "string",
+            "description": "Filter by lifecycle state (default 'active')",
+            "default": "active"
+          },
+          "min_confidence": {
+            "type": "number",
+            "description": "Minimum confidence threshold 0.0-1.0",
+            "default": 0.0
+          },
+          "tags": {
+            "type": "string",
+            "description": "JSON array of tag strings to filter by"
+          },
+          "source": {
+            "type": "string",
+            "description": "Filter by source identifier"
+          },
+          "creator": {
+            "type": "string",
+            "description": "Filter by creator identifier"
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Filter by source_id in the belief's source_ids list"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum number of results (default 10, max 100)",
+            "default": 10
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "resolve_conflict",
+      "description": "Resolve a conflict between two beliefs (keep_a/b/merge/discard_both, or auto-resolve)",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "belief_a_id": {
+            "type": "string",
+            "description": "UUID of the first belief in the conflict"
+          },
+          "belief_b_id": {
+            "type": "string",
+            "description": "UUID of the second belief in the conflict"
+          },
+          "resolution": {
+            "type": "string",
+            "description": "Strategy: keep_a, keep_b, merge, discard_both",
+            "enum": [
+              "keep_a",
+              "keep_b",
+              "merge",
+              "discard_both"
+            ]
+          },
+          "new_proposition": {
+            "type": "string",
+            "description": "Proposition for a new merged belief (required for merge)"
+          },
+          "auto_resolve": {
+            "type": "boolean",
+            "description": "When True, auto-resolve by confidence threshold",
+            "default": false
+          }
+        },
+        "required": [
+          "belief_a_id",
+          "belief_b_id",
+          "resolution"
+        ]
+      }
+    },
+    {
+      "name": "reflect",
+      "description": "Analyse belief store (overview, contradictions, decay, topics, audit, confidence)",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "description": "Mode: overview, contradictions, decay, topics, audit, or confidence",
+            "default": "overview",
+            "enum": [
+              "overview",
+              "contradictions",
+              "decay",
+              "topics",
+              "evidence_audit",
+              "confidence"
+            ]
+          },
+          "topic": {
+            "type": "string",
+            "description": "Optional topic/tag filter"
+          },
+          "min_confidence": {
+            "type": "number",
+            "description": "Minimum confidence threshold 0.0-1.0",
+            "default": 0.0
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Max beliefs to analyse (0 = all, default 50)",
+            "default": 50
+          }
+        },
+        "required": []
+      }
+    }
+  ],
+  "prompt": "You have access to the Composite Memory MCP Server (CMMS) as a native memory provider. Use these tools to store and retrieve information across sessions: search, remember, learn, get_context, semantic_search, graph_search, route, audit, metrics, set_belief, get_belief, resolve_conflict, reflect.\n",
+  "schema_hash": "566f54db869829a6438f11d5d3ed24b20ace69062c8dea096f9220958da813b8"
+}
