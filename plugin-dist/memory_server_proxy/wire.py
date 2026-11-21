@@ -126,5 +126,5 @@ def schema_hash_from_artifacts(tools: list[dict], prompt: str) -> str:
 
 
 def hello_payload(*, schema_hash: str, store_id: str, claimed_home: str) -> dict[str, Any]:
-    """The flat hello-specific fields; the caller adds ``v``/``op``/``correlation_id``."""
+    """The hello payload fields; the caller nests them under ``payload``."""
     return {"schema_hash": schema_hash, "store_id": store_id, "claimed_home": claimed_home}

@@ -55,6 +55,7 @@ class FakeNativeServer:
         self.schema_hash = schema_hash or "f" * 64
         self.connections = 0
         self.ops: list[tuple[str, str, dict]] = []
+        self.hellos: list[dict] = []
         self._handlers: dict = {}
         self._drop_next_response = False
         self._stop = threading.Event()
@@ -89,6 +90,7 @@ class FakeNativeServer:
             try:
                 conn.settimeout(3.0)
                 hello = wire.read_frame_blocking(conn)
+                self.hellos.append(hello)
                 conn.sendall(wire.encode_frame(wire.response_ok(
                     hello["correlation_id"], state="READY", store_id=self.store_id,
                     epoch=self.epoch, schema_hash=self.schema_hash)))
@@ -279,6 +281,10 @@ def test_sync_turn_uncertain_no_retry(tmp_path: Path) -> None:
         assert p._stats["uncertain"] == 1
         assert p._stats["sent"] == 0
         assert [op[0] for op in server.ops] == ["enqueue_turn"]
+        assert set(server.hellos[0]) == {"v", "op", "correlation_id", "payload"}
+        assert server.hellos[0]["payload"] == {
+            "schema_hash": p._schema_hash_value(), "store_id": store_id, "claimed_home": str(tmp_path),
+        }
 
 
 def test_on_session_end_flushes(tmp_path: Path) -> None:

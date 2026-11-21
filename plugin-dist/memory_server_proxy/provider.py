@@ -16,12 +16,10 @@ import socket
 import threading
 import uuid
 from pathlib import Path
-from typing import Any
 
 from agent.memory_provider import MemoryProvider
 
-from . import settings
-from . import wire
+from . import settings, wire
 
 CONNECT_TIMEOUT = 2.0
 HELLO_TIMEOUT = 5.0
@@ -163,8 +161,8 @@ class MemoryServerProxyProvider(MemoryProvider):
                 "v": wire.PROTO_VERSION,
                 "op": wire.OP_HELLO,
                 "correlation_id": self._cid(),
-                **wire.hello_payload(schema_hash=schema_hash, store_id=store_id,
-                                     claimed_home=self._home),
+                "payload": wire.hello_payload(schema_hash=schema_hash, store_id=store_id,
+                                              claimed_home=self._home),
             }
             sock.sendall(wire.encode_frame(hello))
             resp = wire.read_frame_blocking(sock)

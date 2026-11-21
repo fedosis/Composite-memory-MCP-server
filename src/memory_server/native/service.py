@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import socket
 import stat
 import sys
@@ -132,12 +133,24 @@ class NativeOwnerService:
         except Exception:
             self.exit_code = 3
             return self.exit_code
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        assert task is not None
+        # asyncio.run handles SIGINT, not SIGTERM. Cancel the serving task so
+        # run() reaches stop() rather than letting the default signal kill us.
+        try:
+            loop.add_signal_handler(signal.SIGTERM, task.cancel)
+            term_handler = True
+        except (NotImplementedError, RuntimeError, ValueError):
+            term_handler = False
         try:
             assert self._server is not None
             await self._server.serve_forever()
         except asyncio.CancelledError:
             pass
         finally:
+            if term_handler:
+                loop.remove_signal_handler(signal.SIGTERM)
             await self.stop()
         return self.exit_code
 
@@ -255,13 +268,13 @@ class NativeOwnerService:
             await self._best_effort(writer, response_error(cid, "E_INTERNAL"))
         finally:
             self.stats.active -= 1
-            if task is not None:
-                self._connections.discard(task)
             writer.close()
             try:
                 await asyncio.wait_for(writer.wait_closed(), timeout=0.1)
             except (Exception, asyncio.CancelledError):
                 pass
+            if task is not None:
+                self._connections.discard(task)
 
     async def _best_effort(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
         try:

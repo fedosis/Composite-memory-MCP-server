@@ -114,13 +114,17 @@ def _read_frame_blocking(sock: socket.socket, *, max_bytes: int) -> dict[str, An
 
 def _hello(config: ServiceConfig, *, timeout: float) -> dict[str, Any]:
     """Perform one blocking hello exchange against the owner socket."""
+    home = Path.home().resolve()
+    admitted_home = home if home in config.allow_homes else config.allow_homes[0]
     request = {
         "v": PROTO_VERSION,
         "op": "hello",
         "correlation_id": _HELLO_CORRELATION_ID,
-        "schema_hash": schema_hash(),
-        "store_id": config.store_id,
-        "claimed_home": str(Path.home()),
+        "payload": {
+            "schema_hash": schema_hash(),
+            "store_id": config.store_id,
+            "claimed_home": str(admitted_home),
+        },
     }
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)

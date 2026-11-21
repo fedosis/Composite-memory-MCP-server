@@ -55,7 +55,9 @@ def _read_client_frame(conn: socket.socket) -> dict:
     return json.loads(_recv_exact(conn, length).decode("utf-8"))
 
 
-def _start_fake_service(socket_path: Path, reply_factory) -> tuple[socket.socket, threading.Thread]:
+def _start_fake_service(
+    socket_path: Path, reply_factory, seen: list[dict] | None = None,
+) -> tuple[socket.socket, threading.Thread]:
     """Bind ``socket_path`` and answer exactly one hello with ``reply_factory()``."""
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(socket_path))
@@ -69,7 +71,9 @@ def _start_fake_service(socket_path: Path, reply_factory) -> tuple[socket.socket
             return
         with conn:
             try:
-                _read_client_frame(conn)
+                frame = _read_client_frame(conn)
+                if seen is not None:
+                    seen.append(frame)
                 conn.sendall(encode_frame(reply_factory()))
             except OSError:
                 return
@@ -114,6 +118,8 @@ def test_native_status_ready_exit_0(tmp_path: Path, capsys: pytest.CaptureFixtur
     config = make_service_config(tmp_path, store_id=store_id)
     cfg = load_service_config(config)
 
+    # Assert the actual request, including admitted home, not only the fake reply.
+    seen = []
     server, thread = _start_fake_service(
         cfg.socket_path,
         lambda: {
@@ -125,6 +131,7 @@ def test_native_status_ready_exit_0(tmp_path: Path, capsys: pytest.CaptureFixtur
             "epoch": str(uuid.uuid4()),
             "schema_hash": schema_hash(),
         },
+        seen,
     )
     try:
         with pytest.raises(SystemExit) as info:
@@ -134,6 +141,9 @@ def test_native_status_ready_exit_0(tmp_path: Path, capsys: pytest.CaptureFixtur
         thread.join(timeout=10)
 
     assert info.value.code == 0
+    assert seen == [{"v": 1, "op": "hello", "correlation_id": "status",
+                     "payload": {"schema_hash": schema_hash(), "store_id": store_id,
+                                 "claimed_home": str(cfg.allow_homes[0])}}]
     payload = json.loads(capsys.readouterr().out)
     assert payload["state"] == "READY"
     assert payload["store_id"] == store_id

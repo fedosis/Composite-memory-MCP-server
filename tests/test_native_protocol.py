@@ -88,8 +88,9 @@ def test_unknown_tool_rejected():
 
 
 def hello(home: Path):
-    return {"v": 1, "op": "hello", "correlation_id": "cid", "store_id": str(uuid.uuid4()),
-            "schema_hash": "a" * 64, "claimed_home": str(home)}
+    return {"v": 1, "op": "hello", "correlation_id": "cid",
+            "payload": {"store_id": str(uuid.uuid4()), "schema_hash": "a" * 64,
+                        "claimed_home": str(home)}}
 
 
 def test_hello_store_id_mismatch(tmp_path):
@@ -103,7 +104,7 @@ def test_hello_store_id_mismatch(tmp_path):
 def test_hello_schema_mismatch(tmp_path):
     claim = hello(tmp_path)
     with pytest.raises(ProtocolError) as exc:
-        validate_hello(claim, expected_store_id=claim["store_id"], schema_hash="b" * 64,
+        validate_hello(claim, expected_store_id=claim["payload"]["store_id"], schema_hash="b" * 64,
                        allow_homes=(tmp_path,))
     assert exc.value.code == "E_SCHEMA"
 
@@ -111,9 +112,29 @@ def test_hello_schema_mismatch(tmp_path):
 def test_hello_home_not_allowed(tmp_path):
     claim = hello(tmp_path)
     with pytest.raises(ProtocolError) as exc:
-        validate_hello(claim, expected_store_id=claim["store_id"], schema_hash="a" * 64,
+        validate_hello(claim, expected_store_id=claim["payload"]["store_id"], schema_hash="a" * 64,
                        allow_homes=(tmp_path / "elsewhere",))
     assert exc.value.code == "E_PROFILE_DENIED"
+
+
+def test_hello_rejects_uppercase_hash(tmp_path):
+    claim = hello(tmp_path)
+    claim["payload"]["schema_hash"] = "A" * 64
+    with pytest.raises(ProtocolError) as exc:
+        validate_hello(claim, expected_store_id=claim["payload"]["store_id"], schema_hash="A" * 64,
+                       allow_homes=(tmp_path,))
+    assert exc.value.code == "E_SCHEMA"
+
+
+def test_hello_requires_nested_payload(tmp_path):
+    claim = hello(tmp_path)
+    # The real owner must not accept the legacy flat envelope or extra payload fields.
+    for invalid in ({**claim["payload"], "v": 1, "op": "hello", "correlation_id": "cid"},
+                    {**claim, "payload": {**claim["payload"], "extra": True}}):
+        with pytest.raises(ProtocolError) as exc:
+            validate_hello(invalid, expected_store_id=claim["payload"]["store_id"], schema_hash="a" * 64,
+                           allow_homes=(tmp_path,))
+        assert exc.value.code == "E_VALIDATION"
 
 
 async def test_tool_result_passthrough():
@@ -159,8 +180,8 @@ async def test_owner_listener_ready_and_inode_safe_shutdown(tmp_path, monkeypatc
         from memory_server.native.schema_v1 import schema_hash
 
         greeting = hello(config.allow_homes[0])
-        greeting["store_id"] = config.store_id
-        greeting["schema_hash"] = schema_hash()
+        greeting["payload"]["store_id"] = config.store_id
+        greeting["payload"]["schema_hash"] = schema_hash()
         writer.write(encode_frame(greeting))
         await writer.drain()
         ready = await read_frame(reader)

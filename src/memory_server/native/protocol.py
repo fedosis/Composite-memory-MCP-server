@@ -23,7 +23,7 @@ OP_ENQUEUE = "enqueue_turn"
 OP_FLUSH = "flush_observations"
 OP_NAMES: frozenset[str] = frozenset({OP_STATUS, OP_TOOL_CALL, OP_RECALL, OP_ENQUEUE, OP_FLUSH})
 _CID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
-_HASH = re.compile(r"[0-9a-fA-F]{64}\Z")
+_HASH = re.compile(r"[0-9a-f]{64}\Z")
 _MESSAGES = {
     "E_STORE_ID": "store id mismatch",
     "E_SCHEMA": "schema mismatch",
@@ -117,22 +117,25 @@ def validate_hello(
     allow_homes: tuple[Path, ...],
 ) -> None:
     _version(payload)
-    if set(payload) != {"v", "op", "correlation_id", "schema_hash", "store_id", "claimed_home"}:
+    if set(payload) != {"v", "op", "correlation_id", "payload"}:
         raise ProtocolError("E_VALIDATION")
     if payload["op"] != OP_HELLO:
         raise ProtocolError("E_VALIDATION")
     _cid(payload)
-    store_id = payload["store_id"]
+    fields = payload["payload"]
+    if not isinstance(fields, dict) or set(fields) != {"schema_hash", "store_id", "claimed_home"}:
+        raise ProtocolError("E_VALIDATION")
+    store_id = fields["store_id"]
     try:
         canonical = isinstance(store_id, str) and str(uuid.UUID(store_id)) == store_id
     except (ValueError, AttributeError, TypeError):
         canonical = False
     if not canonical or store_id != expected_store_id:
         raise ProtocolError("E_STORE_ID")
-    claim_hash = payload["schema_hash"]
+    claim_hash = fields["schema_hash"]
     if not isinstance(claim_hash, str) or not _HASH.fullmatch(claim_hash) or claim_hash != schema_hash:
         raise ProtocolError("E_SCHEMA")
-    home = payload["claimed_home"]
+    home = fields["claimed_home"]
     if not isinstance(home, str) or "\x00" in home or not Path(home).is_absolute() or ".." in Path(home).parts:
         raise ProtocolError("E_PROFILE_DENIED")
     try:
