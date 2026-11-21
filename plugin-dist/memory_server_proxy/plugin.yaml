@@ -1,0 +1,7 @@
+name: memory_server_proxy
+version: 0.1.0
+description: "Standalone AF_UNIX client for an external CMMS native service."
+config_keys:
+  - memory.memory_server_proxy
+  - memory.provider_config
+python_dependencies: []
