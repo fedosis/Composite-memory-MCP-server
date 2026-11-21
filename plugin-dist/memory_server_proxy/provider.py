@@ -28,6 +28,10 @@ RECALL_TIMEOUT = 10.0
 TOOL_TIMEOUT = 60.0
 FLUSH_TIMEOUT = 30.0
 MAX_RECALL_RESULTS = 5
+PREFETCH_HELLO_TIMEOUT = 2.0
+
+# Mutating tools whose unknown outcome must be classified E_UNCERTAIN (§6.3).
+_MUTATING_TOOLS = frozenset({"remember", "learn", "invalidate", "set_belief", "resolve_conflict"})
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _SCHEMA_PATH = _PLUGIN_DIR / "schema_v1.json"
@@ -46,6 +50,7 @@ class MemoryServerProxyProvider(MemoryProvider):
         self._cache: dict[str, tuple] = {}
         self._generation = 0
         self._epoch: str | None = None
+        self._incompatible = False
         self._worker: threading.Thread | None = None
         self._pending_query: str | None = None
         self._worker_stop = threading.Event()
@@ -135,11 +140,13 @@ class MemoryServerProxyProvider(MemoryProvider):
                 self._epoch = new_epoch
                 self._cache.clear()
 
-    def _open(self) -> socket.socket:
-        """Connect + hello; returns the open socket or raises ``WireError``."""
+    def _open(self, *, hello_timeout: float = HELLO_TIMEOUT) -> socket.socket:
+        """Connect + peercred + hello; returns the open socket or raises ``WireError``."""
         sidecar = self._sidecar
         if not sidecar:
             raise wire.WireError("E_UNAVAILABLE", "no sidecar")
+        if self._incompatible:
+            raise wire.WireError("E_UNAVAILABLE", "endpoint marked incompatible")
         socket_path = sidecar.get("socket_path", "")
         store_id = sidecar.get("expected_store_id", "")
         schema_hash = self._schema_hash_value()
@@ -155,12 +162,23 @@ class MemoryServerProxyProvider(MemoryProvider):
         except OSError:
             sock.close()
             raise wire.WireError("E_UNAVAILABLE", "connect failed")
+        # Client-side peer credential check (§5.7): refuse a foreign-uid peer.
         try:
-            sock.settimeout(HELLO_TIMEOUT)
+            peer_uid = wire.peer_cred(sock)[1]
+        except wire.WireError:
+            sock.close()
+            raise wire.WireError("E_UNAVAILABLE", "peer credentials unavailable")
+        if peer_uid != os.geteuid():
+            sock.close()
+            self._incompatible = True
+            raise wire.WireError("E_PROFILE_DENIED", "peer uid mismatch")
+        cid = self._cid()
+        try:
+            sock.settimeout(hello_timeout)
             hello = {
                 "v": wire.PROTO_VERSION,
                 "op": wire.OP_HELLO,
-                "correlation_id": self._cid(),
+                "correlation_id": cid,
                 "payload": wire.hello_payload(schema_hash=schema_hash, store_id=store_id,
                                               claimed_home=self._home),
             }
@@ -170,11 +188,19 @@ class MemoryServerProxyProvider(MemoryProvider):
             sock.close()
             raise
         if not resp.get("ok"):
+            code = resp.get("code") or "E_UNAVAILABLE"
             sock.close()
-            raise wire.WireError(resp.get("code") or "E_UNAVAILABLE")
-        epoch = resp.get("epoch")
-        if isinstance(epoch, str):
-            self._record_epoch(epoch)
+            if code in ("E_STORE_ID", "E_SCHEMA"):
+                self._incompatible = True
+            raise wire.WireError(code)
+        try:
+            epoch = wire.validate_ready(resp, correlation_id=cid, expected_store_id=store_id,
+                                        schema_hash=schema_hash)
+        except wire.WireError:
+            self._incompatible = True
+            sock.close()
+            raise
+        self._record_epoch(epoch)
         return sock
 
     def _request(self, op: str, payload: dict, *, timeout: float, session_id: str | None = None) -> dict:
@@ -192,6 +218,77 @@ class MemoryServerProxyProvider(MemoryProvider):
             return wire.read_frame_blocking(sock)
         finally:
             sock.close()
+
+    @staticmethod
+    def _try_send(sock: socket.socket, data: bytes) -> int:
+        """Send ``data``, returning how many bytes reached the kernel (§6.3)."""
+        view = memoryview(data)
+        sent = 0
+        while view:
+            try:
+                n = sock.send(view)
+            except OSError:
+                break
+            if n <= 0:
+                break
+            sent += n
+            view = view[n:]
+        return sent
+
+    def _mutation_request(
+        self, op: str, payload: dict, *, timeout: float, session_id: str,
+    ) -> tuple[str, dict | None]:
+        """Send a mutation and classify the outcome.
+
+        Returns ``(outcome, response)`` with outcome one of ``not_attempted``
+        (zero mutation bytes sent), ``uncertain`` (bytes sent, no authoritative
+        response), or ``response`` (an authoritative frame was read).
+        """
+        try:
+            sock = self._open()
+        except wire.WireError:
+            return "not_attempted", None
+        try:
+            sock.settimeout(timeout)
+            frame = {
+                "v": wire.PROTO_VERSION,
+                "op": op,
+                "correlation_id": self._cid(),
+                "session_id": session_id,
+                "payload": payload,
+            }
+            try:
+                frame_bytes = wire.encode_frame(frame)
+            except (wire.WireError, ValueError):
+                return "not_attempted", None
+            if self._try_send(sock, frame_bytes) == 0:
+                return "not_attempted", None
+            try:
+                return "response", wire.read_frame_blocking(sock)
+            except (wire.WireError, OSError):
+                return "uncertain", None
+        finally:
+            sock.close()
+
+    @staticmethod
+    def _is_uncertain(resp: dict) -> bool:
+        """True when a mutation's outcome is unknown even though a frame arrived."""
+        return resp.get("code") == "E_UNCERTAIN" or (
+            resp.get("code") == "E_FRAME" and resp.get("detail_code") == "result_too_large"
+        )
+
+    def _record_mutation_outcome(self, outcome: str, resp: dict | None) -> None:
+        """Update ``_stats`` for a mutation's classified outcome (§6.3)."""
+        if outcome == "not_attempted":
+            self._stats["dropped"] += 1
+        elif outcome == "uncertain":
+            self._stats["uncertain"] += 1
+        elif resp is not None and self._is_uncertain(resp):
+            self._stats["uncertain"] += 1
+        elif resp is None or not resp.get("ok"):
+            self._stats["dropped"] += 1
+        else:
+            self._stats["sent"] += 1
 
     def _availability(self) -> tuple[bool, str]:
         if self._sidecar is None:
@@ -218,6 +315,7 @@ class MemoryServerProxyProvider(MemoryProvider):
         if home:
             self._home = str(home)
         self._session_id = session_id or ""
+        self._incompatible = False  # new session: re-allow probing the endpoint
         try:
             self._read_sidecar()
         except (ValueError, OSError):
@@ -256,15 +354,41 @@ class MemoryServerProxyProvider(MemoryProvider):
 
     # -- Recall -----------------------------------------------------------
 
+    def _confirm_epoch(self) -> bool:
+        """Re-validate the owner epoch via a short bounded hello (§8.3/§8.5).
+
+        ``_open`` performs the peercred check, full READY validation and records
+        any new epoch (which clears the cache). Returns True when the endpoint
+        is still reachable and the current epoch remains authoritative.
+        """
+        try:
+            sock = self._open(hello_timeout=PREFETCH_HELLO_TIMEOUT)
+        except wire.WireError:
+            return False
+        sock.close()
+        return True
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         sid = session_id or self._session_id
         with self._lock:
             entry = self._cache.get("prefetch")
             generation = self._generation
             epoch = self._epoch
-        if entry is not None and entry[0] == query and entry[1] == sid:
-            if entry[3] == generation and entry[4] == epoch and epoch is not None:
-                return entry[2]
+        if not (entry is not None and entry[0] == query and entry[1] == sid
+                and entry[3] == generation and entry[4] == epoch and epoch is not None):
+            return ""
+        # A cache-hit is never served without re-confirming the epoch: a service
+        # restart changes the epoch, so a stale local `_epoch` must not leak old
+        # context into the prompt (§8.3/§8.5).
+        if not self._confirm_epoch():
+            return ""
+        with self._lock:
+            entry = self._cache.get("prefetch")
+            generation = self._generation
+            epoch = self._epoch
+        if entry is not None and entry[0] == query and entry[1] == sid \
+                and entry[3] == generation and entry[4] == epoch and epoch is not None:
+            return entry[2]
         return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -337,46 +461,20 @@ class MemoryServerProxyProvider(MemoryProvider):
                 {"role": "user", "content": user_content},
                 {"role": "assistant", "content": assistant_content},
             ]
-        try:
-            sock = self._open()
-        except wire.WireError:
-            self._stats["dropped"] += 1
-            return
-        try:
-            sock.settimeout(ENQUEUE_TIMEOUT)
-            frame = {
-                "v": wire.PROTO_VERSION,
-                "op": wire.OP_ENQUEUE,
-                "correlation_id": self._cid(),
-                "session_id": sid,
-                "payload": {"messages": messages},
-            }
-            sock.sendall(wire.encode_frame(frame))
-            try:
-                resp = wire.read_frame_blocking(sock)
-            except (wire.WireError, OSError):
-                # Sent but no authoritative response: terminal, never retry.
-                self._stats["uncertain"] += 1
-                return
-            if not resp.get("ok"):
-                self._stats["dropped"] += 1
-            else:
-                self._stats["sent"] += 1
-        finally:
-            sock.close()
+        outcome, resp = self._mutation_request(wire.OP_ENQUEUE, {"messages": messages},
+                                               timeout=ENQUEUE_TIMEOUT, session_id=sid)
+        self._record_mutation_outcome(outcome, resp)
 
     def on_session_end(self, messages: list[dict]) -> None:
-        try:
-            self._request(wire.OP_FLUSH, {}, timeout=FLUSH_TIMEOUT)
-        except (wire.WireError, OSError):
-            self._stats["dropped"] += 1
+        outcome, resp = self._mutation_request(wire.OP_FLUSH, {}, timeout=FLUSH_TIMEOUT,
+                                               session_id=self._session_id)
+        self._record_mutation_outcome(outcome, resp)
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "",
                           reset: bool = False, rewound: bool = False, **kwargs) -> None:
-        try:
-            self._request(wire.OP_FLUSH, {}, timeout=FLUSH_TIMEOUT)
-        except (wire.WireError, OSError):
-            self._stats["dropped"] += 1
+        outcome, resp = self._mutation_request(wire.OP_FLUSH, {}, timeout=FLUSH_TIMEOUT,
+                                               session_id=self._session_id)
+        self._record_mutation_outcome(outcome, resp)
         with self._lock:
             self._generation += 1
             self._cache.clear()
@@ -394,6 +492,30 @@ class MemoryServerProxyProvider(MemoryProvider):
     # -- Tool dispatch ----------------------------------------------------
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        if tool_name in _MUTATING_TOOLS:
+            outcome, resp = self._mutation_request(
+                wire.OP_TOOL_CALL, {"name": tool_name, "args": dict(args)},
+                timeout=TOOL_TIMEOUT, session_id=self._session_id,
+            )
+            if outcome == "not_attempted":
+                return json.dumps({"error": "memory_server_proxy unavailable",
+                                   "code": "E_UNAVAILABLE", "tool": tool_name})
+            if outcome == "uncertain":
+                self._stats["uncertain"] += 1
+                return json.dumps({"error": "outcome unknown", "code": "E_UNCERTAIN",
+                                   "tool": tool_name})
+            assert resp is not None
+            if self._is_uncertain(resp):
+                self._stats["uncertain"] += 1
+                return json.dumps({"error": "outcome unknown", "code": "E_UNCERTAIN",
+                                   "tool": tool_name})
+            if not resp.get("ok") or "result" not in resp:
+                self._stats["dropped"] += 1
+                return json.dumps({"error": "memory_server_proxy unavailable",
+                                   "code": resp.get("code", "E_UNAVAILABLE"), "tool": tool_name})
+            self._stats["sent"] += 1
+            result = resp.get("result")
+            return result if isinstance(result, str) else json.dumps(result)
         try:
             resp = self._request(wire.OP_TOOL_CALL, {"name": tool_name, "args": dict(args)},
                                  timeout=TOOL_TIMEOUT)

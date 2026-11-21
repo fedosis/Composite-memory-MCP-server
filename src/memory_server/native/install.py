@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -237,6 +238,13 @@ def install_proxy_plugin(
             "would_activate": bool(activate),
             "would_write": [str(plugin_dir / path.relative_to(source)) for path in files] + [str(sidecar)],
         }
+
+    try:
+        info = os.lstat(plugin_dir)
+    except FileNotFoundError:
+        info = None
+    if info is not None and stat.S_ISLNK(info.st_mode):
+        raise InstallError("E_PLUGIN_SOURCE", f"plugin dir is a symlink: {plugin_dir}")
 
     plugin_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(plugin_dir, 0o700)

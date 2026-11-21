@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import socket
 import sys
 from pathlib import Path
@@ -35,7 +36,14 @@ from memory_server.native.install import (
     install_proxy_plugin,
     uninstall_proxy_plugin,
 )
-from memory_server.native.protocol import HEADER, PROTO_VERSION, ProtocolError, encode_frame
+from memory_server.native.peercred import PeerCredentialError, peer_cred
+from memory_server.native.protocol import (
+    HEADER,
+    PROTO_VERSION,
+    ProtocolError,
+    encode_frame,
+    validate_ready_reply,
+)
 from memory_server.native.schema_v1 import schema_hash
 from memory_server.paths import cmms_repo_root
 
@@ -130,6 +138,12 @@ def _hello(config: ServiceConfig, *, timeout: float) -> dict[str, Any]:
     sock.settimeout(timeout)
     try:
         sock.connect(str(config.socket_path))
+        try:
+            peer_uid = peer_cred(sock)[1]
+        except PeerCredentialError as exc:
+            _fail(exc.code, str(exc))
+        if peer_uid != os.geteuid():
+            _fail("E_PROFILE_DENIED", "peer uid does not match the current euid")
         sock.sendall(encode_frame(request))
         reply = _read_frame_blocking(sock, max_bytes=config.limits.frame_bytes)
     except OSError as exc:
@@ -143,6 +157,11 @@ def _hello(config: ServiceConfig, *, timeout: float) -> dict[str, Any]:
 
     if reply.get("ok") is not True:
         _fail(str(reply.get("code", "E_HELLO_REJECTED")), str(reply.get("message", "hello rejected")))
+    try:
+        validate_ready_reply(reply, correlation_id=_HELLO_CORRELATION_ID,
+                             expected_store_id=config.store_id, schema_hash=schema_hash())
+    except ProtocolError as exc:
+        _fail(exc.code, str(exc))
     return reply
 
 

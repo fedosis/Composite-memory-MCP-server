@@ -14,6 +14,7 @@ import hashlib
 import json
 import socket
 import struct
+import uuid
 from typing import Any, Mapping
 
 PROTO_VERSION: int = 1
@@ -75,6 +76,11 @@ def _check_depth(value: Any, depth: int = 0) -> None:
             _check_depth(item, depth + 1)
 
 
+def _reject_nan(value: str) -> Any:
+    # NaN/Infinity are valid JSON per ``json.loads`` but forbidden on the wire.
+    raise WireError("E_VALIDATION")
+
+
 def encode_frame(payload: Mapping[str, Any]) -> bytes:
     body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
     if not 1 <= len(body) <= MAX_FRAME_BYTES:
@@ -100,7 +106,7 @@ def read_frame_blocking(sock: socket.socket, *, max_bytes: int = MAX_FRAME_BYTES
         if not 1 <= length <= max_bytes:
             raise WireError("E_FRAME")
         body = _recv_exact(sock, length).decode("utf-8", errors="strict")
-        value = json.loads(body, object_pairs_hook=_no_duplicates)
+        value = json.loads(body, object_pairs_hook=_no_duplicates, parse_constant=_reject_nan)
     except (UnicodeError, ValueError, RecursionError) as exc:
         raise WireError("E_FRAME") from exc
     if not isinstance(value, dict):
@@ -128,3 +134,57 @@ def schema_hash_from_artifacts(tools: list[dict], prompt: str) -> str:
 def hello_payload(*, schema_hash: str, store_id: str, claimed_home: str) -> dict[str, Any]:
     """The hello payload fields; the caller nests them under ``payload``."""
     return {"schema_hash": schema_hash, "store_id": store_id, "claimed_home": claimed_home}
+
+
+def peer_cred(sock: socket.socket) -> tuple[int, int, int]:
+    """Linux ``SO_PEERCRED`` peer identity ``(pid, uid, gid)`` — stdlib only."""
+    if not hasattr(socket, "SO_PEERCRED"):
+        raise WireError("E_PEERCRED_UNAVAILABLE")
+    try:
+        data = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        return struct.unpack("3i", data)
+    except (OSError, struct.error) as exc:
+        raise WireError("E_PEERCRED_UNAVAILABLE") from exc
+
+
+_READY_KEYS: frozenset[str] = frozenset({"v", "ok", "correlation_id", "state", "store_id", "epoch", "schema_hash"})
+
+
+def validate_ready(
+    reply: Mapping[str, Any], *, correlation_id: str, expected_store_id: str, schema_hash: str,
+) -> str:
+    """Validate a hello READY response and return its ``epoch`` (canonical UUID4)."""
+    if not isinstance(reply, Mapping) or set(reply) != _READY_KEYS:
+        raise WireError("E_VALIDATION")
+    if type(reply["v"]) is not int or reply["v"] != PROTO_VERSION:
+        raise WireError("E_SCHEMA")
+    if reply["ok"] is not True:
+        raise WireError("E_VALIDATION")
+    if reply["correlation_id"] != correlation_id:
+        raise WireError("E_VALIDATION")
+    if reply["state"] != "READY":
+        raise WireError("E_NOT_READY")
+    store_id = reply["store_id"]
+    try:
+        canonical = isinstance(store_id, str) and str(uuid.UUID(store_id)) == store_id
+    except (ValueError, AttributeError, TypeError):
+        canonical = False
+    if not canonical or store_id != expected_store_id:
+        raise WireError("E_STORE_ID")
+    claim_hash = reply["schema_hash"]
+    if not isinstance(claim_hash, str) or len(claim_hash) != 64 or not all(c in "0123456789abcdef" for c in claim_hash):
+        raise WireError("E_SCHEMA")
+    if claim_hash != schema_hash:
+        raise WireError("E_SCHEMA")
+    epoch = reply["epoch"]
+    try:
+        canonical_epoch = (
+            isinstance(epoch, str)
+            and str(uuid.UUID(epoch)) == epoch
+            and uuid.UUID(epoch).version == 4
+        )
+    except (ValueError, AttributeError, TypeError):
+        canonical_epoch = False
+    if not canonical_epoch:
+        raise WireError("E_VALIDATION")
+    return epoch
