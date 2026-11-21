@@ -267,7 +267,9 @@ class NativeOwnerService:
             cid = payload.get("correlation_id") if isinstance(payload, dict) else None
             frame = encode_frame(response_error(cid, "E_FRAME", detail_code="result_too_large"))
         writer.write(frame)
-        await asyncio.wait_for(writer.drain(), timeout=0.1)
+        # A 0.1s drain budget aborted the connection on any slow write; use the
+        # configured idle budget instead (same knob that bounds reads).
+        await asyncio.wait_for(writer.drain(), timeout=self.config.limits.read_idle_s)
 
     async def _handle_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -342,7 +344,7 @@ class NativeOwnerService:
             self.stats.active -= 1
             writer.close()
             try:
-                await asyncio.wait_for(writer.wait_closed(), timeout=0.1)
+                await asyncio.wait_for(writer.wait_closed(), timeout=self.config.limits.read_idle_s)
             except (Exception, asyncio.CancelledError):
                 pass
             if task is not None:

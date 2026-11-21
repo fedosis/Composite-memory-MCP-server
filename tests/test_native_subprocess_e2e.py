@@ -38,16 +38,18 @@ for plugin_path in (str(PLUGIN_DIR), "/home/shtorm/.hermes/hermes-agent"):
         sys.path.insert(0, plugin_path)
 from memory_server_proxy.provider import MemoryServerProxyProvider  # noqa: E402
 
+_STOP_BUDGET_S = 30.0  # service unit uses TimeoutStopSec=45; keep below that
+
 
 def _stop(proc: subprocess.Popen) -> int:
     if proc.poll() is None:
         proc.terminate()
     try:
-        return proc.wait(timeout=20)
+        return proc.wait(timeout=_STOP_BUDGET_S)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
-        raise AssertionError("native service did not stop within 20 seconds")
+        raise AssertionError(f"native service did not stop within {_STOP_BUDGET_S} seconds")
 
 
 @pytest.fixture(autouse=True)
