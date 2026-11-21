@@ -18,7 +18,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import prometheus_client
 from storage.outbox import OutboxRepository
@@ -39,7 +39,7 @@ from memory_server.plugins.hermes.resolver import (
     ExtractorRuntimeConfig,
     resolve_extractor_settings,
 )
-from memory_server.plugins.hermes.writer import WriterQueue
+from memory_server.plugins.hermes.writer import WriterBacklogError, WriterQueue
 from memory_server.settings import get_settings
 from memory_server.storage_lock import RuntimeStorageLock, open_directory_nofollow
 
@@ -2058,6 +2058,60 @@ class HermesProvider:
             limit=limit,
         )
         return json.dumps(result)
+
+    # ------------------------------------------------------------------
+    # Native backend seam (T3)
+    # ------------------------------------------------------------------
+
+    async def recall_context_async(self, query: str, *, session_id: str, max_results: int = 5) -> str:
+        """Recall context for the native service without touching the cache."""
+        if self._provider is None:
+            return ""
+        return await self._prefetch_async(query, max_results=max_results)
+
+    async def enqueue_observation_async(
+        self,
+        messages: Any,
+        *,
+        session_id: str,
+        live_limit: int,
+        terminal_limit: int,
+    ) -> None:
+        """Enqueue one turn, gated on the writer's pending-snapshot backlog."""
+        snap = self._writer.pending_snapshot()
+        if snap.live_pending >= live_limit or snap.terminal_failed >= terminal_limit:
+            raise WriterBacklogError("E_BACKLOG")
+        await self._writer.add_turn(messages, turn_id=session_id or "unknown")
+
+    async def flush_observations_async(self) -> dict[str, int]:
+        """Flush and settle the writer, returning scalar report fields."""
+        await self._writer.flush()
+        report = await self._writer.settle()
+        return {
+            "flushed": report.flushed,
+            "failed": report.failed,
+            "requeued": report.requeued,
+            "unsettled": report.unsettled,
+        }
+
+    async def execute_tool_async(self, tool_name: str, args: Mapping[str, Any]) -> str:
+        """Execute one CMMS tool on the owner loop, mirroring handle_tool_call."""
+        handler = self._get_tool_handler(tool_name)
+        if handler is None:
+            raise ValueError(f"Unknown CMMS tool: {tool_name}")
+        try:
+            token = self._bridge.runtime.admit()
+            try:
+                result = await handler(**dict(args))
+            finally:
+                self._bridge.runtime.release_admitted(token)
+            return result if isinstance(result, str) else json.dumps(result)
+        except Exception as exc:
+            projection_error = _projection_error(exc)
+            if projection_error is not None:
+                return projection_error
+            logger.exception("HermesProvider: native tool call '%s' failed", tool_name)
+            return json.dumps({"error": str(exc), "tool": tool_name})
 
     # ------------------------------------------------------------------
     # Writer queue batch handler

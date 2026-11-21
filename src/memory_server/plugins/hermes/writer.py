@@ -64,6 +64,24 @@ class QueueCustodySnapshot:
     invariant_ok: bool
 
 
+class WriterBacklogError(RuntimeError):
+    """Admission rejected because the writer backlog reached its configured cap."""
+
+    def __init__(self, code: str = "E_BACKLOG") -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSnapshot:
+    """Read-only admission view across every custody bucket."""
+
+    live_pending: int
+    terminal_failed: int
+    retry_waiting: int
+    in_flight: int
+
+
 class WriterQueue:
     """Non-blocking batch writer with flush-on-switch semantics.
 
@@ -139,6 +157,10 @@ class WriterQueue:
     @property
     def failed_items(self) -> list[dict[str, Any]]:
         return list(self._failed_items)
+
+    @property
+    def terminal_failed(self) -> int:
+        return len(self._failed_items)
 
     def _retry_delay(self, attempts: int) -> float:
         return min(0.05 * max(1, attempts), 0.5)
@@ -327,6 +349,18 @@ class WriterQueue:
             unsettled=self._total_queued - self._total_flushed - self._total_failed,
             failed_records=len(self._failed_items),
             requeued=self._total_requeued,
+        )
+
+    def pending_snapshot(self) -> PendingSnapshot:
+        """Read-only admission counts; no await and no flush lock."""
+        in_flight = sum(len(batch.items) for batch in self._in_flight.values())
+        retry_waiting = len(self._retry_heap)
+        live = self._queue.qsize() + retry_waiting + in_flight
+        return PendingSnapshot(
+            live_pending=live,
+            terminal_failed=len(self._failed_items),
+            retry_waiting=retry_waiting,
+            in_flight=in_flight,
         )
 
     async def settle(self) -> FlushReport:
