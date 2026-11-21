@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env python -m memory_server native-serve --config /srv/cmms/service.json
+ExecStart=/usr/bin/env python -m memory_server.cli native-serve --config /srv/cmms/service.json
 WorkingDirectory=/srv/cmms
 EnvironmentFile=/etc/cmms/native.env
 Restart=on-failure
