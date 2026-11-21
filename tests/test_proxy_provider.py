@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import shutil
 import socket
 import sys
@@ -44,15 +45,23 @@ def _write_sidecar(home: Path, *, socket_path: str, store_id: str | None = None)
     return store_id
 
 
+def _canonical_schema_hash() -> str:
+    """The real canonical schema hash shipped in ``plugin-dist``."""
+    doc = json.loads(
+        (REPO_ROOT / "plugin-dist" / "memory_server_proxy" / "schema_v1.json").read_text(encoding="utf-8")
+    )
+    return doc["schema_hash"]
+
+
 class FakeNativeServer:
     """Minimal AF_UNIX owner emulator: hello -> one op -> response -> close."""
 
-    def __init__(self, path: Path, *, epoch: str = "epoch-1", store_id: str | None = None,
+    def __init__(self, path: Path, *, epoch: str | None = None, store_id: str | None = None,
                  schema_hash: str | None = None):
         self.path = Path(path)
-        self.epoch = epoch
+        self.epoch = epoch or str(uuid.uuid4())
         self.store_id = store_id or str(uuid.uuid4())
-        self.schema_hash = schema_hash or "f" * 64
+        self.schema_hash = schema_hash or _canonical_schema_hash()
         self.connections = 0
         self.ops: list[tuple[str, str, dict]] = []
         self.hellos: list[dict] = []
@@ -200,11 +209,22 @@ def test_prefetch_offline_returns_empty(provider: MemoryServerProxyProvider) -> 
     assert provider.prefetch("anything", session_id="sess-1") == ""
 
 
-def test_prefetch_cache_hit_same_query_sid(provider: MemoryServerProxyProvider) -> None:
+def test_prefetch_cache_hit_same_query_sid(provider: MemoryServerProxyProvider, monkeypatch) -> None:
     provider._generation = 1
     provider._epoch = "epoch-1"
     provider._cache["prefetch"] = ("q", "sess-1", "CONTEXT", 1, "epoch-1")
+    # A cache-hit is only served after the epoch is re-confirmed (§8.5).
+    monkeypatch.setattr(provider, "_confirm_epoch", lambda: True)
     assert provider.prefetch("q", session_id="sess-1") == "CONTEXT"
+
+
+def test_prefetch_cache_not_served_when_epoch_unconfirmed(provider: MemoryServerProxyProvider, monkeypatch) -> None:
+    provider._generation = 1
+    provider._epoch = "epoch-1"
+    provider._cache["prefetch"] = ("q", "sess-1", "CONTEXT", 1, "epoch-1")
+    # Offline / changed epoch: the stale cache must never leak into the prompt.
+    monkeypatch.setattr(provider, "_confirm_epoch", lambda: False)
+    assert provider.prefetch("q", session_id="sess-1") == ""
 
 
 def test_prefetch_rejects_other_query(provider: MemoryServerProxyProvider) -> None:
@@ -373,3 +393,73 @@ def test_shutdown_stops_worker_under_2s(provider: MemoryServerProxyProvider) -> 
     assert provider._worker_stop.is_set()
     assert elapsed < 2.5
     release.set()
+
+
+# --------------------------------------------------------------------------
+# v12: peercred, READY validation, mutation uncertain semantics
+# --------------------------------------------------------------------------
+
+def test_client_peercred_foreign_uid_rejected(tmp_path: Path, monkeypatch) -> None:
+    sock_dir = _short_socket_dir()
+    sock_path = sock_dir / "memory.sock"
+    p, store_id = _online_provider(tmp_path, sock_path)
+    with FakeNativeServer(sock_path, store_id=store_id) as server:
+        monkeypatch.setattr(wire, "peer_cred", lambda sock: (0, os.geteuid() + 1, 0))
+        with pytest.raises(wire.WireError) as exc:
+            p._open()
+        assert exc.value.code == "E_PROFILE_DENIED"
+        assert p._incompatible is True
+        # No hello reached the server.
+        assert server.hellos == []
+
+
+def test_ready_store_id_mismatch_marks_incompatible(tmp_path: Path) -> None:
+    sock_dir = _short_socket_dir()
+    sock_path = sock_dir / "memory.sock"
+    p, _store_id = _online_provider(tmp_path, sock_path)
+    with FakeNativeServer(sock_path, store_id=str(uuid.uuid4())) as server:
+        with pytest.raises(wire.WireError) as exc:
+            p._open()
+        assert exc.value.code == "E_STORE_ID"
+        assert p._incompatible is True
+        # Subsequent attempts fail fast without another connection attempt.
+        with pytest.raises(wire.WireError) as exc:
+            p._open()
+        assert exc.value.code == "E_UNAVAILABLE"
+        assert server.connections == 1
+
+
+def test_mutating_tool_uncertain(tmp_path: Path) -> None:
+    sock_dir = _short_socket_dir()
+    sock_path = sock_dir / "memory.sock"
+    p, store_id = _online_provider(tmp_path, sock_path)
+    with FakeNativeServer(sock_path, store_id=store_id) as server:
+        server.drop_next_response()
+        result = p.handle_tool_call("remember", {"subject": "s", "predicate": "p", "object": "o"})
+        assert json.loads(result)["code"] == "E_UNCERTAIN"
+        assert p._stats["uncertain"] == 1
+        assert p._stats["dropped"] == 0
+
+
+def test_flush_uncertain_not_dropped(tmp_path: Path) -> None:
+    sock_dir = _short_socket_dir()
+    sock_path = sock_dir / "memory.sock"
+    p, store_id = _online_provider(tmp_path, sock_path)
+    with FakeNativeServer(sock_path, store_id=store_id) as server:
+        server.drop_next_response()
+        p.on_session_end([])
+        assert p._stats["uncertain"] == 1
+        assert p._stats["dropped"] == 0
+
+
+def test_wire_rejects_nan() -> None:
+    left, right = socket.socketpair()
+    try:
+        body = b'{"a": NaN}'
+        left.sendall(wire.HEADER.pack(len(body)) + body)
+        with pytest.raises(wire.WireError) as exc:
+            wire.read_frame_blocking(right)
+        assert exc.value.code == "E_VALIDATION"
+    finally:
+        left.close()
+        right.close()

@@ -28,6 +28,7 @@ from memory_server.native.cli import (
 from memory_server.native.config import ServiceConfigError, load_service_config
 from memory_server.native.install import (
     CLIENT_CONFIG_NAME,
+    InstallError,
     install_proxy_plugin,
     read_client_config,
     uninstall_proxy_plugin,
@@ -160,6 +161,34 @@ def test_native_status_unavailable_exit_2(tmp_path: Path, capsys: pytest.Capture
     assert "E_UNAVAILABLE" in capsys.readouterr().err
 
 
+def test_native_status_rejects_bad_epoch(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    store_id = str(uuid.uuid4())
+    config = make_service_config(tmp_path, store_id=store_id)
+    cfg = load_service_config(config)
+
+    server, thread = _start_fake_service(
+        cfg.socket_path,
+        lambda: {
+            "v": PROTO_VERSION,
+            "ok": True,
+            "correlation_id": "status",
+            "state": "READY",
+            "store_id": cfg.store_id,
+            "epoch": "not-a-uuid",
+            "schema_hash": schema_hash(),
+        },
+    )
+    try:
+        with pytest.raises(SystemExit) as info:
+            native_status(config)
+    finally:
+        server.close()
+        thread.join(timeout=10)
+
+    assert info.value.code == 2
+    assert "E_VALIDATION" in capsys.readouterr().err
+
+
 # ------------------------------------------------------------------ serve
 def test_native_serve_bad_config_exit_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     config = tmp_path / "service.json"
@@ -221,6 +250,29 @@ def test_install_writes_plugin_and_sidecar(tmp_path: Path) -> None:
     assert result["sidecar"] == str(sidecar)
     assert result["activated"] is False
     assert result["backup"] is None
+
+
+def test_install_rejects_symlink_plugin_dir(tmp_path: Path) -> None:
+    home = tmp_path / "hermes"
+    real_dir = tmp_path / "real-target"
+    real_dir.mkdir(parents=True)
+    plugin_dir = home / "plugins" / "memory_server_proxy"
+    plugin_dir.parent.mkdir(parents=True)
+    plugin_dir.symlink_to(real_dir)
+    source = _source_tree(tmp_path)
+
+    with pytest.raises(InstallError) as excinfo:
+        install_proxy_plugin(
+            hermes_home=home,
+            source_dir=source,
+            socket_path=tmp_path / "run" / "memory.sock",
+            expected_store_id=str(uuid.uuid4()),
+            activate=False,
+            dry_run=False,
+        )
+
+    assert excinfo.value.code == "E_PLUGIN_SOURCE"
+    assert plugin_dir.is_symlink()
 
 
 def test_uninstall_removes_only_own_files(tmp_path: Path) -> None:

@@ -228,11 +228,13 @@ def test_oversized_frame(sandbox):
         client.settimeout(3)
         client.connect(str(sock))
         client.sendall(HEADER.pack(MAX_FRAME_BYTES + 1))
-        try:
-            reply = _read_frame(client)
-        except (EOFError, ConnectionResetError):
-            reply = {"code": "E_FRAME"}  # explicit close is also permitted
-        assert reply["code"] == "E_FRAME"
+        # Over-cap request: the server must close without any response frame
+        # (amplification guard, §5.2 p.1) — never synthesize a server code.
+        with pytest.raises((EOFError, ConnectionResetError)):
+            _read_frame(client)
+    # The framing rejection is counted and observable via status.rejected.
+    status = send_op(sock, "status", {})
+    assert status["rejected"] >= 1
 
 
 def test_connection_flood_limit(sandbox):
@@ -311,6 +313,24 @@ def test_stale_socket_blocks_start(sandbox):
     proc = spawn()
     assert proc.wait(timeout=15) == 4
     assert sock.read_text(encoding="utf-8") == "occupied"
+
+
+def test_prefetch_cache_invalidated_on_restart(sandbox):
+    _, home, sock, _, _, spawn, _ = sandbox
+    proc = spawn()
+    wait_ready(sock)
+    provider = _provider(home, "sess-1")
+    epoch = provider._epoch
+    assert epoch
+    provider._generation = 1
+    provider._cache["prefetch"] = ("q", "sess-1", "STALE-CONTEXT", 1, epoch)
+    # Restart the owner: a fresh epoch must invalidate the stale prefetch cache
+    # before it is ever served (§8.5).
+    assert _stop(proc) == 0
+    spawn()
+    wait_ready(sock)
+    assert provider.prefetch("q", session_id="sess-1") == ""
+    assert provider._cache == {}
 
 
 def test_status_does_not_start_backend(sandbox):

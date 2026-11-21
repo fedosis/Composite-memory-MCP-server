@@ -72,6 +72,7 @@ async def test_gate_rejects_at_live_64():
     except WriterBacklogError as exc:
         accepted = False
         assert exc.code == "E_BACKLOG"
+        assert exc.detail_code == "live_limit"
 
     assert accepted is False
     assert writer.add_turn_calls == 0
@@ -88,6 +89,7 @@ async def test_gate_rejects_at_terminal_64():
     except WriterBacklogError as exc:
         accepted = False
         assert exc.code == "E_BACKLOG"
+        assert exc.detail_code == "terminal_limit"
 
     assert accepted is False
     assert writer.add_turn_calls == 0
@@ -113,7 +115,10 @@ async def test_upper_bound_127():
                 writer.live -= 1
                 writer.terminal += 1
 
-    assert max_total <= 127
+    # The bound is exercised, not vacuous: at least one op was admitted and the
+    # peak retention actually reached the documented 127 ceiling (§12.3).
+    assert writer.add_turn_calls > 0
+    assert max_total == 127
 
 
 async def test_accepted_items_not_deleted_after_trip():

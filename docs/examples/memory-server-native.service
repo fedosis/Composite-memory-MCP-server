@@ -15,8 +15,11 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/srv/cmms/store
-RestrictAddressFamilies=AF_UNIX
+RuntimeDirectory=cmms-native
+RuntimeDirectoryMode=0700
+ReadWritePaths=/srv/cmms/store /run/cmms-native
+# AF_INET/AF_INET6 are required for extraction_mode=llm (LLM egress over https).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=multi-user.target

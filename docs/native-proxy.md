@@ -22,10 +22,11 @@ AF_UNIX сокет, клиенты (Hermes-плагин `memory_server_proxy`) �
   знает только путь к сокету и ожидаемый `store_id` из sidecar.
 
 Кадр wire v1: 4-байтовый big-endian заголовок длины + JSON-объект. Hello
-содержит `v`, `op="hello"`, `correlation_id`, `schema_hash`, `store_id`,
-`claimed_home`; ответ содержит `state`, `store_id`, `epoch`, `schema_hash`.
+несёт `v`, `op="hello"`, `correlation_id` и вложенный `payload` с
+`schema_hash`, `store_id`, `claimed_home`; ответ содержит `v`, `ok`,
+`correlation_id` (echo), `state`, `store_id`, `epoch`, `schema_hash`.
 Readiness = `state == "READY"` **и** совпадение `store_id` **и** совпадение
-`schema_hash` с канонической схемой v1.
+`schema_hash` с канонической схемой v1 **и** canonical UUID4 `epoch`.
 
 ## Service JSON
 
@@ -46,8 +47,8 @@ Readiness = `state == "READY"` **и** совпадение `store_id` **и** с�
   symlink, mode 0700, владелец — euid сервиса;
 - `allow_homes` — непустой список существующих абсолютных каталогов; клиент с
   `claimed_home` вне списка получает `E_PROFILE_DENIED`;
-- `backend.storage_mode` — только `shared`; `vector_backend` — `lancedb`,
-  `qdrant` или `none`; `extraction_mode` — `llm` или `none`.
+- `backend.storage_mode` — только `shared`; `vector_backend` — `lancedb` или
+  `qdrant`; `extraction_mode` — `llm` или `none`.
 
 Секретов в файле нет: креды экстрактора передаются только через
 `EnvironmentFile=` systemd (0600).
@@ -107,9 +108,13 @@ Stale socket (код 4, в stderr `E_STALE_SOCKET`):
 
 1. убедиться, что процесс сервиса не запущен (`systemctl status`,
    `pgrep -f "native-serve"`);
-2. удалить **только** файл сокета из `socket_path` (каталог 0700, владелец —
+2. убедиться, что нет держателя root-lock: команда
+   `flock -n "$DATA_ROOT/.cmms-storage.lock" -c true` обязана завершиться
+   успешно; если `flock -n` не берёт lock, другой процесс всё ещё владеет
+   стором — удалять pathname нельзя, откажись с объяснением;
+3. удалить **только** файл сокета из `socket_path` (каталог 0700, владелец —
    сервисный UID);
-3. запустить сервис заново и проверить `native-status`.
+4. запустить сервис заново и проверить `native-status`.
 
 FAILED_CLOSING (код 3):
 
